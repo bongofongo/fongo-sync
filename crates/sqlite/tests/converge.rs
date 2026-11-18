@@ -1030,55 +1030,64 @@ async fn an_identity_of_several_fields_with_an_owner_is_matched_under_the_same_o
 
 #[tokio::test]
 async fn an_owner_graph_with_many_paths_is_walked_once() {
-    // Each part is owned by both parts of the level above, so a part deep down has 2^depth
-    // chains of owners up to the top.
-    const LEVELS: i64 = 40;
-    let schema = ["CREATE TABLE parts (
-        id INTEGER PRIMARY KEY,
-        a INTEGER REFERENCES parts(id) ON DELETE CASCADE,
-        b INTEGER REFERENCES parts(id) ON DELETE CASCADE)"];
+    // Each level is a collection whose two rows are both owned by both rows of the level above,
+    // so a row at the bottom has 2^depth chains of owners up to the top.
+    const LEVELS: usize = 30;
+    let mut schema = vec!["CREATE TABLE level0 (id INTEGER PRIMARY KEY, label TEXT)".to_string()];
+    for level in 1..LEVELS {
+        let up = level - 1;
+        schema.push(format!(
+            "CREATE TABLE level{level} (
+                id INTEGER PRIMARY KEY,
+                a INTEGER REFERENCES level{up}(id) ON DELETE CASCADE,
+                b INTEGER REFERENCES level{up}(id) ON DELETE CASCADE)"
+        ));
+    }
+    let schema: Vec<&str> = schema.iter().map(String::as_str).collect();
     let registry = || {
-        Registry::new(vec![
-            Collection::minted("parts", "parts", "id")
-                .owner("a", "parts")
-                .owner("b", "parts"),
-        ])
-        .unwrap()
+        let mut collections = vec![Collection::minted("level0", "level0", "id").field("label")];
+        for level in 1..LEVELS {
+            let (name, up) = (format!("level{level}"), format!("level{}", level - 1));
+            collections.push(
+                Collection::minted(&name, &name, "id")
+                    .owner("a", &up)
+                    .owner("b", &up),
+            );
+        }
+        Registry::new(collections).unwrap()
     };
     let mut hub = Vec::new();
     let mut peers = [
         Peer::with(&schema, registry()).await,
         Peer::with(&schema, registry()).await,
     ];
-    peers[0].run("INSERT INTO parts (id) VALUES (1), (2)").await;
+    peers[0]
+        .run("INSERT INTO level0 (id, label) VALUES (1, 'a'), (2, 'b')")
+        .await;
     for level in 1..LEVELS {
-        let (top, up) = (2 * level + 1, 2 * level - 1);
         peers[0]
             .run(&format!(
-                "INSERT INTO parts (id, a, b) VALUES ({top}, {up}, {}), ({}, {up}, {})",
-                up + 1,
-                top + 1,
-                up + 1
+                "INSERT INTO level{level} (id, a, b) VALUES (1, 1, 2), (2, 1, 2)"
             ))
             .await;
     }
     let started = std::time::Instant::now();
     settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        count(&mut peers[1], "SELECT count(*) FROM parts").await,
-        2 * LEVELS
-    );
+    let bottom = format!("SELECT count(*) FROM level{}", LEVELS - 1);
+    assert_eq!(count(&mut peers[1], &bottom).await, 2);
 
-    // Deleting one part at the top takes every part below it, since each is owned by it.
-    peers[0].run("DELETE FROM parts WHERE id = 1").await;
+    // Deleting one row at the top takes every row below it, since each is owned by it.
+    peers[0].run("DELETE FROM level0 WHERE id = 1").await;
     settle(&mut peers, &mut hub).await;
     for peer in peers.iter_mut() {
-        assert_eq!(count(peer, "SELECT count(*) FROM parts").await, 1);
+        assert_eq!(count(peer, "SELECT count(*) FROM level0").await, 1);
+        assert_eq!(count(peer, "SELECT count(*) FROM level1").await, 0);
+        assert_eq!(count(peer, &bottom).await, 0);
         assert_eq!(count(peer, "SELECT count(*) FROM fongo_pending").await, 0);
     }
-    let kept = peers[0].gid("parts", 2).await;
-    let row = count(&mut peers[1], "SELECT id FROM parts").await;
-    assert_eq!(peers[1].gid("parts", row).await, kept);
+    let kept = peers[0].gid("level0", 2).await;
+    let row = count(&mut peers[1], "SELECT id FROM level0").await;
+    assert_eq!(peers[1].gid("level0", row).await, kept);
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
 }
 

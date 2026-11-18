@@ -285,7 +285,10 @@ impl Registry {
                     let Some(field) = c.fields.iter().find(|f| f.name == *name) else {
                         return bad(format!("`{}.{name}` is not declared", c.name));
                     };
-                    if field.strategy != Strategy::Lww || c.key_columns().contains(&name.as_str()) {
+                    if field.strategy != Strategy::Lww
+                        || c.key_columns().contains(&name.as_str())
+                        || c.owns_through(field)
+                    {
                         return bad(format!(
                             "`{}.{name}` cannot change together with others",
                             c.name
@@ -324,12 +327,16 @@ impl Registry {
                         c.name, f.name
                     ));
                 }
+                // Two replicas could each make one row the owner of the other.
+                if matches!(&f.kind, Kind::Ref { collection, owned: true } if *collection == c.name)
+                {
+                    return bad(format!("`{}.{}` makes a row own its kind", c.name, f.name));
+                }
             }
         }
         let owners: Vec<BTreeSet<usize>> = collections
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
+            .map(|c| {
                 c.fields
                     .iter()
                     .filter(|f| c.owns_through(f))
@@ -339,7 +346,6 @@ impl Registry {
                         }
                         Kind::Plain => None,
                     })
-                    .filter(|&o| o != i)
                     .collect()
             })
             .collect();
@@ -404,11 +410,16 @@ mod tests {
     #[test]
     fn owners_come_first_and_may_not_go_round() {
         let notes = Collection::minted("notes", "notes", "id").owner("book_id", "books");
-        let books = Collection::minted("books", "books", "id").owner("parent", "books");
-        let registry = Registry::new(vec![notes.clone(), books]).unwrap();
-        assert!(registry.rank(1) < registry.rank(0));
+        let books = Collection::minted("books", "books", "id").owner("shelf_id", "shelves");
+        let shelves = Collection::minted("shelves", "shelves", "id").field("name");
+        let registry = Registry::new(vec![notes.clone(), books, shelves]).unwrap();
+        assert!(registry.rank(2) < registry.rank(1) && registry.rank(1) < registry.rank(0));
         let circle = Collection::minted("books", "books", "id").owner("note_id", "notes");
         assert!(Registry::new(vec![notes, circle]).is_err());
+        let own_kind = Collection::minted("books", "books", "id").owner("parent", "books");
+        assert!(Registry::new(vec![own_kind]).is_err());
+        let referring = Collection::minted("books", "books", "id").reference("sequel", "books");
+        assert!(Registry::new(vec![referring]).is_ok());
     }
 
     #[test]
@@ -438,6 +449,13 @@ mod tests {
         assert!(Registry::new(vec![books().together(&["status", "finished"])]).is_ok());
         assert!(Registry::new(vec![books().together(&["status", "started"])]).is_err());
         assert!(Registry::new(vec![books().together(&["status", "pages"])]).is_err());
+        let owned = Collection::minted("notes", "notes", "id")
+            .owner("book_id", "books")
+            .reference("next", "notes")
+            .field("body");
+        let registry = |set: &[&str]| Registry::new(vec![books(), owned.clone().together(set)]);
+        assert!(registry(&["body", "next"]).is_ok());
+        assert!(registry(&["body", "book_id"]).is_err());
         let twice = books()
             .together(&["status", "finished"])
             .together(&["finished"]);
