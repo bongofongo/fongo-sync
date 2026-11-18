@@ -1796,6 +1796,8 @@ impl Replica {
                                     .await?;
                                 }
                                 written_key = key;
+                                // Rows that referred to the group while it had no row hold null.
+                                self.refer_again(conn, canon, pass).await?;
                             }
                             inserted
                         }

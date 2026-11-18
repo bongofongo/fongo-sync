@@ -121,6 +121,8 @@ struct Peer {
     conn: SqliteConnection,
     replica: Replica,
     cursor: usize,
+    /// Which changes in the hub this peer has applied, for delivery out of order.
+    seen: Vec<bool>,
 }
 
 impl Peer {
@@ -142,6 +144,7 @@ impl Peer {
             conn,
             replica: Replica::new(registry),
             cursor: 0,
+            seen: Vec::new(),
         }
     }
 
@@ -222,6 +225,122 @@ impl Peer {
 
     async fn dump(&mut self) -> Vec<String> {
         self.lines(DUMP).await
+    }
+}
+
+const PENDING: &str = "SELECT collection || ' ' || hex(gid) FROM fongo_pending ORDER BY 1";
+
+/// What must hold of the kernel's own tables whatever was delivered: every mapped id names a row,
+/// only a group's own id is mapped, and every alias points at its group's own id.
+const INTEGRITY: &str = "
+    SELECT 'stale ' || i.collection || ' ' || i.key FROM fongo_ids i
+     WHERE (i.collection = 'authors' AND NOT EXISTS
+               (SELECT 1 FROM authors WHERE id = json_extract(i.key, '$[0]')))
+        OR (i.collection = 'books' AND NOT EXISTS
+               (SELECT 1 FROM books WHERE id = json_extract(i.key, '$[0]')))
+        OR (i.collection = 'notes' AND NOT EXISTS
+               (SELECT 1 FROM notes WHERE id = json_extract(i.key, '$[0]')))
+        OR (i.collection = 'marks' AND NOT EXISTS
+               (SELECT 1 FROM marks WHERE id = json_extract(i.key, '$[0]')))
+        OR (i.collection = 'loans' AND NOT EXISTS
+               (SELECT 1 FROM loans WHERE id = json_extract(i.key, '$[0]')))
+    UNION ALL
+    SELECT 'not canonical ' || i.collection || ' ' || i.key
+      FROM fongo_ids i JOIN fongo_alias a ON a.gid = i.gid WHERE a.canon <> a.gid
+    UNION ALL
+    SELECT 'alias to a member ' || hex(a.gid)
+      FROM fongo_alias a JOIN fongo_alias b ON b.gid = a.canon WHERE b.canon <> b.gid";
+
+impl Peer {
+    async fn push(&mut self, hub: &mut Vec<Change>) {
+        self.replica.collect(&mut self.conn).await.unwrap();
+        let outbox = self
+            .replica
+            .outbox(&mut self.conn, 1_000_000)
+            .await
+            .unwrap();
+        hub.extend(outbox.changes);
+        self.replica
+            .acknowledge(&mut self.conn, outbox.through)
+            .await
+            .unwrap();
+    }
+
+    /// Applies the changes in the hub this peer has not seen and `pick` chooses, in hub order or
+    /// reversed. `twice` applies the same batch again and checks that it changes nothing.
+    async fn deliver(
+        &mut self,
+        hub: &[Change],
+        pick: impl Fn(usize) -> bool,
+        reverse: bool,
+        twice: bool,
+    ) {
+        self.seen.resize(hub.len(), false);
+        let mut chosen: Vec<usize> = (0..hub.len())
+            .filter(|&i| !self.seen[i] && pick(i))
+            .collect();
+        if reverse {
+            chosen.reverse();
+        }
+        let batch: Vec<Change> = chosen.iter().map(|&i| hub[i].clone()).collect();
+        for i in chosen {
+            self.seen[i] = true;
+        }
+        self.replica.apply(&mut self.conn, &batch).await.unwrap();
+        if twice {
+            let before = (
+                self.dump().await,
+                self.lines(SHADOW).await,
+                self.lines(ALIASES).await,
+            );
+            let again = self.replica.apply(&mut self.conn, &batch).await.unwrap();
+            let after = (
+                self.dump().await,
+                self.lines(SHADOW).await,
+                self.lines(ALIASES).await,
+            );
+            assert_eq!(before, after, "applying a batch again changed something");
+            if self.lines(PENDING).await.is_empty() {
+                assert!(again.touched.is_empty(), "{:#?}", again.touched);
+            }
+        }
+    }
+}
+
+fn mix(seed: u64, i: usize) -> u64 {
+    let mut x = seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^ (x >> 33)
+}
+
+/// Every peer sends and takes everything it has not seen, until nothing new is sent.
+async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) {
+    for _ in 0..40 {
+        let before = hub.len();
+        for peer in peers.iter_mut() {
+            peer.push(hub).await;
+            peer.deliver(hub, |_| true, false, false).await;
+        }
+        if hub.len() == before
+            && peers
+                .iter()
+                .all(|p| p.seen.len() == hub.len() && p.seen.iter().all(|s| *s))
+        {
+            return;
+        }
+    }
+    panic!("the peers never stopped sending");
+}
+
+/// Converged, nothing left waiting anywhere, and the kernel's tables intact on every peer.
+async fn check(peers: &mut [Peer]) {
+    assert_converged(peers).await;
+    for peer in peers.iter_mut() {
+        let broken = peer.lines(INTEGRITY).await;
+        assert!(broken.is_empty(), "{broken:#?}");
+        let pending = peer.lines(PENDING).await;
+        assert!(pending.is_empty(), "{pending:#?}\n{:#?}", peer.dump().await);
     }
 }
 
@@ -895,6 +1014,79 @@ async fn an_owner_graph_with_many_paths_is_walked_once() {
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
 }
 
+#[tokio::test]
+async fn a_reference_held_while_its_group_had_no_row_is_restored_when_the_row_returns() {
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::new().await,
+        Peer::new().await,
+        Peer::new().await,
+        Peer::new().await,
+    ];
+    let take = |peer: &mut Peer, hub: &Vec<Change>| {
+        let batch = hub[peer.cursor..].to_vec();
+        peer.cursor = hub.len();
+        batch
+    };
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('a', 'v')")
+        .await;
+    peers[0].push(&mut hub).await;
+    let created = take(&mut peers[0], &hub);
+    peers[1]
+        .replica
+        .apply(&mut peers[1].conn, &created)
+        .await
+        .unwrap();
+    peers[1]
+        .run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Celia')")
+        .await;
+    peers[1].cursor = hub.len();
+    peers[1].push(&mut hub).await;
+    let loan = take(&mut peers[1], &hub);
+    later();
+    peers[0].run("DELETE FROM books").await;
+    peers[0].cursor = hub.len();
+    peers[0].push(&mut hub).await;
+    let deleted = take(&mut peers[0], &hub);
+    later();
+    // Made after the delete, so the group the two books form is alive.
+    peers[2]
+        .run("INSERT INTO books (title, isbn) VALUES ('b', 'v')")
+        .await;
+    peers[2].cursor = hub.len();
+    peers[2].push(&mut hub).await;
+    let remade = take(&mut peers[2], &hub);
+    // Still holding the first book alive, the second replica meets the new one and merges them.
+    peers[1]
+        .replica
+        .apply(&mut peers[1].conn, &remade)
+        .await
+        .unwrap();
+    peers[1].cursor = hub.len();
+    peers[1].push(&mut hub).await;
+    let alias = take(&mut peers[1], &hub);
+
+    for batch in [&created, &loan, &deleted, &alias, &remade] {
+        peers[3]
+            .replica
+            .apply(&mut peers[3].conn, batch)
+            .await
+            .unwrap();
+    }
+    for peer in peers.iter_mut() {
+        peer.cursor = 0;
+    }
+    settle(&mut peers, &mut hub).await;
+    let state = assert_converged(&mut peers).await;
+    let book = state.iter().find(|l| l.starts_with("book ")).unwrap();
+    let loan = state.iter().find(|l| l.starts_with("loan ")).unwrap();
+    assert!(
+        loan.ends_with(&format!(" b={}", book.split(' ').nth(1).unwrap())),
+        "{state:#?}"
+    );
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1018,6 +1210,8 @@ enum Op {
     SetLoanBook(usize, usize),
     DeleteLoan(usize),
     Sync,
+    Push,
+    Deliver(u64, bool, bool),
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -1059,6 +1253,11 @@ fn arb_op() -> impl Strategy<Value = Op> {
         n.clone().prop_map(Op::DeleteLoan),
         Just(Op::Sync),
         Just(Op::Sync),
+        Just(Op::Push),
+        Just(Op::Push),
+        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
+        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
+        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
     ]
 }
 
@@ -1094,7 +1293,17 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             format!("DELETE FROM {parent} WHERE id = {from}")
         }
         Op::Sync => {
-            peer.sync(hub).await;
+            peer.push(hub).await;
+            peer.deliver(hub, |_| true, false, false).await;
+            return;
+        }
+        Op::Push => {
+            peer.push(hub).await;
+            return;
+        }
+        Op::Deliver(seed, reverse, twice) => {
+            peer.deliver(hub, |i| !mix(seed, i).is_multiple_of(3), reverse, twice)
+                .await;
             return;
         }
         Op::AddAuthor(v) => format!("INSERT OR IGNORE INTO authors (name) VALUES ('author{v}')"),
@@ -1124,8 +1333,9 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
              ON CONFLICT (key) DO UPDATE SET value = excluded.value"
         ),
         Op::DeleteSetting(k) => format!("DELETE FROM settings WHERE key = 'key{k}'"),
-        // Values 0 to 2 clash with other books holding the same; 3 clears the identity.
+        // Two values, so books clash often; 3 clears the identity.
         Op::AddIsbnBook(v, i) => {
+            let i = i % 2;
             format!("INSERT OR IGNORE INTO books (title, isbn) VALUES ('title{v}', 'isbn{i}')")
         }
         Op::SetIsbn(n, v) | Op::SetIsbn10(n, v) => {
@@ -1140,7 +1350,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             let value = if v == 3 {
                 "NULL".to_string()
             } else {
-                format!("'{column}{v}'")
+                format!("'{column}{}'", v % 2)
             };
             format!("UPDATE OR IGNORE books SET {column} = {value} WHERE id = {id}")
         }
@@ -1211,17 +1421,17 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
 proptest! {
     #[test]
     fn replicas_that_have_exchanged_everything_are_identical(
-        script in proptest::collection::vec((0usize..3, arb_op()), 0..60)
+        script in proptest::collection::vec((0usize..4, arb_op()), 0..120)
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         runtime.block_on(async {
             let mut hub = Vec::new();
-            let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+            let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await, Peer::new().await];
             for (who, op) in script {
                 perform(&mut peers[who], op, &mut hub).await;
             }
-            settle(&mut peers, &mut hub).await;
-            assert_converged(&mut peers).await;
+            finish(&mut peers, &mut hub).await;
+            check(&mut peers).await;
         });
     }
 }
