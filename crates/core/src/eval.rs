@@ -211,17 +211,6 @@ impl<S: Source> Session<'_, S> {
         target
     }
 
-    /// The canonical gid of `gid`'s group, whatever collection it belongs to.
-    pub fn canonical(&mut self, gid: Gid) -> Answer<Gid> {
-        Ok(self.group(gid)?.canonical)
-    }
-
-    /// The canonical gid of the live group `value` names in `collection`, as a reference to that
-    /// collection reads.
-    pub fn reads_as(&mut self, value: &Value, collection: &str) -> Answer<Option<Gid>> {
-        self.names_live(value, collection)
-    }
-
     pub(crate) fn home(&mut self, gid: Gid) -> Answer<Option<&Collection>> {
         let schema = self.schema;
         Ok(self.info(gid)?.home.map(|h| &schema.collections[h]))
