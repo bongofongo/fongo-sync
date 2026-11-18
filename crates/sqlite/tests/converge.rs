@@ -1165,6 +1165,64 @@ async fn deleting_one_member_keeps_another_made_without_seeing_it() {
     }
 }
 
+#[tokio::test]
+async fn a_swap_of_not_null_unique_identities_converges_and_one_that_cannot_waits() {
+    for check in ["", " CHECK (length(isbn) = 1)"] {
+        let schema = [format!(
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT NOT NULL UNIQUE{check})"
+        )];
+        let schema: Vec<&str> = schema.iter().map(String::as_str).collect();
+        let registry = || {
+            Registry::new(vec![
+                Collection::minted("books", "books", "id")
+                    .field("title")
+                    .field("isbn")
+                    .identity(&["isbn"]),
+            ])
+            .unwrap()
+        };
+        let mut hub = Vec::new();
+        let mut peers = [
+            Peer::with(&schema, registry()).await,
+            Peer::with(&schema, registry()).await,
+        ];
+        peers[0]
+            .run("INSERT INTO books (title, isbn) VALUES ('one', 'x'), ('two', 'y')")
+            .await;
+        settle(&mut peers, &mut hub).await;
+        peers[0]
+            .run("UPDATE books SET isbn = 'z' WHERE id = 1")
+            .await;
+        peers[0]
+            .run("UPDATE books SET isbn = 'x' WHERE id = 2")
+            .await;
+        peers[0]
+            .run("UPDATE books SET isbn = 'y' WHERE id = 1")
+            .await;
+        peers[0].push(&mut hub).await;
+        let mut batch = hub[peers[1].cursor..].to_vec();
+        batch.reverse();
+        let applied = peers[1]
+            .replica
+            .apply(&mut peers[1].conn, &batch)
+            .await
+            .unwrap();
+        peers[1].cursor = hub.len();
+        let rows = peers[1]
+            .lines("SELECT title || ' ' || isbn FROM books ORDER BY 1")
+            .await;
+        if check.is_empty() {
+            assert_eq!(applied.waiting, 0);
+            assert_eq!(rows, ["one y", "two x"]);
+            assert!(peers[1].lines(ALIASES).await.is_empty());
+        } else {
+            // No stand-in passes the check, so the rows wait rather than spin.
+            assert_eq!(applied.waiting, 2);
+            assert_eq!(rows, ["one x", "two y"]);
+        }
+    }
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));

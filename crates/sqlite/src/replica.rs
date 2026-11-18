@@ -127,6 +127,9 @@ enum Local {
 const OWNER_DEPTH: usize = 1024;
 const OWNER_LIMIT: usize = 10_000;
 
+/// Rounds of bringing rows in line in one apply, after which what is left waits for the next.
+const SETTLE_ROUNDS: usize = 1_000;
+
 enum Fate {
     Alive,
     Dead,
@@ -172,6 +175,8 @@ struct Pass {
     rows: Rows,
     /// Whether each entity looked at is deleted or owned by one that is. Valid until groups merge.
     dead: BTreeMap<(usize, Gid), bool>,
+    /// Rows written or removed and groups merged so far.
+    writes: usize,
 }
 
 type Rows = BTreeMap<(usize, String), (Gid, bool)>;
@@ -201,10 +206,12 @@ impl Pass {
             more: BTreeSet::new(),
             rows: Rows::new(),
             dead: BTreeMap::new(),
+            writes: 0,
         }
     }
 
     fn touch(&mut self, idx: usize, key: String, gid: Gid, deleted: bool) {
+        self.writes += 1;
         self.rows.insert((idx, key), (gid, deleted));
     }
 }
@@ -816,7 +823,8 @@ impl Replica {
         pass: &mut Pass,
     ) -> Result<BTreeSet<(usize, Gid)>> {
         round.append(&mut pass.more);
-        loop {
+        for _ in 0..SETTLE_ROUNDS {
+            let writes = pass.writes;
             let mut waiting = BTreeSet::new();
             let mut progressed = false;
             let mut order: Vec<(usize, Gid)> = round.iter().copied().collect();
@@ -842,13 +850,16 @@ impl Replica {
                     waiting.insert((idx, gid));
                 }
             }
-            let grew = !pass.more.is_empty();
+            // Entities are queued again only by a write, so a round that wrote nothing and
+            // settled nothing would repeat itself.
+            let wrote = pass.writes > writes;
             waiting.append(&mut pass.more);
-            if waiting.is_empty() || !(progressed || grew) {
+            if waiting.is_empty() || !(progressed || wrote) {
                 return Ok(waiting);
             }
             round = waiting;
         }
+        Ok(round)
     }
 
     /// Queues entities whose rows could not be written, to be retried by every later apply.
@@ -918,6 +929,7 @@ impl Replica {
         let Some(canon) = union(conn, a, b).await? else {
             return Ok(false);
         };
+        pass.writes += 1;
         pass.dead.clear();
         pass.more.insert((idx, canon));
         let c = &self.registry.collections()[idx];
@@ -1284,6 +1296,7 @@ impl Replica {
                 && has_shadow(conn, other).await?
                 && let Some(canon) = union(conn, gid, other).await?
             {
+                pass.writes += 1;
                 pass.dead.clear();
                 pass.more.insert((idx, canon));
             }
