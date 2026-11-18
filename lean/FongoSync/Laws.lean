@@ -207,7 +207,7 @@ theorem full_view_ignores_unknown_collection (sc : Full.Schema) (c : Change Valu
 
 /-- An alias that does not name another gid is ignored. -/
 theorem full_view_ignores_bad_alias (sc : Full.Schema) (c : Change Value)
-    (cs : List (Change Value)) (h : Full.aliasOk c = false) :
+    (cs : List (Change Value)) (h : aliasOk c = false) :
     Full.view sc (c :: cs) = Full.view sc cs :=
   Full.view_ignores_bad_alias sc c cs h
 

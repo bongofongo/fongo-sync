@@ -52,7 +52,9 @@ One chain, each link checked against the one above it:
 
 Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
 `clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
-faithful. The Lean view covers several collections, which collection a gid belongs to, the
+faithful. The one cross-check is `make lean-diff` (part of `make check`): it runs a handful of
+fixed cases through the single-collection Lean view, computed and proven equal to its
+specification, and through `model::view`, and compares the output. The Lean view covers several collections, which collection a gid belongs to, the
 changes `model::view` ignores, `together` sets and natural keys, but not `Real` values, and it is
 a specification: it states the least groups and least live set rather than computing them.
 

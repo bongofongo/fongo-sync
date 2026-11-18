@@ -100,6 +100,14 @@ def Schema.strategyOf (sc : Schema) (_collection field : String) : Strategy :=
   ((sc.fields.find? (·.name = field)).map (·.strategy)).getD .lww
 
 
+/-- An alias change is valid only if it names another gid. -/
+def aliasOk (c : Change Value) : Bool :=
+  if c.field = ALIAS then
+    match c.value with
+    | .ref t => t ≠ c.gid
+    | _ => false
+  else true
+
 section Inputs
 
 variable (sc : Schema) (cs : List (Change Value))
@@ -110,8 +118,9 @@ def step (st : State Value) (c : Change Value) : State Value :=
 
 def registers : State Value := cs.foldl (step sc) State.empty
 
-/-- The changes to this collection. -/
-def ours : List (Change Value) := cs.filter (·.collection = sc.collection)
+/-- The changes to this collection, without aliases that do not name another gid: those are
+ignored outright, so they do not make a gid known. -/
+def ours : List (Change Value) := cs.filter fun c => c.collection = sc.collection ∧ aliasOk c
 
 /-- Every gid a change to this collection has named, ascending. -/
 def known : List Gid := gidSet ((ours sc cs).map (·.gid))

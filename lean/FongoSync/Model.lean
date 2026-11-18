@@ -79,14 +79,6 @@ def Schema.Restricted (sc : Schema) : Prop :=
 
 /-! ## From changes to inputs -/
 
-/-- An alias change is valid only if it names another gid. -/
-def aliasOk (c : Change Value) : Bool :=
-  if c.field = ALIAS then
-    match c.value with
-    | .ref t => t ≠ c.gid
-    | _ => false
-  else true
-
 /-- The changes not ignored outright. -/
 def candidates (sc : Schema) (cs : List (Change Value)) : List (Change Value) :=
   cs.filter fun c => decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome

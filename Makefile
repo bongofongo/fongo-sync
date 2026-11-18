@@ -1,8 +1,8 @@
-.PHONY: check fmt-check lint test wasm lean
+.PHONY: check fmt-check lint test wasm lean lean-diff
 
 LAKE := $(shell command -v lake || echo $(HOME)/.elan/bin/lake)
 
-check: fmt-check lint test wasm lean
+check: fmt-check lint test wasm lean lean-diff
 
 fmt-check:
 	cargo fmt --all --check
@@ -27,3 +27,10 @@ lean:
 	@cd lean && $(LAKE) env lean Audit.lean > .lake/axioms.txt && cat .lake/axioms.txt
 	@! grep -oE '\[.*\]' lean/.lake/axioms.txt | tr -d '[] ' | tr ',' '\n' \
 		| grep -vxE 'propext|Classical\.choice|Quot\.sound'
+
+# Runs fixed cases through the Lean view and through model::view, and compares the output.
+lean-diff:
+	cd lean && $(LAKE) build cases
+	lean/.lake/build/bin/cases > lean/.lake/cases-lean.txt
+	cargo run --quiet -p fongo-sync-core --example view_cases --locked > lean/.lake/cases-rust.txt
+	diff -u lean/.lake/cases-lean.txt lean/.lake/cases-rust.txt
