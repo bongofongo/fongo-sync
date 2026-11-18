@@ -1,6 +1,6 @@
 //! What the application wrote, told apart from what the kernel wrote, by comparing its tables
 //! before each kernel step with how the previous step left them, and by triggers of the test's
-//! own that see a row deleted and made again at the same key. A replica may send a field of an
+//! own that see a row made again at the same key or a field set back to what it held. A replica may send a field of an
 //! entity only when the application wrote that field of its row, or wrote any part of a set the
 //! field changes with, or made or removed the row; besides that it sends aliases, and what an
 //! install adopts. Anything else it sends is a value the application did not write, such as a
@@ -49,12 +49,16 @@ async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
     out
 }
 
-/// Triggers that log each row made at a key, whoever makes it.
+/// Triggers that log each row made at a key and each field set, whoever does it: a field set
+/// back to the value it had, such as a reference to a row at a reused local id, leaves no trace
+/// in the table.
 async fn witness(conn: &mut SqliteConnection, replica: &Replica) {
-    sqlx::query("CREATE TABLE IF NOT EXISTS witness_made (collection TEXT, key TEXT)")
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS witness_made (collection TEXT, key TEXT)",
+        "CREATE TABLE IF NOT EXISTS witness_set (collection TEXT, key TEXT, field TEXT)",
+    ] {
+        sqlx::query(sql).execute(&mut *conn).await.unwrap();
+    }
     for c in replica.registry().collections() {
         let key = |row: &str| {
             let parts: Vec<String> = key_columns(c)
@@ -65,7 +69,29 @@ async fn witness(conn: &mut SqliteConnection, replica: &Replica) {
         };
         let (new, old) = (key("NEW"), key("OLD"));
         let made = format!("INSERT INTO witness_made VALUES ('{}', {new});", c.name);
+        let set: String = c
+            .fields
+            .iter()
+            .map(|f| {
+                let column = quoted(&f.name);
+                format!(
+                    "INSERT INTO witness_set SELECT '{}', {new}, '{}'
+                      WHERE OLD.{column} IS NOT NEW.{column};",
+                    c.name, f.name
+                )
+            })
+            .collect();
+        let set = if set.is_empty() {
+            "SELECT 1;".to_string()
+        } else {
+            set
+        };
         for sql in [
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS witness_{}_as AFTER UPDATE ON {} BEGIN {set} END",
+                c.name,
+                quoted(&c.table)
+            ),
             format!(
                 "CREATE TRIGGER IF NOT EXISTS witness_{}_ai AFTER INSERT ON {} BEGIN {made} END",
                 c.name,
@@ -100,6 +126,12 @@ impl Writes {
                 .iter()
                 .map(|row| (text(&row[0]), text(&row[1])))
                 .collect();
+        let mut set: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for row in rows(conn, "SELECT collection, key, field FROM witness_set", &[]).await {
+            set.entry((text(&row[0]), text(&row[1])))
+                .or_default()
+                .insert(text(&row[2]));
+        }
         for (at, values) in &current {
             let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
                 continue;
@@ -113,6 +145,9 @@ impl Writes {
             }
             if remade.contains(at) {
                 touched.extend(c.fields.iter().map(|f| f.name.clone()));
+            }
+            if let Some(fields) = set.get(at) {
+                touched.extend(fields.iter().cloned());
             }
             if touched.is_empty() {
                 continue;
@@ -201,10 +236,9 @@ impl Writes {
     /// After a kernel step: the rows as it left them.
     pub async fn after(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
         witness(conn, replica).await;
-        sqlx::query("DELETE FROM witness_made")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+        for sql in ["DELETE FROM witness_made", "DELETE FROM witness_set"] {
+            sqlx::query(sql).execute(&mut *conn).await.unwrap();
+        }
         self.after = now(conn, replica).await;
         let keys: Vec<(String, String)> = self.after.keys().cloned().collect();
         for (collection, key) in keys {
