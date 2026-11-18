@@ -29,6 +29,7 @@ import FongoSync
 #print axioms FongoSync.Laws.view_swap_writes
 #print axioms FongoSync.Laws.view_swap_alias
 #print axioms FongoSync.Laws.view_twice
+#print axioms FongoSync.Laws.view_runs
 #print axioms FongoSync.Laws.view_set
 #print axioms FongoSync.Laws.full_view_set
 #print axioms FongoSync.Laws.full_view_ignores_unencodable

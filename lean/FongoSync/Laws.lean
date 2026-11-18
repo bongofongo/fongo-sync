@@ -1,5 +1,6 @@
 import FongoSync.Examples
 import FongoSync.Model
+import FongoSync.Run
 
 /-!
 # The laws
@@ -171,6 +172,11 @@ theorem view_swap_alias (sc : Schema) (pre post : List (Change Value)) (a b : Ch
 theorem view_twice (sc : Schema) (pre post : List (Change Value)) (a : Change Value) :
     view sc (pre ++ a :: a :: post) = view sc (pre ++ a :: post) :=
   FongoSync.view_twice sc pre post a
+
+/-- The view can be computed: `runView` applies the liveness rule once per gid and gives the
+same answer. -/
+theorem view_runs (sc : Schema) (cs : List (Change Value)) : runView sc cs = view sc cs :=
+  runView_eq_view sc cs
 
 /-- **The view depends only on the set of changes**, given unique clocks per register. -/
 theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
