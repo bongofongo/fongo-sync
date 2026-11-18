@@ -146,8 +146,8 @@ impl Schema {
     /// Whether [`view`] can be asked about this schema. It refuses: duplicate names; field names
     /// starting with `$`; references to undeclared collections; undeclared fields in a key, an
     /// identity key or a `together` set; identity keys on natural collections; a `together`
-    /// field that does not merge `Lww`, or that is in two sets; and owner references that form a
-    /// cycle across collections. A collection owning its own rows is allowed.
+    /// field that does not merge `Lww`, is an owner reference, or is in two sets; a collection
+    /// owning its own rows; and owner references that form a cycle across collections.
     pub fn check(&self) -> Result<(), String> {
         let mut names = BTreeSet::new();
         for c in &self.collections {
@@ -166,6 +166,12 @@ impl Schema {
                     && self.collection(t).is_none()
                 {
                     return Err(format!("{}.{} refers to unknown {t}", c.name, f.name));
+                }
+                if f.kind == FieldKind::Owner(c.name.clone()) {
+                    return Err(format!(
+                        "{}.{} owns rows of its own collection",
+                        c.name, f.name
+                    ));
                 }
             }
             let undeclared = |set: &[String]| set.iter().find(|f| c.declared(f).is_none()).cloned();
@@ -203,6 +209,9 @@ impl Schema {
                     if c.strategy(f) != Strategy::Lww {
                         return Err(format!("{}.{f} is in a together set but not Lww", c.name));
                     }
+                    if matches!(c.declared(f).map(|d| &d.kind), Some(FieldKind::Owner(_))) {
+                        return Err(format!("{}.{f} is an owner in a together set", c.name));
+                    }
                 }
             }
         }
@@ -212,9 +221,7 @@ impl Schema {
             while let Some(name) = at.pop() {
                 let fields = self.collection(name).map_or(&[][..], |c| &c.fields);
                 for f in fields {
-                    if let FieldKind::Owner(t) = &f.kind
-                        && t != name
-                    {
+                    if let FieldKind::Owner(t) = &f.kind {
                         if t == &start.name {
                             return Err(format!("ownership cycles through {}", start.name));
                         }
@@ -287,16 +294,23 @@ impl PartialEq for View {
 ///    `Hlc::encode`, it is an [`ALIAS`] whose value is not a reference to another gid, or its gid
 ///    belongs to another collection. A gid belongs to the collection of its change with the
 ///    smallest clock, ties going to the smaller collection name. Changes to undeclared fields
-///    are kept: they claim the gid, but are not shown.
+///    are kept: they claim the gid, but are not shown. In a natural collection, a change to a
+///    key field is ignored unless its value is part of a key that derives the entity's gid: one
+///    value per key field, each written to that field, such that `Gid::derive` of them is the gid.
+///    Short of a hash collision only one key derives a gid, so a rewrite of a key field is
+///    always ignored.
 /// 2. Each (gid, field) holds the winner among its changes by the field's strategy; `$deleted`
 ///    and undeclared fields merge `Lww`.
 /// 3. An alias whose target belongs to the same collection joins the two gids. Groups are the
 ///    connected components, closed under natural keys becoming equal, and a group's canonical
-///    gid is its smallest member. A natural entity takes part in key matching only once every key
-///    field has a value.
+///    gid is its smallest member. A natural entity whose key has not yet been seen to derive its
+///    gid joins no group and is not live.
 /// 4. A member is live if its `$deleted` is not `Int(1)` and every owner field it holds is NULL
-///    or names a gid of the owner collection whose group is live. This is the least such set, so
-///    an ownership cycle with no live way out is not live. A group is live if a member is.
+///    or names a gid of the owner collection whose group is live. A group is live if a member is.
+///    This is well-founded because the schema forbids ownership cycles, including a collection
+///    owning its own rows: two replicas moving A under B and B under A at once would form a
+///    cycle, and no answer to whether such rows are live is obviously right, so self-ownership is
+///    not supported yet.
 /// 5. A live group shows, for each field, the strategy winner among its live members; for a
 ///    `together` set, the set of the live member holding the latest clock across the set.
 ///    References read as described on [`FieldKind`].
@@ -333,9 +347,30 @@ fn encodable(clock: &Hlc) -> bool {
     Hlc::decode(&clock.encode()) == Some(*clock)
 }
 
+/// The key, one value from each of `options` in order, whose derived gid is `gid`.
+fn deriving(
+    collection: &str,
+    gid: Gid,
+    options: &[Vec<&Value>],
+    chosen: &mut Vec<Value>,
+) -> Option<Vec<Value>> {
+    let Some((first, rest)) = options.split_first() else {
+        return (Gid::derive(collection, chosen) == gid).then(|| chosen.clone());
+    };
+    for value in first {
+        chosen.push((*value).clone());
+        if let Some(key) = deriving(collection, gid, rest, chosen) {
+            return Some(key);
+        }
+        chosen.pop();
+    }
+    None
+}
+
 struct Merged<'a> {
     schema: &'a Schema,
     home: BTreeMap<Gid, &'a Collection>,
+    unverified: BTreeSet<Gid>,
     registers: BTreeMap<Gid, BTreeMap<&'a str, (Value, Hlc)>>,
     root: BTreeMap<Gid, Gid>,
     live: BTreeSet<Gid>,
@@ -364,9 +399,57 @@ impl<'a> Merged<'a> {
         }
         let home: BTreeMap<Gid, &Collection> =
             first.into_iter().map(|(gid, (_, c))| (gid, c)).collect();
-        let accepted: Vec<(&Change, &Collection)> = candidates
+        let claimed: Vec<(&Change, &Collection)> = candidates
             .into_iter()
             .filter(|(c, coll)| home[&c.gid].name == coll.name)
+            .collect();
+
+        let mut keys: BTreeMap<Gid, Vec<Value>> = BTreeMap::new();
+        let mut unverified = BTreeSet::new();
+        for (&gid, coll) in &home {
+            let Identity::Natural(key) = &coll.identity else {
+                continue;
+            };
+            let options: Vec<Vec<&Value>> = key
+                .iter()
+                .map(|f| {
+                    let mut seen: Vec<&Value> = Vec::new();
+                    for (c, _) in &claimed {
+                        if c.gid == gid
+                            && &c.field == f
+                            && !seen
+                                .iter()
+                                .any(|v| v.total_cmp(&c.value) == Ordering::Equal)
+                        {
+                            seen.push(&c.value);
+                        }
+                    }
+                    seen.sort_by(|a, b| a.total_cmp(b));
+                    seen
+                })
+                .collect();
+            match deriving(&coll.name, gid, &options, &mut Vec::new()) {
+                Some(values) => {
+                    keys.insert(gid, values);
+                }
+                None => {
+                    unverified.insert(gid);
+                }
+            }
+        }
+        let accepted: Vec<(&Change, &Collection)> = claimed
+            .into_iter()
+            .filter(|(c, coll)| {
+                let Identity::Natural(key) = &coll.identity else {
+                    return true;
+                };
+                match key.iter().position(|f| *f == c.field) {
+                    None => true,
+                    Some(i) => keys
+                        .get(&c.gid)
+                        .is_some_and(|k| k[i].total_cmp(&c.value) == Ordering::Equal),
+                }
+            })
             .collect();
 
         let mut registers: BTreeMap<Gid, BTreeMap<&str, (Value, Hlc)>> = BTreeMap::new();
@@ -375,6 +458,8 @@ impl<'a> Merged<'a> {
             if c.field == ALIAS {
                 if let Value::Ref(target) = c.value
                     && home.get(&target).is_some_and(|t| t.name == coll.name)
+                    && !unverified.contains(&c.gid)
+                    && !unverified.contains(&target)
                 {
                     edges.insert((c.gid, target));
                 }
@@ -390,6 +475,7 @@ impl<'a> Merged<'a> {
         let mut merged = Merged {
             schema,
             home,
+            unverified,
             registers,
             root: BTreeMap::new(),
             live: BTreeSet::new(),
@@ -434,7 +520,7 @@ impl<'a> Merged<'a> {
                 };
                 let mut keyed: Vec<(Vec<Value>, Gid)> = Vec::new();
                 for (&gid, coll) in &self.home {
-                    if coll.name != c.name {
+                    if coll.name != c.name || self.unverified.contains(&gid) {
                         continue;
                     }
                     let Some(values) = key
@@ -495,7 +581,7 @@ impl<'a> Merged<'a> {
             let newly: Vec<Gid> = self
                 .home
                 .iter()
-                .filter(|(gid, _)| !self.live.contains(gid))
+                .filter(|(gid, _)| !self.live.contains(gid) && !self.unverified.contains(gid))
                 .filter(|(gid, _)| {
                     !matches!(self.register(**gid, DELETED), Some((Value::Int(1), _)))
                 })

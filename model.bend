@@ -210,7 +210,8 @@ def labels(+n: Nat, +es: List<&2, Edge>) -> List<&2, Nat>:
   rounds(n, List.range(n), es, List.range(n))
 
 # One gid's registers: `$deleted` (1 is deleted), its owner (0 is none, 1+o is gid o) and one
-# field. In the registers a replica holds, gid g's are at positions 3g, 3g+1 and 3g+2.
+# field. In the registers a replica holds, gid g's are at positions 3g, 3g+1 and 3g+2. Gids of
+# every collection share one numbering here, so an owner is a gid of another collection.
 type Row is Data:
   Row{deleted: Reg, owner: Reg, field: Reg}
 

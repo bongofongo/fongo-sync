@@ -45,8 +45,8 @@ Three layers, each checked against the one above it:
    full and executably: a slow, plain function from a schema and a set of changes to what an
    application sees. Its own tests check that it ignores order and duplicates and hold one case
    for each rule.
-3. **The storage adapter.** `fongo-sync-sqlite` is tested by comparing what each replica shows
-   with `model::view` of the changes it has seen, not only with other replicas.
+3. **The storage adapter.** `fongo-sync-sqlite` will be tested by comparing what each replica
+   shows with `model::view` of the changes it has seen, not only with other replicas.
 
 Nothing mechanically links the Bend model to the Rust: `model.bend` mirrors
 `crates/core/src/change.rs`, `clock.rs` and `model.rs` by hand, in miniature (a gid is a number, a
