@@ -43,6 +43,20 @@ const TABLES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS fongo_shadow_refs ON fongo_shadow (value) WHERE is_ref = 1",
     "CREATE TABLE IF NOT EXISTS fongo_pending (gid BLOB PRIMARY KEY, collection TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS fongo_alias (gid BLOB PRIMARY KEY, canon BLOB NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS fongo_bases (
+        gid BLOB NOT NULL,
+        field TEXT NOT NULL,
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        base,
+        base_is_ref INTEGER NOT NULL DEFAULT 0,
+        base_clock TEXT,
+        local,
+        local_is_ref INTEGER NOT NULL DEFAULT 0,
+        local_clock TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        reported TEXT,
+        PRIMARY KEY (gid, field))",
     "CREATE INDEX IF NOT EXISTS fongo_alias_canon ON fongo_alias (canon)",
 ];
 
@@ -184,22 +198,10 @@ struct Pass {
 /// whether it was last removed. A key can hold one entity removed and another written.
 type Rows = BTreeMap<(usize, String, Gid), (usize, bool)>;
 
-/// A local edit to a field that reports conflicts, as collected.
-struct Edit {
-    idx: usize,
-    gid: Gid,
-    key: String,
-    field: String,
-    base: Option<(Value, Hlc)>,
-    value: Value,
-    clock: Hlc,
-}
-
 #[derive(Default)]
 struct Collected {
     produced: usize,
     rows: Rows,
-    edits: Vec<Edit>,
 }
 
 impl Pass {
@@ -427,6 +429,54 @@ async fn send(conn: &mut SqliteConnection, change: &Change) -> Result<()> {
             value,
             is_ref,
             Value::Text(change.clock.encode()),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Remembers what a local edit to a field that reports conflicts replaced, until released. A
+/// later edit before then keeps the first base, since the remote side has seen neither.
+async fn remember_base(
+    conn: &mut SqliteConnection,
+    canon: Gid,
+    key: &str,
+    base: Option<&(Value, Hlc)>,
+    change: &Change,
+) -> Result<()> {
+    let seq = query(conn, "SELECT max(seq) FROM fongo_outbox", &[]).await?;
+    let seq = seq
+        .first()
+        .map(|row| row[0].clone())
+        .unwrap_or(Value::Int(0));
+    let (base, base_is_ref, base_clock) = match base {
+        Some((value, clock)) => {
+            let (value, is_ref) = stored(value);
+            (value, is_ref, Value::Text(clock.encode()))
+        }
+        None => (Value::Null, Value::Int(0), Value::Null),
+    };
+    let (local, local_is_ref) = stored(&change.value);
+    exec(
+        conn,
+        "INSERT INTO fongo_bases (gid, field, collection, key, base, base_is_ref, base_clock,
+                                  local, local_is_ref, local_clock, seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (gid, field) DO UPDATE SET
+            key = excluded.key, local = excluded.local, local_is_ref = excluded.local_is_ref,
+            local_clock = excluded.local_clock, seq = excluded.seq",
+        &[
+            Value::Ref(canon),
+            Value::Text(change.field.clone()),
+            Value::Text(change.collection.clone()),
+            Value::Text(key.into()),
+            base,
+            base_is_ref,
+            base_clock,
+            local,
+            local_is_ref,
+            Value::Text(change.clock.encode()),
+            seq,
         ],
     )
     .await?;
@@ -736,7 +786,7 @@ impl Replica {
         let waiting = self.settle(&mut tx, touched, &mut pass).await?;
         exec(&mut tx, "DELETE FROM fongo_pending", &[]).await?;
         applied.waiting = self.hold(&mut tx, waiting).await?;
-        applied.conflicts = self.conflicts(&mut tx, &collected.edits, changes).await?;
+        applied.conflicts = self.conflicts(&mut tx, changes).await?;
         set_applying(&mut tx, false).await?;
         save_clock(&mut tx, &pass.clock).await?;
         tx.commit().await?;
@@ -755,37 +805,92 @@ impl Replica {
         Ok(applied)
     }
 
-    /// Pairs each local edit with the latest incoming change to the same field of the same group
-    /// that was made without seeing the value the edit replaced.
+    /// Pairs each remembered local edit with the latest incoming change to the same field of the
+    /// same group that is later than the value the edit replaced, and was made elsewhere.
     async fn conflicts(
         &self,
         conn: &mut SqliteConnection,
-        edits: &[Edit],
         changes: &[Change],
     ) -> Result<Vec<Conflict>> {
-        let mut conflicts = Vec::new();
-        for edit in edits {
-            let c = &self.registry.collections()[edit.idx];
-            let canon = canon_of(conn, edit.gid).await?;
-            let mut latest: Option<&Change> = None;
-            for change in changes {
-                if change.field != edit.field
-                    || change.collection != c.name
-                    || change.clock == edit.clock
-                    || edit
-                        .base
-                        .as_ref()
-                        .is_some_and(|(_, base)| change.clock <= *base)
-                    || latest.is_some_and(|held| held.clock >= change.clock)
-                    || canon_of(conn, change.gid).await? != canon
-                {
-                    continue;
-                }
-                latest = Some(change);
+        let node = meta_get(conn, "node").await?;
+        let node = node.as_ref().map(as_gid).transpose()?;
+        let mut latest: BTreeMap<(Vec<u8>, String), &Change> = BTreeMap::new();
+        for change in changes {
+            if Some(change.clock.node) == node {
+                continue;
             }
-            let Some(remote) = latest else {
+            let Some(c) = self
+                .registry
+                .index(&change.collection)
+                .map(|i| &self.registry.collections()[i])
+            else {
                 continue;
             };
+            if !c
+                .field_index(&change.field)
+                .is_some_and(|i| c.fields[i].reports_conflicts)
+            {
+                continue;
+            }
+            let canon = canon_of(conn, change.gid).await?;
+            for member in members_of(conn, canon).await? {
+                let rows = query(
+                    conn,
+                    "SELECT base_clock, local_clock, reported FROM fongo_bases
+                     WHERE gid = ? AND field = ?",
+                    &[Value::Ref(member), Value::Text(change.field.clone())],
+                )
+                .await?;
+                let Some(row) = rows.first() else {
+                    continue;
+                };
+                let after = |held: &Value| -> Result<bool> {
+                    Ok(match held {
+                        Value::Null => true,
+                        clock => change.clock > as_clock(clock)?,
+                    })
+                };
+                if !after(&row[0])? || as_clock(&row[1])? == change.clock || !after(&row[2])? {
+                    continue;
+                }
+                let slot = (member.0.to_vec(), change.field.clone());
+                if latest
+                    .get(&slot)
+                    .is_none_or(|held| held.clock < change.clock)
+                {
+                    latest.insert(slot, change);
+                }
+            }
+        }
+        let mut conflicts = Vec::new();
+        for ((member, field), remote) in latest {
+            let member = Value::Blob(member);
+            exec(
+                conn,
+                "UPDATE fongo_bases SET reported = ? WHERE gid = ? AND field = ?",
+                &[
+                    Value::Text(remote.clock.encode()),
+                    member.clone(),
+                    Value::Text(field.clone()),
+                ],
+            )
+            .await?;
+            let rows = query(
+                conn,
+                "SELECT collection, key, base, base_is_ref, local, local_is_ref, local_clock,
+                        base_clock
+                 FROM fongo_bases WHERE gid = ? AND field = ?",
+                &[member, Value::Text(field.clone())],
+            )
+            .await?;
+            let Some(row) = rows.first() else {
+                continue;
+            };
+            let Some(idx) = self.registry.index(as_text(&row[0])?) else {
+                continue;
+            };
+            let c = &self.registry.collections()[idx];
+            let canon = canon_of(conn, remote.gid).await?;
             let key = match &c.key {
                 Key::Minted { .. } => query(
                     conn,
@@ -796,29 +901,46 @@ impl Replica {
                 .first()
                 .map(|row| as_text(&row[0]).map(str::to_string))
                 .transpose()?,
-                Key::Natural { .. } => self
-                    .row_exists(conn, c, &edit.key)
-                    .await?
-                    .then(|| edit.key.clone()),
+                Key::Natural { .. } => {
+                    let key = as_text(&row[1])?.to_string();
+                    self.row_exists(conn, c, &key).await?.then_some(key)
+                }
             };
-            let strategy = self.registry.strategy(&c.name, &edit.field);
+            let local = loaded(&row[4], &row[5])?;
+            let strategy = self.registry.strategy(&c.name, &field);
             conflicts.push(Conflict {
                 collection: c.name.clone(),
                 gid: canon,
                 key,
-                field: edit.field.clone(),
-                base: edit.base.as_ref().map(|(value, _)| value.clone()),
-                local: edit.value.clone(),
-                remote: remote.value.clone(),
+                base: match &row[7] {
+                    Value::Null => None,
+                    _ => Some(loaded(&row[2], &row[3])?),
+                },
                 remote_won: wins(
                     strategy,
-                    Some((&edit.value, &edit.clock)),
+                    Some((&local, &as_clock(&row[6])?)),
                     &remote.value,
                     &remote.clock,
                 ),
+                field,
+                local,
+                remote: remote.value.clone(),
             });
         }
         Ok(conflicts)
+    }
+
+    /// Forgets the bases of local edits sent through outbox sequence `through`. An application
+    /// calls it once it has read the shared log past the changes it appended, after which any
+    /// change it meets was made knowing those edits, so is not a conflict with them.
+    pub async fn release_bases(&self, conn: &mut SqliteConnection, through: i64) -> Result<()> {
+        exec(
+            conn,
+            "DELETE FROM fongo_bases WHERE seq <= ?",
+            &[Value::Int(through)],
+        )
+        .await?;
+        Ok(())
     }
 
     /// The global id of a row in a minted collection, once it has been collected or applied.
@@ -1655,7 +1777,6 @@ impl Replica {
         }
 
         let mut produced = 0;
-        let mut edits = Vec::new();
         let mut present: BTreeSet<Gid> = BTreeSet::new();
         let mut overruled: BTreeSet<(usize, Gid)> = BTreeSet::new();
         for e in &entries {
@@ -1696,30 +1817,21 @@ impl Replica {
                     overruled.insert((e.idx, gid));
                     continue;
                 }
-                if c.field_index(&field)
-                    .is_some_and(|i| c.fields[i].reports_conflicts)
-                {
-                    edits.push(Edit {
-                        idx: e.idx,
-                        gid,
-                        key: e.key.clone(),
-                        field: field.clone(),
-                        base: merged.get(&field).cloned(),
-                        value: value.clone(),
-                        clock: stamp,
-                    });
+                let reports = c
+                    .field_index(&field)
+                    .is_some_and(|i| c.fields[i].reports_conflicts);
+                let change = Change {
+                    collection: c.name.clone(),
+                    gid,
+                    field,
+                    value,
+                    clock: stamp,
+                };
+                emit(conn, &change).await?;
+                if reports {
+                    let base = merged.get(&change.field);
+                    remember_base(conn, group.canon, &e.key, base, &change).await?;
                 }
-                emit(
-                    conn,
-                    &Change {
-                        collection: c.name.clone(),
-                        gid,
-                        field,
-                        value,
-                        clock: stamp,
-                    },
-                )
-                .await?;
                 produced += 1;
             }
         }
@@ -1758,7 +1870,6 @@ impl Replica {
         Ok(Collected {
             produced,
             rows: pass.rows,
-            edits,
         })
     }
 

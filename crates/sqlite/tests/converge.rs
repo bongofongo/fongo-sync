@@ -123,6 +123,8 @@ struct Peer {
     cursor: usize,
     /// Which changes in the hub this peer has applied, for delivery out of order.
     seen: Vec<bool>,
+    /// Where this peer's last sent changes end in the hub, and their last outbox sequence.
+    sent: Option<(usize, i64)>,
 }
 
 impl Peer {
@@ -145,6 +147,7 @@ impl Peer {
             replica: Replica::new(registry),
             cursor: 0,
             seen: Vec::new(),
+            sent: None,
         }
     }
 
@@ -183,20 +186,22 @@ impl Peer {
     /// Sends local changes to the hub, then takes everything the hub has that this peer has not
     /// seen, its own changes included.
     async fn sync(&mut self, hub: &mut Vec<Change>) -> Applied {
-        self.replica.collect(&mut self.conn).await.unwrap();
-        let outbox = self.replica.outbox(&mut self.conn, 100_000).await.unwrap();
-        hub.extend(outbox.changes);
-        self.replica
-            .acknowledge(&mut self.conn, outbox.through)
-            .await
-            .unwrap();
-        let applied = self
-            .replica
-            .apply(&mut self.conn, &hub[self.cursor..])
-            .await
-            .unwrap();
-        self.cursor = hub.len();
-        applied
+        self.push(hub).await;
+        self.pull(hub).await
+    }
+
+    /// Once this peer has read the hub past what it sent, edits it sent are known to everyone
+    /// who sends after them.
+    async fn release(&mut self, read_through: impl Fn(usize) -> bool) {
+        if let Some((end, through)) = self.sent
+            && read_through(end)
+        {
+            self.replica
+                .release_bases(&mut self.conn, through)
+                .await
+                .unwrap();
+            self.sent = None;
+        }
     }
 
     /// Takes what the hub has without sending first, so local edits are still unsent when the
@@ -208,6 +213,8 @@ impl Peer {
             .await
             .unwrap();
         self.cursor = hub.len();
+        let cursor = self.cursor;
+        self.release(|end| end <= cursor).await;
         applied
     }
 
@@ -259,7 +266,10 @@ impl Peer {
             .outbox(&mut self.conn, 1_000_000)
             .await
             .unwrap();
-        hub.extend(outbox.changes);
+        if !outbox.changes.is_empty() {
+            hub.extend(outbox.changes);
+            self.sent = Some((hub.len(), outbox.through));
+        }
         self.replica
             .acknowledge(&mut self.conn, outbox.through)
             .await
@@ -287,6 +297,8 @@ impl Peer {
             self.seen[i] = true;
         }
         self.replica.apply(&mut self.conn, &batch).await.unwrap();
+        let seen = self.seen.clone();
+        self.release(|end| seen[..end].iter().all(|s| *s)).await;
         if twice {
             let before = (
                 self.dump().await,
@@ -1293,6 +1305,63 @@ async fn a_row_left_waiting_is_not_reported_again_until_it_changes() {
         .unwrap();
     assert_eq!(again.waiting, 1);
     assert!(again.touched.is_empty(), "{:#?}", again.touched);
+}
+
+#[tokio::test]
+async fn a_conflict_is_found_in_a_later_page_reported_once_and_not_after_release() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+
+    peers[0]
+        .run("INSERT INTO settings VALUES ('theme', 'dark')")
+        .await;
+    peers[0].run("UPDATE notes SET body = 'one'").await;
+    later();
+    peers[1].run("UPDATE notes SET body = 'two'").await;
+    peers[0].push(&mut hub).await;
+    let (first, second): (Vec<Change>, Vec<Change>) = hub[peers[1].cursor..]
+        .iter()
+        .cloned()
+        .partition(|c| c.collection == "settings");
+    peers[1].cursor = hub.len();
+    let replica = peers[1].replica.clone();
+    let conn = &mut peers[1].conn;
+    assert!(
+        replica
+            .apply(conn, &first)
+            .await
+            .unwrap()
+            .conflicts
+            .is_empty()
+    );
+    let applied = replica.apply(conn, &second).await.unwrap();
+    assert_eq!(applied.conflicts.len(), 1, "{:#?}", applied.conflicts);
+    assert_eq!(applied.conflicts[0].local, Value::Text("two".into()));
+    assert_eq!(applied.conflicts[0].remote, Value::Text("one".into()));
+    assert!(
+        replica
+            .apply(conn, &second)
+            .await
+            .unwrap()
+            .conflicts
+            .is_empty()
+    );
+
+    // Released, the edit no longer counts, however late another arrives.
+    replica.release_bases(conn, i64::MAX).await.unwrap();
+    peers[0].run("UPDATE notes SET body = 'three'").await;
+    let from = hub.len();
+    peers[0].push(&mut hub).await;
+    let late = hub[from..].to_vec();
+    let applied = replica.apply(&mut peers[1].conn, &late).await.unwrap();
+    assert!(applied.conflicts.is_empty(), "{:#?}", applied.conflicts);
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
