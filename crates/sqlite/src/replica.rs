@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use fongo_sync_core::{ALIAS, Change, Clock, DELETED, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
@@ -99,17 +101,29 @@ pub struct Touched {
 }
 
 enum Outcome {
-    Settled { deleted: bool },
+    Settled,
     Waiting,
+    /// The row is to be removed once the rows that may refer to it have been written.
+    Remove(Doomed),
+}
+
+enum Doomed {
+    Minted,
+    /// The local values of the natural key.
+    Natural(Vec<Value>),
 }
 
 enum Local {
     Value(Value),
-    /// The referenced entity is deleted, so no local row will ever exist for it.
-    Gone,
+    /// The referenced entity is deleted or owned by one that is. Holds its local id while its row
+    /// is still there to be removed, else null.
+    Gone(Value),
     /// The referenced entity has not arrived yet.
     Unknown,
 }
+
+/// How deep a chain of owners is followed to learn whether an entity is deleted.
+const OWNER_DEPTH: usize = 64;
 
 struct Entry {
     idx: usize,
@@ -511,46 +525,6 @@ async fn to_shared(conn: &mut SqliteConnection, field: &Field, local: Value) -> 
     }
 }
 
-/// A shared value on its way in: a reference becomes the local id of the row it names.
-async fn to_local(conn: &mut SqliteConnection, field: &Field, shared: &Value) -> Result<Local> {
-    match (&field.kind, shared) {
-        (Kind::Plain, Value::Ref(_)) => Ok(Local::Value(Value::Null)),
-        (Kind::Plain, value) => Ok(Local::Value(value.clone())),
-        (Kind::Ref { .. }, Value::Ref(gid)) => {
-            let canon = canon_of(conn, *gid).await?;
-            let rows = query(
-                conn,
-                "SELECT json_extract(key, '$[0]') FROM fongo_ids WHERE gid = ?",
-                &[Value::Ref(canon)],
-            )
-            .await?;
-            if let Some(row) = rows.into_iter().next() {
-                return Ok(Local::Value(row[0].clone()));
-            }
-            let mut latest: Option<(Value, Hlc)> = None;
-            for member in members_of(conn, canon).await? {
-                let rows = query(
-                    conn,
-                    "SELECT value, clock FROM fongo_shadow WHERE gid = ? AND field = ?",
-                    &[Value::Ref(member), Value::Text(DELETED.into())],
-                )
-                .await?;
-                if let Some(row) = rows.first() {
-                    let clock = as_clock(&row[1])?;
-                    if latest.as_ref().is_none_or(|(_, held)| clock > *held) {
-                        latest = Some((row[0].clone(), clock));
-                    }
-                }
-            }
-            match latest {
-                Some((Value::Int(1), _)) => Ok(Local::Gone),
-                _ => Ok(Local::Unknown),
-            }
-        }
-        (Kind::Ref { .. }, _) => Ok(Local::Value(Value::Null)),
-    }
-}
-
 impl Replica {
     pub fn new(registry: Registry) -> Replica {
         Replica { registry }
@@ -816,18 +790,27 @@ impl Replica {
         loop {
             let mut waiting = BTreeSet::new();
             let mut progressed = false;
-            for &(idx, gid) in &round {
+            let mut order: Vec<(usize, Gid)> = round.iter().copied().collect();
+            order.sort_by_key(|&(idx, gid)| (self.registry.rank(idx), gid));
+            // Writes go parents first and removals children first, so a row moved off a parent
+            // that goes in the same batch is moved before the parent's removal can cascade to it.
+            let mut removals = Vec::new();
+            for (idx, gid) in order {
                 match self.materialise(conn, idx, gid, pass).await? {
-                    Outcome::Settled { deleted } => {
-                        progressed = true;
-                        // Before the next insert can be handed a local id the cascade just freed.
-                        if deleted {
-                            self.forget_cascaded(conn, pass).await?;
-                        }
-                    }
+                    Outcome::Settled => progressed = true,
                     Outcome::Waiting => {
                         waiting.insert((idx, gid));
                     }
+                    Outcome::Remove(doomed) => removals.push((idx, gid, doomed)),
+                }
+            }
+            removals
+                .sort_by_key(|&(idx, gid, _)| (std::cmp::Reverse(self.registry.rank(idx)), gid));
+            for (idx, gid, doomed) in removals {
+                if self.remove(conn, idx, gid, doomed, pass).await? {
+                    progressed = true;
+                } else {
+                    waiting.insert((idx, gid));
                 }
             }
             let grew = !pass.more.is_empty();
@@ -974,7 +957,18 @@ impl Replica {
                 }
             }
         }
-        for &member in &members {
+        self.refer_again(conn, canon, pass).await?;
+        Ok(true)
+    }
+
+    /// Queues every entity that refers to a group, to be brought in line again.
+    async fn refer_again(
+        &self,
+        conn: &mut SqliteConnection,
+        canon: Gid,
+        pass: &mut Pass,
+    ) -> Result<()> {
+        for member in members_of(conn, canon).await? {
             let referring = query(
                 conn,
                 "SELECT DISTINCT collection, gid FROM fongo_shadow WHERE is_ref = 1 AND value = ?",
@@ -986,6 +980,154 @@ impl Replica {
                     pass.more.insert((i, as_gid(&row[1])?));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A shared value on its way in: a reference becomes the local id of the row it names.
+    async fn to_local(
+        &self,
+        conn: &mut SqliteConnection,
+        field: &Field,
+        shared: &Value,
+    ) -> Result<Local> {
+        match (&field.kind, shared) {
+            (Kind::Plain, Value::Ref(_)) => Ok(Local::Value(Value::Null)),
+            (Kind::Plain, value) => Ok(Local::Value(value.clone())),
+            (Kind::Ref { collection, .. }, Value::Ref(gid)) => {
+                let canon = canon_of(conn, *gid).await?;
+                let rows = query(
+                    conn,
+                    "SELECT json_extract(key, '$[0]') FROM fongo_ids WHERE gid = ?",
+                    &[Value::Ref(canon)],
+                )
+                .await?;
+                let local = rows.into_iter().next().and_then(|mut row| row.pop());
+                let dead = match self.registry.index(collection) {
+                    Some(target) => self.dead(conn, target, canon, 0).await?,
+                    None => false,
+                };
+                Ok(match (dead, local) {
+                    (true, local) => Local::Gone(local.unwrap_or(Value::Null)),
+                    (false, Some(local)) => Local::Value(local),
+                    (false, None) => Local::Unknown,
+                })
+            }
+            (Kind::Ref { .. }, _) => Ok(Local::Value(Value::Null)),
+        }
+    }
+
+    /// Whether an entity's merged state has no row: it is deleted, or an owner of it is.
+    fn dead<'a>(
+        &'a self,
+        conn: &'a mut SqliteConnection,
+        idx: usize,
+        gid: Gid,
+        depth: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let c = &self.registry.collections()[idx];
+            let group = self.group(conn, c, gid).await?;
+            if is_deleted(&group.merged) {
+                return Ok(true);
+            }
+            if depth >= OWNER_DEPTH {
+                return Ok(false);
+            }
+            for field in &c.fields {
+                if !c.owns_through(field) {
+                    continue;
+                }
+                let (Kind::Ref { collection, .. }, Some((Value::Ref(target), _))) =
+                    (&field.kind, group.merged.get(&field.name))
+                else {
+                    continue;
+                };
+                let Some(t) = self.registry.index(collection) else {
+                    continue;
+                };
+                let target = canon_of(conn, *target).await?;
+                if self.dead(conn, t, target, depth + 1).await? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    /// Removes an entity's row. Rows the removal cascaded to or nulled are brought in line again,
+    /// in case their merged state says otherwise. Returns false when the row must wait.
+    async fn remove(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: usize,
+        gid: Gid,
+        doomed: Doomed,
+        pass: &mut Pass,
+    ) -> Result<bool> {
+        let c = &self.registry.collections()[idx];
+        let canon = canon_of(conn, gid).await?;
+        let table = quoted(&c.table);
+        match (&c.key, doomed) {
+            (Key::Minted { column }, _) => {
+                let rows = query(
+                    conn,
+                    "SELECT key FROM fongo_ids WHERE gid = ?",
+                    &[Value::Ref(canon)],
+                )
+                .await?;
+                let Some(key) = rows.first().map(|row| as_text(&row[0])).transpose()? else {
+                    return Ok(true);
+                };
+                let key = key.to_string();
+                let doomed = self.dependents(conn, c, &key).await?;
+                let removed = exec(
+                    conn,
+                    &format!(
+                        "DELETE FROM {table} WHERE {} = json_extract(?1, '$[0]')",
+                        quoted(column)
+                    ),
+                    &[Value::Text(key.clone())],
+                )
+                .await?;
+                exec(
+                    conn,
+                    "DELETE FROM fongo_ids WHERE gid = ?",
+                    &[Value::Ref(canon)],
+                )
+                .await?;
+                if removed > 0 {
+                    pass.touch(idx, key, canon, true);
+                }
+                for (d_idx, d_key, d_gid) in doomed {
+                    let d = &self.registry.collections()[d_idx];
+                    if !self.row_exists(conn, d, &d_key).await? {
+                        pass.touch(d_idx, d_key, d_gid, true);
+                    }
+                }
+                self.forget_cascaded(conn, pass).await?;
+                self.refer_again(conn, canon, pass).await?;
+            }
+            (Key::Natural { fields }, Doomed::Natural(key)) => {
+                let matches: Vec<String> = fields
+                    .iter()
+                    .map(|k| format!("{} = ?", quoted(k)))
+                    .collect();
+                let removed = exec(
+                    conn,
+                    &format!("DELETE FROM {table} WHERE {}", matches.join(" AND ")),
+                    &key,
+                )
+                .await?;
+                if removed > 0 {
+                    let marks = vec!["?"; key.len()].join(", ");
+                    let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
+                    if let Some(row) = json.first() {
+                        pass.touch(idx, as_text(&row[0])?.to_string(), canon, true);
+                    }
+                }
+            }
+            (Key::Natural { .. }, Doomed::Minted) => {}
         }
         Ok(true)
     }
@@ -1129,9 +1271,9 @@ impl Replica {
                     for name in identity {
                         let local = match (theirs.merged.get(name), c.field_index(name)) {
                             (Some((shared, _)), Some(i)) => {
-                                match to_local(conn, &c.fields[i], shared).await? {
+                                match self.to_local(conn, &c.fields[i], shared).await? {
                                     Local::Value(value) => value,
-                                    Local::Gone | Local::Unknown => Value::Null,
+                                    Local::Gone(_) | Local::Unknown => Value::Null,
                                 }
                             }
                             _ => Value::Null,
@@ -1461,24 +1603,24 @@ impl Replica {
         loop {
             let Group { canon, merged } = self.group(conn, c, gid).await?;
             if merged.is_empty() {
-                return Ok(Outcome::Settled { deleted: false });
+                return Ok(Outcome::Settled);
             }
             let deleted = is_deleted(&merged);
             let table = quoted(&c.table);
 
             let mut columns: Vec<(&Field, Value)> = Vec::new();
+            let mut leaving: BTreeMap<&str, Value> = BTreeMap::new();
             let mut unresolved = false;
             let mut orphaned = false;
             for field in &c.fields {
                 let Some((shared, _)) = merged.get(&field.name) else {
                     continue;
                 };
-                let owning = matches!(&field.kind, Kind::Ref { owned: true, .. })
-                    || matches!(&c.key, Key::Natural { fields } if fields.contains(&field.name));
-                match to_local(conn, field, shared).await? {
+                match self.to_local(conn, field, shared).await? {
                     Local::Value(value) => columns.push((field, value)),
-                    Local::Gone => {
-                        orphaned |= owning;
+                    Local::Gone(local) => {
+                        orphaned |= c.owns_through(field);
+                        leaving.insert(&field.name, local);
                         columns.push((field, Value::Null));
                     }
                     Local::Unknown => {
@@ -1519,34 +1661,7 @@ impl Replica {
                     let key = rows.first().map(|row| as_text(&row[0])).transpose()?;
                     let key = key.map(str::to_string);
                     if deleted {
-                        if let Some(key) = key {
-                            let doomed = self.dependents(conn, c, &key).await?;
-                            let removed = exec(
-                                conn,
-                                &format!(
-                                    "DELETE FROM {table} WHERE {} = json_extract(?1, '$[0]')",
-                                    quoted(column)
-                                ),
-                                &[Value::Text(key.clone())],
-                            )
-                            .await?;
-                            exec(
-                                conn,
-                                "DELETE FROM fongo_ids WHERE gid = ?",
-                                &[Value::Ref(canon)],
-                            )
-                            .await?;
-                            if removed > 0 {
-                                pass.touch(idx, key, canon, true);
-                            }
-                            for (d_idx, d_key, d_gid) in doomed {
-                                let d = &self.registry.collections()[d_idx];
-                                if !self.row_exists(conn, d, &d_key).await? {
-                                    pass.touch(d_idx, d_key, d_gid, true);
-                                }
-                            }
-                        }
-                        return Ok(Outcome::Settled { deleted: true });
+                        return Ok(Outcome::Remove(Doomed::Minted));
                     }
                     match key {
                         Some(_) if columns.is_empty() => Ok(0),
@@ -1600,11 +1715,18 @@ impl Replica {
                 Key::Natural { fields } => {
                     let mut key = Vec::new();
                     for name in fields {
-                        match columns.iter().find(|(f, _)| f.name == *name) {
-                            Some((_, value)) if *value != Value::Null => key.push(value.clone()),
-                            _ if deleted => return Ok(Outcome::Settled { deleted: false }),
+                        let value = match columns.iter().find(|(f, _)| f.name == *name) {
+                            Some((_, Value::Null)) | None => leaving.get(name.as_str()),
+                            Some((_, value)) => Some(value),
+                        };
+                        match value {
+                            Some(value) if *value != Value::Null => key.push(value.clone()),
+                            _ if deleted => return Ok(Outcome::Settled),
                             _ => return Ok(Outcome::Waiting),
                         }
+                    }
+                    if deleted {
+                        return Ok(Outcome::Remove(Doomed::Natural(key)));
                     }
                     let matches: Vec<String> = fields
                         .iter()
@@ -1617,17 +1739,6 @@ impl Replica {
                         .first()
                         .map(|row| as_text(&row[0]).map(str::to_string))
                         .transpose()?;
-                    if deleted {
-                        let removed =
-                            exec(conn, &format!("DELETE FROM {table} WHERE {matches}"), &key)
-                                .await?;
-                        if let Some(json) = json
-                            && removed > 0
-                        {
-                            pass.touch(idx, json, canon, true);
-                        }
-                        return Ok(Outcome::Settled { deleted: true });
-                    }
                     written_key = json;
                     let exists = !query(
                         conn,
@@ -1671,7 +1782,7 @@ impl Replica {
             }
             return match written {
                 Ok(_) if unresolved => Ok(Outcome::Waiting),
-                Ok(_) => Ok(Outcome::Settled { deleted: false }),
+                Ok(_) => Ok(Outcome::Settled),
                 Err(error) if is_constraint(&error) => Ok(Outcome::Waiting),
                 Err(error) => Err(error.into()),
             };
@@ -1703,7 +1814,8 @@ impl Replica {
     }
 
     /// Applying a delete can cascade to rows the triggers were told not to watch. Their ids are
-    /// dropped so a reused local id is never mistaken for the old entity.
+    /// dropped so a reused local id is never mistaken for the old entity, and they are brought in
+    /// line again, since their merged state may still have a row.
     async fn forget_cascaded(&self, conn: &mut SqliteConnection, pass: &mut Pass) -> Result<()> {
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let Key::Minted { column } = &c.key else {
@@ -1723,6 +1835,7 @@ impl Replica {
             for row in gone {
                 let gid = as_gid(&row[1])?;
                 pass.touch(idx, as_text(&row[0])?.to_string(), gid, true);
+                pass.more.insert((idx, gid));
                 exec(
                     conn,
                     "DELETE FROM fongo_ids WHERE gid = ?",

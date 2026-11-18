@@ -137,6 +137,12 @@ impl Collection {
         }
     }
 
+    /// Whether a row goes when the row this field refers to goes.
+    pub(crate) fn owns_through(&self, field: &Field) -> bool {
+        matches!(field.kind, Kind::Ref { owned: true, .. })
+            || matches!(&self.key, Key::Natural { fields } if fields.contains(&field.name))
+    }
+
     pub(crate) fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.name == name)
     }
@@ -235,6 +241,11 @@ impl Registry {
 
     pub fn collections(&self) -> &[Collection] {
         &self.collections
+    }
+
+    /// Where a collection comes when rows are written parents first.
+    pub(crate) fn rank(&self, idx: usize) -> usize {
+        idx
     }
 
     pub(crate) fn index(&self, name: &str) -> Option<usize> {

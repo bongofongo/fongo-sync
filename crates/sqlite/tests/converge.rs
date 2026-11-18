@@ -20,6 +20,10 @@ const SCHEMA: &[&str] = &[
         id INTEGER PRIMARY KEY,
         book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
         body TEXT)",
+    "CREATE TABLE marks (
+        id INTEGER PRIMARY KEY,
+        note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        place INTEGER)",
     "CREATE TABLE tags (
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
         tag TEXT NOT NULL,
@@ -47,6 +51,9 @@ fn registry() -> Registry {
         Collection::minted("notes", "notes", "id")
             .owner("book_id", "books")
             .field_reporting_conflicts("body"),
+        Collection::minted("marks", "marks", "id")
+            .owner("note_id", "notes")
+            .field("place"),
         Collection::natural("tags", "tags", &["book_id", "tag"])
             .owner("book_id", "books")
             .field("tag")
@@ -76,6 +83,11 @@ const DUMP: &str = "
            || COALESCE((SELECT hex(gid) FROM fongo_ids
                         WHERE collection = 'books' AND key = json_array(n.book_id)), '-')
       FROM notes n LEFT JOIN fongo_ids i ON i.collection = 'notes' AND i.key = json_array(n.id)
+    UNION ALL
+    SELECT 'mark ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || COALESCE(m.place, '-') || ' n='
+           || COALESCE((SELECT hex(gid) FROM fongo_ids
+                        WHERE collection = 'notes' AND key = json_array(m.note_id)), '-')
+      FROM marks m LEFT JOIN fongo_ids i ON i.collection = 'marks' AND i.key = json_array(m.id)
     UNION ALL
     SELECT 'tag ' || COALESCE((SELECT hex(gid) FROM fongo_ids
                                WHERE collection = 'books' AND key = json_array(t.book_id)), 'UNMAPPED')
@@ -708,6 +720,48 @@ async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
     assert_eq!(state.len(), 2, "{state:#?}");
 }
 
+#[tokio::test]
+async fn a_row_moved_off_a_parent_deleted_in_the_same_batch_keeps_what_it_owns() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    let a = &mut peers[0];
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch'), ('Daniel Deronda')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'moved')")
+        .await;
+    a.run("INSERT INTO marks (note_id, place) VALUES (1, 7)")
+        .await;
+    a.run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Celia')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let note_row: i64 = count(&mut peers[1], "SELECT id FROM notes").await;
+
+    peers[0].run("UPDATE notes SET book_id = 2").await;
+    peers[0].run("DELETE FROM books WHERE id = 1").await;
+    settle(&mut peers, &mut hub).await;
+
+    let state = assert_converged(&mut peers).await;
+    let book = peers[0].gid("books", 2).await.to_hex().to_uppercase();
+    let note = peers[0].gid("notes", 1).await.to_hex().to_uppercase();
+    assert!(
+        state.contains(&format!("note {note} moved b={book}")),
+        "{state:#?}"
+    );
+    assert!(
+        state
+            .iter()
+            .any(|l| l.starts_with("mark ") && l.ends_with(&format!(" 7 n={note}"))),
+        "{state:#?}"
+    );
+    assert!(
+        state
+            .iter()
+            .any(|l| l.starts_with("loan ") && l.ends_with(" b=-")),
+        "{state:#?}"
+    );
+    assert_eq!(count(&mut peers[1], "SELECT id FROM notes").await, note_row);
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -815,6 +869,9 @@ enum Op {
     SetNote(usize, u8),
     DeleteNote(usize),
     AddTag(usize, u8),
+    AddMark(usize, u8),
+    MoveNoteOffDeletedBook(usize, usize),
+    MoveMarkOffDeletedNote(usize, usize),
     SetTagNote(usize, u8),
     DeleteTag(usize),
     SetSetting(u8, u8),
@@ -844,6 +901,15 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetNote(a, b)),
         n.clone().prop_map(Op::DeleteNote),
         (n.clone(), 0u8..2).prop_map(|(a, b)| Op::AddTag(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTagNote(a, b)),
         n.clone().prop_map(Op::DeleteTag),
         (0u8..2, v.clone()).prop_map(|(a, b)| Op::SetSetting(a, b)),
@@ -861,6 +927,33 @@ fn arb_op() -> impl Strategy<Value = Op> {
 
 async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
     let sql = match op {
+        Op::AddMark(n, v) => match peer.pick("notes", n).await {
+            Some(id) => format!("INSERT INTO marks (note_id, place) VALUES ({id}, {v})"),
+            None => return,
+        },
+        Op::MoveNoteOffDeletedBook(n, m) | Op::MoveMarkOffDeletedNote(n, m) => {
+            let (child, parent, column) = match op {
+                Op::MoveNoteOffDeletedBook(..) => ("notes", "books", "book_id"),
+                _ => ("marks", "notes", "note_id"),
+            };
+            let (Some(id), Some(to)) = (peer.pick(child, n).await, peer.pick(parent, m).await)
+            else {
+                return;
+            };
+            let from: Option<i64> =
+                sqlx::query_scalar(&format!("SELECT {column} FROM {child} WHERE id = {id}"))
+                    .fetch_one(&mut peer.conn)
+                    .await
+                    .unwrap();
+            let Some(from) = from.filter(|from| *from != to) else {
+                return;
+            };
+            peer.run(&format!(
+                "UPDATE {child} SET {column} = {to} WHERE id = {id}"
+            ))
+            .await;
+            format!("DELETE FROM {parent} WHERE id = {from}")
+        }
         Op::Sync => {
             peer.sync(hub).await;
             return;
