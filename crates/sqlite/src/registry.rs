@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use fongo_sync_core::{DELETED, Strategy};
+use fongo_sync_core::{DELETED, Strategy, Value};
 
 use crate::error::{Error, Result};
 
@@ -48,6 +48,17 @@ pub struct Collection {
     /// Columns of tables outside the registry that hold this collection's local ids, as
     /// `(table, column)`.
     pub local_dependents: Vec<(String, String)>,
+    /// Columns the kernel does not sync, and what to put in them when it inserts a row.
+    pub local_defaults: Vec<(String, LocalDefault)>,
+}
+
+/// What the kernel writes into a column it does not sync when it inserts a row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalDefault {
+    Value(Value),
+    /// An SQL expression, written into the insert as given. It comes from the application,
+    /// never from what a user typed.
+    Sql(String),
 }
 
 impl Collection {
@@ -61,6 +72,7 @@ impl Collection {
             fields: Vec::new(),
             identity: Vec::new(),
             local_dependents: Vec::new(),
+            local_defaults: Vec::new(),
         }
     }
 
@@ -74,6 +86,7 @@ impl Collection {
             fields: Vec::new(),
             identity: Vec::new(),
             local_dependents: Vec::new(),
+            local_defaults: Vec::new(),
         }
     }
 
@@ -112,6 +125,13 @@ impl Collection {
     /// case they are left to its `ON DELETE` action.
     pub fn local_dependent(mut self, table: &str, column: &str) -> Collection {
         self.local_dependents.push((table.into(), column.into()));
+        self
+    }
+
+    /// A column this replica keeps for itself that must be filled when the kernel inserts a row,
+    /// such as a `NOT NULL` column without a `DEFAULT`.
+    pub fn local_default(mut self, column: &str, value: LocalDefault) -> Collection {
+        self.local_defaults.push((column.into(), value));
         self
     }
 
@@ -189,6 +209,7 @@ impl Registry {
                 names.push(table);
                 names.push(column);
             }
+            names.extend(c.local_defaults.iter().map(|(column, _)| column.as_str()));
             if let Some(name) = names.iter().find(|n| !is_identifier(n)) {
                 return bad(format!(
                     "`{name}` in `{}` is not a plain identifier",
@@ -206,6 +227,14 @@ impl Registry {
                 if f.name == DELETED {
                     return bad(format!("`{}.{}` is reserved", c.name, f.name));
                 }
+            }
+            if let Some((column, _)) = c.local_defaults.iter().find(|(column, _)| {
+                fields.contains(column.as_str()) || c.key_columns().contains(&column.as_str())
+            }) {
+                return bad(format!(
+                    "`{}.{column}` is synced, so cannot have a local default",
+                    c.name
+                ));
             }
             match &c.key {
                 Key::Minted { column } => {
@@ -309,6 +338,15 @@ mod tests {
             .field("key")
             .field("value");
         assert!(Registry::new(vec![c]).is_ok());
+    }
+
+    #[test]
+    fn a_local_default_is_for_a_column_that_is_not_synced() {
+        let books = || Collection::minted("books", "books", "id").field("title");
+        let default = || LocalDefault::Value(Value::Int(0));
+        assert!(Registry::new(vec![books().local_default("seen", default())]).is_ok());
+        assert!(Registry::new(vec![books().local_default("title", default())]).is_err());
+        assert!(Registry::new(vec![books().local_default("id", default())]).is_err());
     }
 
     #[test]

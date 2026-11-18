@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
-use fongo_sync_sqlite::{Applied, Collection, Conflict, Registry, Replica};
+use fongo_sync_sqlite::{Applied, Collection, Conflict, LocalDefault, Registry, Replica};
 use proptest::prelude::*;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -46,7 +46,9 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE loans (
         id INTEGER PRIMARY KEY,
         book_id INTEGER REFERENCES books(id) ON DELETE SET NULL,
-        borrower TEXT)",
+        borrower TEXT,
+        lent_seq INTEGER NOT NULL,
+        origin TEXT NOT NULL)",
 ];
 
 fn registry() -> Registry {
@@ -82,7 +84,15 @@ fn registry() -> Registry {
             .field("value"),
         Collection::minted("loans", "loans", "id")
             .reference("book_id", "books")
-            .field("borrower"),
+            .field("borrower")
+            .local_default(
+                "lent_seq",
+                LocalDefault::Sql("SELECT COALESCE(max(lent_seq), 0) + 1 FROM loans".into()),
+            )
+            .local_default(
+                "origin",
+                LocalDefault::Value(Value::Text("elsewhere".into())),
+            ),
     ])
     .unwrap()
 }
@@ -621,8 +631,10 @@ async fn the_same_identity_made_on_two_replicas_is_one_entity_with_all_its_child
         .await;
     a.run("INSERT INTO tags (book_id, tag, note) VALUES (1, 'classic', 'a'), (1, 'shared', 'a')")
         .await;
-    a.run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Dorothea')")
-        .await;
+    a.run(
+        "INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES (1, 'Dorothea', 0, 'here')",
+    )
+    .await;
     let b = &mut peers[1];
     b.run("INSERT INTO authors (name) VALUES ('Woolf')").await;
     b.run(
@@ -634,7 +646,7 @@ async fn the_same_identity_made_on_two_replicas_is_one_entity_with_all_its_child
         .await;
     b.run("INSERT INTO tags (book_id, tag, note) VALUES (1, 'victorian', 'b'), (1, 'shared', 'b')")
         .await;
-    b.run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Celia')")
+    b.run("INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES (1, 'Celia', 0, 'here')")
         .await;
     let mut made = Vec::new();
     for peer in &mut peers[..2] {
@@ -850,7 +862,7 @@ async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
     // The third replica holds both books as two rows, and lends the one without an isbn.
     peers[2].sync(&mut hub).await;
     peers[2]
-        .run("INSERT INTO loans (book_id, borrower) SELECT id, 'Celia' FROM books WHERE isbn IS NULL")
+        .run("INSERT INTO loans (book_id, borrower, lent_seq, origin) SELECT id, 'Celia', 0, 'here' FROM books WHERE isbn IS NULL")
         .await;
     let loan_book: i64 = count(&mut peers[2], "SELECT book_id FROM loans").await;
 
@@ -896,7 +908,7 @@ async fn a_row_moved_off_a_parent_deleted_in_the_same_batch_keeps_what_it_owns()
         .await;
     a.run("INSERT INTO marks (note_id, place) VALUES (1, 7)")
         .await;
-    a.run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Celia')")
+    a.run("INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES (1, 'Celia', 0, 'here')")
         .await;
     settle(&mut peers, &mut hub).await;
     let note_row: i64 = count(&mut peers[1], "SELECT id FROM notes").await;
@@ -1066,7 +1078,7 @@ async fn a_reference_held_while_its_group_had_no_row_is_restored_when_the_row_re
         .await
         .unwrap();
     peers[1]
-        .run("INSERT INTO loans (book_id, borrower) VALUES (1, 'Celia')")
+        .run("INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES (1, 'Celia', 0, 'here')")
         .await;
     peers[1].cursor = hub.len();
     peers[1].push(&mut hub).await;
@@ -1503,6 +1515,26 @@ async fn a_delete_another_table_refuses_waits_until_it_is_let_go() {
     assert!(assert_converged(&mut peers).await.is_empty());
 }
 
+#[tokio::test]
+async fn a_column_kept_by_each_replica_is_filled_when_the_kernel_inserts() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[1]
+        .run("INSERT INTO loans (borrower, lent_seq, origin) VALUES ('Mary', 5, 'here')")
+        .await;
+    peers[0]
+        .run("INSERT INTO loans (borrower, lent_seq, origin) VALUES ('Celia', 1, 'here')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    assert_converged(&mut peers).await;
+    assert_eq!(
+        peers[1]
+            .lines("SELECT borrower || ' ' || lent_seq || ' ' || origin FROM loans ORDER BY 1")
+            .await,
+        ["Celia 6 elsewhere", "Mary 5 here"]
+    );
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1771,8 +1803,11 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             format!("UPDATE OR IGNORE books SET {column} = {value} WHERE id = {id}")
         }
         Op::AddLoan(n) => match peer.pick("books", n).await {
-            Some(b) => format!("INSERT INTO loans (book_id, borrower) VALUES ({b}, 'friend')"),
-            None => "INSERT INTO loans (borrower) VALUES ('friend')".to_string(),
+            Some(b) => format!(
+                "INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES ({b}, 'friend', 0, 'here')"
+            ),
+            None => "INSERT INTO loans (borrower, lent_seq, origin) VALUES ('friend', 0, 'here')"
+                .to_string(),
         },
         Op::SetLoanBook(n, m) => {
             let (Some(l), Some(b)) = (peer.pick("loans", n).await, peer.pick("books", m).await)

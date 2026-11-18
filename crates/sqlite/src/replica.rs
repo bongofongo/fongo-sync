@@ -5,7 +5,7 @@ use sqlx::{Connection, SqliteConnection};
 
 use crate::db::{exec, query};
 use crate::error::{Error, Result};
-use crate::registry::{Collection, Field, Key, Kind, Registry};
+use crate::registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 
 const NOW: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 const QUIET: &str =
@@ -2129,12 +2129,23 @@ impl Replica {
             .filter(|(f, _)| !absent.contains(f.name.as_str()))
             .collect();
         let table = quoted(&c.table);
-        if columns.is_empty() {
+        let mut names: Vec<String> = columns.iter().map(|(f, _)| quoted(&f.name)).collect();
+        let mut marks = vec!["?".to_string(); columns.len()];
+        let mut params: Vec<Value> = columns.iter().map(|(_, v)| v.clone()).collect();
+        for (column, default) in &c.local_defaults {
+            names.push(quoted(column));
+            match default {
+                LocalDefault::Value(value) => {
+                    marks.push("?".into());
+                    params.push(value.clone());
+                }
+                LocalDefault::Sql(sql) => marks.push(format!("({sql})")),
+            }
+        }
+        if names.is_empty() {
             return exec(conn, &format!("INSERT INTO {table} DEFAULT VALUES"), &[]).await;
         }
-        let names: Vec<String> = columns.iter().map(|(f, _)| quoted(&f.name)).collect();
-        let marks = vec!["?"; columns.len()].join(", ");
-        let params: Vec<Value> = columns.iter().map(|(_, v)| v.clone()).collect();
+        let marks = marks.join(", ");
         exec(
             conn,
             &format!(

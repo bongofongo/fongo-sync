@@ -9,5 +9,5 @@ mod replica;
 
 pub use error::{Error, Result};
 pub use fongo_sync_core as core;
-pub use registry::{Collection, Field, Key, Kind, Registry};
+pub use registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 pub use replica::{Applied, Conflict, Outbox, Replica, Touched};
