@@ -20,6 +20,12 @@ impl Hlc {
         }
     }
 
+    /// Whether the text form holds this reading. One with a later wall time would be stored as
+    /// another, so a replica that receives it ignores it rather than read it back differently.
+    pub fn encodable(&self) -> bool {
+        self.wall_ms <= WALL_MAX
+    }
+
     /// Fixed-width text whose byte order is the clock order, so a database can compare it.
     pub fn encode(&self) -> String {
         format!(
@@ -78,9 +84,12 @@ impl Clock {
         self.last
     }
 
+    /// Moves past a reading from elsewhere. A reading the text form cannot hold is ignored.
     pub fn observe(&mut self, remote: &Hlc) {
-        if (remote.wall_ms, remote.counter) > (self.last.wall_ms, self.last.counter) {
-            self.last.wall_ms = remote.wall_ms.min(WALL_MAX);
+        if remote.encodable()
+            && (remote.wall_ms, remote.counter) > (self.last.wall_ms, self.last.counter)
+        {
+            self.last.wall_ms = remote.wall_ms;
             self.last.counter = remote.counter;
         }
     }
@@ -122,6 +131,44 @@ mod tests {
         assert_eq!(Hlc::decode(&a.encode()), Some(a));
         assert!(a.encode() < b.encode());
         assert_eq!(a.encode().len(), 52);
+    }
+
+    #[test]
+    fn a_reading_beyond_the_text_form_is_not_encodable_and_not_observed() {
+        let beyond = Hlc {
+            wall_ms: WALL_MAX + 1,
+            counter: 0,
+            node: node(7),
+        };
+        let edge = Hlc {
+            wall_ms: WALL_MAX,
+            ..beyond
+        };
+        assert!(!beyond.encodable());
+        assert!(edge.encodable());
+        assert_eq!(Hlc::decode(&edge.encode()), Some(edge));
+        let mut clock = Clock::new(node(1));
+        clock.observe(&beyond);
+        assert_eq!(clock.last(), Hlc::zero(node(1)));
+    }
+
+    #[test]
+    fn observing_a_reading_beyond_the_text_form_never_moves_the_clock_back() {
+        for wall_ms in [WALL_MAX + 1, u64::MAX] {
+            let last = Hlc {
+                wall_ms: WALL_MAX,
+                counter: 5,
+                node: node(1),
+            };
+            let mut clock = Clock::resume(last);
+            clock.observe(&Hlc {
+                wall_ms,
+                counter: 0,
+                node: node(2),
+            });
+            assert_eq!(clock.last(), last);
+            assert!(clock.tick(0) > last);
+        }
     }
 
     #[test]
