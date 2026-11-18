@@ -1223,6 +1223,39 @@ async fn a_swap_of_not_null_unique_identities_converges_and_one_that_cannot_wait
     }
 }
 
+#[tokio::test]
+async fn a_local_id_given_to_another_entity_in_the_same_apply_reports_both() {
+    let schema = ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT UNIQUE)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+    ];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let old = peers[0].gid("books", 1).await;
+    // The new row cannot be written until the old one is gone, then takes its local id.
+    peers[0].run("DELETE FROM books").await;
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0].push(&mut hub).await;
+    let new = peers[0].gid("books", 1).await;
+    let applied = peers[1].pull(&hub).await;
+    assert_eq!(
+        touched(&applied),
+        vec![("books", "[1]", old, true), ("books", "[1]", new, false)]
+    );
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));

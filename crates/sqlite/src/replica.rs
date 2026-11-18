@@ -61,7 +61,8 @@ pub struct Applied {
     /// Entities held back because a row they need has not arrived or a constraint refused them.
     /// They are retried on every later apply.
     pub waiting: usize,
-    /// The rows this apply wrote or removed, by collection in registry order, then by key.
+    /// The rows this apply wrote or removed, by collection in registry order, then by key. A key
+    /// whose entity was removed and whose local id went to another lists both, in that order.
     pub touched: Vec<Touched>,
     /// Fields flagged to report conflicts that were edited here and elsewhere concurrently. Only
     /// a local edit this apply collects is compared, one not yet sent, so a sync that wants these
@@ -179,7 +180,9 @@ struct Pass {
     writes: usize,
 }
 
-type Rows = BTreeMap<(usize, String), (Gid, bool)>;
+/// Each row written or removed, by collection, key and entity: when it was first reported, and
+/// whether it was last removed. A key can hold one entity removed and another written.
+type Rows = BTreeMap<(usize, String, Gid), (usize, bool)>;
 
 /// A local edit to a field that reports conflicts, as collected.
 struct Edit {
@@ -212,7 +215,11 @@ impl Pass {
 
     fn touch(&mut self, idx: usize, key: String, gid: Gid, deleted: bool) {
         self.writes += 1;
-        self.rows.insert((idx, key), (gid, deleted));
+        let first = self.rows.len();
+        self.rows
+            .entry((idx, key, gid))
+            .or_insert((first, deleted))
+            .1 = deleted;
     }
 }
 
@@ -725,10 +732,11 @@ impl Replica {
         save_clock(&mut tx, &pass.clock).await?;
         tx.commit().await?;
         let collections = self.registry.collections();
-        applied.touched = pass
-            .rows
+        let mut rows: Vec<_> = pass.rows.into_iter().collect();
+        rows.sort_by(|((a, k, _), (s, _)), ((b, l, _), (t, _))| (a, k, s).cmp(&(b, l, t)));
+        applied.touched = rows
             .into_iter()
-            .map(|((idx, key), (gid, deleted))| Touched {
+            .map(|((idx, key, gid), (_, deleted))| Touched {
                 collection: collections[idx].name.clone(),
                 key,
                 gid,
