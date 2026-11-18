@@ -7,7 +7,11 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 
 const SCHEMA: &[&str] = &[
-    "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+    "CREATE TABLE authors (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        born INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (name, born))",
     "CREATE TABLE books (
         id INTEGER PRIMARY KEY,
         title TEXT NOT NULL,
@@ -23,7 +27,8 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE marks (
         id INTEGER PRIMARY KEY,
         note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-        place INTEGER)",
+        place INTEGER,
+        UNIQUE (note_id, place))",
     "CREATE TABLE tags (
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
         tag TEXT NOT NULL,
@@ -38,7 +43,10 @@ const SCHEMA: &[&str] = &[
 
 fn registry() -> Registry {
     Registry::new(vec![
-        Collection::minted("authors", "authors", "id").field("name"),
+        Collection::minted("authors", "authors", "id")
+            .field("name")
+            .field("born")
+            .identity(&["name", "born"]),
         Collection::minted("books", "books", "id")
             .field("title")
             .field("year")
@@ -53,7 +61,8 @@ fn registry() -> Registry {
             .field_reporting_conflicts("body"),
         Collection::minted("marks", "marks", "id")
             .owner("note_id", "notes")
-            .field("place"),
+            .field("place")
+            .identity(&["note_id", "place"]),
         Collection::natural("tags", "tags", &["book_id", "tag"])
             .owner("book_id", "books")
             .field("tag")
@@ -69,7 +78,7 @@ fn registry() -> Registry {
 }
 
 const DUMP: &str = "
-    SELECT 'author ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || a.name
+    SELECT 'author ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || a.name || ' ' || a.born
       FROM authors a LEFT JOIN fongo_ids i ON i.collection = 'authors' AND i.key = json_array(a.id)
     UNION ALL
     SELECT 'book ' || COALESCE(hex(i.gid), 'UNMAPPED')
@@ -762,6 +771,66 @@ async fn a_row_moved_off_a_parent_deleted_in_the_same_batch_keeps_what_it_owns()
     assert_eq!(count(&mut peers[1], "SELECT id FROM notes").await, note_row);
 }
 
+#[tokio::test]
+async fn a_not_null_identity_merges_and_is_given_up_by_an_out_of_date_row() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO authors (name) VALUES ('Eliot'), ('Gaskell')")
+        .await;
+    peers[1]
+        .run("INSERT INTO authors (name) VALUES ('Eliot')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let state = assert_converged(&mut peers).await;
+    assert_eq!(state.len(), 2, "{state:#?}");
+    assert_eq!(peers[0].lines(ALIASES).await.len(), 2);
+
+    // The names are swapped by way of a third, so they never clash on the first replica.
+    peers[0]
+        .run("UPDATE authors SET name = 'x' WHERE id = 1")
+        .await;
+    peers[0]
+        .run("UPDATE authors SET name = 'Eliot' WHERE id = 2")
+        .await;
+    peers[0]
+        .run("UPDATE authors SET name = 'Gaskell' WHERE id = 1")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let state = assert_converged(&mut peers).await;
+    assert_eq!(state.len(), 2, "{state:#?}");
+    assert_eq!(peers[0].lines(ALIASES).await.len(), 2);
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM fongo_pending").await, 0);
+    }
+}
+
+#[tokio::test]
+async fn an_identity_of_several_fields_with_an_owner_is_matched_under_the_same_owner() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'one'), (1, 'two')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+
+    peers[0]
+        .run("INSERT INTO marks (note_id, place) VALUES (1, 3), (2, 3)")
+        .await;
+    peers[1]
+        .run("INSERT INTO marks (note_id, place) VALUES (1, 3), (1, 4)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+
+    let state = assert_converged(&mut peers).await;
+    let marks: Vec<&String> = state.iter().filter(|l| l.starts_with("mark ")).collect();
+    assert_eq!(marks.len(), 3, "{state:#?}");
+    assert_eq!(peers[0].lines(ALIASES).await.len(), 2);
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -858,6 +927,8 @@ async fn an_edit_made_after_seeing_another_is_not_a_conflict() {
 #[derive(Debug, Clone)]
 enum Op {
     AddAuthor(u8),
+    RenameAuthor(usize, u8),
+    SetBorn(usize, u8),
     AddBook(u8, usize),
     SetTitle(usize, u8),
     SetYear(usize, u8),
@@ -890,6 +961,8 @@ fn arb_op() -> impl Strategy<Value = Op> {
     let v = 0u8..4;
     prop_oneof![
         v.clone().prop_map(Op::AddAuthor),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::RenameAuthor(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetBorn(a, b)),
         (v.clone(), n.clone()).prop_map(|(a, b)| Op::AddBook(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTitle(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetYear(a, b)),
@@ -928,7 +1001,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
 async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
     let sql = match op {
         Op::AddMark(n, v) => match peer.pick("notes", n).await {
-            Some(id) => format!("INSERT INTO marks (note_id, place) VALUES ({id}, {v})"),
+            Some(id) => {
+                format!("INSERT OR IGNORE INTO marks (note_id, place) VALUES ({id}, {v})")
+            }
             None => return,
         },
         Op::MoveNoteOffDeletedBook(n, m) | Op::MoveMarkOffDeletedNote(n, m) => {
@@ -949,7 +1024,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                 return;
             };
             peer.run(&format!(
-                "UPDATE {child} SET {column} = {to} WHERE id = {id}"
+                "UPDATE OR IGNORE {child} SET {column} = {to} WHERE id = {id}"
             ))
             .await;
             format!("DELETE FROM {parent} WHERE id = {from}")
@@ -958,7 +1033,17 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             peer.sync(hub).await;
             return;
         }
-        Op::AddAuthor(v) => format!("INSERT INTO authors (name) VALUES ('author{v}')"),
+        Op::AddAuthor(v) => format!("INSERT OR IGNORE INTO authors (name) VALUES ('author{v}')"),
+        Op::RenameAuthor(n, v) | Op::SetBorn(n, v) => {
+            let Some(id) = peer.pick("authors", n).await else {
+                return;
+            };
+            let set = match op {
+                Op::RenameAuthor(..) => format!("name = 'author{v}'"),
+                _ => format!("born = {}", v % 2),
+            };
+            format!("UPDATE OR IGNORE authors SET {set} WHERE id = {id}")
+        }
         Op::AddBook(v, n) => match peer.pick("authors", n).await {
             Some(a) => format!("INSERT INTO books (title, author_id) VALUES ('title{v}', {a})"),
             None => format!("INSERT INTO books (title) VALUES ('title{v}')"),

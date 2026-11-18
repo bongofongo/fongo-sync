@@ -1284,28 +1284,68 @@ impl Replica {
                         return Ok(Some(other));
                     }
                 }
-                let cleared: Vec<String> = identity
-                    .iter()
-                    .map(|f| format!("{} = NULL", quoted(f)))
-                    .collect();
-                let cleared = exec(
-                    conn,
-                    &format!(
-                        "UPDATE OR IGNORE {} SET {} WHERE {} = json_extract(?1, '$[0]')",
-                        quoted(&c.table),
-                        cleared.join(", "),
-                        quoted(column)
-                    ),
-                    &[Value::Text(key.clone())],
-                )
-                .await?;
-                if cleared > 0 {
+                if self.give_up(conn, c, identity, &key).await? {
                     pass.touch(idx, key, other, false);
+                    pass.more.insert((idx, other));
                 }
-                pass.more.insert((idx, other));
             }
         }
         Ok(None)
+    }
+
+    /// Takes an identity off an out-of-date row so another can hold it: null where the columns
+    /// allow, else a stand-in no other row holds. References stay, since they must name a row.
+    async fn give_up(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        identity: &[String],
+        key: &str,
+    ) -> Result<bool> {
+        let Key::Minted { column } = &c.key else {
+            return Ok(false);
+        };
+        let plain: Vec<String> = identity
+            .iter()
+            .filter(|name| {
+                c.field_index(name)
+                    .is_some_and(|i| matches!(c.fields[i].kind, Kind::Plain))
+            })
+            .map(|name| quoted(name))
+            .collect();
+        if plain.is_empty() {
+            return Ok(false);
+        }
+        let nulls: Vec<String> = plain.iter().map(|f| format!("{f} = NULL")).collect();
+        let stand_ins: Vec<String> = plain
+            .iter()
+            .map(|f| {
+                format!(
+                    "{f} = CASE typeof({f})
+                        WHEN 'integer' THEN -1 - abs(random() / 2)
+                        WHEN 'real' THEN -1.0 - abs(random() / 2)
+                        WHEN 'blob' THEN randomblob(16)
+                        ELSE 'fongo:' || hex(randomblob(16)) END"
+                )
+            })
+            .collect();
+        for sets in [nulls, stand_ins] {
+            let changed = exec(
+                conn,
+                &format!(
+                    "UPDATE OR IGNORE {} SET {} WHERE {} = json_extract(?1, '$[0]')",
+                    quoted(&c.table),
+                    sets.join(", "),
+                    quoted(column)
+                ),
+                &[Value::Text(key.into())],
+            )
+            .await?;
+            if changed > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn read_row(
