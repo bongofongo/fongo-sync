@@ -4,7 +4,7 @@ import FongoSync
 
 #print axioms FongoSync.Clock.tick_after_any_history
 #print axioms FongoSync.Clock.observe_then_tick
-#print axioms FongoSync.Clock.observe_can_move_back
+#print axioms FongoSync.Clock.observe_ignores
 #print axioms FongoSync.merge_comm
 #print axioms FongoSync.merge_assoc
 #print axioms FongoSync.merge_idem

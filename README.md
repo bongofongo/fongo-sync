@@ -24,9 +24,8 @@ builds it (it is not part of `make check`). Proven, about the model:
 - a register merges commutatively, associatively and idempotently under `Lww` and `Max`, so a
   replica's state depends only on the set of changes it has applied, given that no two changes to
   one field share a clock with different values (and an example shows that condition is needed);
-- every `Clock::tick` is later than every reading issued or observed before it, provided observed
-  readings have a wall time `Hlc::encode` can write; without that, `observe` can move the clock
-  back, and an example shows it;
+- every `Clock::tick` is later than every reading issued before it and every reading observed
+  before it that `Hlc::encode` can write, for a clock whose `observe` ignores readings it cannot;
 - alias groups and their canonical gids (the smallest member) depend only on the set of edges;
 - the view (live groups, values from live members, references read through canonical gids)
   depends only on the set of changes.

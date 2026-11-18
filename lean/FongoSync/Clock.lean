@@ -74,10 +74,17 @@ def Clock.tick (c : Clock) (wall : Nat) : Hlc × Clock :=
       { c.last with wall := c.last.wall + 1, counter := 0 }
   (last, ⟨last⟩)
 
-/-- `Clock::observe`. The Rust compares `(wall_ms, counter)` tuples; the node is ignored. -/
+/-- `Hlc::encodable`: the text form holds this reading. -/
+def Hlc.encodable (h : Hlc) : Prop := h.wall ≤ WALL_MAX
+
+instance (h : Hlc) : Decidable h.encodable := inferInstanceAs (Decidable (h.wall ≤ WALL_MAX))
+
+/-- `Clock::observe`: moves past a reading from elsewhere, ignoring one the text form cannot
+hold. The Rust compares `(wall_ms, counter)` tuples; the node is ignored. -/
 def Clock.observe (c : Clock) (remote : Hlc) : Clock :=
-  if remote.wall > c.last.wall ∨ remote.wall = c.last.wall ∧ remote.counter > c.last.counter then
-    ⟨{ c.last with wall := min remote.wall WALL_MAX, counter := remote.counter }⟩
+  if remote.encodable ∧
+      (remote.wall > c.last.wall ∨ remote.wall = c.last.wall ∧ remote.counter > c.last.counter) then
+    ⟨{ c.last with wall := remote.wall, counter := remote.counter }⟩
   else
     c
 
@@ -124,27 +131,33 @@ theorem Clock.tick_node (c : Clock) (wall : Nat) : (c.tick wall).1.node = c.last
   · rfl
   · split <;> rfl
 
-/-- Observing a remote reading whose wall time `Hlc::encode` can write never moves the clock
-back, and leaves it at or past the remote reading. -/
-theorem Clock.observe_notAfter (c : Clock) (remote : Hlc) (h : remote.wall ≤ WALL_MAX) :
-    c.last.NotAfter (c.observe remote).last ∧ remote.NotAfter (c.observe remote).last := by
+/-- A reading the text form cannot hold is ignored. -/
+theorem Clock.observe_ignores (c : Clock) (remote : Hlc) (h : ¬ remote.encodable) :
+    c.observe remote = c := by
+  simp [Clock.observe, h]
+
+/-- Observing never moves the clock back, and leaves it at or past any encodable remote reading. -/
+theorem Clock.observe_notAfter (c : Clock) (remote : Hlc) :
+    c.last.NotAfter (c.observe remote).last ∧
+      (remote.encodable → remote.NotAfter (c.observe remote).last) := by
   unfold Clock.observe Hlc.NotAfter
   split
-  · simp only; omega
-  · omega
+  · rename_i h; simp only [Hlc.encodable, true_and] at h ⊢; omega
+  · rename_i h; simp only [Hlc.encodable, true_and] at h ⊢; omega
 
-/-- The next tick after observing such a remote reading is later than it. -/
+/-- The next tick after observing an encodable reading is later than it. -/
 theorem Clock.observe_then_tick (c : Clock) (remote : Hlc) (wall : Nat)
-    (h : remote.wall ≤ WALL_MAX) : remote < ((c.observe remote).tick wall).1 :=
+    (h : remote.encodable) : remote < ((c.observe remote).tick wall).1 :=
   Hlc.lt_of_before <| Hlc.before_of_notAfter_of_before
-    (c.observe_notAfter remote h).2 ((c.observe remote).tick_before wall)
+    ((c.observe_notAfter remote).2 h) ((c.observe remote).tick_before wall)
 
 /-- What a clock is asked to do. -/
 inductive Event where
   | tick (wall : Nat)
   | observe (remote : Hlc)
 
-/-- Runs `events` in order: the clock afterwards, and every reading it issued or observed. -/
+/-- Runs `events` in order: the clock afterwards, and every reading it issued or took into
+account (the encodable readings it observed). -/
 def Clock.run (c : Clock) : List Event → Clock × List Hlc
   | [] => (c, [])
   | .tick wall :: rest =>
@@ -153,22 +166,16 @@ def Clock.run (c : Clock) : List Event → Clock × List Hlc
     (final, reading :: seen)
   | .observe remote :: rest =>
     let (final, seen) := (c.observe remote).run rest
-    (final, remote :: seen)
+    (final, if remote.encodable then remote :: seen else seen)
 
-/-- Every remote reading in `events` has a wall time `Hlc::encode` can write. -/
-def Encodable : List Event → Prop
-  | [] => True
-  | .tick _ :: rest => Encodable rest
-  | .observe remote :: rest => remote.wall ≤ WALL_MAX ∧ Encodable rest
-
-theorem Clock.run_notAfter (c : Clock) (events : List Event) (h : Encodable events) :
+theorem Clock.run_notAfter (c : Clock) (events : List Event) :
     c.last.NotAfter (c.run events).1.last ∧ ∀ r ∈ (c.run events).2, r.NotAfter (c.run events).1.last := by
   induction events generalizing c with
   | nil => exact ⟨Hlc.notAfter_refl _, by simp [Clock.run]⟩
   | cons e rest ih =>
     cases e with
     | tick wall =>
-      have ⟨h₁, h₂⟩ := ih (c.tick wall).2 h
+      have ⟨h₁, h₂⟩ := ih (c.tick wall).2
       have step : c.last.NotAfter (c.tick wall).2.last := by
         have := c.tick_before wall
         unfold Hlc.Before at this; unfold Hlc.NotAfter; rw [Clock.tick_last]; omega
@@ -179,39 +186,28 @@ theorem Clock.run_notAfter (c : Clock) (events : List Event) (h : Encodable even
       · rw [← Clock.tick_last]; exact h₁
       · exact h₂ r hr
     | observe remote =>
-      have ⟨hw, hrest⟩ := h
-      have ⟨h₁, h₂⟩ := ih (c.observe remote) hrest
-      have ⟨s₁, s₂⟩ := c.observe_notAfter remote hw
+      have ⟨h₁, h₂⟩ := ih (c.observe remote)
+      have ⟨s₁, s₂⟩ := c.observe_notAfter remote
       refine ⟨Hlc.notAfter_trans s₁ h₁, ?_⟩
       intro r hr
-      simp only [Clock.run, List.mem_cons] at hr
-      rcases hr with rfl | hr
-      · exact Hlc.notAfter_trans s₂ h₁
-      · exact h₂ r hr
+      simp only [Clock.run] at hr
+      by_cases he : remote.encodable
+      · simp only [he, ↓reduceIte, List.mem_cons] at hr
+        rcases hr with rfl | hr
+        · exact Hlc.notAfter_trans (s₂ he) h₁
+        · exact h₂ r hr
+      · simp only [he, ↓reduceIte] at hr
+        exact h₂ r hr
 
-/-- **The clock law.** After any history of ticks and observations of encodable remote readings,
-the next tick is later than the clock's starting point and than every reading issued or observed
-along the way, whatever wall time it is given. -/
-theorem Clock.tick_after_any_history (c : Clock) (events : List Event) (wall : Nat)
-    (h : Encodable events) :
+/-- **The clock law.** After any history of ticks and observations, the next tick is later than
+the clock's starting point, than every reading it issued, and than every encodable reading it
+observed, whatever wall time it is given. -/
+theorem Clock.tick_after_any_history (c : Clock) (events : List Event) (wall : Nat) :
     c.last < ((c.run events).1.tick wall).1 ∧
       ∀ r ∈ (c.run events).2, r < ((c.run events).1.tick wall).1 := by
-  have ⟨h₁, h₂⟩ := c.run_notAfter events h
+  have ⟨h₁, h₂⟩ := c.run_notAfter events
   have t := (c.run events).1.tick_before wall
   exact ⟨Hlc.lt_of_before (Hlc.before_of_notAfter_of_before h₁ t),
     fun r hr => Hlc.lt_of_before (Hlc.before_of_notAfter_of_before (h₂ r hr) t)⟩
-
-/-! ## Where the law needs its hypothesis
-
-`Clock::observe` clamps the remote wall time to `WALL_MAX` but compares it unclamped. A remote
-reading past `WALL_MAX` therefore moves the clock back, and the next tick repeats a reading below
-one already issued. Wire decoding accepts any `u64` wall time, so the hypothesis `Encodable` is a
-real obligation on callers. -/
-
-theorem Clock.observe_can_move_back :
-    let c : Clock := ⟨⟨WALL_MAX, 5, 1⟩⟩
-    let remote : Hlc := ⟨WALL_MAX + 1, 0, 2⟩
-    (c.observe remote).last < c.last ∧ ((c.observe remote).tick 0).1 < c.last := by
-  decide
 
 end FongoSync
