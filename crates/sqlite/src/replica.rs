@@ -82,6 +82,20 @@ pub struct Applied {
     /// a local edit this apply collects is compared, one not yet sent, so a sync that wants these
     /// applies what it receives before it collects and sends.
     pub conflicts: Vec<Conflict>,
+    /// The entities counted in `waiting`, by collection and id.
+    pub held: Vec<Held>,
+}
+
+/// An entity whose row could not be written. When the kernel cannot resolve what holds it back,
+/// such as a partial unique index another row already satisfies, the application can read the
+/// entity's merged values with [`Replica::merged`], change its own rows, and call
+/// [`Replica::apply`] with no changes to try again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub collection: String,
+    pub gid: Gid,
+    /// The key of the entity's local row, when it has one.
+    pub key: Option<String>,
 }
 
 /// A local edit not yet sent and a remote edit to the same field, neither made after seeing the
@@ -786,6 +800,22 @@ impl Replica {
         let waiting = self.settle(&mut tx, touched, &mut pass).await?;
         exec(&mut tx, "DELETE FROM fongo_pending", &[]).await?;
         applied.waiting = self.hold(&mut tx, waiting).await?;
+        for row in query(
+            &mut tx,
+            "SELECT collection, gid FROM fongo_pending ORDER BY collection, gid",
+            &[],
+        )
+        .await?
+        {
+            let collection = as_text(&row[0])?.to_string();
+            let gid = as_gid(&row[1])?;
+            let key = self.key_for_gid(&mut tx, &collection, gid).await?;
+            applied.held.push(Held {
+                collection,
+                gid,
+                key,
+            });
+        }
         applied.conflicts = self.conflicts(&mut tx, changes).await?;
         set_applying(&mut tx, false).await?;
         save_clock(&mut tx, &pass.clock).await?;
@@ -941,6 +971,86 @@ impl Replica {
         )
         .await?;
         Ok(())
+    }
+
+    /// An entity's merged field values, following its alias group, with `$deleted` among them.
+    /// Empty when nothing is known of it.
+    pub async fn merged(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        gid: Gid,
+    ) -> Result<BTreeMap<String, Value>> {
+        let Some(idx) = self.registry.index(collection) else {
+            return Ok(BTreeMap::new());
+        };
+        let group = self
+            .group(conn, &self.registry.collections()[idx], gid)
+            .await?;
+        Ok(group
+            .merged
+            .into_iter()
+            .map(|(field, (value, _))| (field, value))
+            .collect())
+    }
+
+    /// The id of the entity a local row holds, by the row's key as the change-capture triggers
+    /// write it. The id is the group's own when the entity has been merged with others.
+    pub async fn gid_for_key(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        key: &str,
+    ) -> Result<Option<Gid>> {
+        let Some(idx) = self.registry.index(collection) else {
+            return Ok(None);
+        };
+        self.row_gid(conn, &self.registry.collections()[idx], key)
+            .await
+    }
+
+    /// The key of the local row that holds an entity, or any entity merged with it.
+    pub async fn key_for_gid(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        gid: Gid,
+    ) -> Result<Option<String>> {
+        let Some(idx) = self.registry.index(collection) else {
+            return Ok(None);
+        };
+        let c = &self.registry.collections()[idx];
+        let canon = canon_of(conn, gid).await?;
+        let Key::Natural { fields } = &c.key else {
+            return query(
+                conn,
+                "SELECT key FROM fongo_ids WHERE gid = ?",
+                &[Value::Ref(canon)],
+            )
+            .await?
+            .first()
+            .map(|row| as_text(&row[0]).map(str::to_string))
+            .transpose();
+        };
+        let group = self.group(conn, c, canon).await?;
+        let mut pass = Pass::new(Clock::new(canon));
+        let mut key = Vec::with_capacity(fields.len());
+        for name in fields {
+            let (Some(i), Some((shared, _))) = (c.field_index(name), group.merged.get(name)) else {
+                return Ok(None);
+            };
+            match self.to_local(conn, &c.fields[i], shared, &mut pass).await? {
+                Local::Value(value) if value != Value::Null => key.push(value),
+                _ => return Ok(None),
+            }
+        }
+        let marks = vec!["?"; key.len()].join(", ");
+        let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
+        let Some(json) = json.first().map(|row| as_text(&row[0])).transpose()? else {
+            return Ok(None);
+        };
+        let json = json.to_string();
+        Ok(self.row_exists(conn, c, &json).await?.then_some(json))
     }
 
     /// The global id of a row in a minted collection, once it has been collected or applied.

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
-use fongo_sync_sqlite::{Applied, Collection, Conflict, LocalDefault, Registry, Replica};
+use fongo_sync_sqlite::{Applied, Collection, Conflict, Held, LocalDefault, Registry, Replica};
 use proptest::prelude::*;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -19,7 +19,9 @@ const SCHEMA: &[&str] = &[
         pages INTEGER,
         author_id INTEGER REFERENCES authors(id) ON DELETE SET NULL,
         isbn TEXT UNIQUE,
-        isbn10 TEXT UNIQUE)",
+        isbn10 TEXT UNIQUE,
+        current INTEGER)",
+    "CREATE UNIQUE INDEX one_current_book ON books (current) WHERE current = 1",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
         book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
@@ -64,6 +66,7 @@ fn registry() -> Registry {
             .reference("author_id", "authors")
             .field("isbn")
             .field("isbn10")
+            .field("current")
             .identity(&["isbn"])
             .identity(&["isbn10"])
             .local_dependent("positions", "book_id")
@@ -691,6 +694,19 @@ async fn the_same_identity_made_on_two_replicas_is_one_entity_with_all_its_child
     }
     // The group is known by the smallest of its ids, on every replica.
     assert_eq!(book, made.iter().min().unwrap().to_hex().to_uppercase());
+    // Either id finds the row, and the row names the group.
+    let replica = peers[0].replica.clone();
+    let conn = &mut peers[0].conn;
+    let key = replica.key_for_gid(conn, "books", made[1]).await.unwrap();
+    let key = key.unwrap();
+    assert_eq!(
+        replica.key_for_gid(conn, "books", made[0]).await.unwrap(),
+        Some(key.clone())
+    );
+    assert_eq!(
+        replica.gid_for_key(conn, "books", &key).await.unwrap(),
+        made.iter().min().copied()
+    );
 
     // The merged book is edited and deleted like any other.
     peers[2]
@@ -1533,6 +1549,73 @@ async fn a_column_kept_by_each_replica_is_filled_when_the_kernel_inserts() {
             .await,
         ["Celia 6 elsewhere", "Mary 5 here"]
     );
+}
+
+#[tokio::test]
+async fn the_application_resolves_what_the_kernel_reports_waiting() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title, current) VALUES ('Middlemarch', 1)")
+        .await;
+    peers[1]
+        .run("INSERT INTO books (title, current) VALUES ('Romola', 1)")
+        .await;
+    peers[0].push(&mut hub).await;
+    let theirs = peers[0].gid("books", 1).await;
+
+    // Each replica has a current book, and the index allows one.
+    let applied = peers[1].pull(&hub).await;
+    assert_eq!(
+        applied.held,
+        [Held {
+            collection: "books".into(),
+            gid: theirs,
+            key: None,
+        }]
+    );
+    let replica = peers[1].replica.clone();
+    let conn = &mut peers[1].conn;
+    let merged = replica.merged(conn, "books", theirs).await.unwrap();
+    assert_eq!(merged["current"], Value::Int(1));
+    assert_eq!(merged["title"], Value::Text("Middlemarch".into()));
+    let ours = replica.gid_of(conn, "books", 1).await.unwrap().unwrap();
+    assert_eq!(
+        replica.gid_for_key(conn, "books", "[1]").await.unwrap(),
+        Some(ours)
+    );
+    assert_eq!(
+        replica
+            .key_for_gid(conn, "books", ours)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("[1]")
+    );
+
+    peers[1].run("UPDATE books SET current = 0").await;
+    let replica = peers[1].replica.clone();
+    let conn = &mut peers[1].conn;
+    let applied = replica.apply(conn, &[]).await.unwrap();
+    assert_eq!(applied.waiting, 0);
+    assert!(applied.held.is_empty());
+    assert_eq!(
+        replica
+            .key_for_gid(conn, "books", theirs)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("[2]")
+    );
+    settle(&mut peers, &mut hub).await;
+    assert_converged(&mut peers).await;
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM fongo_pending").await, 0);
+        assert_eq!(
+            count(peer, "SELECT count(*) FROM books WHERE current = 1").await,
+            1
+        );
+    }
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
