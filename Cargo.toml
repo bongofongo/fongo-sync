@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/sqlite"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+fongo-sync-core = { path = "crates/core" }
+sha2 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros"] }
+proptest = "1"
