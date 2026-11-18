@@ -14,7 +14,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BEND_NO_TELEMETRY: "1"
 
 jobs:
   gate:
@@ -29,26 +28,6 @@ jobs:
           rustup target list --installed | grep -qx wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install Bend
-        env:
-          BEND_VERSION: 2.0.40
-          BEND_SHA256: c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b
-        run: |
-          archive="$RUNNER_TEMP/bend.tar.gz"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
-            "https://github.com/bendlang/bend/releases/download/v${BEND_VERSION}/bend-${BEND_VERSION}-linux-x64.tar.gz"
-          echo "${BEND_SHA256}  ${archive}" | sha256sum --check --strict
-          unpacked="$RUNNER_TEMP/bend-unpacked"
-          mkdir -p "$unpacked"
-          tar -xzf "$archive" -C "$unpacked"
-          bend_home="$HOME/.bend"
-          mkdir -p "$bend_home/bin"
-          mv "$unpacked/bend/bin/bend" "$bend_home/bin/bend"
-          mv "$unpacked/bend/bend2" "$unpacked/bend/guide" "$bend_home/"
-          echo "BEND_HOME=$bend_home" >> "$GITHUB_ENV"
-          echo "$bend_home/bin" >> "$GITHUB_PATH"
-          "$bend_home/bin/bend" version
 
       - name: Install Lean
         env:
@@ -69,6 +48,5 @@ jobs:
       - run: make lint
       - run: make test
       - run: make wasm
-      - run: make proof
       - run: make lean
-      - run: make verdict
+      - run: make lean-diff

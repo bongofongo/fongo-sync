@@ -18,22 +18,6 @@ changes from elsewhere. Its schema is left as it is; the kernel keeps its state 
 What replicas must converge to is stated twice, once to run and once to prove; see
 [Verification](#verification).
 
-`lean/` restates the core in [Lean 4](https://lean-lang.org) and proves more of it; `make lean`
-builds it (it is not part of `make check`). Proven, about the model:
-
-- a register merges commutatively, associatively and idempotently under `Lww` and `Max`, so a
-  replica's state depends only on the set of changes it has applied, given that no two changes to
-  one field share a clock with different values (and an example shows that condition is needed);
-- every `Clock::tick` is later than every reading issued or observed before it, provided observed
-  readings have a wall time `Hlc::encode` can write; without that, `observe` can move the clock
-  back, and an example shows it;
-- alias groups and their canonical gids (the smallest member) depend only on the set of edges;
-- the view (live groups, values from live members, references read through canonical gids)
-  depends only on the set of changes.
-
-Not covered: several collections and gid claiming, natural keys, `together` sets, `Real` values,
-the SQLite layer, and any link between the Lean model and the Rust beyond reading both.
-
 Devices exchange changes through a server that stores encrypted batches and learns nothing about
 their content: it sees a library id, a device id, a key epoch, a size and an arrival time.
 `fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
@@ -47,16 +31,18 @@ make check
 
 ## Verification
 
-Three layers, each checked against the one above it:
+One chain, each link checked against the one above it:
 
-1. **Laws, in [Bend](https://bend-lang.com).** `model.bend` is a miniature of the merge rules:
-   registers under both strategies, a replica's registers as a fold over the changes it received,
-   alias groups as labels computed from a list of aliases, and liveness and group state computed
-   from registers and labels. `LAWS.bend` states what they must guarantee, among them that a
-   replica's registers, groups and view do not depend on the order changes arrive in or on
-   duplicates, and that the view depends on nothing but registers and groups. `PROOF.bend` proves
-   every law; `make proof` checks the proofs, and `make verdict` rechecks them with Bend's small
-   kernel, which itself has a proof in Lean (it needs Lean installed).
+1. **Laws, in [Lean 4](https://lean-lang.org).** `lean/` restates the core: clocks, registers
+   under both strategies, a replica's state as a fold over the changes it received, alias groups,
+   liveness through owners, and the view over several collections. `lean/FongoSync/Laws.lean` states every law in one
+   place; the other files prove them. Among them: a replica's registers, groups and view do not
+   depend on the order changes arrive in or on duplicates, given that no two changes to one
+   register share a clock with different values (an example shows that condition is needed); the
+   view depends on nothing but registers, the gids seen and the groups; and every `Clock::tick`
+   is later than every reading issued or observed before it, for a clock that ignores observed
+   readings `Hlc::encode` cannot hold. `make lean` builds the proofs and fails if any law rests
+   on an unproven step; `make check` includes it.
 2. **The reference model, in Rust.** `fongo_sync_core::model::view` states the same semantics in
    full and executably: a slow, plain function from a schema and a set of changes to what an
    application sees. Its own tests check that it ignores order and duplicates and hold one case
@@ -64,10 +50,13 @@ Three layers, each checked against the one above it:
 3. **The storage adapter.** `fongo-sync-sqlite` will be tested by comparing what each replica
    shows with `model::view` of the changes it has seen, not only with other replicas.
 
-Nothing mechanically links the Bend model to the Rust: `model.bend` mirrors
-`crates/core/src/change.rs`, `clock.rs` and `model.rs` by hand, in miniature (a gid is a number, a
-value is a number, a collection has one field), so a proof covers the Rust only as far as that
-transcription is faithful.
+Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
+`clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
+faithful. The one cross-check is `make lean-diff` (part of `make check`): it runs a handful of
+fixed cases through the single-collection Lean view, computed and proven equal to its
+specification, and through `model::view`, and compares the output. The Lean view covers several collections, which collection a gid belongs to, the
+changes `model::view` ignores, `together` sets and natural keys, but not `Real` values, and it is
+a specification: it states the least groups and least live set rather than computing them.
 
 ## Licence
 

@@ -43,6 +43,12 @@ example :
 example : (((⟨⟨5, COUNTER_MAX, 1⟩⟩ : Clock).tick 5).1.wall, ((⟨⟨5, COUNTER_MAX, 1⟩⟩ : Clock).tick 5).1.counter) = (6, 0) := by
   decide
 
+/-- A reading the text form cannot hold is ignored, so it cannot move the clock back. -/
+example :
+    let c : Clock := ⟨⟨WALL_MAX, 5, 1⟩⟩
+    c.observe ⟨WALL_MAX + 1, 0, 2⟩ = c ∧ c.last < ((c.observe ⟨WALL_MAX + 1, 0, 2⟩).tick 0).1 := by
+  decide
+
 /-- Groups join through any path of edges, and the smallest member names the group. -/
 example :
     let E : List Edge := [(5, 3), (9, 7), (3, 9), (12, 11)]
