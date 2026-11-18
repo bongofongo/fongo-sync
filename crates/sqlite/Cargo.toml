@@ -12,5 +12,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Matches the version sqlx links, so tests can reach the same SQLite.
+libsqlite3-sys = "=0.30.1"
 proptest.workspace = true
 tokio.workspace = true

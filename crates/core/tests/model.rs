@@ -411,6 +411,20 @@ fn a_malformed_alias_is_ignored_and_claims_nothing() {
 }
 
 #[test]
+fn a_tombstone_that_is_neither_zero_nor_one_is_ignored_and_claims_nothing() {
+    let v = view(
+        &schema(),
+        &[
+            change("parts", gid(1), DELETED, Value::Int(5), 1),
+            change("sites", gid(1), "name", text("north"), 2),
+            change("sites", gid(1), DELETED, Value::Int(1), 3),
+            change("sites", gid(1), DELETED, Value::Text("no".into()), 4),
+        ],
+    );
+    assert_eq!(v, View::default());
+}
+
+#[test]
 fn an_undeclared_field_is_kept_claims_its_gid_and_is_not_shown() {
     let v = view(
         &schema(),
