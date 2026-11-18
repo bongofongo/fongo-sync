@@ -34,6 +34,10 @@ def Change.key (c : Change V) : Key := (c.collection, c.gid, c.field)
 
 def Change.entry (c : Change V) : Entry V := ⟨c.value, c.clock⟩
 
+/-- Two changes to one register (same collection, gid and field) at one clock carry one value. -/
+def Compatible (a b : Change V) : Prop :=
+  a.key = b.key → a.clock = b.clock → a.value = b.value
+
 /-- No two changes to the same field share a clock with different values. Honest clocks give
 every change its own clock, which is stronger. -/
 def ClockDetermines (cs : List (Change V)) : Prop :=
@@ -97,6 +101,54 @@ theorem uniqueClocks_entriesAt {cs : List (Change V)} (h : ClockDetermines cs) (
   rw [hv, hab]
 
 variable [TransOrd V] [LawfulEqOrd V]
+
+/-- Two compatible changes may be applied in either order, to any state. -/
+theorem State.apply_swap (σ : String → String → Strategy) (st : State V) (a b : Change V)
+    (h : Compatible a b) :
+    State.apply σ (State.apply σ st a) b = State.apply σ (State.apply σ st b) a := by
+  funext k
+  simp only [State.apply]
+  by_cases ha : k = a.key <;> by_cases hb : k = b.key
+  · subst ha
+    have hab : a.key = b.key := hb
+    simp only [hb, ↓reduceIte]
+    rw [← hab]
+    apply apply_any_order
+    intro hc
+    have hv := h hab hc
+    simp only [Change.entry] at hc ⊢
+    rw [hv, hc]
+  · subst ha
+    have hab : a.key ≠ b.key := hb
+    simp [hab]
+  · subst hb
+    have hab : b.key ≠ a.key := ha
+    simp [hab]
+  · simp [ha, hb]
+
+/-- Applying a change a second time changes nothing. -/
+theorem State.apply_twice (σ : String → String → Strategy) (st : State V) (a : Change V) :
+    State.apply σ (State.apply σ st a) a = State.apply σ st a := by
+  funext k
+  simp only [State.apply]
+  by_cases ha : k = a.key
+  · simp only [ha, ↓reduceIte]; exact FongoSync.apply_twice _ _ _
+  · simp [ha]
+
+/-- Swapping two neighbouring compatible changes anywhere in a delivery, from any state, leaves
+every register the same. -/
+theorem State.foldl_swap (σ : String → String → Strategy) (st : State V)
+    (pre post : List (Change V)) (a b : Change V) (h : Compatible a b) :
+    (pre ++ a :: b :: post).foldl (State.apply σ) st =
+      (pre ++ b :: a :: post).foldl (State.apply σ) st := by
+  simp only [List.foldl_append, List.foldl_cons, State.apply_swap σ _ a b h]
+
+/-- Receiving a change twice in a row anywhere in a delivery is receiving it once. -/
+theorem State.foldl_twice (σ : String → String → Strategy) (st : State V)
+    (pre post : List (Change V)) (a : Change V) :
+    (pre ++ a :: a :: post).foldl (State.apply σ) st =
+      (pre ++ a :: post).foldl (State.apply σ) st := by
+  simp only [List.foldl_append, List.foldl_cons, State.apply_twice]
 
 /-- **Convergence of the merged state.** Two replicas that applied the same set of changes hold
 the same state, whatever the order and however often each change arrived. -/

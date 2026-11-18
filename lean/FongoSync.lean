@@ -1,4 +1,5 @@
 import FongoSync.Clock
+import FongoSync.GidSet
 import FongoSync.Register
 import FongoSync.State
 import FongoSync.Alias

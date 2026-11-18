@@ -22,3 +22,6 @@ import FongoSync
 #print axioms FongoSync.view_dup
 #print axioms FongoSync.apply_lww_clock
 #print axioms FongoSync.order_matters_without_unique_clocks
+#print axioms FongoSync.State.foldl_swap
+#print axioms FongoSync.State.foldl_twice
+#print axioms FongoSync.gidSet_eq_of_mem_iff
