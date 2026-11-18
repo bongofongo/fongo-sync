@@ -1,4 +1,4 @@
-.PHONY: check fmt-check lint test wasm proof lean
+.PHONY: check fmt-check lint test wasm proof verdict lean
 
 BEND := $(shell command -v bend || echo $(HOME)/.bend/bin/bend)
 LAKE := $(shell command -v lake || echo $(HOME)/.elan/bin/lake)
@@ -25,3 +25,7 @@ lean:
 	cd lean && $(LAKE) build
 	@! grep -rnwE 'sorry|admit|axiom|native_decide' lean/FongoSync lean/FongoSync.lean
 	@cd lean && $(LAKE) env lean Audit.lean | tee /dev/stderr | { ! grep -q sorryAx; }
+
+# Rechecks the proofs with BendTT's kernel, which needs Lean on PATH.
+verdict:
+	@$(BEND) PROOF.bend --verdict | tee /dev/stderr | grep -q '^ALL PROOFS CHECK'

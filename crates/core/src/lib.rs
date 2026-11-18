@@ -3,6 +3,7 @@
 
 mod change;
 mod clock;
+pub mod model;
 mod value;
 
 pub use change::{Change, DELETED, State, Strategy, wins};
