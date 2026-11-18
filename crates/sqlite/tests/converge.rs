@@ -53,8 +53,7 @@ const SCHEMA: &[&str] = &[
         book_id INTEGER REFERENCES books(id) ON DELETE SET NULL,
         borrower TEXT,
         lent_seq INTEGER NOT NULL,
-        origin TEXT NOT NULL,
-        private INTEGER NOT NULL DEFAULT 0)",
+        origin TEXT NOT NULL)",
 ];
 
 fn registry() -> Registry {
@@ -103,8 +102,7 @@ fn registry() -> Registry {
             .local_default(
                 "origin",
                 LocalDefault::Value(Value::Text("elsewhere".into())),
-            )
-            .filter("private = 0"),
+            ),
     ])
     .unwrap()
 }
@@ -144,7 +142,6 @@ const DUMP: &str = "
            || COALESCE((SELECT hex(gid) FROM fongo_ids
                         WHERE collection = 'books' AND key = json_array(l.book_id)), '-')
       FROM loans l LEFT JOIN fongo_ids i ON i.collection = 'loans' AND i.key = json_array(l.id)
-     WHERE l.private = 0
     ORDER BY 1";
 
 const SHADOW: &str = "
@@ -1664,51 +1661,6 @@ async fn two_tables_that_refer_to_each_other_arrive_together() {
 }
 
 #[tokio::test]
-async fn a_row_outside_the_filter_is_not_synced_and_crossing_it_makes_or_deletes() {
-    let mut hub = Vec::new();
-    let mut peers = [Peer::new().await, Peer::new().await];
-    peers[0]
-        .run(
-            "INSERT INTO loans (borrower, lent_seq, origin, private)
-             VALUES ('Celia', 1, 'here', 0), ('Rosamond', 2, 'here', 1)",
-        )
-        .await;
-    settle(&mut peers, &mut hub).await;
-    let loans = "SELECT borrower FROM loans ORDER BY 1";
-    assert_eq!(peers[1].lines(loans).await, ["Celia"]);
-
-    // Out of the filter it is gone elsewhere, and edits to it stay here.
-    peers[0]
-        .run("UPDATE loans SET private = 1 WHERE borrower = 'Celia'")
-        .await;
-    peers[0]
-        .run("UPDATE loans SET borrower = 'Celia B.' WHERE borrower = 'Celia'")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    assert!(peers[1].lines(loans).await.is_empty());
-    assert_eq!(peers[0].lines(loans).await, ["Celia B.", "Rosamond"]);
-
-    // Into the filter it is made elsewhere, as a new entity.
-    peers[0]
-        .run("UPDATE loans SET private = 0 WHERE borrower = 'Rosamond'")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(peers[1].lines(loans).await, ["Rosamond"]);
-    assert_converged(&mut peers).await;
-
-    // The kernel leaves a row outside the filter alone, whatever arrives for its entity.
-    peers[1].run("UPDATE loans SET borrower = 'Mary'").await;
-    peers[0]
-        .run("UPDATE loans SET private = 1 WHERE borrower = 'Rosamond'")
-        .await;
-    peers[1].push(&mut hub).await;
-    peers[0].sync(&mut hub).await;
-    assert_eq!(peers[0].lines(loans).await, ["Celia B.", "Rosamond"]);
-    settle(&mut peers, &mut hub).await;
-    assert_converged(&mut peers).await;
-}
-
-#[tokio::test]
 async fn writes_while_suspended_are_not_collected() {
     let mut hub = Vec::new();
     let mut peers = [Peer::new().await, Peer::new().await];
@@ -1913,7 +1865,6 @@ enum Op {
     AddLoan(usize),
     SetLoanBook(usize, usize),
     DeleteLoan(usize),
-    ToggleLoanPrivate(usize),
     Sync,
     Push,
     Deliver(u64, bool, bool),
@@ -1959,7 +1910,6 @@ fn arb_op() -> impl Strategy<Value = Op> {
         n.clone().prop_map(Op::AddLoan),
         (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetLoanBook(a, b)),
         n.clone().prop_map(Op::DeleteLoan),
-        n.clone().prop_map(Op::ToggleLoanPrivate),
         Just(Op::Sync),
         Just(Op::Sync),
         Just(Op::Push),
@@ -2084,10 +2034,6 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             };
             format!("UPDATE loans SET book_id = {b} WHERE id = {l}")
         }
-        Op::ToggleLoanPrivate(n) => match peer.pick("loans", n).await {
-            Some(id) => format!("UPDATE loans SET private = 1 - private WHERE id = {id}"),
-            None => return,
-        },
         Op::DeleteLoan(n) => match peer.pick("loans", n).await {
             Some(id) => format!("DELETE FROM loans WHERE id = {id}"),
             None => return,

@@ -24,8 +24,8 @@ reference may own its row, which then goes with its target. A collection can als
   keeps one row, points every reference at it, and merges the live members' fields by clock.
 - fields that change together, which merge as one write.
 - fields that report conflicts, so an application can combine concurrent edits to text.
-- a filter selecting which rows sync, columns it fills when inserting a row, and tables outside
-  the registry whose rows follow a merged row.
+- columns it fills when inserting a row, and tables outside the registry whose rows follow a
+  merged row.
 
 `Replica::suspend` and `resume` let an application migrate its schema without its writes being
 collected, and `uninstall` removes everything the kernel added.

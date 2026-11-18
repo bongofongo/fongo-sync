@@ -706,11 +706,10 @@ impl Replica {
                 &mut tx,
                 &format!(
                     "INSERT OR IGNORE INTO fongo_dirty (collection, key, at)
-                     SELECT '{}', json_array({}), 0 FROM {} WHERE 1{}",
+                     SELECT '{}', json_array({}), 0 FROM {}",
                     c.name,
                     key.join(", "),
-                    quoted(&c.table),
-                    c.visible()
+                    quoted(&c.table)
                 ),
                 &[],
             )
@@ -767,10 +766,9 @@ impl Replica {
         let rows = query(
             conn,
             &format!(
-                "SELECT json_array({}) FROM {} WHERE 1{}",
+                "SELECT json_array({}) FROM {}",
                 keys.join(", "),
-                quoted(&c.table),
-                c.visible()
+                quoted(&c.table)
             ),
             &[],
         )
@@ -1622,11 +1620,7 @@ impl Replica {
                     .collect();
                 let removed = match exec(
                     conn,
-                    &format!(
-                        "DELETE FROM {table} WHERE {}{}",
-                        matches.join(" AND "),
-                        c.visible()
-                    ),
+                    &format!("DELETE FROM {table} WHERE {}", matches.join(" AND ")),
                     &key,
                 )
                 .await
@@ -1782,11 +1776,10 @@ impl Replica {
             let rows = query(
                 conn,
                 &format!(
-                    "SELECT json_array({}) FROM {} WHERE {}{}",
+                    "SELECT json_array({}) FROM {} WHERE {}",
                     quoted(column),
                     quoted(&c.table),
-                    matches.join(" AND "),
-                    c.visible()
+                    matches.join(" AND ")
                 ),
                 &values,
             )
@@ -1899,11 +1892,10 @@ impl Replica {
         let rows = query(
             conn,
             &format!(
-                "SELECT {} FROM {} WHERE {}{}",
+                "SELECT {} FROM {} WHERE {}",
                 columns.join(", "),
                 quoted(&c.table),
-                where_key_json(c),
-                c.visible()
+                where_key_json(c)
             ),
             &[Value::Text(key.into())],
         )
@@ -2028,16 +2020,6 @@ impl Replica {
             });
         }
         let collections = self.registry.collections();
-        // A row outside a collection's filter is, to the kernel, not there.
-        for e in entries.iter_mut().filter(|e| !e.gone) {
-            if self
-                .read_row(conn, &collections[e.idx], &e.key)
-                .await?
-                .is_none()
-            {
-                e.gone = true;
-            }
-        }
         let mut pass = Pass::new(load_clock(conn).await?);
 
         // Natural ids of rows that went away are derived before any minted id below is retired.
@@ -2363,17 +2345,13 @@ impl Replica {
                         .map(|row| as_text(&row[0]).map(str::to_string))
                         .transpose()?;
                     written_key = json;
-                    let found = query(
+                    let exists = !query(
                         conn,
-                        &format!("SELECT 1, 1{} FROM {table} WHERE {matches}", c.visible()),
+                        &format!("SELECT 1 FROM {table} WHERE {matches}"),
                         &key,
                     )
-                    .await?;
-                    let exists = !found.is_empty();
-                    if found.first().is_some_and(|row| row[1] != Value::Int(1)) {
-                        // The key's row is outside the filter, so not this replica's to write.
-                        return Ok(Outcome::Settled);
-                    }
+                    .await?
+                    .is_empty();
                     if exists {
                         let rest: Vec<&(&Field, Value)> = columns
                             .iter()

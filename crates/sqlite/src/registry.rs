@@ -50,8 +50,6 @@ pub struct Collection {
     pub local_dependents: Vec<(String, String)>,
     /// Columns the kernel does not sync, and what to put in them when it inserts a row.
     pub local_defaults: Vec<(String, LocalDefault)>,
-    /// Which rows are synced, as an SQL condition over the table's columns.
-    pub filter: Option<String>,
     /// Sets of fields that change together.
     pub together: Vec<Vec<String>>,
 }
@@ -77,7 +75,6 @@ impl Collection {
             identity: Vec::new(),
             local_dependents: Vec::new(),
             local_defaults: Vec::new(),
-            filter: None,
             together: Vec::new(),
         }
     }
@@ -93,7 +90,6 @@ impl Collection {
             identity: Vec::new(),
             local_dependents: Vec::new(),
             local_defaults: Vec::new(),
-            filter: None,
             together: Vec::new(),
         }
     }
@@ -140,18 +136,6 @@ impl Collection {
     /// such as a `NOT NULL` column without a `DEFAULT`.
     pub fn local_default(mut self, column: &str, value: LocalDefault) -> Collection {
         self.local_defaults.push((column.into(), value));
-        self
-    }
-
-    /// Syncs only the rows for which `condition`, an SQL expression over the table's columns
-    /// written as after `WHERE`, is true. It comes from the application, never from what a user
-    /// typed. A row outside it is not collected, and the kernel neither writes nor removes it. A
-    /// row that leaves it is collected as deleted; one that enters it as made, which for a
-    /// minted collection is a new entity and for a natural key brings back the entity of that
-    /// key. The condition should depend on columns that are not synced, since rows the kernel
-    /// writes are not looked at again.
-    pub fn filter(mut self, condition: &str) -> Collection {
-        self.filter = Some(condition.into());
         self
     }
 
@@ -205,13 +189,6 @@ impl Collection {
     pub(crate) fn owns_through(&self, field: &Field) -> bool {
         matches!(field.kind, Kind::Ref { owned: true, .. })
             || matches!(&self.key, Key::Natural { fields } if fields.contains(&field.name))
-    }
-
-    /// `AND` the filter, to follow a `WHERE` clause; empty without one.
-    pub(crate) fn visible(&self) -> String {
-        self.filter
-            .as_ref()
-            .map_or_else(String::new, |f| format!(" AND ({f})"))
     }
 
     /// Which set of fields changing together holds `field`, if any.
