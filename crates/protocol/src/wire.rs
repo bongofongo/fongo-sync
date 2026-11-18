@@ -15,7 +15,7 @@ pub enum DecodeError {
     UnknownValueTag(u8),
     #[error("text is not UTF-8")]
     InvalidUtf8,
-    #[error("a length is not minimally encoded or exceeds the input")]
+    #[error("a length is not minimally encoded")]
     BadLength,
 }
 
@@ -84,15 +84,16 @@ impl<'a> Reader<'a> {
     }
 
     /// A length that must fit in what is left of the input, each unit taking `unit` bytes or more.
+    /// One that does not is reported as `Truncated`, since the input it claims is missing.
     pub(crate) fn len(&mut self, unit: usize) -> Result<usize, DecodeError> {
         let n = self.varint()?;
-        let n = usize::try_from(n).map_err(|_| DecodeError::BadLength)?;
-        if n.checked_mul(unit.max(1))
-            .is_none_or(|need| need > self.rest.len())
-        {
-            return Err(DecodeError::BadLength);
-        }
-        Ok(n)
+        usize::try_from(n)
+            .ok()
+            .filter(|&n| {
+                n.checked_mul(unit.max(1))
+                    .is_some_and(|need| need <= self.rest.len())
+            })
+            .ok_or(DecodeError::Truncated)
     }
 
     pub(crate) fn blob(&mut self) -> Result<&'a [u8], DecodeError> {
@@ -145,8 +146,9 @@ mod tests {
     fn a_length_longer_than_the_input_is_refused_before_allocating() {
         let mut out = Vec::new();
         put_varint(&mut out, u64::MAX);
-        assert_eq!(Reader::new(&out).len(1), Err(DecodeError::BadLength));
-        assert_eq!(Reader::new(&[3, 0, 0]).len(1), Err(DecodeError::BadLength));
+        assert_eq!(Reader::new(&out).len(1), Err(DecodeError::Truncated));
+        assert_eq!(Reader::new(&[3, 0, 0]).len(1), Err(DecodeError::Truncated));
+        assert_eq!(Reader::new(&[2, 0, 0]).len(2), Err(DecodeError::Truncated));
         assert_eq!(Reader::new(&[2, 0, 0]).len(1), Ok(2));
     }
 }

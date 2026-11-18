@@ -7,7 +7,8 @@ pub const BATCH_FORMAT: u8 = 1;
 
 const MIN_CHANGE_LEN: usize = 1 + 16 + 1 + 1 + 8 + 4 + 16;
 
-/// The canonical bytes of a batch. Equal batches encode to equal bytes.
+/// The canonical bytes of a batch: bit-identical batches encode to identical bytes. Reals are
+/// encoded by bit pattern, so `0.0` and `-0.0`, or NaNs with different payloads, differ.
 ///
 /// Bytes: format, flags (zero; reserved for compression), a LEB128 count, then per change: the
 /// collection, the gid, the field, the value, and the clock's wall time (u64), counter (u32) and
@@ -28,8 +29,9 @@ pub fn encode_batch(changes: &[Change]) -> Vec<u8> {
     out
 }
 
-/// Decodes what `encode_batch` wrote. Fails on any other input, allocating no more than the input's
-/// length, and never panics.
+/// Decodes what `encode_batch` wrote. Fails on any other input and never panics. Allocation is
+/// bounded by a constant multiple of the input's length, because every count and length is checked
+/// against the remaining input first.
 pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Change>, DecodeError> {
     let mut r = Reader::new(bytes);
     let version = r.u8()?;
@@ -219,6 +221,16 @@ pub(crate) mod tests {
     fn a_huge_claimed_count_allocates_nothing() {
         let mut bytes = vec![BATCH_FORMAT, 0];
         put_varint(&mut bytes, u64::MAX >> 1);
-        assert_eq!(decode_batch(&bytes), Err(DecodeError::BadLength));
+        assert_eq!(decode_batch(&bytes), Err(DecodeError::Truncated));
+    }
+
+    proptest! {
+        #[test]
+        fn every_proper_prefix_reports_truncation(changes in arb_changes()) {
+            let bytes = encode_batch(&changes);
+            for cut in 0..bytes.len() {
+                prop_assert_eq!(decode_batch(&bytes[..cut]), Err(DecodeError::Truncated), "cut {}", cut);
+            }
+        }
     }
 }

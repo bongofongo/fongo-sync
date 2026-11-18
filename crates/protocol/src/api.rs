@@ -162,7 +162,9 @@ impl BatchPage {
         out
     }
 
-    /// Fails on anything `encode` would not write, allocating no more than the input's length.
+    /// Fails on anything `encode` would not write. Allocation is bounded by a constant multiple of
+    /// the input's length, because every count and length is checked against the remaining input
+    /// first.
     pub fn decode(bytes: &[u8]) -> Result<BatchPage, DecodeError> {
         let mut r = Reader::new(bytes);
         let version = r.u8()?;

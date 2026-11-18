@@ -7,6 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [features]
+# Native targets only: getrandom does not build for wasm32-unknown-unknown without a JS backend.
 rand = ["dep:getrandom"]
 
 [dependencies]

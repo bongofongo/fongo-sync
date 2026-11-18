@@ -38,7 +38,8 @@ impl Envelope {
     }
 
     /// Parses the structure without checking the signature. Fails on anything `encode` would not
-    /// write, allocating no more than the input's length.
+    /// write. Allocation is bounded by a constant multiple of the input's length, because every
+    /// length is checked against the remaining input first.
     pub fn decode(bytes: &[u8]) -> Result<Envelope, DecodeError> {
         let mut r = Reader::new(bytes);
         let version = r.u8()?;
@@ -145,7 +146,9 @@ pub fn seal(
 }
 
 /// Verifies an envelope's signature against the key `device_key` returns for its device, then
-/// decrypts it. Needs the library secret; this is what devices call.
+/// decrypts it. Needs the library secret; this is what devices call. It cannot tell a device key
+/// from the recovery key, so a caller that must refuse envelopes the recovery key signed has to
+/// keep that key out of what `device_key` returns.
 pub fn open(
     bytes: &[u8],
     keys: &LibraryKeys,
@@ -177,7 +180,8 @@ pub fn open(
 
 /// Checks an envelope's structure and that `device_key` signed it, without any library secret.
 /// This is what the server calls; it must still check that the library and device are the ones
-/// the request is for.
+/// the request is for. It cannot tell a device key from the recovery key, so a server that must
+/// refuse envelopes the recovery key signed has to check that itself.
 pub fn verify_envelope(bytes: &[u8], device_key: &VerifyingKey) -> Result<Envelope, EnvelopeError> {
     let envelope = Envelope::decode(bytes).map_err(EnvelopeError::Decode)?;
     envelope.verify(device_key)?;
@@ -280,6 +284,18 @@ mod tests {
         assert!(open(&longer, &library(), known).is_err());
         for cut in 0..bytes.len() {
             assert!(open(&bytes[..cut], &library(), known).is_err());
+        }
+    }
+
+    #[test]
+    fn every_proper_prefix_reports_truncation() {
+        let bytes = sealed();
+        for cut in 0..bytes.len() {
+            assert_eq!(
+                Envelope::decode(&bytes[..cut]),
+                Err(DecodeError::Truncated),
+                "cut {cut}"
+            );
         }
     }
 

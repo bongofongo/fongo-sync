@@ -4,7 +4,7 @@
 //!
 //! Needs no threads, async runtime or randomness source, so it builds for
 //! `wasm32-unknown-unknown`. The `rand` feature adds key and nonce generation from the operating
-//! system.
+//! system and is for native targets only; it does not build for `wasm32-unknown-unknown`.
 
 pub mod api;
 mod batch;
