@@ -23,11 +23,14 @@ pub struct Writes {
     after: Rows,
     /// Every entity each row has held, by collection and key.
     gids: BTreeMap<(String, String), BTreeSet<Gid>>,
+    /// The entity each row held when last looked at.
+    latest: BTreeMap<(String, String), Gid>,
     /// Fields the application wrote since the last send, by collection, key and field;
     /// `$deleted` for a row made or removed.
     written: BTreeSet<(String, String, String)>,
-    /// Rows the application removed since the last send, by collection and key.
-    removed: BTreeSet<(String, String)>,
+    /// Rows the application deleted since the last send, by collection and key, with the
+    /// members of the entity's group marked live when it did.
+    removed: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// Changes an install produced, which are not checked.
     adopted: Vec<Change>,
 }
@@ -82,7 +85,12 @@ async fn witness(conn: &mut SqliteConnection, replica: &Replica) {
 
 impl Writes {
     /// Before a kernel step: what changed since the last is the application's.
-    pub async fn before(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+    pub async fn before(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        taken: &[Change],
+    ) {
         witness(conn, replica).await;
         let current = now(conn, replica).await;
         let registry = replica.registry();
@@ -130,6 +138,7 @@ impl Writes {
             .keys()
             .filter(|at| !current.contains_key(*at))
             .collect();
+        let mut deleted = Vec::new();
         for at in &gone {
             self.written
                 .insert((at.0.clone(), at.1.clone(), DELETED.to_string()));
@@ -149,8 +158,43 @@ impl Writes {
                 }
             });
             if !with_owner {
-                self.removed.insert((*at).clone());
+                deleted.push((*at).clone());
             }
+        }
+        if deleted.is_empty() {
+            return;
+        }
+        // The group as the replica knew it when the application deleted the row: the model's
+        // group of what it had taken in, as far as the replica had joined it, since the model
+        // may join through a gid known only from aliases before the replica can.
+        let seen = super::seen(conn, replica, taken).await;
+        let merge = model::merge(&registry.model_schema(), &seen);
+        let canon: BTreeMap<(String, Gid), Gid> = match replica.inspect(conn).await {
+            Ok(inspection) => inspection
+                .aliases
+                .into_iter()
+                .map(|(c, g, k)| ((c, g), k))
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
+        let canonical = |c: &str, g: Gid| *canon.get(&(c.to_string(), g)).unwrap_or(&g);
+        for at in deleted {
+            let mut members = BTreeSet::new();
+            if let Some(gid) = self.latest.get(&at)
+                && let Some(e) = merge.entities.get(gid)
+            {
+                let here = canonical(&at.0, *gid);
+                for (g, m) in &merge.entities {
+                    if m.collection == e.collection
+                        && m.canonical == e.canonical
+                        && canonical(&m.collection, *g) == here
+                        && matches!(m.registers.get(DELETED), Some((Value::Int(0), _)))
+                    {
+                        members.insert(*g);
+                    }
+                }
+            }
+            self.removed.entry(at).or_default().extend(members);
         }
     }
 
@@ -171,6 +215,10 @@ impl Writes {
     /// After an apply, which reports the rows it wrote and removed with their entities, among
     /// them rows the application made that the apply collected and then removed.
     pub fn touched(&mut self, touched: &[fongo_sync_sqlite::Touched]) {
+        for t in touched.iter().filter(|t| !t.deleted) {
+            self.latest
+                .insert((t.collection.clone(), t.key.clone()), t.gid);
+        }
         for t in touched {
             self.gids
                 .entry((t.collection.clone(), t.key.clone()))
@@ -186,18 +234,61 @@ impl Writes {
         collection: &str,
         key: &str,
     ) {
+        let at = (collection.to_string(), key.to_string());
         // Before the first install there is nothing to look up.
         if let Ok(Some(gid)) = replica.gid_for_key(conn, collection, key).await {
-            self.gids
-                .entry((collection.to_string(), key.to_string()))
-                .or_default()
-                .insert(gid);
+            self.latest.insert(at.clone(), gid);
+            self.gids.entry(at.clone()).or_default().insert(gid);
         }
+        // A natural row's writes go to the gid its key derives, with references read as the
+        // rows they name here, which may be another member of the entity's group.
+        let Some(c) = replica
+            .registry()
+            .collections()
+            .iter()
+            .find(|c| c.name == collection)
+        else {
+            return;
+        };
+        let Key::Natural { fields } = &c.key else {
+            return;
+        };
+        let mut values = Vec::new();
+        for (i, name) in fields.iter().enumerate() {
+            let part = rows(
+                conn,
+                &format!("SELECT json_extract(?1, '$[{i}]')"),
+                &[Value::Text(key.to_string())],
+            )
+            .await
+            .remove(0)
+            .remove(0);
+            let kind = c.fields.iter().find(|f| f.name == *name).map(|f| &f.kind);
+            let value = match (kind, part) {
+                (Some(Kind::Ref { collection, .. }), Value::Int(local)) => {
+                    match replica.gid_of(conn, collection, local).await {
+                        Ok(Some(gid)) => Value::Ref(gid),
+                        _ => return,
+                    }
+                }
+                (_, part) => part,
+            };
+            values.push(value);
+        }
+        self.gids
+            .entry(at)
+            .or_default()
+            .insert(Gid::derive(collection, &values));
     }
 
     /// Before an install, which may record what rows hold for fields it adopts.
-    pub async fn installing(&mut self, conn: &mut SqliteConnection, replica: &Replica) -> usize {
-        self.before(conn, replica).await;
+    pub async fn installing(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        taken: &[Change],
+    ) -> usize {
+        self.before(conn, replica, taken).await;
         // Before the first install there is no outbox.
         replica
             .outbox(conn, u32::MAX)
@@ -255,10 +346,23 @@ impl Writes {
             {
                 keys.push(key);
             }
-            let wrote = keys.iter().any(|k| {
-                self.written
-                    .contains(&(change.collection.clone(), k.clone(), change.field.clone()))
-            });
+            // A row the application made and an apply removed before anything named its entity
+            // can only be matched by collection and field.
+            let unnamed = keys.is_empty()
+                && self.written.iter().any(|(c, k, f)| {
+                    *c == change.collection
+                        && *f == change.field
+                        && !self.gids.contains_key(&(c.clone(), k.clone()))
+                        && !self.after.contains_key(&(c.clone(), k.clone()))
+                });
+            let wrote = unnamed
+                || keys.iter().any(|k| {
+                    self.written.contains(&(
+                        change.collection.clone(),
+                        k.clone(),
+                        change.field.clone(),
+                    ))
+                });
             if !wrote {
                 wrong.push(format!(
                     "sent a write the application did not make, to rows {keys:?}: {change:?}"
@@ -266,38 +370,45 @@ impl Writes {
             }
         }
         // A row the application deleted, itself and not with its owner, is deleted everywhere:
-        // what this replica has seen and sent leaves every member of its group with a tombstone,
-        // unless the group still has a row here or the row was not an entity of its own. That
-        // the group is merely not live is not enough, since an owner yet to arrive revives it.
+        // what this replica has seen and sent leaves no member of its group that was marked live
+        // when it deleted the row still marked live, unless the group still has a row here or
+        // the row was not an entity of its own. That the group is merely not live is not enough,
+        // since an owner yet to arrive revives it.
         let leftover: BTreeSet<(String, String)> = inspection.leftover.into_iter().collect();
         let mut all = seen.to_vec();
         all.extend(sent.iter().cloned());
-        let merge = model::merge(&replica.registry().model_schema(), &all);
-        let tombstoned = |gid: &Gid| {
-            let Some(e) = merge.entities.get(gid) else {
-                return true;
-            };
-            merge
-                .entities
-                .values()
-                .filter(|m| m.collection == e.collection && m.canonical == e.canonical)
-                .all(|m| matches!(m.registers.get(DELETED), Some((Value::Int(1), _))))
-        };
-        for at in &self.removed {
-            let Some(held) = self.gids.get(at) else {
+        let after = model::merge(&replica.registry().model_schema(), &all);
+        for (at, members) in &self.removed {
+            let Some(gid) = self.latest.get(at) else {
                 continue;
             };
-            let targets: BTreeSet<Gid> = held.iter().map(|g| canonical(&at.0, *g)).collect();
+            let target = canonical(&at.0, *gid);
             let still = self.after.keys().any(|other| {
                 other.0 == at.0
-                    && self.gids.get(other).is_some_and(|gs| {
-                        gs.iter()
-                            .any(|g| targets.contains(&canonical(&other.0, *g)))
-                    })
+                    && self
+                        .latest
+                        .get(other)
+                        .is_some_and(|g| canonical(&other.0, *g) == target)
             });
-            if !still && !leftover.contains(at) && !held.iter().all(tombstoned) {
+            // A member is gone once tombstoned, or not live with every owner it names known:
+            // one waiting for an owner yet to arrive comes back with it.
+            let alive: Vec<&Gid> = members
+                .iter()
+                .filter(|g| {
+                    let Some(m) = after.entities.get(g) else {
+                        return false;
+                    };
+                    let tombstoned = matches!(m.registers.get(DELETED), Some((Value::Int(1), _)));
+                    let owners_known = m.registers.values().all(|(v, _)| match v {
+                        Value::Ref(o) => after.entities.contains_key(o),
+                        _ => true,
+                    });
+                    !tombstoned && (m.live || !owners_known)
+                })
+                .collect();
+            if !still && !leftover.contains(at) && !alive.is_empty() {
                 wrong.push(format!(
-                    "the application deleted {} row {} and its entity was not deleted",
+                    "the application deleted {} row {} and members {alive:?} of its entity live on",
                     at.0, at.1
                 ));
             }
@@ -306,7 +417,7 @@ impl Writes {
         let uncollected: BTreeSet<(String, String)> = inspection.uncollected.into_iter().collect();
         self.written
             .retain(|(c, k, _)| uncollected.contains(&(c.clone(), k.clone())));
-        self.removed.retain(|at| uncollected.contains(at));
+        self.removed.retain(|at, _| uncollected.contains(at));
         self.adopted.clear();
         wrong
     }

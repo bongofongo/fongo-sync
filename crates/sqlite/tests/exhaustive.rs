@@ -191,7 +191,9 @@ impl Peer {
     }
 
     async fn send(&mut self, batches: &mut Vec<Vec<Change>>) -> Result<(), String> {
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.collect(&mut self.conn).await.unwrap();
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
@@ -215,7 +217,9 @@ impl Peer {
         self.has.resize(batches.len(), false);
         self.has[n] = true;
         self.taken.extend(batches[n].iter().cloned());
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         let applied = self
             .replica
             .apply(&mut self.conn, &batches[n])

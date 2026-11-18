@@ -7,6 +7,7 @@ mod support;
 use fongo_sync_sqlite::core::Change;
 use fongo_sync_sqlite::{Collection, LocalDefault, Registry, Replica, Resume};
 use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 use sqlx::SqliteConnection;
 use support::world::World;
 
@@ -135,7 +136,10 @@ impl Peer {
         if !self.upgraded {
             self.upgraded = true;
             self.replica = Replica::new(registry(true));
-            let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
+            let waiting = self
+                .writes
+                .installing(&mut self.conn, &self.replica, &self.taken)
+                .await;
             self.replica.install(&mut self.conn).await.unwrap();
             self.writes
                 .installed(&mut self.conn, &self.replica, waiting)
@@ -173,16 +177,21 @@ impl Peer {
         (!ids.is_empty()).then(|| ids[n % ids.len()])
     }
 
-    /// The rows and what the replica holds.
+    /// The rows, registers and alias groups.
     async fn state(&mut self) -> String {
         let kernel = support::read(&mut self.conn, &self.replica).await;
         let inspection = self.replica.inspect(&mut self.conn).await.unwrap();
-        format!("{:?}\n{:?}", kernel.view, inspection)
+        format!(
+            "{:?}\n{:?}\n{:?}",
+            kernel.view, inspection.registers, inspection.aliases
+        )
     }
 
     async fn apply(&mut self, batch: &[Change]) -> Result<(), String> {
         self.taken.extend(batch.iter().cloned());
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         let applied = self.replica.apply(&mut self.conn, batch).await.unwrap();
         self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;
@@ -190,7 +199,9 @@ impl Peer {
     }
 
     async fn push(&mut self, hub: &mut Vec<Change>) -> Result<(), String> {
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.collect(&mut self.conn).await.unwrap();
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
@@ -198,6 +209,7 @@ impl Peer {
             .outbox(&mut self.conn, 1_000_000)
             .await
             .unwrap();
+        self.midway().await?;
         let unwritten = self
             .writes
             .unwritten(&mut self.conn, &self.replica, &self.taken, &outbox.changes)
@@ -375,7 +387,10 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
                 ))
                 .await;
             }
-            let waiting = peer.writes.installing(&mut peer.conn, &peer.replica).await;
+            let waiting = peer
+                .writes
+                .installing(&mut peer.conn, &peer.replica, &peer.taken)
+                .await;
             replica.resume(&mut peer.conn, Resume::Send).await.unwrap();
             peer.writes
                 .installed(&mut peer.conn, &peer.replica, waiting)
@@ -692,9 +707,19 @@ fn cases() -> u32 {
         .unwrap_or(32)
 }
 
+/// One fixed run unless `PROPTEST_RNG_SEED` asks for another, so `make check` is repeatable;
+/// `make deep` picks a new seed each time and prints it.
+fn rng_seed() -> RngSeed {
+    match std::env::var("PROPTEST_RNG_SEED") {
+        Ok(_) => ProptestConfig::default().rng_seed,
+        Err(_) => RngSeed::Fixed(17),
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: cases(),
+        rng_seed: rng_seed(),
         failure_persistence: None,
         ..ProptestConfig::default()
     })]

@@ -354,7 +354,7 @@ theorem apply_any_order (s : Strategy) (h : Option (Entry V)) (a b : Entry V)
   · simp only [apply_lww]; exact keep_swap h a b unique
   · simp only [apply_max]; exact keep_swap h a b Entry.pair_inj
 
-/-- Bend's `merge_keeps_later_clock`: under `Lww` a register ends at the later of the two clocks. -/
+/-- Under `Lww` a register ends at the later of the two clocks. -/
 theorem apply_lww_clock (held e : Entry V) :
     (apply .lww (some held) e).map (·.clock) =
       some (if held.clock < e.clock then e.clock else held.clock) := by

@@ -239,8 +239,17 @@ fn bookkeeping(
     merge: &Merge,
     kernel: &Kernel,
     seen: &[Change],
+    settled: bool,
 ) -> Vec<String> {
     let mut wrong = kernel.broken.clone();
+    // The model joins by an alias to a gid it knows only from aliases; the kernel waits for that
+    // gid's own changes. Until then its groups may be finer than the model's, never coarser.
+    let bare: BTreeSet<(&str, Gid)> = merge
+        .entities
+        .values()
+        .filter(|e| e.registers.is_empty())
+        .map(|e| (e.collection.as_str(), e.canonical))
+        .collect();
     let empty = BTreeMap::new();
     for ((collection, gid), registers) in &kernel.registers {
         match merge.entities.get(gid) {
@@ -292,7 +301,13 @@ fn bookkeeping(
             ));
         }
         let canon = kernel.canonical(&e.collection, *gid);
-        if canon != e.canonical {
+        let finer = !settled
+            && bare.contains(&(e.collection.as_str(), e.canonical))
+            && merge
+                .entities
+                .get(&canon)
+                .is_some_and(|k| k.collection == e.collection && k.canonical == e.canonical);
+        if canon != e.canonical && !finer {
             wrong.push(format!(
                 "{} {gid:?} is in the group of {canon:?}, the model says {:?}",
                 e.collection, e.canonical
@@ -558,19 +573,42 @@ pub async fn midway(
     let merge = model::merge(&schema, &seen);
     let expected = model::view(&schema, &seen);
     let kernel = read(conn, replica).await;
-    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen);
+    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen, false);
     wrong.extend(tables(conn, replica, &kernel).await);
     let incomplete = incomplete_sets(registry, &merge);
     let pinned = pinned(&kernel);
     let unconfirmed = unconfirmed(&schema, &merge);
+    // Where the kernel's groups may be finer than the model's (see `bookkeeping`), a reference
+    // reads as the model's name for the group it names.
+    let mut shown = kernel.view.clone();
+    for rows in shown.collections.values_mut() {
+        for row in rows.values_mut() {
+            for value in row.values_mut() {
+                if let Value::Ref(g) = value
+                    && let Some(e) = merge.entities.get(g)
+                    && merge
+                        .entities
+                        .values()
+                        .any(|m| m.registers.is_empty() && m.canonical == e.canonical)
+                {
+                    *g = e.canonical;
+                }
+            }
+        }
+    }
     wrong.extend(rows_differ(
         &expected,
-        &kernel.view,
+        &shown,
         |c, g| {
             let at = (c.to_string(), g);
+            let modelled = merge
+                .entities
+                .get(&g)
+                .map_or((c.to_string(), g), |e| (c.to_string(), e.canonical));
             kernel.pending.contains(&at)
                 || kernel.uncollected.contains(&at)
                 || unconfirmed.contains(&at)
+                || unconfirmed.contains(&modelled)
         },
         |c, g, f| {
             let at = (c.to_string(), g, f.to_string());
@@ -612,7 +650,7 @@ pub async fn settled(
     let merge = model::merge(&schema, &seen);
     let expected = model::view(&schema, &seen);
     let kernel = read(conn, replica).await;
-    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen);
+    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen, true);
     wrong.extend(tables(conn, replica, &kernel).await);
     for (what, left) in [
         ("waiting", format!("{:?}", kernel.pending)),

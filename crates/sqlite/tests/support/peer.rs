@@ -51,7 +51,10 @@ impl Peer {
     }
 
     pub async fn install(&mut self) {
-        let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.install(&mut self.conn).await.unwrap();
         self.writes
             .installed(&mut self.conn, &self.replica, waiting)
@@ -71,7 +74,10 @@ impl Peer {
 
     /// Resumes; what the application wrote while suspended stays its own, to be collected.
     pub async fn resume(&mut self, how: Resume) {
-        let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
         let replica = self.replica.clone();
         replica.resume(&mut self.conn, how).await.unwrap();
         self.writes
@@ -120,7 +126,9 @@ impl Peer {
 
     /// Collects and sends to `log`, returning what was sent.
     pub async fn push(&mut self, log: &mut Vec<Change>) -> Vec<Change> {
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.collect(&mut self.conn).await.unwrap();
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
@@ -143,7 +151,9 @@ impl Peer {
 
     pub async fn apply(&mut self, changes: &[Change]) -> Applied {
         self.taken.extend(changes.iter().cloned());
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
         self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;

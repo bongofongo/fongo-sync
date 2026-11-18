@@ -205,7 +205,10 @@ impl Peer {
     }
 
     async fn install(&mut self) {
-        let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.install(&mut self.conn).await.unwrap();
         self.writes
             .installed(&mut self.conn, &self.replica, waiting)
@@ -227,7 +230,9 @@ impl Peer {
 
     async fn apply(&mut self, changes: &[Change]) -> Applied {
         self.taken.extend(changes.iter().cloned());
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
         self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;
@@ -296,7 +301,9 @@ impl Peer {
 
 impl Peer {
     async fn push(&mut self, hub: &mut Vec<Change>) {
-        self.writes.before(&mut self.conn, &self.replica).await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &self.taken)
+            .await;
         self.replica.collect(&mut self.conn).await.unwrap();
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
