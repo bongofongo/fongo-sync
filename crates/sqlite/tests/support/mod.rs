@@ -11,7 +11,8 @@
 //! holds back its entity too. The model
 //! has no notion of waiting, so those rows are compared only once they are settled. Fields of a
 //! set that changes together are also left out midway while the set's newest write has not all
-//! arrived, since the kernel keeps what the row held until then. A field the application pinned
+//! arrived, since the kernel keeps what the row held until then; so are groups with a live member
+//! whose tombstone has not arrived (see [`unconfirmed`]). A field the application pinned
 //! as its own baseline on resuming is never compared: it is outside what the model describes.
 
 #![allow(dead_code)]
@@ -21,7 +22,7 @@ pub mod world;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_sqlite::core::model::{self, Merge, Row, View};
-use fongo_sync_sqlite::core::{Change, Gid, Hlc, Strategy, Value, wins};
+use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Strategy, Value, wins};
 use fongo_sync_sqlite::{Collection, Key, Kind, Registry, Replica};
 use sqlx::SqliteConnection;
 
@@ -468,6 +469,18 @@ fn incomplete_sets(registry: &Registry, merge: &Merge) -> BTreeSet<(String, Gid,
     out
 }
 
+/// Groups with a live member whose tombstone has not arrived. The model counts such a member
+/// live, having no notion of waiting; the kernel waits for the tombstone, which every replica
+/// writes when it makes an entity, before it shows the member or lends its fields to the group.
+fn unconfirmed(merge: &Merge) -> BTreeSet<(String, Gid)> {
+    merge
+        .entities
+        .values()
+        .filter(|e| e.live && !e.registers.contains_key(DELETED))
+        .map(|e| (e.collection.clone(), e.canonical))
+        .collect()
+}
+
 fn pinned(kernel: &Kernel) -> BTreeSet<(String, Gid, String)> {
     let mut out = BTreeSet::new();
     for ((collection, key, field), pinned) in &kernel.deviations {
@@ -560,12 +573,15 @@ pub async fn midway(
     wrong.extend(tables(conn, replica, &kernel).await);
     let incomplete = incomplete_sets(registry, &merge);
     let pinned = pinned(&kernel);
+    let unconfirmed = unconfirmed(&merge);
     wrong.extend(rows_differ(
         &expected,
         &kernel.view,
         |c, g| {
             let at = (c.to_string(), g);
-            kernel.pending.contains(&at) || kernel.uncollected.contains(&at)
+            kernel.pending.contains(&at)
+                || kernel.uncollected.contains(&at)
+                || unconfirmed.contains(&at)
         },
         |c, g, f| {
             let at = (c.to_string(), g, f.to_string());
