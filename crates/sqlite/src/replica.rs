@@ -1093,6 +1093,19 @@ impl Replica {
         if let Some(((_, keep), losers)) = rows.split_first() {
             for (_, lose) in losers {
                 self.repoint(conn, c, lose, keep, pass).await?;
+                for (table, column) in &c.local_dependents {
+                    let column = quoted(column);
+                    exec(
+                        conn,
+                        &format!(
+                            "UPDATE OR IGNORE {} SET {column} = json_extract(?2, '$[0]')
+                             WHERE {column} = json_extract(?1, '$[0]')",
+                            quoted(table)
+                        ),
+                        &[Value::Text(lose.clone()), Value::Text(keep.clone())],
+                    )
+                    .await?;
+                }
                 exec(
                     conn,
                     &format!(

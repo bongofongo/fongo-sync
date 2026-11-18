@@ -45,6 +45,9 @@ pub struct Collection {
     /// Sets of fields that name the thing itself. Two entities whose values for every field of one
     /// set are equal and not null are the same entity, and become one on every replica.
     pub identity: Vec<Vec<String>>,
+    /// Columns of tables outside the registry that hold this collection's local ids, as
+    /// `(table, column)`.
+    pub local_dependents: Vec<(String, String)>,
 }
 
 impl Collection {
@@ -57,6 +60,7 @@ impl Collection {
             },
             fields: Vec::new(),
             identity: Vec::new(),
+            local_dependents: Vec::new(),
         }
     }
 
@@ -69,6 +73,7 @@ impl Collection {
             },
             fields: Vec::new(),
             identity: Vec::new(),
+            local_dependents: Vec::new(),
         }
     }
 
@@ -101,6 +106,15 @@ impl Collection {
 
     /// Declares an identity: entities equal on all of `fields` are merged. Only a minted
     /// collection can have one, and the table should hold the fields `UNIQUE` together.
+    /// Declares a table the kernel does not sync whose `column` refers to this collection's rows.
+    /// When two entities merge and one of their rows is given up, rows of `table` that point at
+    /// it are moved to the row kept, unless that would break a constraint of `table`, in which
+    /// case they are left to its `ON DELETE` action.
+    pub fn local_dependent(mut self, table: &str, column: &str) -> Collection {
+        self.local_dependents.push((table.into(), column.into()));
+        self
+    }
+
     pub fn identity(mut self, fields: &[&str]) -> Collection {
         self.identity
             .push(fields.iter().map(|f| (*f).into()).collect());
@@ -171,6 +185,10 @@ impl Registry {
             let mut names = vec![c.name.as_str(), c.table.as_str()];
             names.extend(c.key_columns());
             names.extend(c.fields.iter().map(|f| f.name.as_str()));
+            for (table, column) in &c.local_dependents {
+                names.push(table);
+                names.push(column);
+            }
             if let Some(name) = names.iter().find(|n| !is_identifier(n)) {
                 return bad(format!(
                     "`{name}` in `{}` is not a plain identifier",

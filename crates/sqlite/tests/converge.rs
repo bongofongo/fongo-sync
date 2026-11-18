@@ -35,6 +35,13 @@ const SCHEMA: &[&str] = &[
         note TEXT,
         PRIMARY KEY (book_id, tag))",
     "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE positions (
+        id INTEGER PRIMARY KEY,
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        page INTEGER)",
+    "CREATE TABLE covers (
+        book_id INTEGER NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
+        path TEXT)",
     "CREATE TABLE loans (
         id INTEGER PRIMARY KEY,
         book_id INTEGER REFERENCES books(id) ON DELETE SET NULL,
@@ -55,7 +62,9 @@ fn registry() -> Registry {
             .field("isbn")
             .field("isbn10")
             .identity(&["isbn"])
-            .identity(&["isbn10"]),
+            .identity(&["isbn10"])
+            .local_dependent("positions", "book_id")
+            .local_dependent("covers", "book_id"),
         Collection::minted("notes", "notes", "id")
             .owner("book_id", "books")
             .field_reporting_conflicts("body"),
@@ -1422,6 +1431,49 @@ async fn two_local_rows_with_one_identity_become_one_without_a_unique_constraint
         assert_eq!(peer.lines(rows).await, ["one v", "two v"]);
     }
     assert_eq!(peers[0].lines(SHADOW).await, peers[1].lines(SHADOW).await);
+}
+
+#[tokio::test]
+async fn rows_outside_the_registry_move_to_the_row_a_merge_keeps() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+    peers[1].run("INSERT INTO books (title) VALUES ('b')").await;
+    peers[1].sync(&mut hub).await;
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('a', '9780141439549')")
+        .await;
+    peers[0].sync(&mut hub).await;
+    // The third replica holds the two books as two rows, each with local rows of its own.
+    peers[2].sync(&mut hub).await;
+    peers[2]
+        .run("INSERT INTO positions (book_id, page) SELECT id, id * 10 FROM books")
+        .await;
+    peers[2]
+        .run("INSERT INTO covers (book_id, path) SELECT id, 'cover' || id FROM books")
+        .await;
+    peers[1]
+        .run("UPDATE books SET isbn = '9780141439549'")
+        .await;
+    peers[1].sync(&mut hub).await;
+    peers[1].sync(&mut hub).await;
+    peers[2].sync(&mut hub).await;
+
+    let third = &mut peers[2];
+    let kept: i64 = count(third, "SELECT id FROM books").await;
+    assert_eq!(count(third, "SELECT count(*) FROM books").await, 1);
+    assert_eq!(
+        third
+            .lines("SELECT book_id || ' ' || page FROM positions ORDER BY page")
+            .await,
+        [format!("{kept} 10"), format!("{kept} 20")]
+    );
+    // Two covers cannot share a book: the kept row's own stays, the other went with its row.
+    assert_eq!(
+        third
+            .lines("SELECT book_id || ' ' || path FROM covers")
+            .await,
+        [format!("{kept} cover{kept}")]
+    );
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
