@@ -25,3 +25,6 @@ import FongoSync
 #print axioms FongoSync.State.foldl_swap
 #print axioms FongoSync.State.foldl_twice
 #print axioms FongoSync.gidSet_eq_of_mem_iff
+#print axioms FongoSync.view_from_inputs
+#print axioms FongoSync.view_swap
+#print axioms FongoSync.view_twice

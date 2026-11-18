@@ -38,10 +38,10 @@ def Change.entry (c : Change V) : Entry V := ⟨c.value, c.clock⟩
 def Compatible (a b : Change V) : Prop :=
   a.key = b.key → a.clock = b.clock → a.value = b.value
 
-/-- No two changes to the same field share a clock with different values. Honest clocks give
-every change its own clock, which is stronger. -/
+/-- No two changes to one register share a clock with different values. Honest clocks give every
+change its own clock, which is stronger. -/
 def ClockDetermines (cs : List (Change V)) : Prop :=
-  ∀ a ∈ cs, ∀ b ∈ cs, a.field = b.field → a.clock = b.clock → a.value = b.value
+  ∀ a ∈ cs, ∀ b ∈ cs, Compatible a b
 
 /-- Which strategy a field merges by; `$deleted` always merges `Lww`. -/
 def strategyAt (strategyOf : String → String → Strategy) (k : Key) : Strategy :=
@@ -92,11 +92,7 @@ theorem uniqueClocks_entriesAt {cs : List (Change V)} (h : ClockDetermines cs) (
   intro a ha b hb hab
   obtain ⟨ca, hca, kca, rfl⟩ := mem_entriesAt.mp ha
   obtain ⟨cb, hcb, kcb, rfl⟩ := mem_entriesAt.mp hb
-  have hf : ca.field = cb.field := by
-    have := kca.trans kcb.symm
-    simp only [Change.key, Prod.mk.injEq] at this
-    exact this.2.2
-  have hv := h ca hca cb hcb hf hab
+  have hv := h ca hca cb hcb (kca.trans kcb.symm) hab
   simp only [Change.entry] at hab ⊢
   rw [hv, hab]
 
