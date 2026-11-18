@@ -430,6 +430,34 @@ async fn an_envelope_for_another_library_garbage_or_a_forgery_is_skipped_and_cou
 }
 
 #[tokio::test]
+async fn an_envelope_forged_in_this_devices_name_is_refused_and_counted() {
+    let server = Server::new();
+    let [mut a, _b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    a.sync(&server).await.unwrap();
+    let forger = generate_signing_key().unwrap();
+    let mut forged = sealed_by(&setting("forged", 1), &keys, &forger);
+    // Format byte, then the library id, then the device id.
+    forged[17..33].copy_from_slice(&a.credentials.device_id().0);
+    server.inject(keys.id, forged);
+
+    let report = a.sync(&server).await.unwrap();
+    let refused: Vec<_> = report
+        .refused
+        .iter()
+        .map(|r| (r.seq, r.device, r.reason))
+        .collect();
+    assert_eq!(
+        refused,
+        [(2, Some(a.credentials.device_id()), Refusal::BadSignature)]
+    );
+    assert_eq!(report.refused_total, 1);
+    assert_eq!(a.settings().await, ["mine=x"]);
+    assert_eq!(a.cursor().await, 2);
+}
+
+#[tokio::test]
 async fn a_device_missing_from_a_stale_list_is_found_on_the_one_refresh() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;
