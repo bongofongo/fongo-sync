@@ -165,6 +165,12 @@ async fn timings() {
     let started = Instant::now();
     replica.apply(&mut c, &group).await.unwrap();
     table.time("apply of 200 entities with one identity", started);
+    let joined = replica.inspect(&mut c).await.unwrap().aliases.len();
+    assert_eq!(
+        joined,
+        usize::from(GROUP),
+        "the entities did not become one group"
+    );
     let one = Change {
         collection: "books".into(),
         gid: Gid([GROUP / 2; 16]),
