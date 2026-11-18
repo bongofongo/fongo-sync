@@ -54,8 +54,10 @@ pub struct Collection {
     /// Sets of fields. Two live groups whose values agree, non-null, on every field of one set
     /// are one entity, and a replica that sees them must alias them.
     pub identity_keys: Vec<Vec<String>>,
-    /// Sets of fields whose values are taken as a unit from the latest clock written to any of
-    /// them; a field of the set not written at that clock reads as NULL.
+    /// Sets of plain fields whose values are taken as a unit from the latest clock written to
+    /// any of them; a field of the set not written at that clock reads as NULL. A replica writes
+    /// a set whole as it reads it, and a reference can read as NULL only because its target is not
+    /// live there yet, so a set may hold no reference.
     pub together: Vec<Vec<String>>,
 }
 
@@ -146,7 +148,7 @@ impl Schema {
     /// Whether [`view`] can be asked about this schema. It refuses: duplicate names; field names
     /// starting with `$`; references to undeclared collections; undeclared fields in a key, an
     /// identity key or a `together` set; identity keys on natural collections; a `together`
-    /// field that does not merge `Lww`, is an owner reference, or is in two sets; a collection
+    /// field that does not merge `Lww`, is a reference of either kind, or is in two sets; a collection
     /// owning its own rows; and owner references that form a cycle across collections.
     pub fn check(&self) -> Result<(), String> {
         let mut names = BTreeSet::new();
@@ -209,8 +211,8 @@ impl Schema {
                     if c.strategy(f) != Strategy::Lww {
                         return Err(format!("{}.{f} is in a together set but not Lww", c.name));
                     }
-                    if matches!(c.declared(f).map(|d| &d.kind), Some(FieldKind::Owner(_))) {
-                        return Err(format!("{}.{f} is an owner in a together set", c.name));
+                    if !matches!(c.declared(f).map(|d| &d.kind), Some(FieldKind::Plain)) {
+                        return Err(format!("{}.{f} is a reference in a together set", c.name));
                     }
                 }
             }

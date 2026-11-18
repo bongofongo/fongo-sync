@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::arb_case;
+use common::{arb_case, arb_random_case};
 use fongo_sync_core::eval::Evaluator;
 use fongo_sync_core::model::{Row, Schema, View, view};
 use fongo_sync_core::source::Store;
@@ -11,8 +11,10 @@ use proptest::prelude::*;
 
 /// Changes, and a delivery of them: every change at least once, in a random order, some again,
 /// cut into batches of random sizes.
-fn arb_delivery() -> impl Strategy<Value = (Schema, Vec<Change>, Vec<Vec<Change>>)> {
-    arb_case(0..50).prop_flat_map(|(schema, changes)| {
+fn arb_delivery(
+    case: impl Strategy<Value = (Schema, Vec<Change>)>,
+) -> impl Strategy<Value = (Schema, Vec<Change>, Vec<Vec<Change>>)> {
+    case.prop_flat_map(|(schema, changes)| {
         let n = changes.len();
         let order: Vec<usize> = (0..n).collect();
         (
@@ -74,34 +76,50 @@ proptest! {
     /// materialised rows equal to evaluating everything, and to `model::view`.
     #[test]
     fn re_evaluating_only_the_affected_entities_keeps_every_row_right(
-        (schema, changes, batches) in arb_delivery()
+        (schema, changes, batches) in arb_delivery(arb_case(0..50))
     ) {
-        let ev = Evaluator::new(&schema).unwrap();
-        let mut store = Store::default();
-        let mut rows: BTreeMap<(String, Gid), Row> = BTreeMap::new();
-        let mut merged: Vec<Change> = Vec::new();
-        for batch in &batches {
-            let affected = ev.affected(&store, batch).unwrap();
-            for c in batch {
-                store.merge(&schema, c);
-            }
-            merged.extend(batch.iter().cloned());
-            let mut session = ev.session(&store);
-            for (c, g) in affected {
-                let t = session.target(&c, g).unwrap();
-                match t.row {
-                    Some(row) if t.canonical == g => {
-                        rows.insert((c, g), row);
-                    }
-                    _ => {
-                        rows.remove(&(c, g));
-                    }
+        incremental(&schema, &changes, &batches)?;
+    }
+
+    #[test]
+    fn the_incremental_law_holds_over_random_schemas(
+        (schema, changes, batches) in arb_delivery(arb_random_case(70))
+    ) {
+        incremental(&schema, &changes, &batches)?;
+    }
+}
+
+fn incremental(
+    schema: &Schema,
+    changes: &[Change],
+    batches: &[Vec<Change>],
+) -> Result<(), TestCaseError> {
+    let ev = Evaluator::new(schema).unwrap();
+    let mut store = Store::default();
+    let mut rows: BTreeMap<(String, Gid), Row> = BTreeMap::new();
+    let mut merged: Vec<Change> = Vec::new();
+    for batch in batches {
+        let affected = ev.affected(&store, batch).unwrap();
+        for c in batch {
+            store.merge(schema, c);
+        }
+        merged.extend(batch.iter().cloned());
+        let mut session = ev.session(&store);
+        for (c, g) in affected {
+            let t = session.target(&c, g).unwrap();
+            match t.row {
+                Some(row) if t.canonical == g => {
+                    rows.insert((c, g), row);
+                }
+                _ => {
+                    rows.remove(&(c, g));
                 }
             }
-            let expected = view(&schema, &merged);
-            prop_assert_eq!(&as_view(&rows), &expected);
         }
-        prop_assert_eq!(from_scratch(&ev, &store), view(&schema, &changes));
-        prop_assert_eq!(as_view(&rows), view(&schema, &changes));
+        let expected = view(schema, &merged);
+        prop_assert_eq!(&as_view(&rows), &expected);
     }
+    prop_assert_eq!(from_scratch(&ev, &store), view(schema, changes));
+    prop_assert_eq!(as_view(&rows), view(schema, changes));
+    Ok(())
 }

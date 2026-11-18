@@ -67,7 +67,8 @@ pub enum Body {
 }
 
 /// The fact a change contributes, or `None` if `model::view` ignores it outright: an unknown
-/// collection, a clock `Hlc::encode` cannot hold, or an alias that does not name another gid.
+/// collection, a clock `Hlc::encode` cannot hold, an alias that does not name another gid, or a
+/// `$deleted` that is neither `Int(0)` nor `Int(1)`.
 ///
 /// A store keeps, for each (collection, gid) any fact names, the smallest clock among those facts
 /// (a [`Claim`]); for each (collection, gid, field), entries as the fact's [`Slot`] says; and the
@@ -76,7 +77,9 @@ pub enum Body {
 /// different values.
 pub fn admit(schema: &Schema, change: &Change) -> Option<Fact> {
     let collection = schema.collection(&change.collection)?;
-    if Hlc::decode(&change.clock.encode()) != Some(change.clock) {
+    if !change.clock.encodable()
+        || (change.field == DELETED && !matches!(change.value, Value::Int(0 | 1)))
+    {
         return None;
     }
     let body = if change.field == ALIAS {

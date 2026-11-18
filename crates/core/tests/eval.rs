@@ -1,6 +1,6 @@
 mod common;
 
-use common::{arb_case, gid, mentioned};
+use common::{arb_case, arb_random_case, gid, mentioned};
 use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
 use fongo_sync_core::model::{ALIAS, Collection, Schema, View, view};
 use fongo_sync_core::source::Store;
@@ -52,6 +52,13 @@ proptest! {
 
     #[test]
     fn the_evaluator_shows_what_the_model_shows((schema, changes) in arb_case(0..60)) {
+        agrees(&schema, &changes)?;
+    }
+
+    #[test]
+    fn the_evaluator_shows_what_the_model_shows_over_random_schemas(
+        (schema, changes) in arb_random_case(80)
+    ) {
         agrees(&schema, &changes)?;
     }
 

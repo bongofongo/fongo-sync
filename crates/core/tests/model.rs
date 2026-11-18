@@ -856,7 +856,7 @@ fn a_collection_may_not_own_its_own_rows_because_concurrent_moves_could_form_a_c
 }
 
 #[test]
-fn an_owner_may_not_be_in_a_together_set_but_a_plain_reference_may() {
+fn a_together_set_may_hold_no_reference_of_either_kind() {
     let with = |field: Collection| {
         Schema::new(vec![
             Collection::minted("b"),
@@ -870,6 +870,11 @@ fn an_owner_may_not_be_in_a_together_set_but_a_plain_reference_may() {
     );
     assert!(
         with(Collection::minted("a").reference("o", "b"))
+            .check()
+            .is_err()
+    );
+    assert!(
+        with(Collection::minted("a").plain("o", Merge::Lww))
             .check()
             .is_ok()
     );

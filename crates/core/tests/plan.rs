@@ -252,6 +252,67 @@ proptest! {
     /// `clashes`, asked about every live group, finds exactly the pairs `unmerged_identities`
     /// reports.
     #[test]
+    fn edits_report_only_what_the_application_changed(
+        (schema, changes) in arb_case(0..50),
+        pick in any::<usize>(),
+        parked in proptest::collection::vec(any::<bool>(), 8),
+        value in prop_oneof![Just(Value::Null), Just(Value::Int(7)), Just(text("edited"))],
+    ) {
+        // Whatever the adapter wrote into a row (a reference that reads NULL because its target is
+        // not live here, a parked NULL) is in the image, so it is never reported as an edit: only
+        // the field the application set, and the plain fields of a `together` set it belongs to.
+        let store = store(&schema, &changes);
+        let ev = Evaluator::new(&schema).unwrap();
+        let mut session = ev.session(&store);
+        let shown = view(&schema, &changes);
+        let rows: Vec<(String, Gid)> = schema
+            .collections
+            .iter()
+            .flat_map(|c| shown.rows(&c.name).map(move |(g, _)| (c.name.clone(), *g)))
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let (c, g) = &rows[pick % rows.len()];
+        let coll = schema.collection(c).unwrap();
+        let mut image = session.target(c, *g).unwrap().row.unwrap();
+        for (f, park) in coll.fields.iter().zip(&parked) {
+            if *park && !matches!(f.kind, FieldKind::Plain) {
+                image.insert(f.name.clone(), Value::Null);
+            }
+        }
+        prop_assert_eq!(edits(&schema, c, Some(&image), Some(&image)), vec![]);
+        let key: Vec<String> = match &coll.identity {
+            Identity::Natural(k) => k.clone(),
+            Identity::Minted => Vec::new(),
+        };
+        let field = &coll.fields[pick / 7 % coll.fields.len()];
+        if key.contains(&field.name) {
+            return Ok(());
+        }
+        let mut row = image.clone();
+        row.insert(field.name.clone(), value);
+        let set: Vec<&String> = coll
+            .together
+            .iter()
+            .find(|s| s.contains(&field.name))
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        for e in edits(&schema, c, Some(&image), Some(&row)) {
+            let FieldEdit::Set(f, v) = e else {
+                prop_assert!(false, "{:?} is not an edit of one field", e);
+                unreachable!();
+            };
+            prop_assert!(f == field.name || set.contains(&&f), "{} reported, {} set", f, field.name);
+            prop_assert!(
+                f == field.name
+                    || coll.fields.iter().any(|d| d.name == f && d.kind == FieldKind::Plain)
+            );
+            prop_assert_eq!(&v, &row[&f]);
+        }
+    }
+
+    #[test]
     fn clashes_are_the_unmerged_identities((schema, changes) in arb_case(0..60)) {
         let store = store(&schema, &changes);
         let ev = Evaluator::new(&schema).unwrap();
