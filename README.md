@@ -9,6 +9,7 @@ The kernel knows nothing about any particular application.
 | `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules. No I/O. |
 | `fongo-sync-sqlite` | change capture by trigger, and applying remote changes to an application's own tables. |
 | `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
+| `fongo-sync-client` | a device's side: creating and joining a library, and one sync round against a server, over a transport the application implements with its own HTTP client. |
 
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
 its database, `Replica::collect` to turn local writes into changes, and `Replica::apply` to merge
@@ -28,7 +29,12 @@ their content: it sees a library id, a device id, a key epoch, a size and an arr
 `fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
 by depending on it.
 
-Not yet here: an HTTP client, a server, and blob transfer.
+`fongo-sync-client` drives a `Replica` against such a server: `sync` reads what other devices
+appended after its cursor, refuses envelopes no listed device signed, applies the rest, then seals
+and appends the outbox. Credentials stay with the application; the client stores only its cursor
+and the envelope it is sending, in a table of its own.
+
+Not yet here: a server, an HTTP transport, and blob transfer.
 
 ```
 make check
