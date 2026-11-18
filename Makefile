@@ -1,6 +1,8 @@
-.PHONY: check fmt-check lint test
+.PHONY: check fmt-check lint test proof
 
-check: fmt-check lint test
+BEND := $(shell command -v bend || echo $(HOME)/.bend/bin/bend)
+
+check: fmt-check lint test proof
 
 fmt-check:
 	cargo fmt --all --check
@@ -10,3 +12,6 @@ lint:
 
 test:
 	cargo test --workspace --locked
+
+proof:
+	@$(BEND) PROOF.bend | tee /dev/stderr | grep -q '^ALL PROOFS CHECK'
