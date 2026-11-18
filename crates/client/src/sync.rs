@@ -20,6 +20,10 @@ use crate::transport::{Method, Transport};
 const DEFAULT_PAGE: u32 = 256;
 /// Received changes held in memory before they are applied and the cursor moves.
 const APPLY_CHUNK: usize = 50_000;
+/// Pages read in one call; [`SyncReport::more`] says when the log held more.
+const MAX_PAGES: usize = 1_000;
+/// Refusals listed in [`SyncReport::refused`]; [`SyncReport::refused_total`] counts them all.
+const REFUSALS_LISTED: usize = 100;
 /// Most changes sealed into one envelope.
 const OUTBOX_PAGE: u32 = 1_000;
 
@@ -73,10 +77,16 @@ pub struct SyncReport {
     /// What applying them did, merged over every apply in the sync: changes accepted, rows
     /// touched (each row once, as it was left), conflicts, and entities still waiting.
     pub applied: Applied,
+    /// The first refusals, at most 100.
     pub refused: Vec<Refused>,
+    /// Every refusal in this sync, listed or not.
+    pub refused_total: usize,
     /// Set when the pull stopped at an envelope from an unlisted signer. What came before it was
     /// applied and the outbox was still sent.
     pub blocked: Option<Blocked>,
+    /// The pull stopped after the most pages one call reads, with more waiting. Everything read
+    /// was applied and the outbox was sent; call again to read on.
+    pub more: bool,
     /// The last sequence number this sync knows the library's log to hold.
     pub head: u64,
 }
@@ -86,10 +96,12 @@ pub struct SyncReport {
 ///
 /// `now` gives the current unix time in seconds; every request is stamped with it.
 ///
-/// Received changes are applied, and the cursor moved past them, in one transaction, so a crash
-/// at any point leaves either both or neither; re-reading changes already applied is harmless.
-/// Local writes are collected by that apply, so a concurrent remote edit to a field that reports
-/// conflicts is reported in [`SyncReport::applied`].
+/// The cursor is stored after every page read. Received changes are held across pages, up to a
+/// bound, and applied together with the cursor in one transaction, so a crash at any point
+/// leaves either both or neither; re-reading changes already applied is harmless. Local writes
+/// are collected by that apply and compared with every change held, so a concurrent remote edit
+/// to a field that reports conflicts is reported in [`SyncReport::applied`]. Whatever is held is
+/// also applied before this returns an error, so a failure part-way keeps the progress made.
 ///
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
@@ -122,53 +134,27 @@ pub async fn sync<T: Transport>(
     let mut keys = Keys::new(credentials);
     let mut report = SyncReport::default();
 
-    let mut read = cursor;
-    let mut received: Vec<Change> = Vec::new();
-    loop {
-        let query = ReadBatches {
-            after: read,
-            limit: Some(limit),
-        };
-        let body = rpc
-            .call(
-                Method::Get,
-                query.target(library),
-                Body::Empty,
-                Some(credentials.device()),
-            )
-            .await?;
-        let page = BatchPage::decode(&body)
-            .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
-        check_page(&page, read, limit)?;
-        for batch in &page.batches {
-            match keys.open(&rpc, batch).await? {
-                Opened::Changes(changes) => received.extend(changes),
-                Opened::Refused(refused) => report.refused.push(refused),
-                Opened::Unlisted(device) => {
-                    report.blocked = Some(Blocked {
-                        seq: batch.seq,
-                        device,
-                    });
-                    break;
-                }
-            }
-            read = batch.seq;
-        }
-        let done = !page.more || report.blocked.is_some();
-        if received.len() >= APPLY_CHUNK || done {
-            let mut tx = conn.begin().await?;
-            let applied = replica.apply(&mut tx, &received).await?;
-            state::advance(&mut tx, library, read).await?;
-            tx.commit().await?;
-            cursor = read;
-            report.received += received.len();
-            merge(&mut report.applied, applied);
-            received.clear();
-        }
-        if done {
-            break;
-        }
-    }
+    let mut pull = Pull {
+        read: cursor,
+        held: Vec::new(),
+        applied: false,
+    };
+    let pulled = read_pages(
+        &rpc,
+        conn,
+        replica,
+        &mut keys,
+        limit,
+        &mut pull,
+        &mut report,
+    )
+    .await;
+    let collect = !pull.applied;
+    let committed = pull
+        .commit(conn, replica, library, &mut report, collect)
+        .await;
+    pulled.and(committed)?;
+    cursor = pull.read;
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
     if let Some(sending) = saved.sending {
@@ -233,6 +219,101 @@ pub async fn sync<T: Transport>(
         report.head = report.head.max(seq);
     }
     Ok(report)
+}
+
+/// Where reading the log stands: envelopes through `read` are dealt with, and `held` has the
+/// changes among them not yet applied.
+struct Pull {
+    read: u64,
+    held: Vec<Change>,
+    applied: bool,
+}
+
+impl Pull {
+    /// Applies what is held and stores the cursor at `read`, in one transaction. With `collect`
+    /// it applies even when nothing is held, so local writes are collected.
+    async fn commit(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        library: fongo_sync_protocol::LibraryId,
+        report: &mut SyncReport,
+        collect: bool,
+    ) -> Result<(), Error> {
+        let mut tx = conn.begin().await?;
+        let applied = if collect || !self.held.is_empty() {
+            Some(replica.apply(&mut tx, &self.held).await?)
+        } else {
+            None
+        };
+        state::advance(&mut tx, library, self.read).await?;
+        tx.commit().await?;
+        if let Some(applied) = applied {
+            self.applied = true;
+            report.received += self.held.len();
+            merge(&mut report.applied, applied);
+        }
+        self.held.clear();
+        Ok(())
+    }
+}
+
+/// Reads pages after `pull.read` until the log ends, an unlisted signer blocks, or the page limit.
+/// Stores the cursor after each page unless changes are held to be applied together.
+async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
+    rpc: &Rpc<'_, T, N>,
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    keys: &mut Keys<'_>,
+    limit: u32,
+    pull: &mut Pull,
+    report: &mut SyncReport,
+) -> Result<(), Error> {
+    let library = keys.credentials.library_id();
+    for _ in 0..MAX_PAGES {
+        let query = ReadBatches {
+            after: pull.read,
+            limit: Some(limit),
+        };
+        let body = rpc
+            .call(
+                Method::Get,
+                query.target(library),
+                Body::Empty,
+                Some(keys.credentials.device()),
+            )
+            .await?;
+        let page = BatchPage::decode(&body)
+            .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
+        check_page(&page, pull.read, limit)?;
+        for batch in &page.batches {
+            match keys.open(rpc, batch).await? {
+                Opened::Changes(changes) => pull.held.extend(changes),
+                Opened::Refused(refused) => {
+                    report.refused_total += 1;
+                    if report.refused.len() < REFUSALS_LISTED {
+                        report.refused.push(refused);
+                    }
+                }
+                Opened::Unlisted(device) => {
+                    report.blocked = Some(Blocked {
+                        seq: batch.seq,
+                        device,
+                    });
+                    return Ok(());
+                }
+            }
+            pull.read = batch.seq;
+        }
+        if !page.more {
+            return Ok(());
+        }
+        if pull.held.is_empty() || pull.held.len() >= APPLY_CHUNK {
+            pull.commit(conn, replica, library, report, false).await?;
+        }
+    }
+    report.more = true;
+    Ok(())
 }
 
 /// Refuses a page that does not continue the log from `after` one sequence number at a time, or

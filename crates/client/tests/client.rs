@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use fongo_sync_client::protocol::api::{
-    BatchPage, ErrorBody, ErrorCode, Notification, StoredBatch, devices_path,
+    BatchPage, ErrorBody, ErrorCode, Notification, ReadBatches, Route, StoredBatch, devices_path,
 };
 use fongo_sync_client::protocol::{
     DeviceId, LibraryId, LibraryKeys, SigningKey, generate_signing_key, random_nonce, seal,
@@ -543,6 +543,80 @@ async fn a_page_longer_than_asked_for_is_an_error() {
         Err(Error::MalformedResponse(_))
     ));
     assert_eq!(a.cursor().await, 1);
+}
+
+/// Answers every page read with one envelope that is not an envelope, and says more follow.
+struct EndlessJunk<'a> {
+    server: &'a Server,
+}
+
+impl Transport for EndlessJunk<'_> {
+    async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        if let (Method::Get, Some((Route::Batches(_), Some(query)))) =
+            (request.method, Route::parse(&request.target))
+        {
+            let read = ReadBatches::parse_query(query).unwrap();
+            let page = BatchPage {
+                batches: vec![StoredBatch {
+                    seq: read.after + 1,
+                    envelope: vec![0; 64],
+                }],
+                more: true,
+            };
+            return Ok(Response {
+                status: 200,
+                headers: Vec::new(),
+                body: page.encode(),
+            });
+        }
+        self.server.send(request).await
+    }
+}
+
+#[tokio::test]
+async fn endless_junk_pages_end_the_call_with_progress_kept_and_more_reported() {
+    let server = Server::new();
+    let [mut a, _] = pair(&server).await;
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    let junk = EndlessJunk { server: &server };
+    let mut cursor = 0;
+    for _ in 0..2 {
+        let report = sync(&mut a.conn, &a.replica, &junk, &a.credentials, now)
+            .await
+            .unwrap();
+        assert!(report.more);
+        assert!(report.refused_total > 100);
+        assert_eq!(report.refused.len(), 100);
+        assert!(
+            report
+                .refused
+                .iter()
+                .all(|r| r.reason == Refusal::Malformed)
+        );
+        assert_eq!(a.cursor().await, cursor + report.refused_total as u64);
+        cursor = a.cursor().await;
+    }
+    assert_eq!(server.log(a.credentials.library_id()).len(), 1);
+}
+
+#[tokio::test]
+async fn pages_read_before_a_failure_stay_applied() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    let [mut a, mut b] = pair(&server).await;
+    for n in 0..3 {
+        b.run(&format!("INSERT INTO settings VALUES ('b{n}', 'x')"))
+            .await;
+        b.sync(&server).await.unwrap();
+    }
+    // Capabilities, the first page, the device list, the second page, then the third fails.
+    server.fail_at(5);
+    assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+    assert_eq!(a.cursor().await, 2);
+    assert_eq!(a.settings().await, ["b0=x", "b1=x"]);
+    server.behave();
+    a.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
 }
 
 type Respond = fn(&fongo_sync_client::Request) -> Option<Response>;
