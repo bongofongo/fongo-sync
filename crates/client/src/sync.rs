@@ -120,6 +120,13 @@ pub struct SyncReport {
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
 /// may not hold them. An append the server places right after the cursor moves the cursor past
 /// it, so a device does not usually read back what it sent.
+///
+/// # What the server is relied on for
+///
+/// - Numbering each library's envelopes 1, 2, 3 and so on without gaps, as the protocol states. A
+///   page that skips, repeats or reorders a number is refused as malformed.
+/// - Nothing else about appends: storing an identical envelope only once is welcome but not
+///   relied on, since a copy is applied idempotently.
 pub async fn sync<T: Transport>(
     conn: &mut SqliteConnection,
     replica: &Replica,
