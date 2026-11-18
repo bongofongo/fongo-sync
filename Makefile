@@ -24,7 +24,13 @@ proof:
 lean:
 	cd lean && $(LAKE) build
 	@! grep -rnwE 'sorry|admit|axiom|native_decide' lean/FongoSync lean/FongoSync.lean
-	@cd lean && $(LAKE) env lean Audit.lean | tee /dev/stderr | { ! grep -q sorryAx; }
+	@grep -oE '^theorem [^ ]+' lean/FongoSync/Laws.lean \
+		| sed 's/^theorem /#print axioms FongoSync.Laws./' > lean/.lake/laws.txt
+	@grep '^#print axioms' lean/Audit.lean | cmp -s - lean/.lake/laws.txt \
+		|| { echo 'lean/Audit.lean must list exactly the theorems of lean/FongoSync/Laws.lean' >&2; exit 1; }
+	@cd lean && $(LAKE) env lean Audit.lean > .lake/axioms.txt && cat .lake/axioms.txt
+	@! grep -oE '\[.*\]' lean/.lake/axioms.txt | tr -d '[] ' | tr ',' '\n' \
+		| grep -vxE 'propext|Classical\.choice|Quot\.sound'
 
 # Rechecks the proofs with BendTT's kernel, which needs Lean on PATH.
 verdict:
