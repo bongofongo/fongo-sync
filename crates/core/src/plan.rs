@@ -115,8 +115,11 @@ fn expand(coll: &Collection, pick: impl Fn(&str) -> bool) -> Vec<&String> {
 /// - `Created` writes `$deleted = 0` to `new`, the gid of the entity the row now names (a fresh
 ///   gid, or for a natural collection the gid its key derives), and every `Set` to it.
 /// - Otherwise each `Set` goes to the smallest live member of `old` (its canonical gid if none is
-///   live), so the write is one the group shows; a `Set` of an owner field goes to every live
-///   member, so the whole entity moves.
+///   live), so the write is one the group shows. A `Set` of an owner field goes to every member,
+///   live or not: a member that is dead only because its owner has not arrived here would
+///   otherwise come back under its old owner when that owner arrives. A member that was dead
+///   only through its owner comes back with the move, and its fields compete as a live
+///   member's do.
 ///
 /// Returns nothing for `Created` without `new`, or for a `Set` or `Deleted` without `old`.
 pub fn record(
@@ -172,8 +175,8 @@ pub fn record(
             .fields
             .iter()
             .any(|d| &d.name == f && matches!(d.kind, FieldKind::Owner(_)));
-        if owner && !old.live.is_empty() {
-            for &m in &old.live {
+        if owner {
+            for &m in &old.members {
                 out.push(change(m, f, v.clone()));
             }
         } else {

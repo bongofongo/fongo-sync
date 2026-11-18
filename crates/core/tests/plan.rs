@@ -244,6 +244,13 @@ proptest! {
             }
             let after = ev.target(&store, c, *g).unwrap();
             prop_assert_eq!(after.canonical, before.canonical);
+            let revives = matches!(f.kind, FieldKind::Owner(_)) && before.live != before.members;
+            if revives {
+                // Moving the entity moves members that were dead only through their old owner;
+                // they come back and their fields compete as any live member's do.
+                prop_assert_eq!(&after.row.as_ref().unwrap()[&f.name], &edited[&f.name]);
+                continue;
+            }
             prop_assert_eq!(after.row.as_ref(), Some(&edited));
             prop_assert_eq!(write(after.row.as_ref(), Some(&edited)), RowAction::Nothing);
         }
@@ -600,4 +607,68 @@ fn a_swap_of_unique_values_is_written_in_two_steps() {
             },
         ]
     );
+}
+
+#[test]
+fn moving_a_merged_entity_moves_every_member_even_one_dead_for_now() {
+    let schema = Schema::new(vec![
+        Collection::minted("sites").plain("name", Merge::Lww),
+        Collection::minted("items")
+            .plain("text", Merge::Lww)
+            .owner("site", "sites"),
+    ]);
+    let ev = Evaluator::new(&schema).unwrap();
+    let (s, t, u) = (gid(1), gid(2), gid(3));
+    let (a, b) = (gid(10), gid(11));
+    let at = |wall_ms: u64, counter: u32| Hlc {
+        wall_ms,
+        counter,
+        node: gid(9),
+    };
+    let ch = |c: &str, g: Gid, f: &str, v: Value, n: u32| Change {
+        collection: c.into(),
+        gid: g,
+        field: f.into(),
+        value: v,
+        clock: at(1, n),
+    };
+    // Member b is dead here only because its owner t has not arrived.
+    let mut known = vec![
+        ch("sites", s, "name", text("S"), 0),
+        ch("sites", u, "name", text("U"), 1),
+        ch("items", a, "site", Value::Ref(s), 2),
+        ch("items", a, "text", text("x"), 3),
+        ch("items", b, "site", Value::Ref(t), 4),
+        ch("items", b, fongo_sync_core::model::ALIAS, Value::Ref(a), 5),
+    ];
+    let before = ev.target(&store(&schema, &known), "items", a).unwrap();
+    assert_eq!(
+        (before.members.clone(), before.live.clone()),
+        (vec![a, b], vec![a])
+    );
+    let moved = record(
+        &schema,
+        "items",
+        &[set("site", Value::Ref(u))],
+        Some(&before),
+        None,
+        at(5, 0),
+    );
+    let movers: BTreeSet<Gid> = moved.iter().map(|c| c.gid).collect();
+    assert_eq!(movers, [a, b].into());
+    known.extend(moved);
+    known.push(ch("sites", t, "name", text("T"), 6));
+    let shown: Vec<Row> = view(&schema, &known)
+        .rows("items")
+        .map(|(_, r)| r.clone())
+        .collect();
+    assert_eq!(
+        shown,
+        vec![row(&[("site", Value::Ref(u)), ("text", text("x"))])]
+    );
+    known.push(Change {
+        clock: at(6, 0),
+        ..ch("sites", u, fongo_sync_core::DELETED, Value::Int(1), 0)
+    });
+    assert_eq!(view(&schema, &known).rows("items").count(), 0);
 }
