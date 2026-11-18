@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fongo_sync_protocol::api::{
     Appended, BatchPage, Devices, ReadBatches, StoredBatch, batches_path, devices_path,
@@ -32,7 +32,9 @@ pub enum Refusal {
     WrongLibrary,
     /// Signed by the library's recovery key, which may add devices but never writes.
     RecoveryKey,
-    /// Signed by a key the library's device list does not hold.
+    /// Signed by a key the library's device list does not hold. Not reported by this version: such
+    /// an envelope may become valid once the list catches up, so it blocks the pull instead (see
+    /// [`SyncReport::blocked`]).
     UnknownDevice,
     /// Its signature does not verify against the key of the device it names.
     BadSignature,
@@ -50,6 +52,17 @@ pub struct Refused {
     pub reason: Refusal,
 }
 
+/// An envelope the pull stopped at: its signer is not in the library's device list, even fetched
+/// afresh. An honest server stores only envelopes from listed devices, so the list is behind or
+/// the server is faulty; either way the envelope may become valid, so the cursor stays before it
+/// and every later sync tries it again. Change notifications keep reporting a sync worth running
+/// meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocked {
+    pub seq: u64,
+    pub device: DeviceId,
+}
+
 /// What one [`sync`] did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SyncReport {
@@ -61,6 +74,9 @@ pub struct SyncReport {
     /// touched (each row once, as it was left), conflicts, and entities still waiting.
     pub applied: Applied,
     pub refused: Vec<Refused>,
+    /// Set when the pull stopped at an envelope from an unlisted signer. What came before it was
+    /// applied and the outbox was still sent.
+    pub blocked: Option<Blocked>,
     /// The last sequence number this sync knows the library's log to hold.
     pub head: u64,
 }
@@ -126,12 +142,20 @@ pub async fn sync<T: Transport>(
         check_page(&page, read, limit)?;
         for batch in &page.batches {
             match keys.open(&rpc, batch).await? {
-                Ok(changes) => received.extend(changes),
-                Err(refused) => report.refused.push(refused),
+                Opened::Changes(changes) => received.extend(changes),
+                Opened::Refused(refused) => report.refused.push(refused),
+                Opened::Unlisted(device) => {
+                    report.blocked = Some(Blocked {
+                        seq: batch.seq,
+                        device,
+                    });
+                    break;
+                }
             }
             read = batch.seq;
         }
-        if received.len() >= APPLY_CHUNK || !page.more {
+        let done = !page.more || report.blocked.is_some();
+        if received.len() >= APPLY_CHUNK || done {
             let mut tx = conn.begin().await?;
             let applied = replica.apply(&mut tx, &received).await?;
             state::advance(&mut tx, library, read).await?;
@@ -141,11 +165,11 @@ pub async fn sync<T: Transport>(
             merge(&mut report.applied, applied);
             received.clear();
         }
-        if !page.more {
+        if done {
             break;
         }
     }
-    report.head = cursor;
+    report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
     if let Some(sending) = saved.sending {
         let ours = Envelope::decode(&sending.envelope)
@@ -239,16 +263,27 @@ fn check_page(page: &BatchPage, after: u64, limit: u32) -> Result<(), Error> {
     Ok(())
 }
 
-/// The keys envelopes may be signed with: the library's device list, fetched when first needed
-/// and once more on meeting a device it lacks.
+/// The keys envelopes may be signed with: this device's own, and the library's device list,
+/// fetched when first needed and again on meeting each device it lacks.
 struct Keys<'a> {
     credentials: &'a Credentials,
     recovery: DeviceId,
     devices: Option<HashMap<DeviceId, (VerifyingKey, bool)>>,
-    refreshed: bool,
+    looked_for: HashSet<DeviceId>,
 }
 
-type Opened = Result<Vec<Change>, Refused>;
+enum Opened {
+    Changes(Vec<Change>),
+    Refused(Refused),
+    /// Signed by a device the list lacks even fetched afresh.
+    Unlisted(DeviceId),
+}
+
+enum Signer {
+    Key(VerifyingKey),
+    Refused(Refusal),
+    Unlisted,
+}
 
 impl<'a> Keys<'a> {
     fn new(credentials: &'a Credentials) -> Keys<'a> {
@@ -257,18 +292,18 @@ impl<'a> Keys<'a> {
             credentials,
             recovery: DeviceId::of(&recovery),
             devices: None,
-            refreshed: false,
+            looked_for: HashSet::new(),
         }
     }
 
-    /// The changes in one stored envelope, or its refusal.
+    /// The changes in one stored envelope, its refusal, or that its signer is unlisted.
     async fn open<T: Transport, N: Fn() -> u64 + Sync>(
         &mut self,
         rpc: &Rpc<'_, T, N>,
         batch: &StoredBatch,
     ) -> Result<Opened, Error> {
         let refuse = |device, reason| {
-            Ok(Err(Refused {
+            Ok(Opened::Refused(Refused {
                 seq: batch.seq,
                 device,
                 reason,
@@ -281,38 +316,41 @@ impl<'a> Keys<'a> {
         if envelope.library != self.credentials.library_id() {
             return refuse(Some(device), Refusal::WrongLibrary);
         }
-        let key = match self.key_of(rpc, device).await? {
-            Ok(key) => key,
-            Err(reason) => return refuse(Some(device), reason),
+        let key = match self.signer(rpc, device).await? {
+            Signer::Key(key) => key,
+            Signer::Refused(reason) => return refuse(Some(device), reason),
+            Signer::Unlisted => return Ok(Opened::Unlisted(device)),
         };
         match open(&batch.envelope, self.credentials.library(), |_| Some(key)) {
-            Ok(opened) => Ok(Ok(opened.changes)),
+            Ok(opened) => Ok(Opened::Changes(opened.changes)),
             Err(error) => refuse(Some(device), refusal(error)),
         }
     }
 
-    async fn key_of<T: Transport, N: Fn() -> u64 + Sync>(
+    async fn signer<T: Transport, N: Fn() -> u64 + Sync>(
         &mut self,
         rpc: &Rpc<'_, T, N>,
         device: DeviceId,
-    ) -> Result<Result<VerifyingKey, Refusal>, Error> {
+    ) -> Result<Signer, Error> {
         if device == self.recovery {
-            return Ok(Err(Refusal::RecoveryKey));
+            return Ok(Signer::Refused(Refusal::RecoveryKey));
         }
-        let known = |devices: &Option<HashMap<_, _>>| {
+        if device == self.credentials.device_id() {
+            return Ok(Signer::Key(self.credentials.device().verifying_key()));
+        }
+        let listed = |devices: &Option<HashMap<_, _>>| {
             devices.as_ref().is_some_and(|d| d.contains_key(&device))
         };
         if self.devices.is_none() {
             self.devices = Some(self.fetch(rpc).await?);
         }
-        if !known(&self.devices) && !self.refreshed {
-            self.refreshed = true;
+        if !listed(&self.devices) && self.looked_for.insert(device) {
             self.devices = Some(self.fetch(rpc).await?);
         }
         Ok(match self.devices.as_ref().and_then(|d| d.get(&device)) {
-            None => Err(Refusal::UnknownDevice),
-            Some((_, true)) => Err(Refusal::RecoveryKey),
-            Some((key, false)) => Ok(*key),
+            None => Signer::Unlisted,
+            Some((_, true)) => Signer::Refused(Refusal::RecoveryKey),
+            Some((key, false)) => Signer::Key(*key),
         })
     }
 

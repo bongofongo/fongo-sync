@@ -54,6 +54,8 @@ pub struct State {
     respond: Option<Respond>,
     /// The next device list leaves out the device added last.
     pub stale_devices: bool,
+    /// Keys every device list leaves out.
+    pub hidden: Vec<VerifyingKey>,
 }
 
 pub struct Server {
@@ -110,6 +112,7 @@ impl Server {
                 tamper: None,
                 respond: None,
                 stale_devices: false,
+                hidden: Vec::new(),
             }),
         }
     }
@@ -147,6 +150,7 @@ impl Server {
             s.tamper = None;
             s.respond = None;
             s.stale_devices = false;
+            s.hidden.clear();
         });
     }
 
@@ -303,6 +307,7 @@ impl State {
                 if std::mem::take(&mut self.stale_devices) {
                     devices.pop();
                 }
+                devices.retain(|d| !self.hidden.contains(&d.public_key));
                 Ok(json(200, &Devices { devices }))
             }
             (Route::Devices(id), Method::Post) => {

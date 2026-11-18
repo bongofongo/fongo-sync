@@ -1,18 +1,19 @@
 mod support;
 
 use std::future::Future;
+use std::sync::Mutex;
 
 use fongo_sync_client::protocol::api::{
     BatchPage, ErrorBody, ErrorCode, Notification, StoredBatch, devices_path,
 };
 use fongo_sync_client::protocol::{
-    LibraryId, LibraryKeys, SigningKey, generate_signing_key, random_nonce, seal,
+    DeviceId, LibraryId, LibraryKeys, SigningKey, generate_signing_key, random_nonce, seal,
 };
 use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_client::sqlite::{Conflict, Replica};
 use fongo_sync_client::{
-    Credentials, Error, Method, Refusal, Response, add_device, create_library, join_library, sync,
-    worth_syncing,
+    Blocked, Credentials, Error, Method, Refusal, Request, Response, Transport, TransportError,
+    add_device, create_library, join_library, sync, worth_syncing,
 };
 use sqlx::SqliteConnection;
 use support::{Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch, settle};
@@ -252,8 +253,7 @@ fn sealed_by(changes: &[Change], keys: &LibraryKeys, key: &SigningKey) -> Vec<u8
 }
 
 #[tokio::test]
-async fn envelopes_signed_by_the_recovery_key_or_an_unlisted_key_are_refused_and_the_rest_applied()
-{
+async fn the_recovery_keys_envelope_is_refused_and_an_unlisted_signer_blocks_the_pull() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;
     let keys = a.credentials.library().clone();
@@ -268,27 +268,128 @@ async fn envelopes_signed_by_the_recovery_key_or_an_unlisted_key_are_refused_and
     server.inject(id, sealed_by(&setting("stranger", 1), &keys, &stranger));
     b.run("INSERT INTO settings VALUES ('after', 'x')").await;
     b.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
 
     let lists = || server.count(Method::Get, &devices_path(id));
     let listed = lists();
     let report = a.sync(&server).await.unwrap();
     let refused: Vec<(u64, Refusal)> = report.refused.iter().map(|r| (r.seq, r.reason)).collect();
-    assert_eq!(
-        refused,
-        [(2, Refusal::RecoveryKey), (3, Refusal::UnknownDevice)]
-    );
-    assert_eq!(
-        report.refused[1].device,
-        Some(fongo_sync_client::protocol::DeviceId::of(
-            &stranger.verifying_key()
-        ))
-    );
-    assert_eq!(a.settings().await, ["after=x", "before=x"]);
-    assert_eq!(a.cursor().await, 4);
-    // The unlisted key made the client look at the device list once more, and only once.
+    assert_eq!(refused, [(2, Refusal::RecoveryKey)]);
+    let blocked = Some(Blocked {
+        seq: 3,
+        device: DeviceId::of(&stranger.verifying_key()),
+    });
+    assert_eq!(report.blocked, blocked);
+    // Nothing from the blocked envelope on is applied, but what is before it is, and the
+    // outbox still went out.
+    assert_eq!(a.settings().await, ["before=x", "mine=x"]);
+    assert_eq!(a.cursor().await, 2);
+    assert!(report.sent > 0);
+    // The unlisted signer made the client fetch the list once more, and only once.
     assert_eq!(lists() - listed, 2);
+
     let again = a.sync(&server).await.unwrap();
-    assert!(again.refused.is_empty() && again.received == 0);
+    assert_eq!((again.blocked, again.received), (blocked, 0));
+    assert_eq!(a.cursor().await, 2);
+
+    server.register(id, stranger.verifying_key());
+    let unblocked = a.sync(&server).await.unwrap();
+    assert_eq!(unblocked.blocked, None);
+    assert_eq!(
+        a.settings().await,
+        ["after=x", "before=x", "mine=x", "stranger=stranger"]
+    );
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_server_that_keeps_leaving_a_device_out_blocks_at_its_envelope_every_time() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    let hidden = generate_signing_key().unwrap();
+    let mut c = Peer::new(Credentials::new(keys.clone(), hidden.clone(), 0)).await;
+    add_device(&server, &b.credentials, &hidden.verifying_key(), now)
+        .await
+        .unwrap();
+    server.with(|s| s.hidden.push(hidden.verifying_key()));
+    b.run("INSERT INTO settings VALUES ('b1', 'x')").await;
+    b.sync(&server).await.unwrap();
+    c.run("INSERT INTO settings VALUES ('c', 'x')").await;
+    c.sync(&server).await.unwrap();
+    b.run("INSERT INTO settings VALUES ('b2', 'x')").await;
+    b.sync(&server).await.unwrap();
+
+    for _ in 0..3 {
+        let report = a.sync(&server).await.unwrap();
+        assert_eq!(report.blocked.map(|b| b.seq), Some(2));
+        assert_eq!(a.settings().await, ["b1=x"]);
+        assert_eq!(a.cursor().await, 1);
+    }
+    server.with(|s| s.hidden.clear());
+    let mut peers = [a, b, c];
+    settle(&mut peers, &server).await;
+    assert_converged(&mut peers).await;
+}
+
+/// Lets a new device join and write, and a listed device write after it, each time the client
+/// fetches the device list.
+struct JoinsWhileListing<'a> {
+    server: &'a Server,
+    keys: LibraryKeys,
+    joiners: Mutex<Vec<SigningKey>>,
+    listed: SigningKey,
+}
+
+impl Transport for JoinsWhileListing<'_> {
+    async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        let listing = request.method == Method::Get && request.target.ends_with("/devices");
+        let response = self.server.send(request).await;
+        let joiner = listing.then(|| self.joiners.lock().unwrap().pop());
+        if let Some(Some(key)) = joiner {
+            let id = self.keys.id;
+            self.server.register(id, key.verifying_key());
+            let name = DeviceId::of(&key.verifying_key()).to_hex();
+            let changes = setting(&name, 5);
+            self.server
+                .inject(id, sealed_by(&changes, &self.keys, &key));
+            let changes = setting(&format!("after-{name}"), 5);
+            self.server
+                .inject(id, sealed_by(&changes, &self.keys, &self.listed));
+        }
+        response
+    }
+}
+
+#[tokio::test]
+async fn devices_that_join_during_a_sync_are_found_by_that_sync() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    let [mut a, mut b] = pair(&server).await;
+    for n in 0..2 {
+        b.run(&format!("INSERT INTO settings VALUES ('b{n}', 'x')"))
+            .await;
+        b.sync(&server).await.unwrap();
+    }
+    let keys = a.credentials.library().clone();
+    let joining = JoinsWhileListing {
+        server: &server,
+        keys,
+        joiners: Mutex::new(vec![
+            generate_signing_key().unwrap(),
+            generate_signing_key().unwrap(),
+        ]),
+        listed: b.credentials.device().clone(),
+    };
+    let report = sync(&mut a.conn, &a.replica, &joining, &a.credentials, now)
+        .await
+        .unwrap();
+    assert!(report.refused.is_empty(), "{report:#?}");
+    assert_eq!(report.blocked, None);
+    assert_eq!(a.settings().await.len(), 6);
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
 }
 
 #[tokio::test]
