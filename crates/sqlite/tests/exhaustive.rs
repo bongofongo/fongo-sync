@@ -1,6 +1,6 @@
 //! Every script up to a small length, rather than a sample of long ones: replicas of a tiny
-//! library write, send what they collected as a batch, and take batches in any order, any number
-//! of times. Then every replica sends and takes what it lacks, odd ones newest first, until no one
+//! library write and send each write as a batch, and take one another's batches in any order,
+//! any number of times. Then every replica sends and takes what it lacks, odd ones newest first, until no one
 //! sends anything. After every apply and collect each replica must agree with the reference model,
 //! and at the end each must show the model's view.
 //!
@@ -48,40 +48,49 @@ fn registry() -> Registry {
     .unwrap()
 }
 
-/// What one replica's application does, always to its first row of a kind.
+/// What one replica's application does, always to its first row of a kind. Making a shelf also
+/// puts a book and a tag on it, so short scripts reach merges that carry children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Write {
-    AddShelf,
+    MakeShelf,
     RenameShelf,
     Recode,
     DeleteShelf,
     AddBook,
     Retitle,
     DeleteBook,
-    AddTag,
     NoteTag,
     DeleteTag,
 }
 
 const WRITES: &[Write] = &[
-    Write::AddShelf,
+    Write::MakeShelf,
     Write::RenameShelf,
     Write::Recode,
     Write::DeleteShelf,
     Write::AddBook,
     Write::Retitle,
     Write::DeleteBook,
-    Write::AddTag,
     Write::NoteTag,
     Write::DeleteTag,
 ];
 
 impl Write {
-    fn sql(self, replica: usize) -> String {
+    fn sql(self, replica: usize) -> Vec<String> {
         let shelf = "(SELECT min(id) FROM shelves)";
-        match self {
-            Write::AddShelf => {
-                "INSERT OR IGNORE INTO shelves (code, name) VALUES ('a', 'new')".into()
+        let one = match self {
+            Write::MakeShelf => {
+                return vec![
+                    "INSERT OR IGNORE INTO shelves (code, name) VALUES ('a', 'new')".into(),
+                    format!(
+                        "INSERT INTO books (shelf_id, title)
+                         SELECT {shelf}, 'new' WHERE {shelf} IS NOT NULL"
+                    ),
+                    format!(
+                        "INSERT OR IGNORE INTO tags (shelf_id, tag)
+                         SELECT {shelf}, 't' WHERE {shelf} IS NOT NULL"
+                    ),
+                ];
             }
             Write::RenameShelf => {
                 format!("UPDATE shelves SET name = 'by {replica}' WHERE id = {shelf}")
@@ -98,10 +107,6 @@ impl Write {
                 "UPDATE books SET title = 'by {replica}' WHERE id = (SELECT min(id) FROM books)"
             ),
             Write::DeleteBook => "DELETE FROM books WHERE id = (SELECT min(id) FROM books)".into(),
-            Write::AddTag => format!(
-                "INSERT OR IGNORE INTO tags (shelf_id, tag)
-                 SELECT {shelf}, 't' WHERE {shelf} IS NOT NULL"
-            ),
             Write::NoteTag => format!(
                 "UPDATE tags SET note = 'by {replica}'
                   WHERE rowid = (SELECT min(rowid) FROM tags)"
@@ -109,16 +114,17 @@ impl Write {
             Write::DeleteTag => {
                 "DELETE FROM tags WHERE rowid = (SELECT min(rowid) FROM tags)".into()
             }
-        }
+        };
+        vec![one]
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
+    /// The replica writes, then collects and sends its outbox as one batch.
     Write(usize, Write),
-    /// The replica collects and sends its outbox as one batch.
-    Send(usize),
-    /// The replica takes the batch of the `n`th send in the script, again if it already has.
+    /// The replica takes the batch of the `n`th write in the script, which another replica sent,
+    /// again if it already has.
     Take(usize, usize),
 }
 
@@ -130,13 +136,22 @@ fn scripts(replicas: usize, steps: usize) -> Vec<Vec<Op>> {
             out.push(script.clone());
             return;
         }
-        let sends = script.iter().filter(|op| matches!(op, Op::Send(_))).count();
+        let senders: Vec<usize> = script
+            .iter()
+            .filter_map(|op| match op {
+                Op::Write(r, _) => Some(*r),
+                Op::Take(..) => None,
+            })
+            .collect();
         let actors = if script.is_empty() { 1 } else { replicas };
         let mut next = Vec::new();
         for r in 0..actors {
             next.extend(WRITES.iter().map(|w| Op::Write(r, *w)));
-            next.push(Op::Send(r));
-            next.extend((0..sends).map(|n| Op::Take(r, n)));
+            for (n, sender) in senders.iter().enumerate() {
+                if *sender != r {
+                    next.push(Op::Take(r, n));
+                }
+            }
         }
         for op in next {
             script.push(op);
@@ -207,10 +222,11 @@ async fn run(seed: u64, replicas: usize, script: &[Op]) -> Result<(), String> {
     for (step, op) in script.iter().enumerate() {
         let done = match *op {
             Op::Write(r, w) => {
-                let _ = sqlx::query(&w.sql(r)).execute(&mut peers[r].conn).await;
-                Ok(())
+                for sql in w.sql(r) {
+                    let _ = sqlx::query(&sql).execute(&mut peers[r].conn).await;
+                }
+                peers[r].send(&mut batches).await
             }
-            Op::Send(r) => peers[r].send(&mut batches).await,
             Op::Take(r, n) => peers[r].take(&batches, n).await,
         };
         done.map_err(|e| format!("after step {step}, {op:?}: {e}"))?;

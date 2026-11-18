@@ -78,8 +78,16 @@ Three layers, each checked against the one above it:
    full and executably: a slow, plain function from a schema and a set of changes to what an
    application sees. Its own tests check that it ignores order and duplicates and hold one case
    for each rule.
-3. **The storage adapter.** `fongo-sync-sqlite` will be tested by comparing what each replica
-   shows with `model::view` of the changes it has seen, not only with other replicas.
+3. **The storage adapter.** `fongo-sync-sqlite`'s tests compare each replica with the model of
+   the changes it has taken in, not only with other replicas. After every apply and collect, its
+   registers and alias groups must be the model's, and every row it is not holding back must be
+   the model's row; once nothing waits, its rows must be exactly `model::view`.
+   `Registry::model_schema` gives the model's schema, and a registry the model cannot answer for
+   is refused. Random scripts run in `tests/property.rs`, every script up to a small length in
+   `tests/exhaustive.rs`; both repeat exactly from a seed. `make deep` runs them longer.
+   Known to differ: the model gives each gid to the collection that used it first, and the
+   kernel does not, so a reference to a gid of another collection, which no honest replica
+   writes, waits forever instead of reading as null (an ignored test in `tests/regressions.rs`).
 
 Nothing mechanically links the Bend model to the Rust: `model.bend` mirrors
 `crates/core/src/change.rs`, `clock.rs` and `model.rs` by hand, in miniature (a gid is a number, a
