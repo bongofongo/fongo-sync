@@ -31,6 +31,8 @@ pub struct Field {
     pub name: String,
     pub kind: Kind,
     pub strategy: Strategy,
+    /// Whether an apply reports a local edit and a remote one made without seeing each other.
+    pub reports_conflicts: bool,
 }
 
 /// One synced table.
@@ -79,6 +81,20 @@ impl Collection {
             name: name.into(),
             kind: Kind::Plain,
             strategy,
+            reports_conflicts: false,
+        });
+        self
+    }
+
+    /// A field whose concurrent edits [`crate::Replica::apply`] reports in
+    /// [`crate::Applied::conflicts`], so the application can combine them. The later edit is
+    /// still the one kept until the application writes something else.
+    pub fn field_reporting_conflicts(mut self, name: &str) -> Collection {
+        self.fields.push(Field {
+            name: name.into(),
+            kind: Kind::Plain,
+            strategy: Strategy::Lww,
+            reports_conflicts: true,
         });
         self
     }
@@ -109,6 +125,7 @@ impl Collection {
                 owned,
             },
             strategy: Strategy::Lww,
+            reports_conflicts: false,
         });
         self
     }

@@ -54,7 +54,7 @@ pub struct Outbox {
     pub through: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Applied {
     /// Incoming changes that replaced what this replica held.
     pub accepted: usize,
@@ -63,6 +63,28 @@ pub struct Applied {
     pub waiting: usize,
     /// The rows this apply wrote or removed, by collection in registry order, then by key.
     pub touched: Vec<Touched>,
+    /// Fields flagged to report conflicts that were edited here and elsewhere concurrently. Only
+    /// a local edit this apply collects is compared, one not yet sent, so a sync that wants these
+    /// applies what it receives before it collects and sends.
+    pub conflicts: Vec<Conflict>,
+}
+
+/// A local edit not yet sent and a remote edit to the same field, neither made after seeing the
+/// other. The field's strategy has already chosen between them; the application may combine the
+/// two, for instance by a three-way merge of text, and write the result as a new edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Conflict {
+    pub collection: String,
+    pub gid: Gid,
+    /// The key of the entity's local row, when it has one.
+    pub key: Option<String>,
+    pub field: String,
+    /// The value both edits were made against, unless the field had none.
+    pub base: Option<Value>,
+    pub local: Value,
+    pub remote: Value,
+    /// Whether the field now holds the remote edit rather than the local one.
+    pub remote_won: bool,
 }
 
 /// A row an apply wrote or removed.
@@ -114,6 +136,24 @@ struct Pass {
 }
 
 type Rows = BTreeMap<(usize, String), (Gid, bool)>;
+
+/// A local edit to a field that reports conflicts, as collected.
+struct Edit {
+    idx: usize,
+    gid: Gid,
+    key: String,
+    field: String,
+    base: Option<(Value, Hlc)>,
+    value: Value,
+    clock: Hlc,
+}
+
+#[derive(Default)]
+struct Collected {
+    produced: usize,
+    rows: Rows,
+    edits: Vec<Edit>,
+}
 
 impl Pass {
     fn new(clock: Clock) -> Pass {
@@ -579,7 +619,7 @@ impl Replica {
     /// many changes were produced.
     pub async fn collect(&self, conn: &mut SqliteConnection) -> Result<usize> {
         let mut tx = conn.begin().await?;
-        let (produced, _) = self.collect_in(&mut tx).await?;
+        let produced = self.collect_in(&mut tx).await?.produced;
         tx.commit().await?;
         Ok(produced)
     }
@@ -622,9 +662,9 @@ impl Replica {
     /// writes are collected first, so each has a clock to be compared by.
     pub async fn apply(&self, conn: &mut SqliteConnection, changes: &[Change]) -> Result<Applied> {
         let mut tx = conn.begin().await?;
-        let (_, rows) = self.collect_in(&mut tx).await?;
+        let collected = self.collect_in(&mut tx).await?;
         let mut pass = Pass::new(load_clock(&mut tx).await?);
-        pass.rows = rows;
+        pass.rows = collected.rows;
         set_applying(&mut tx, true).await?;
 
         let mut applied = Applied::default();
@@ -670,6 +710,7 @@ impl Replica {
         let waiting = self.settle(&mut tx, touched, &mut pass).await?;
         exec(&mut tx, "DELETE FROM fongo_pending", &[]).await?;
         applied.waiting = self.hold(&mut tx, waiting).await?;
+        applied.conflicts = self.conflicts(&mut tx, &collected.edits, changes).await?;
         set_applying(&mut tx, false).await?;
         save_clock(&mut tx, &pass.clock).await?;
         tx.commit().await?;
@@ -685,6 +726,72 @@ impl Replica {
             })
             .collect();
         Ok(applied)
+    }
+
+    /// Pairs each local edit with the latest incoming change to the same field of the same group
+    /// that was made without seeing the value the edit replaced.
+    async fn conflicts(
+        &self,
+        conn: &mut SqliteConnection,
+        edits: &[Edit],
+        changes: &[Change],
+    ) -> Result<Vec<Conflict>> {
+        let mut conflicts = Vec::new();
+        for edit in edits {
+            let c = &self.registry.collections()[edit.idx];
+            let canon = canon_of(conn, edit.gid).await?;
+            let mut latest: Option<&Change> = None;
+            for change in changes {
+                if change.field != edit.field
+                    || change.collection != c.name
+                    || change.clock == edit.clock
+                    || edit
+                        .base
+                        .as_ref()
+                        .is_some_and(|(_, base)| change.clock <= *base)
+                    || latest.is_some_and(|held| held.clock >= change.clock)
+                    || canon_of(conn, change.gid).await? != canon
+                {
+                    continue;
+                }
+                latest = Some(change);
+            }
+            let Some(remote) = latest else {
+                continue;
+            };
+            let key = match &c.key {
+                Key::Minted { .. } => query(
+                    conn,
+                    "SELECT key FROM fongo_ids WHERE gid = ?",
+                    &[Value::Ref(canon)],
+                )
+                .await?
+                .first()
+                .map(|row| as_text(&row[0]).map(str::to_string))
+                .transpose()?,
+                Key::Natural { .. } => self
+                    .row_exists(conn, c, &edit.key)
+                    .await?
+                    .then(|| edit.key.clone()),
+            };
+            let strategy = self.registry.strategy(&c.name, &edit.field);
+            conflicts.push(Conflict {
+                collection: c.name.clone(),
+                gid: canon,
+                key,
+                field: edit.field.clone(),
+                base: edit.base.as_ref().map(|(value, _)| value.clone()),
+                local: edit.value.clone(),
+                remote: remote.value.clone(),
+                remote_won: wins(
+                    strategy,
+                    Some((&edit.value, &edit.clock)),
+                    &remote.value,
+                    &remote.clock,
+                ),
+            });
+        }
+        Ok(conflicts)
     }
 
     /// The global id of a row in a minted collection, once it has been collected or applied.
@@ -1168,9 +1275,7 @@ impl Replica {
         Ok(Some(derived))
     }
 
-    /// Returns how many changes were produced, and the rows written while putting back local
-    /// writes their field's strategy refused.
-    async fn collect_in(&self, conn: &mut SqliteConnection) -> Result<(usize, Rows)> {
+    async fn collect_in(&self, conn: &mut SqliteConnection) -> Result<Collected> {
         // A write first, so the transaction holds the write lock before it reads what to do.
         exec(
             conn,
@@ -1185,7 +1290,7 @@ impl Replica {
         )
         .await?;
         if rows.is_empty() {
-            return Ok((0, Rows::new()));
+            return Ok(Collected::default());
         }
         let mut entries = Vec::new();
         for row in &rows {
@@ -1244,6 +1349,7 @@ impl Replica {
         }
 
         let mut produced = 0;
+        let mut edits = Vec::new();
         let mut present: BTreeSet<Gid> = BTreeSet::new();
         let mut overruled: BTreeSet<(usize, Gid)> = BTreeSet::new();
         for e in &entries {
@@ -1278,6 +1384,19 @@ impl Replica {
                 if field != DELETED && !wins(strategy, held, &value, &stamp) {
                     overruled.insert((e.idx, gid));
                     continue;
+                }
+                if c.field_index(&field)
+                    .is_some_and(|i| c.fields[i].reports_conflicts)
+                {
+                    edits.push(Edit {
+                        idx: e.idx,
+                        gid,
+                        key: e.key.clone(),
+                        field: field.clone(),
+                        base: merged.get(&field).cloned(),
+                        value: value.clone(),
+                        clock: stamp,
+                    });
                 }
                 emit(
                     conn,
@@ -1323,7 +1442,11 @@ impl Replica {
             set_applying(conn, false).await?;
         }
         save_clock(conn, &pass.clock).await?;
-        Ok((produced, pass.rows))
+        Ok(Collected {
+            produced,
+            rows: pass.rows,
+            edits,
+        })
     }
 
     /// Makes one entity's row match the merged state of its group.

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
-use fongo_sync_sqlite::{Applied, Collection, Registry, Replica};
+use fongo_sync_sqlite::{Applied, Collection, Conflict, Registry, Replica};
 use proptest::prelude::*;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -46,7 +46,7 @@ fn registry() -> Registry {
             .identity(&["isbn10"]),
         Collection::minted("notes", "notes", "id")
             .owner("book_id", "books")
-            .field("body"),
+            .field_reporting_conflicts("body"),
         Collection::natural("tags", "tags", &["book_id", "tag"])
             .owner("book_id", "books")
             .field("tag")
@@ -156,6 +156,18 @@ impl Peer {
             .acknowledge(&mut self.conn, outbox.through)
             .await
             .unwrap();
+        let applied = self
+            .replica
+            .apply(&mut self.conn, &hub[self.cursor..])
+            .await
+            .unwrap();
+        self.cursor = hub.len();
+        applied
+    }
+
+    /// Takes what the hub has without sending first, so local edits are still unsent when the
+    /// incoming changes are applied.
+    async fn pull(&mut self, hub: &[Change]) -> Applied {
         let applied = self
             .replica
             .apply(&mut self.conn, &hub[self.cursor..])
@@ -694,6 +706,99 @@ async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
     settle(&mut peers, &mut hub).await;
     let state = assert_converged(&mut peers).await;
     assert_eq!(state.len(), 2, "{state:#?}");
+}
+
+/// Lets the wall clock move on, so the next edit is stamped later than the last.
+fn later() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+async fn note_body(peer: &mut Peer) -> String {
+    sqlx::query_scalar("SELECT body FROM notes")
+        .fetch_one(&mut peer.conn)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_edits_to_a_field_that_reports_conflicts_are_reported_whichever_wins() {
+    let text = |s: &str| Value::Text(s.into());
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let note = peers[0].gid("notes", 1).await;
+    let conflict = |base: &str, local: &str, remote: &str, remote_won| Conflict {
+        collection: "notes".into(),
+        gid: note,
+        key: Some("[1]".into()),
+        field: "body".into(),
+        base: Some(text(base)),
+        local: text(local),
+        remote: text(remote),
+        remote_won,
+    };
+
+    // The second replica's edit is the later, and it learns of the first while holding it.
+    peers[0].run("UPDATE notes SET body = 'one'").await;
+    later();
+    peers[1].run("UPDATE notes SET body = 'two'").await;
+    assert!(peers[0].sync(&mut hub).await.conflicts.is_empty());
+    let applied = peers[1].pull(&hub).await;
+    assert_eq!(
+        applied.conflicts,
+        vec![conflict("base", "two", "one", false)]
+    );
+    settle(&mut peers, &mut hub).await;
+    assert_converged(&mut peers).await;
+    assert_eq!(note_body(&mut peers[0]).await, "two");
+
+    // Now the replica holding its edit made the earlier one.
+    peers[0].run("UPDATE notes SET body = 'three'").await;
+    later();
+    peers[1].run("UPDATE notes SET body = 'four'").await;
+    assert!(peers[1].sync(&mut hub).await.conflicts.is_empty());
+    let applied = peers[0].pull(&hub).await;
+    assert_eq!(
+        applied.conflicts,
+        vec![conflict("two", "three", "four", true)]
+    );
+    settle(&mut peers, &mut hub).await;
+    assert_converged(&mut peers).await;
+    assert_eq!(note_body(&mut peers[1]).await, "four");
+}
+
+#[tokio::test]
+async fn an_edit_made_after_seeing_another_is_not_a_conflict() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+
+    peers[0].run("UPDATE notes SET body = 'one'").await;
+    peers[0].sync(&mut hub).await;
+    peers[1].sync(&mut hub).await;
+    peers[1].run("UPDATE notes SET body = 'two'").await;
+    let mut reports = Vec::new();
+    for _ in 0..2 {
+        for peer in peers.iter_mut() {
+            reports.extend(peer.pull(&hub).await.conflicts);
+            reports.extend(peer.sync(&mut hub).await.conflicts);
+        }
+    }
+    assert!(reports.is_empty(), "{reports:#?}");
+    assert_converged(&mut peers).await;
+    assert_eq!(note_body(&mut peers[0]).await, "two");
 }
 
 #[derive(Debug, Clone)]
