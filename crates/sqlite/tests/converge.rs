@@ -39,6 +39,7 @@ const SCHEMA: &[&str] = &[
         id INTEGER PRIMARY KEY,
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
         page INTEGER)",
+    "CREATE TABLE shelf (book_id INTEGER NOT NULL REFERENCES books(id))",
     "CREATE TABLE covers (
         book_id INTEGER NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
         path TEXT)",
@@ -1474,6 +1475,32 @@ async fn rows_outside_the_registry_move_to_the_row_a_merge_keeps() {
             .await,
         [format!("{kept} cover{kept}")]
     );
+}
+
+#[tokio::test]
+async fn a_delete_another_table_refuses_waits_until_it_is_let_go() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    peers[1].run("INSERT INTO shelf (book_id) VALUES (1)").await;
+    peers[0].run("DELETE FROM books").await;
+    peers[0].push(&mut hub).await;
+
+    let applied = peers[1].pull(&hub).await;
+    assert_eq!(applied.waiting, 1);
+    assert_eq!(count(&mut peers[1], "SELECT count(*) FROM books").await, 1);
+    peers[1].run("DELETE FROM shelf").await;
+    let applied = peers[1]
+        .replica
+        .apply(&mut peers[1].conn, &[])
+        .await
+        .unwrap();
+    assert_eq!(applied.waiting, 0);
+    settle(&mut peers, &mut hub).await;
+    assert!(assert_converged(&mut peers).await.is_empty());
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.

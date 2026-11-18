@@ -1106,7 +1106,7 @@ impl Replica {
                     )
                     .await?;
                 }
-                exec(
+                let gone = exec(
                     conn,
                     &format!(
                         "DELETE FROM {} WHERE {} = json_extract(?1, '$[0]')",
@@ -1115,7 +1115,13 @@ impl Replica {
                     ),
                     &[Value::Text(lose.clone())],
                 )
-                .await?;
+                .await;
+                // A row another table will not let go of stays, no longer the group's.
+                match gone {
+                    Ok(_) => {}
+                    Err(error) if is_constraint(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 exec(
                     conn,
                     "DELETE FROM fongo_ids WHERE collection = ? AND key = ?",
@@ -1328,7 +1334,13 @@ impl Replica {
                     ),
                     &[Value::Text(key.clone())],
                 )
-                .await?;
+                .await;
+                let removed = match removed {
+                    Ok(removed) => removed,
+                    // Another table still refers to the row and does not let it go.
+                    Err(error) if is_constraint(&error) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
                 exec(
                     conn,
                     "DELETE FROM fongo_ids WHERE gid = ?",
@@ -1352,12 +1364,17 @@ impl Replica {
                     .iter()
                     .map(|k| format!("{} = ?", quoted(k)))
                     .collect();
-                let removed = exec(
+                let removed = match exec(
                     conn,
                     &format!("DELETE FROM {table} WHERE {}", matches.join(" AND ")),
                     &key,
                 )
-                .await?;
+                .await
+                {
+                    Ok(removed) => removed,
+                    Err(error) if is_constraint(&error) => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                };
                 if removed > 0 {
                     let marks = vec!["?"; key.len()].join(", ");
                     let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
