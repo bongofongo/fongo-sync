@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::pin::Pin;
 
 use fongo_sync_core::{ALIAS, Change, Clock, DELETED, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
@@ -120,10 +118,21 @@ enum Local {
     Gone(Value),
     /// The referenced entity has not arrived yet.
     Unknown,
+    /// Whether the referenced entity is deleted could not be decided.
+    Undecided,
 }
 
-/// How deep a chain of owners is followed to learn whether an entity is deleted.
-const OWNER_DEPTH: usize = 64;
+/// How deep a chain of owners, and how many entities in all, are followed to learn whether an
+/// entity is deleted. The owner graph comes from other replicas, so neither is left unbounded.
+const OWNER_DEPTH: usize = 1024;
+const OWNER_LIMIT: usize = 10_000;
+
+enum Fate {
+    Alive,
+    Dead,
+    /// The owner graph was too large to follow to the end.
+    Undecided,
+}
 
 struct Entry {
     idx: usize,
@@ -147,6 +156,8 @@ struct Pass {
     /// Entities a merge of identities touched, to be brought in line before the round ends.
     more: BTreeSet<(usize, Gid)>,
     rows: Rows,
+    /// Whether each entity looked at is deleted or owned by one that is. Valid until groups merge.
+    dead: BTreeMap<(usize, Gid), bool>,
 }
 
 type Rows = BTreeMap<(usize, String), (Gid, bool)>;
@@ -175,6 +186,7 @@ impl Pass {
             clock,
             more: BTreeSet::new(),
             rows: Rows::new(),
+            dead: BTreeMap::new(),
         }
     }
 
@@ -656,7 +668,10 @@ impl Replica {
                         self.join(&mut tx, idx, change.gid, *other, &mut pass)
                             .await?
                     }
-                    None => union(&mut tx, change.gid, *other).await?.is_some(),
+                    None => {
+                        pass.dead.clear();
+                        union(&mut tx, change.gid, *other).await?.is_some()
+                    }
                 };
                 applied.accepted += usize::from(joined);
                 continue;
@@ -873,6 +888,7 @@ impl Replica {
         let Some(canon) = union(conn, a, b).await? else {
             return Ok(false);
         };
+        pass.dead.clear();
         pass.more.insert((idx, canon));
         let c = &self.registry.collections()[idx];
         let Key::Minted { column } = &c.key else {
@@ -990,6 +1006,7 @@ impl Replica {
         conn: &mut SqliteConnection,
         field: &Field,
         shared: &Value,
+        pass: &mut Pass,
     ) -> Result<Local> {
         match (&field.kind, shared) {
             (Kind::Plain, Value::Ref(_)) => Ok(Local::Value(Value::Null)),
@@ -1003,56 +1020,84 @@ impl Replica {
                 )
                 .await?;
                 let local = rows.into_iter().next().and_then(|mut row| row.pop());
-                let dead = match self.registry.index(collection) {
-                    Some(target) => self.dead(conn, target, canon, 0).await?,
-                    None => false,
+                let fate = match self.registry.index(collection) {
+                    Some(target) => self.fate(conn, target, canon, pass).await?,
+                    None => Fate::Alive,
                 };
-                Ok(match (dead, local) {
-                    (true, local) => Local::Gone(local.unwrap_or(Value::Null)),
-                    (false, Some(local)) => Local::Value(local),
-                    (false, None) => Local::Unknown,
+                Ok(match (fate, local) {
+                    (Fate::Undecided, _) => Local::Undecided,
+                    (Fate::Dead, local) => Local::Gone(local.unwrap_or(Value::Null)),
+                    (Fate::Alive, Some(local)) => Local::Value(local),
+                    (Fate::Alive, None) => Local::Unknown,
                 })
             }
             (Kind::Ref { .. }, _) => Ok(Local::Value(Value::Null)),
         }
     }
 
-    /// Whether an entity's merged state has no row: it is deleted, or an owner of it is.
-    fn dead<'a>(
-        &'a self,
-        conn: &'a mut SqliteConnection,
+    /// Whether an entity's merged state has no row: it is deleted, or something it is owned by,
+    /// directly or through other owners, is. Each entity in the owner graph is looked at once,
+    /// and answers are kept for the rest of the pass. A graph too deep or too wide to finish is
+    /// left undecided, so the entity waits rather than being removed on a guess.
+    async fn fate(
+        &self,
+        conn: &mut SqliteConnection,
         idx: usize,
         gid: Gid,
-        depth: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(async move {
-            let c = &self.registry.collections()[idx];
-            let group = self.group(conn, c, gid).await?;
-            if is_deleted(&group.merged) {
-                return Ok(true);
-            }
-            if depth >= OWNER_DEPTH {
-                return Ok(false);
-            }
-            for field in &c.fields {
-                if !c.owns_through(field) {
-                    continue;
+        pass: &mut Pass,
+    ) -> Result<Fate> {
+        let start = (idx, canon_of(conn, gid).await?);
+        if let Some(&dead) = pass.dead.get(&start) {
+            return Ok(if dead { Fate::Dead } else { Fate::Alive });
+        }
+        let mut seen = BTreeSet::from([start]);
+        let mut frontier = vec![start];
+        for _ in 0..=OWNER_DEPTH {
+            if frontier.is_empty() {
+                for entity in seen {
+                    pass.dead.insert(entity, false);
                 }
-                let (Kind::Ref { collection, .. }, Some((Value::Ref(target), _))) =
-                    (&field.kind, group.merged.get(&field.name))
-                else {
-                    continue;
-                };
-                let Some(t) = self.registry.index(collection) else {
-                    continue;
-                };
-                let target = canon_of(conn, *target).await?;
-                if self.dead(conn, t, target, depth + 1).await? {
-                    return Ok(true);
+                return Ok(Fate::Alive);
+            }
+            let mut next = Vec::new();
+            for (i, g) in frontier {
+                match pass.dead.get(&(i, g)) {
+                    Some(true) => {
+                        pass.dead.insert(start, true);
+                        return Ok(Fate::Dead);
+                    }
+                    Some(false) => continue,
+                    None => {}
+                }
+                let c = &self.registry.collections()[i];
+                let group = self.group(conn, c, g).await?;
+                if is_deleted(&group.merged) {
+                    pass.dead.insert((i, g), true);
+                    pass.dead.insert(start, true);
+                    return Ok(Fate::Dead);
+                }
+                for field in c.fields.iter().filter(|f| c.owns_through(f)) {
+                    let (Kind::Ref { collection, .. }, Some((Value::Ref(target), _))) =
+                        (&field.kind, group.merged.get(&field.name))
+                    else {
+                        continue;
+                    };
+                    let Some(t) = self.registry.index(collection) else {
+                        continue;
+                    };
+                    let owner = (t, canon_of(conn, *target).await?);
+                    if seen.insert(owner) {
+                        if seen.len() > OWNER_LIMIT {
+                            return Ok(Fate::Undecided);
+                        }
+                        next.push(owner);
+                    }
                 }
             }
-            Ok(false)
-        })
+            next.sort();
+            frontier = next;
+        }
+        Ok(Fate::Undecided)
     }
 
     /// Removes an entity's row. Rows the removal cascaded to or nulled are brought in line again,
@@ -1209,6 +1254,7 @@ impl Replica {
                 && has_shadow(conn, other).await?
                 && let Some(canon) = union(conn, gid, other).await?
             {
+                pass.dead.clear();
                 pass.more.insert((idx, canon));
             }
         }
@@ -1271,9 +1317,11 @@ impl Replica {
                     for name in identity {
                         let local = match (theirs.merged.get(name), c.field_index(name)) {
                             (Some((shared, _)), Some(i)) => {
-                                match self.to_local(conn, &c.fields[i], shared).await? {
+                                match self.to_local(conn, &c.fields[i], shared, pass).await? {
                                     Local::Value(value) => value,
-                                    Local::Gone(_) | Local::Unknown => Value::Null,
+                                    Local::Gone(_) | Local::Unknown | Local::Undecided => {
+                                        Value::Null
+                                    }
                                 }
                             }
                             _ => Value::Null,
@@ -1656,7 +1704,8 @@ impl Replica {
                 let Some((shared, _)) = merged.get(&field.name) else {
                     continue;
                 };
-                match self.to_local(conn, field, shared).await? {
+                match self.to_local(conn, field, shared, pass).await? {
+                    Local::Undecided => return Ok(Outcome::Waiting),
                     Local::Value(value) => columns.push((field, value)),
                     Local::Gone(local) => {
                         orphaned |= c.owns_through(field);

@@ -125,20 +125,30 @@ struct Peer {
 
 impl Peer {
     async fn bare() -> Peer {
+        Peer::bare_with(SCHEMA, registry()).await
+    }
+
+    async fn bare_with(schema: &[&str], registry: Registry) -> Peer {
         let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .foreign_keys(true)
             .connect()
             .await
             .unwrap();
-        for sql in SCHEMA {
+        for sql in schema {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
         Peer {
             conn,
-            replica: Replica::new(registry()),
+            replica: Replica::new(registry),
             cursor: 0,
         }
+    }
+
+    async fn with(schema: &[&str], registry: Registry) -> Peer {
+        let mut peer = Peer::bare_with(schema, registry).await;
+        peer.install().await;
+        peer
     }
 
     async fn new() -> Peer {
@@ -829,6 +839,60 @@ async fn an_identity_of_several_fields_with_an_owner_is_matched_under_the_same_o
     let marks: Vec<&String> = state.iter().filter(|l| l.starts_with("mark ")).collect();
     assert_eq!(marks.len(), 3, "{state:#?}");
     assert_eq!(peers[0].lines(ALIASES).await.len(), 2);
+}
+
+#[tokio::test]
+async fn an_owner_graph_with_many_paths_is_walked_once() {
+    // Each part is owned by both parts of the level above, so a part deep down has 2^depth
+    // chains of owners up to the top.
+    const LEVELS: i64 = 40;
+    let schema = ["CREATE TABLE parts (
+        id INTEGER PRIMARY KEY,
+        a INTEGER REFERENCES parts(id) ON DELETE CASCADE,
+        b INTEGER REFERENCES parts(id) ON DELETE CASCADE)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("parts", "parts", "id")
+                .owner("a", "parts")
+                .owner("b", "parts"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+    ];
+    peers[0].run("INSERT INTO parts (id) VALUES (1), (2)").await;
+    for level in 1..LEVELS {
+        let (top, up) = (2 * level + 1, 2 * level - 1);
+        peers[0]
+            .run(&format!(
+                "INSERT INTO parts (id, a, b) VALUES ({top}, {up}, {}), ({}, {up}, {})",
+                up + 1,
+                top + 1,
+                up + 1
+            ))
+            .await;
+    }
+    let started = std::time::Instant::now();
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        count(&mut peers[1], "SELECT count(*) FROM parts").await,
+        2 * LEVELS
+    );
+
+    // Deleting one part at the top takes every part below it, since each is owned by it.
+    peers[0].run("DELETE FROM parts WHERE id = 1").await;
+    settle(&mut peers, &mut hub).await;
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM parts").await, 1);
+        assert_eq!(count(peer, "SELECT count(*) FROM fongo_pending").await, 0);
+    }
+    let kept = peers[0].gid("parts", 2).await;
+    let row = count(&mut peers[1], "SELECT id FROM parts").await;
+    assert_eq!(peers[1].gid("parts", row).await, kept);
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
