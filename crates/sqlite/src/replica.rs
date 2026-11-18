@@ -61,6 +61,19 @@ pub struct Applied {
     /// Entities held back because a row they need has not arrived or a constraint refused them.
     /// They are retried on every later apply.
     pub waiting: usize,
+    /// The rows this apply wrote or removed, by collection in registry order, then by key.
+    pub touched: Vec<Touched>,
+}
+
+/// A row an apply wrote or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Touched {
+    pub collection: String,
+    /// The row's key as the JSON array the change-capture triggers record: `[7]` for a minted
+    /// row, the key fields in order for a natural one.
+    pub key: String,
+    pub gid: Gid,
+    pub deleted: bool,
 }
 
 enum Outcome {
@@ -97,6 +110,23 @@ struct Pass {
     clock: Clock,
     /// Entities a merge of identities touched, to be brought in line before the round ends.
     more: BTreeSet<(usize, Gid)>,
+    rows: Rows,
+}
+
+type Rows = BTreeMap<(usize, String), (Gid, bool)>;
+
+impl Pass {
+    fn new(clock: Clock) -> Pass {
+        Pass {
+            clock,
+            more: BTreeSet::new(),
+            rows: Rows::new(),
+        }
+    }
+
+    fn touch(&mut self, idx: usize, key: String, gid: Gid, deleted: bool) {
+        self.rows.insert((idx, key), (gid, deleted));
+    }
 }
 
 /// One database's side of a synced library.
@@ -549,7 +579,7 @@ impl Replica {
     /// many changes were produced.
     pub async fn collect(&self, conn: &mut SqliteConnection) -> Result<usize> {
         let mut tx = conn.begin().await?;
-        let produced = self.collect_in(&mut tx).await?;
+        let (produced, _) = self.collect_in(&mut tx).await?;
         tx.commit().await?;
         Ok(produced)
     }
@@ -592,11 +622,9 @@ impl Replica {
     /// writes are collected first, so each has a clock to be compared by.
     pub async fn apply(&self, conn: &mut SqliteConnection, changes: &[Change]) -> Result<Applied> {
         let mut tx = conn.begin().await?;
-        self.collect_in(&mut tx).await?;
-        let mut pass = Pass {
-            clock: load_clock(&mut tx).await?,
-            more: BTreeSet::new(),
-        };
+        let (_, rows) = self.collect_in(&mut tx).await?;
+        let mut pass = Pass::new(load_clock(&mut tx).await?);
+        pass.rows = rows;
         set_applying(&mut tx, true).await?;
 
         let mut applied = Applied::default();
@@ -645,6 +673,17 @@ impl Replica {
         set_applying(&mut tx, false).await?;
         save_clock(&mut tx, &pass.clock).await?;
         tx.commit().await?;
+        let collections = self.registry.collections();
+        applied.touched = pass
+            .rows
+            .into_iter()
+            .map(|((idx, key), (gid, deleted))| Touched {
+                collection: collections[idx].name.clone(),
+                key,
+                gid,
+                deleted,
+            })
+            .collect();
         Ok(applied)
     }
 
@@ -676,7 +715,7 @@ impl Replica {
                         progressed = true;
                         // Before the next insert can be handed a local id the cascade just freed.
                         if deleted {
-                            self.forget_cascaded(conn).await?;
+                            self.forget_cascaded(conn, pass).await?;
                         }
                     }
                     Outcome::Waiting => {
@@ -766,7 +805,7 @@ impl Replica {
         rows.sort_by_key(|(gid, _)| (*gid != canon, *gid));
         if let Some(((_, keep), losers)) = rows.split_first() {
             for (_, lose) in losers {
-                self.repoint(conn, c, lose, keep).await?;
+                self.repoint(conn, c, lose, keep, pass).await?;
                 exec(
                     conn,
                     &format!(
@@ -783,9 +822,10 @@ impl Replica {
                     &[Value::Text(c.name.clone()), Value::Text(lose.clone())],
                 )
                 .await?;
+                pass.touch(idx, lose.clone(), canon, true);
             }
             if !losers.is_empty() {
-                self.forget_cascaded(conn).await?;
+                self.forget_cascaded(conn, pass).await?;
             }
             // Lookups by gid in fongo_ids expect only a group's smallest id there.
             exec(
@@ -852,7 +892,11 @@ impl Replica {
         c: &Collection,
         lose: &str,
         keep: &str,
+        pass: &mut Pass,
     ) -> Result<()> {
+        for (d_idx, key, gid) in self.dependents(conn, c, lose).await? {
+            pass.touch(d_idx, key, gid, true);
+        }
         for d in self.registry.collections() {
             for f in &d.fields {
                 if !matches!(&f.kind, Kind::Ref { collection, .. } if *collection == c.name) {
@@ -995,7 +1039,7 @@ impl Replica {
                     .iter()
                     .map(|f| format!("{} = NULL", quoted(f)))
                     .collect();
-                exec(
+                let cleared = exec(
                     conn,
                     &format!(
                         "UPDATE OR IGNORE {} SET {} WHERE {} = json_extract(?1, '$[0]')",
@@ -1003,9 +1047,12 @@ impl Replica {
                         cleared.join(", "),
                         quoted(column)
                     ),
-                    &[Value::Text(key)],
+                    &[Value::Text(key.clone())],
                 )
                 .await?;
+                if cleared > 0 {
+                    pass.touch(idx, key, other, false);
+                }
                 pass.more.insert((idx, other));
             }
         }
@@ -1121,7 +1168,9 @@ impl Replica {
         Ok(Some(derived))
     }
 
-    async fn collect_in(&self, conn: &mut SqliteConnection) -> Result<usize> {
+    /// Returns how many changes were produced, and the rows written while putting back local
+    /// writes their field's strategy refused.
+    async fn collect_in(&self, conn: &mut SqliteConnection) -> Result<(usize, Rows)> {
         // A write first, so the transaction holds the write lock before it reads what to do.
         exec(
             conn,
@@ -1136,7 +1185,7 @@ impl Replica {
         )
         .await?;
         if rows.is_empty() {
-            return Ok(0);
+            return Ok((0, Rows::new()));
         }
         let mut entries = Vec::new();
         for row in &rows {
@@ -1154,10 +1203,7 @@ impl Replica {
             });
         }
         let collections = self.registry.collections();
-        let mut pass = Pass {
-            clock: load_clock(conn).await?,
-            more: BTreeSet::new(),
-        };
+        let mut pass = Pass::new(load_clock(conn).await?);
 
         // Natural ids of rows that went away are derived before any minted id below is retired.
         let mut tombstones: Vec<(usize, Gid, u64)> = Vec::new();
@@ -1277,7 +1323,7 @@ impl Replica {
             set_applying(conn, false).await?;
         }
         save_clock(conn, &pass.clock).await?;
-        Ok(produced)
+        Ok((produced, pass.rows))
     }
 
     /// Makes one entity's row match the merged state of its group.
@@ -1338,6 +1384,7 @@ impl Replica {
                 continue;
             }
 
+            let mut written_key: Option<String> = None;
             let written = match &c.key {
                 Key::Minted { column } => {
                     let rows = query(
@@ -1346,16 +1393,18 @@ impl Replica {
                         &[Value::Ref(canon)],
                     )
                     .await?;
-                    let key = rows.first().map(|row| row[0].clone());
+                    let key = rows.first().map(|row| as_text(&row[0])).transpose()?;
+                    let key = key.map(str::to_string);
                     if deleted {
                         if let Some(key) = key {
-                            exec(
+                            let doomed = self.dependents(conn, c, &key).await?;
+                            let removed = exec(
                                 conn,
                                 &format!(
                                     "DELETE FROM {table} WHERE {} = json_extract(?1, '$[0]')",
                                     quoted(column)
                                 ),
-                                &[key],
+                                &[Value::Text(key.clone())],
                             )
                             .await?;
                             exec(
@@ -1364,19 +1413,29 @@ impl Replica {
                                 &[Value::Ref(canon)],
                             )
                             .await?;
+                            if removed > 0 {
+                                pass.touch(idx, key, canon, true);
+                            }
+                            for (d_idx, d_key, d_gid) in doomed {
+                                let d = &self.registry.collections()[d_idx];
+                                if !self.row_exists(conn, d, &d_key).await? {
+                                    pass.touch(d_idx, d_key, d_gid, true);
+                                }
+                            }
                         }
                         return Ok(Outcome::Settled { deleted: true });
                     }
                     match key {
                         Some(_) if columns.is_empty() => Ok(0),
                         Some(key) => {
+                            written_key = Some(key.clone());
                             let sets: Vec<String> = columns
                                 .iter()
                                 .map(|(f, _)| format!("{} = ?", quoted(&f.name)))
                                 .collect();
                             let mut params: Vec<Value> =
                                 columns.iter().map(|(_, v)| v.clone()).collect();
-                            params.push(key);
+                            params.push(Value::Text(key));
                             exec(
                                 conn,
                                 &format!(
@@ -1391,13 +1450,25 @@ impl Replica {
                         None => {
                             let inserted = self.insert(conn, c, &columns).await;
                             if inserted.is_ok() {
-                                exec(
-                                    conn,
-                                    "INSERT INTO fongo_ids (collection, key, gid)
-                                     VALUES (?, json_array(last_insert_rowid()), ?)",
-                                    &[Value::Text(c.name.clone()), Value::Ref(canon)],
-                                )
-                                .await?;
+                                let key =
+                                    query(conn, "SELECT json_array(last_insert_rowid())", &[])
+                                        .await?
+                                        .first()
+                                        .map(|row| as_text(&row[0]).map(str::to_string))
+                                        .transpose()?;
+                                if let Some(key) = &key {
+                                    exec(
+                                        conn,
+                                        "INSERT INTO fongo_ids (collection, key, gid) VALUES (?, ?, ?)",
+                                        &[
+                                            Value::Text(c.name.clone()),
+                                            Value::Text(key.clone()),
+                                            Value::Ref(canon),
+                                        ],
+                                    )
+                                    .await?;
+                                }
+                                written_key = key;
                             }
                             inserted
                         }
@@ -1417,10 +1488,24 @@ impl Replica {
                         .map(|k| format!("{} = ?", quoted(k)))
                         .collect();
                     let matches = matches.join(" AND ");
+                    let marks = vec!["?"; key.len()].join(", ");
+                    let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
+                    let json = json
+                        .first()
+                        .map(|row| as_text(&row[0]).map(str::to_string))
+                        .transpose()?;
                     if deleted {
-                        exec(conn, &format!("DELETE FROM {table} WHERE {matches}"), &key).await?;
+                        let removed =
+                            exec(conn, &format!("DELETE FROM {table} WHERE {matches}"), &key)
+                                .await?;
+                        if let Some(json) = json
+                            && removed > 0
+                        {
+                            pass.touch(idx, json, canon, true);
+                        }
                         return Ok(Outcome::Settled { deleted: true });
                     }
+                    written_key = json;
                     let exists = !query(
                         conn,
                         &format!("SELECT 1 FROM {table} WHERE {matches}"),
@@ -1456,6 +1541,11 @@ impl Replica {
                 }
             };
 
+            if let (Ok(n), Some(key)) = (&written, written_key)
+                && *n > 0
+            {
+                pass.touch(idx, key, canon, false);
+            }
             return match written {
                 Ok(_) if unresolved => Ok(Outcome::Waiting),
                 Ok(_) => Ok(Outcome::Settled { deleted: false }),
@@ -1491,15 +1581,15 @@ impl Replica {
 
     /// Applying a delete can cascade to rows the triggers were told not to watch. Their ids are
     /// dropped so a reused local id is never mistaken for the old entity.
-    async fn forget_cascaded(&self, conn: &mut SqliteConnection) -> Result<()> {
-        for c in self.registry.collections() {
+    async fn forget_cascaded(&self, conn: &mut SqliteConnection, pass: &mut Pass) -> Result<()> {
+        for (idx, c) in self.registry.collections().iter().enumerate() {
             let Key::Minted { column } = &c.key else {
                 continue;
             };
-            exec(
+            let gone = query(
                 conn,
                 &format!(
-                    "DELETE FROM fongo_ids WHERE collection = ?1 AND NOT EXISTS (
+                    "SELECT key, gid FROM fongo_ids WHERE collection = ?1 AND NOT EXISTS (
                         SELECT 1 FROM {} WHERE {} = json_extract(fongo_ids.key, '$[0]'))",
                     quoted(&c.table),
                     quoted(column)
@@ -1507,7 +1597,75 @@ impl Replica {
                 &[Value::Text(c.name.clone())],
             )
             .await?;
+            for row in gone {
+                let gid = as_gid(&row[1])?;
+                pass.touch(idx, as_text(&row[0])?.to_string(), gid, true);
+                exec(
+                    conn,
+                    "DELETE FROM fongo_ids WHERE gid = ?",
+                    &[Value::Ref(gid)],
+                )
+                .await?;
+            }
         }
         Ok(())
+    }
+
+    /// The natural-key rows that hold minted row `key` of `c` in their key, so go with it.
+    async fn dependents(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        key: &str,
+    ) -> Result<Vec<(usize, String, Gid)>> {
+        let mut found = Vec::new();
+        for (idx, d) in self.registry.collections().iter().enumerate() {
+            let Key::Natural { fields } = &d.key else {
+                continue;
+            };
+            for f in d.fields.iter().filter(|f| fields.contains(&f.name)) {
+                if !matches!(&f.kind, Kind::Ref { collection, .. } if *collection == c.name) {
+                    continue;
+                }
+                let columns: Vec<String> = fields.iter().map(|k| quoted(k)).collect();
+                let rows = query(
+                    conn,
+                    &format!(
+                        "SELECT json_array({}) FROM {} WHERE {} = json_extract(?1, '$[0]')",
+                        columns.join(", "),
+                        quoted(&d.table),
+                        quoted(&f.name)
+                    ),
+                    &[Value::Text(key.into())],
+                )
+                .await?;
+                for row in rows {
+                    let key = as_text(&row[0])?.to_string();
+                    if let Some(gid) = self.gone_natural_gid(conn, d, fields, &key).await? {
+                        found.push((idx, key, gid));
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn row_exists(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        key: &str,
+    ) -> Result<bool> {
+        let rows = query(
+            conn,
+            &format!(
+                "SELECT 1 FROM {} WHERE {}",
+                quoted(&c.table),
+                where_key_json(c)
+            ),
+            &[Value::Text(key.into())],
+        )
+        .await?;
+        Ok(!rows.is_empty())
     }
 }

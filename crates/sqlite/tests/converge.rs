@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use fongo_sync_sqlite::core::{Change, Strategy as Merge};
-use fongo_sync_sqlite::{Collection, Registry, Replica};
+use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
+use fongo_sync_sqlite::{Applied, Collection, Registry, Replica};
 use proptest::prelude::*;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -148,7 +148,7 @@ impl Peer {
 
     /// Sends local changes to the hub, then takes everything the hub has that this peer has not
     /// seen, its own changes included.
-    async fn sync(&mut self, hub: &mut Vec<Change>) {
+    async fn sync(&mut self, hub: &mut Vec<Change>) -> Applied {
         self.replica.collect(&mut self.conn).await.unwrap();
         let outbox = self.replica.outbox(&mut self.conn, 100_000).await.unwrap();
         hub.extend(outbox.changes);
@@ -156,11 +156,18 @@ impl Peer {
             .acknowledge(&mut self.conn, outbox.through)
             .await
             .unwrap();
-        self.replica
+        let applied = self
+            .replica
             .apply(&mut self.conn, &hub[self.cursor..])
             .await
             .unwrap();
         self.cursor = hub.len();
+        applied
+    }
+
+    async fn gid(&mut self, collection: &str, id: i64) -> Gid {
+        let gid = self.replica.gid_of(&mut self.conn, collection, id).await;
+        gid.unwrap().unwrap()
     }
 
     async fn lines(&mut self, sql: &str) -> Vec<String> {
@@ -588,6 +595,105 @@ async fn a_row_that_is_only_out_of_date_is_not_mistaken_for_the_same_entity() {
     let state = assert_converged(&mut peers).await;
     assert_eq!(state.len(), 2, "{state:#?}");
     assert!(peers[0].lines(ALIASES).await.is_empty());
+}
+
+fn touched(applied: &Applied) -> Vec<(&str, &str, Gid, bool)> {
+    applied
+        .touched
+        .iter()
+        .map(|t| (t.collection.as_str(), t.key.as_str(), t.gid, t.deleted))
+        .collect()
+}
+
+#[tokio::test]
+async fn apply_reports_each_row_it_wrote_or_removed() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'slow start')")
+        .await;
+    peers[0]
+        .run("INSERT INTO tags (book_id, tag) VALUES (1, 'classic')")
+        .await;
+    assert!(touched(&peers[0].sync(&mut hub).await).is_empty());
+    let book = peers[0].gid("books", 1).await;
+    let note = peers[0].gid("notes", 1).await;
+    let tag = Gid::derive("tags", &[Value::Ref(book), Value::Text("classic".into())]);
+
+    let applied = peers[1].sync(&mut hub).await;
+    assert_eq!(
+        touched(&applied),
+        vec![
+            ("books", "[1]", book, false),
+            ("notes", "[1]", note, false),
+            ("tags", "[1,\"classic\"]", tag, false),
+        ]
+    );
+
+    peers[0].run("UPDATE books SET year = 1871").await;
+    peers[0].sync(&mut hub).await;
+    let applied = peers[1].sync(&mut hub).await;
+    assert_eq!(touched(&applied), vec![("books", "[1]", book, false)]);
+
+    // What the database removes along with the book is reported too.
+    peers[0].run("DELETE FROM books").await;
+    peers[0].sync(&mut hub).await;
+    let applied = peers[1].sync(&mut hub).await;
+    assert_eq!(
+        touched(&applied),
+        vec![
+            ("books", "[1]", book, true),
+            ("notes", "[1]", note, true),
+            ("tags", "[1,\"classic\"]", tag, true),
+        ]
+    );
+    assert!(touched(&peers[0].sync(&mut hub).await).is_empty());
+}
+
+#[tokio::test]
+async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+    peers[1].run("INSERT INTO books (title) VALUES ('b')").await;
+    peers[1].sync(&mut hub).await;
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('a', '9780141439549')")
+        .await;
+    peers[0].sync(&mut hub).await;
+    // The third replica holds both books as two rows, and lends the one without an isbn.
+    peers[2].sync(&mut hub).await;
+    peers[2]
+        .run("INSERT INTO loans (book_id, borrower) SELECT id, 'Celia' FROM books WHERE isbn IS NULL")
+        .await;
+
+    // The second replica gives its book the same isbn before it has seen the first's.
+    peers[1]
+        .run("UPDATE books SET isbn = '9780141439549'")
+        .await;
+    peers[1].sync(&mut hub).await;
+    peers[1].sync(&mut hub).await;
+    let applied = peers[2].sync(&mut hub).await;
+
+    let rows = touched(&applied);
+    let books: Vec<_> = rows.iter().filter(|r| r.0 == "books").collect();
+    assert_eq!(books.len(), 2, "{rows:#?}");
+    assert_eq!(books[0].2, books[1].2, "{rows:#?}");
+    assert_ne!(books[0].3, books[1].3, "{rows:#?}");
+    let kept: i64 = count(&mut peers[2], "SELECT id FROM books").await;
+    assert!(rows.contains(&("books", &format!("[{kept}]"), books[0].2, false)));
+    let loan = peers[2].gid("loans", 1).await;
+    assert!(rows.contains(&("loans", "[1]", loan, false)), "{rows:#?}");
+    assert_eq!(
+        count(&mut peers[2], "SELECT book_id FROM loans").await,
+        kept
+    );
+
+    settle(&mut peers, &mut hub).await;
+    let state = assert_converged(&mut peers).await;
+    assert_eq!(state.len(), 2, "{state:#?}");
 }
 
 #[derive(Debug, Clone)]
