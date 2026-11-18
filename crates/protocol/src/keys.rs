@@ -144,6 +144,14 @@ pub fn random_nonce() -> Result<[u8; 24], getrandom::Error> {
     Ok(nonce)
 }
 
+/// A random nonce for `sign_request`.
+#[cfg(feature = "rand")]
+pub fn random_request_nonce() -> Result<[u8; 16], getrandom::Error> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)?;
+    Ok(nonce)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +198,9 @@ mod tests {
             generate_signing_key().unwrap().to_bytes()
         );
         assert_ne!(random_nonce().unwrap(), random_nonce().unwrap());
+        assert_ne!(
+            random_request_nonce().unwrap(),
+            random_request_nonce().unwrap()
+        );
     }
 }

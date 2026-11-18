@@ -2,6 +2,7 @@
 //! deployed peer, so it needs a new format version, not an updated expectation.
 
 use fongo_sync_core::{Change, Gid, Hlc, Value};
+use fongo_sync_protocol::api::{Notification, ReadBatches};
 use fongo_sync_protocol::{
     DeviceId, LibraryId, LibraryKeys, SigningKey, encode_batch, seal, sign_request,
 };
@@ -54,6 +55,7 @@ fn the_wire_formats_do_not_drift() {
         "/v1/libraries/x/batches",
         b"body",
         1_700_000_000,
+        [6; 16],
     );
     let actual = [
         hex(&Sha256::digest(&batch)),
@@ -62,14 +64,22 @@ fn the_wire_formats_do_not_drift() {
         hex(&keys().recovery_signing_key().verifying_key().to_bytes()),
         hex(&request.signature.to_bytes()),
         keys().recovery_code(),
+        hex(&Notification { seq: 258 }.encode()),
+        ReadBatches {
+            after: 7,
+            limit: Some(100),
+        }
+        .target(keys().id),
     ];
     let expected = [
         "d9d01f5bc57e59bbb09610f48d56c58720278eec709066af48bcd1cbc9951d63",
         "bf270a22258467f3e155269816704a8f61474226b6decbcabb820df2cab3e7df",
         "b62e867fa2f33afe62d5d6b1642e1621",
         "9f6af73fffee10125a8b522b998d162a26d8916e71ed9682cd189744797c040c",
-        "70dd12c4be795c0e9f6feb0113501114fc3ae157800a4f98060b58c7b72306c120439f58fdd6751e05607305e087954764e83f091b234fbaf9811ed36a95cf04",
+        "c00ce7d98565c00019243c37dfc032cd88684527005030e6e993dab6a5128d12270659ad04db71cecf55f2359dbda355e218feb83b529beeb6bc1c60d78be305",
         "040G2-08104-0G208-1040G-20810-40G40-G2081-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040MW-ZXCD0",
+        "010000000000000102",
+        "/v1/libraries/01010101010101010101010101010101/batches?after=7&limit=100",
     ];
     assert_eq!(actual, expected);
 }

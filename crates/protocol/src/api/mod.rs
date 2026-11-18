@@ -1,8 +1,17 @@
-//! Control-plane messages, sent as JSON, and the paths they go to. Every request except
-//! `GET` [`CAPABILITIES_PATH`] carries [`RequestAuth`](crate::RequestAuth) headers.
+//! Control-plane messages, sent as JSON, the paths they go to, the error vocabulary and the
+//! change notification. Every request except `GET` [`CAPABILITIES_PATH`] carries
+//! [`RequestAuth`](crate::RequestAuth) headers.
+
+mod error;
+mod notify;
+mod route;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+
+pub use error::{ErrorBody, ErrorCode};
+pub use notify::{NOTIFICATION_FORMAT, Notification};
+pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
 use crate::keys::LibraryId;
@@ -16,6 +25,9 @@ pub const LIBRARIES_PATH: &str = "/v1/libraries";
 pub const DEVICES_PATH: &str = "/v1/libraries/{library}/devices";
 /// `POST` envelope bytes: [`Appended`]. `GET` with [`ReadBatches`] as the query: a [`BatchPage`].
 pub const BATCHES_PATH: &str = "/v1/libraries/{library}/batches";
+/// `GET` upgraded to a WebSocket: a stream of [`Notification`]s. Offered when
+/// [`Capabilities::notifications`] is true.
+pub const NOTIFICATIONS_PATH: &str = "/v1/libraries/{library}/notifications";
 
 /// Content type of envelope request bodies and [`BatchPage`] responses.
 pub const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -34,17 +46,35 @@ pub fn batches_path(library: LibraryId) -> String {
     BATCHES_PATH.replace("{library}", &library.to_hex())
 }
 
+/// [`NOTIFICATIONS_PATH`] for one library.
+pub fn notifications_path(library: LibraryId) -> String {
+    NOTIFICATIONS_PATH.replace("{library}", &library.to_hex())
+}
+
 /// What a server offers. Absent quotas are unlimited or undisclosed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub protocol_version: u32,
     pub blobs: bool,
+    /// Whether [`NOTIFICATIONS_PATH`] is served.
+    pub notifications: bool,
+    /// How far a request timestamp may be from the server's clock, either side, in seconds.
+    pub skew_secs: u64,
+    /// Largest envelope accepted, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_bytes: Option<u64>,
+    /// Largest total of stored envelope bytes per library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_library_bytes: Option<u64>,
+    /// Most devices per library, not counting the recovery key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_devices: Option<u32>,
+    /// Most envelopes in one [`BatchPage`], whatever `limit` asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_page_batches: Option<u32>,
+    /// Most envelope bytes in one [`BatchPage`]; a single larger envelope still comes alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_page_bytes: Option<u64>,
 }
 
 /// Registers a library with its first device and its recovery key. The server must refuse an id
@@ -126,7 +156,9 @@ pub struct Appended {
     pub seq: u64,
 }
 
-/// Query of a batch read: envelopes with sequence numbers greater than `after`, oldest first.
+/// Query of a batch read: envelopes with sequence numbers greater than `after`, oldest first, at
+/// most `limit` of them (at least 1). Sent as [`ReadBatches::to_query`] and read with
+/// [`ReadBatches::parse_query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadBatches {
     pub after: u64,
@@ -221,13 +253,24 @@ mod tests {
         let caps = Capabilities {
             protocol_version: 1,
             blobs: false,
+            notifications: true,
+            skew_secs: 300,
             max_batch_bytes: Some(10),
             max_library_bytes: None,
             max_devices: None,
+            max_page_batches: Some(256),
+            max_page_bytes: None,
         };
         assert_eq!(
             serde_json::to_value(&caps).unwrap(),
-            json!({"protocol_version": 1, "blobs": false, "max_batch_bytes": 10})
+            json!({
+                "protocol_version": 1,
+                "blobs": false,
+                "notifications": true,
+                "skew_secs": 300,
+                "max_batch_bytes": 10,
+                "max_page_batches": 256,
+            })
         );
         let key = SigningKey::from_bytes(&[1; 32]).verifying_key();
         let add = AddDevice { device_key: key };
@@ -256,6 +299,10 @@ mod tests {
         assert_eq!(
             devices_path(id),
             format!("/v1/libraries/{}/devices", "ab".repeat(16))
+        );
+        assert_eq!(
+            notifications_path(id),
+            format!("/v1/libraries/{}/notifications", "ab".repeat(16))
         );
     }
 
