@@ -1,9 +1,8 @@
-.PHONY: check fmt-check lint test wasm proof verdict lean
+.PHONY: check fmt-check lint test wasm lean
 
-BEND := $(shell command -v bend || echo $(HOME)/.bend/bin/bend)
 LAKE := $(shell command -v lake || echo $(HOME)/.elan/bin/lake)
 
-check: fmt-check lint test wasm proof
+check: fmt-check lint test wasm lean
 
 fmt-check:
 	cargo fmt --all --check
@@ -17,10 +16,7 @@ test:
 wasm:
 	cargo build -p fongo-sync-protocol --target wasm32-unknown-unknown --locked
 
-proof:
-	@$(BEND) PROOF.bend | tee /dev/stderr | grep -q '^ALL PROOFS CHECK'
-
-# Not part of `check`: it needs a Lean toolchain (see lean/lean-toolchain).
+# Builds the proofs in lean/ (toolchain in lean/lean-toolchain) and audits Laws.lean.
 lean:
 	cd lean && $(LAKE) build
 	@! grep -rnwE 'sorry|admit|axiom|native_decide' lean/FongoSync lean/FongoSync.lean
@@ -31,7 +27,3 @@ lean:
 	@cd lean && $(LAKE) env lean Audit.lean > .lake/axioms.txt && cat .lake/axioms.txt
 	@! grep -oE '\[.*\]' lean/.lake/axioms.txt | tr -d '[] ' | tr ',' '\n' \
 		| grep -vxE 'propext|Classical\.choice|Quot\.sound'
-
-# Rechecks the proofs with BendTT's kernel, which needs Lean on PATH.
-verdict:
-	@$(BEND) PROOF.bend --verdict | tee /dev/stderr | grep -q '^ALL PROOFS CHECK'
