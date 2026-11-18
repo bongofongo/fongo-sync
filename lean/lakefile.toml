@@ -1,0 +1,8 @@
+name = "fongo-sync-model"
+defaultTargets = ["FongoSync"]
+
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "FongoSync"
