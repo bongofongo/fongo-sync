@@ -178,7 +178,7 @@ theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
     view sc cs₁ = view sc cs₂ :=
   view_eq_of_mem_iff sc same unique
 
-/-! ## The view over several collections, with `together` sets -/
+/-! ## The view over several collections, with `together` sets and natural keys -/
 
 /-- **The view over several collections depends only on the set of changes**, given unique
 clocks per register. -/

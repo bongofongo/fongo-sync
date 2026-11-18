@@ -5,17 +5,21 @@ import FongoSync.View
 
 Closer to `model::view`: a schema of several collections, references and owners naming a target
 collection, the rule for which collection a gid belongs to, the changes ignored as invalid, and
-`together` field sets. Natural keys are not covered.
+`together` field sets, and natural keys.
 
 1. A change is ignored if its clock is not encodable, it is an alias whose value is not a
    reference to another gid, or its collection is unknown. Of the rest, a gid belongs to the
    collection of its change with the smallest clock, ties going to the smaller collection name,
-   and a change to that gid in another collection is ignored.
+   and a change to that gid in another collection is ignored. In a natural collection a gid is
+   verified if some key derives it: one value per key field, each written to that field, whose
+   `derive` is the gid. A change to a key field is ignored unless its value is part of that key.
 2. Each (collection, gid, field) holds the winner among its changes; `$deleted` and undeclared
    fields merge `Lww`.
-3. An alias whose target belongs to the same collection joins the two gids; the canonical gid of
-   a group is its smallest member.
-4. A member is live if it is not deleted and every owner field it holds is unset, null, or names
+3. An alias whose target belongs to the same collection joins the two gids, unless either is
+   unverified. Groups are also closed under natural keys that become equal once references are
+   read through groups: the least such grouping. The canonical gid of a group is its smallest
+   member.
+4. A member is live if it is verified, not deleted, and every owner field it holds is unset, null, or names
    a gid of the owner collection whose group has a live member: the least such set.
 5. A live group shows, for each field outside a `together` set, the strategy winner among its
    live members, and for each `together` set, the fields of the live member holding the latest
@@ -43,9 +47,13 @@ structure Collection where
   name : String
   fields : List Field
   together : List (List String)
+  /-- The key fields of a natural collection; `none` for a collection of minted gids. -/
+  natural : Option (List String)
 
+/-- `derive` is `Gid::derive`: the gid a natural collection's key names. -/
 structure Schema where
   collections : List Collection
+  derive : String → List Value → Gid
 
 def Schema.find (sc : Schema) (name : String) : Option Collection :=
   sc.collections.find? (·.name = name)
@@ -79,12 +87,8 @@ def aliasOk (c : Change Value) : Bool :=
     | _ => false
   else true
 
-section Inputs
-
-variable (sc : Schema) (cs : List (Change Value))
-
 /-- The changes not ignored outright. -/
-def candidates : List (Change Value) :=
+def candidates (sc : Schema) (cs : List (Change Value)) : List (Change Value) :=
   cs.filter fun c => decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome
 
 /-- Claims compare by clock, then collection name. -/
@@ -95,36 +99,117 @@ def claimCmp (a b : Hlc × String) : Ordering :=
 def claimFirst (a b : Hlc × String) : Ordering := claimCmp b a
 
 /-- The collection a gid belongs to: that of its change with the smallest claim. -/
-def home (g : Gid) : Option String :=
-  ((((candidates sc cs).filter (·.gid = g)).map fun c => (c.clock, c.collection)).foldl
+def home (_sc : Schema) (cs : List (Change Value)) (g : Gid) : Option String :=
+  (((cs.filter (·.gid = g)).map fun c => (c.clock, c.collection)).foldl
     (keep claimFirst id) none).map (·.2)
+
+section Inputs
+
+/-! In this section `cs` is a list of candidate changes. -/
+
+variable (sc : Schema) (cs : List (Change Value))
+
 
 /-- The changes that count: valid, and to the collection their gid belongs to. -/
 def claimed : List (Change Value) :=
-  (candidates sc cs).filter fun c => home sc cs c.gid = some c.collection
+  cs.filter fun c => home sc cs c.gid = some c.collection
 
-def registers : State Value :=
-  merged sc.strategyOf ((claimed sc cs).filter fun c => c.field ≠ ALIAS)
+/-- The collection a gid belongs to, as declared. -/
+def homeCollection (g : Gid) : Option Collection := (home sc cs g).bind sc.find
+
+/-- `k` derives `g`: one value per key field, each written to that field by a counted change to
+`g`, and `derive` of them is `g`. -/
+def Derives (g : Gid) (c : Collection) (fields : List String) (k : List Value) : Prop :=
+  k.length = fields.length ∧
+    (∀ p ∈ fields.zip k, ∃ x ∈ claimed sc cs, x.gid = g ∧ x.field = p.1 ∧ x.value = p.2) ∧
+    sc.derive c.name k = g
+
+/-- The key that derives a natural gid, if any. The Rust takes the first in sorted order; the two
+agree unless two keys derive one gid, which takes a hash collision. -/
+noncomputable def key (g : Gid) : Option (List Value) :=
+  match homeCollection sc cs g with
+  | some c =>
+    match c.natural with
+    | some fields => if h : ∃ k, Derives sc cs g c fields k then some (Classical.choose h) else none
+    | none => none
+  | none => none
+
+/-- A natural gid that no key derives yet. -/
+def Unverified (g : Gid) : Prop :=
+  ∃ c fields, homeCollection sc cs g = some c ∧ c.natural = some fields ∧ key sc cs g = none
+
+/-- A change to a key field counts only if its value is part of the key. -/
+noncomputable def keyFieldOk (x : Change Value) : Prop :=
+  match homeCollection sc cs x.gid with
+  | some c =>
+    match c.natural with
+    | some fields =>
+      match fields.findIdx? (· = x.field) with
+      | some i => ∃ k, key sc cs x.gid = some k ∧ k[i]? = some x.value
+      | none => True
+    | none => True
+  | none => True
+
+noncomputable def accepted : List (Change Value) :=
+  (claimed sc cs).filter fun x => decide (keyFieldOk sc cs x)
+
+noncomputable def registers : State Value :=
+  merged sc.strategyOf ((accepted sc cs).filter fun c => c.field ≠ ALIAS)
 
 /-- Every gid that belongs to a collection, ascending. -/
 def gids : List Gid := gidSet ((claimed sc cs).map (·.gid))
 
-/-- Every alias whose target belongs to the alias's own collection. -/
-def edges : List Edge :=
-  (claimed sc cs).filterMap fun c =>
+/-- Every alias between verified gids of one collection. -/
+noncomputable def edges : List Edge :=
+  (accepted sc cs).filterMap fun c =>
     if c.field = ALIAS then
       match c.value with
-      | .ref t => if home sc cs t = some c.collection then some (c.gid, t) else none
+      | .ref t =>
+        if home sc cs t = some c.collection ∧ ¬ Unverified sc cs c.gid ∧ ¬ Unverified sc cs t then
+          some (c.gid, t)
+        else none
       | _ => none
     else none
+
+/-- Two values agree once references are read through `R`. -/
+def SameUnder (R : Gid → Gid → Prop) (v w : Value) : Prop :=
+  v = w ∨ ∃ x y, v = .ref x ∧ w = .ref y ∧ R x y
+
+/-- `a` and `b` are verified gids of one natural collection whose keys agree under `R`. -/
+def KeyPair (R : Gid → Gid → Prop) (a b : Gid) : Prop :=
+  ∃ c fields, homeCollection sc cs a = some c ∧ c.natural = some fields ∧
+    home sc cs b = home sc cs a ∧ ¬ Unverified sc cs a ∧ ¬ Unverified sc cs b ∧
+    ∀ f ∈ fields, ∃ ea eb, registers sc cs (c.name, a, f) = some ea ∧
+      registers sc cs (c.name, b, f) = some eb ∧ SameUnder R ea.value eb.value
+
+/-- The equivalence relation a relation generates. -/
+inductive Joined (E : Gid → Gid → Prop) : Gid → Gid → Prop
+  | refl (a : Gid) : Joined E a a
+  | edge {a b : Gid} : E a b → Joined E a b
+  | symm {a b : Gid} : Joined E a b → Joined E b a
+  | trans {a b c : Gid} : Joined E a b → Joined E b c → Joined E a c
+
+/-- Groups after `k` rounds of joining gids whose keys agree. -/
+noncomputable def groupedAt : Nat → Gid → Gid → Prop
+  | 0 => Joined fun a b => (a, b) ∈ edges sc cs
+  | k + 1 => Joined fun a b => (a, b) ∈ edges sc cs ∨ KeyPair sc cs (groupedAt k) a b
+
+/-- The least grouping closed under aliases and under keys that agree. -/
+def Grouped (a b : Gid) : Prop := ∃ k, groupedAt sc cs k a b
+
+/-- The smallest gid grouped with `g`. -/
+noncomputable def canon (g : Gid) : Gid :=
+  ((List.range (g + 1)).find? fun h => decide (Grouped sc cs g h)).getD g
 
 structure Inputs where
   registers : State Value
   home : Gid → Option String
   gids : List Gid
   canon : Gid → Gid
+  unverified : Gid → Prop
 
-def inputs : Inputs := ⟨registers sc cs, home sc cs, gids sc cs, canonical (edges sc cs)⟩
+noncomputable def inputs : Inputs :=
+  ⟨registers sc cs, home sc cs, gids sc cs, canon sc cs, Unverified sc cs⟩
 
 end Inputs
 
@@ -158,7 +243,7 @@ def liveAt : Nat → Gid → Prop
   | 0, _ => False
   | k + 1, g =>
     liveAt k g ∨
-      (g ∈ inp.gids ∧ ¬ deleted inp g ∧
+      (g ∈ inp.gids ∧ ¬ inp.unverified g ∧ ¬ deleted inp g ∧
         ∃ c, (inp.home g).bind sc.find = some c ∧
           ∀ f ∈ c.fields, ∀ t, f.kind = .owner t →
             ownerAllows inp (liveAt k) t (register inp g f.name))
@@ -229,7 +314,7 @@ end Present
 
 /-- **The view** of the changes `cs`: for each collection, its live groups' rows. -/
 noncomputable def view (sc : Schema) (cs : List (Change Value)) : String → Gid → Option Row :=
-  present sc (inputs sc cs)
+  present sc (inputs sc (candidates sc cs))
 
 /-! ## The view depends only on the set of changes -/
 
@@ -248,51 +333,98 @@ instance : LawfulEqCmp claimFirst := inferInstanceAs (LawfulEqCmp fun a b => cla
 
 section Invariance
 
+/-! Here `cs₁` and `cs₂` are lists of candidate changes with the same members. -/
+
 variable (sc : Schema) {cs₁ cs₂ : List (Change Value)} (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂)
 
 include same
-
-theorem mem_candidates_iff (c : Change Value) :
-    c ∈ candidates sc cs₁ ↔ c ∈ candidates sc cs₂ := by
-  simp [candidates, same]
 
 theorem home_eq : home sc cs₁ = home sc cs₂ := by
   funext g
   simp only [home]
   congr 1
   exact fold_keep_eq_of_mem_iff (cmp := claimFirst) (key := id) _ _ (fun x => by
-    simp only [List.mem_map, List.mem_filter, mem_candidates_iff sc same])
+    simp only [List.mem_map, List.mem_filter, same])
     (fun a _ b _ h => h)
 
 theorem mem_claimed_iff (c : Change Value) : c ∈ claimed sc cs₁ ↔ c ∈ claimed sc cs₂ := by
-  simp only [claimed, List.mem_filter, mem_candidates_iff sc same, home_eq sc same]
+  simp only [claimed, List.mem_filter, same, home_eq sc same]
 
 theorem gids_eq : gids sc cs₁ = gids sc cs₂ :=
   gidSet_eq_of_mem_iff fun g => by simp only [List.mem_map, mem_claimed_iff sc same]
 
+theorem homeCollection_eq : homeCollection sc cs₁ = homeCollection sc cs₂ := by
+  funext g; simp only [homeCollection, home_eq sc same]
+
+theorem derives_eq : Derives sc cs₁ = Derives sc cs₂ := by
+  funext g c fields k
+  simp only [Derives, mem_claimed_iff sc same]
+
+theorem key_eq : key sc cs₁ = key sc cs₂ := by
+  funext g
+  unfold key
+  rw [homeCollection_eq sc same, derives_eq sc same]
+
+theorem unverified_eq : Unverified sc cs₁ = Unverified sc cs₂ := by
+  funext g
+  simp only [Unverified, homeCollection_eq sc same, key_eq sc same]
+
+theorem mem_accepted_iff (c : Change Value) : c ∈ accepted sc cs₁ ↔ c ∈ accepted sc cs₂ := by
+  have : keyFieldOk sc cs₁ = keyFieldOk sc cs₂ := by
+    funext x; unfold keyFieldOk; rw [homeCollection_eq sc same, key_eq sc same]
+  simp only [accepted, List.mem_filter, mem_claimed_iff sc same, this]
+
 theorem mem_edges_iff (e : Edge) : e ∈ edges sc cs₁ ↔ e ∈ edges sc cs₂ := by
-  simp only [edges, List.mem_filterMap, mem_claimed_iff sc same, home_eq sc same]
+  unfold edges
+  rw [unverified_eq sc same, home_eq sc same]
+  simp only [List.mem_filterMap, mem_accepted_iff sc same]
 
 theorem registers_eq (unique : ClockDetermines cs₁) : registers sc cs₁ = registers sc cs₂ := by
   apply merged_eq_of_mem_iff
-  · intro c; simp only [List.mem_filter, mem_claimed_iff sc same]
+  · intro c; simp only [List.mem_filter, mem_accepted_iff sc same]
   · intro a ha b hb
-    have hsub : ∀ x, x ∈ (claimed sc cs₁).filter (fun c => c.field ≠ ALIAS) → x ∈ cs₁ := by
+    have hsub : ∀ x, x ∈ (accepted sc cs₁).filter (fun c => c.field ≠ ALIAS) → x ∈ cs₁ := by
       intro x hx
-      simp only [List.mem_filter, claimed, candidates] at hx
+      simp only [List.mem_filter, accepted, claimed] at hx
       exact hx.1.1.1
     exact unique a (hsub a ha) b (hsub b hb)
 
+theorem groupedAt_eq (unique : ClockDetermines cs₁) (k : Nat) :
+    groupedAt sc cs₁ k = groupedAt sc cs₂ k := by
+  have he : (fun a b => (a, b) ∈ edges sc cs₁) = (fun a b => (a, b) ∈ edges sc cs₂) := by
+    funext a b; exact propext (mem_edges_iff sc same _)
+  have hk : KeyPair sc cs₁ = KeyPair sc cs₂ := by
+    funext R a b
+    simp only [KeyPair, homeCollection_eq sc same, home_eq sc same, unverified_eq sc same,
+      registers_eq sc same unique]
+  induction k with
+  | zero => simp only [groupedAt, he]
+  | succ k ih =>
+    simp only [groupedAt, ih, hk]
+    congr
+    funext a b
+    rw [propext (mem_edges_iff sc same (a, b))]
+
+theorem canon_eq (unique : ClockDetermines cs₁) : canon sc cs₁ = canon sc cs₂ := by
+  have : Grouped sc cs₁ = Grouped sc cs₂ := by
+    funext a b; simp only [Grouped, groupedAt_eq sc same unique]
+  funext g; unfold canon; rw [this]
+
 theorem inputs_eq (unique : ClockDetermines cs₁) : inputs sc cs₁ = inputs sc cs₂ := by
   simp only [inputs, registers_eq sc same unique, home_eq sc same, gids_eq sc same,
-    canonical_eq_of_mem_iff _ _ (mem_edges_iff sc same)]
+    canon_eq sc same unique, unverified_eq sc same]
+
+end Invariance
 
 /-- **The view over several collections depends only on the set of changes**, given that no two
 changes to one register share a clock with different values. -/
-theorem view_eq_of_mem_iff (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ := by
-  simp only [view, inputs_eq sc same unique]
-
-end Invariance
+theorem view_eq_of_mem_iff (sc : Schema) {cs₁ cs₂ : List (Change Value)}
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    view sc cs₁ = view sc cs₂ := by
+  simp only [view]
+  rw [inputs_eq sc (cs₁ := candidates sc cs₁) (cs₂ := candidates sc cs₂)
+    (fun c => by simp [candidates, same])
+    (fun a ha b hb => unique a (List.mem_filter.mp ha).1 b (List.mem_filter.mp hb).1)]
 
 theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂)
     (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ :=
@@ -319,9 +451,7 @@ theorem view_ignores (sc : Schema) (c : Change Value) (cs : List (Change Value))
         · exact .inl (.inr (by simpa using h₂))
       · exact .inl (.inl h₁)
     simp [this]
-  have hh : home sc (c :: cs) = home sc cs := by funext g; simp only [home, hc]
-  have hcl : claimed sc (c :: cs) = claimed sc cs := by simp only [claimed, hc, hh]
-  simp only [view, inputs, registers, gids, edges, hcl, hh]
+  simp only [view, hc]
 
 /-- A change whose clock the text form cannot hold is ignored. -/
 theorem view_ignores_unencodable (sc : Schema) (c : Change Value) (cs : List (Change Value))
