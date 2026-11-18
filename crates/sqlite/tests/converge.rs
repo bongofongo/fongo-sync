@@ -229,6 +229,7 @@ impl Peer {
         self.taken.extend(changes.iter().cloned());
         self.writes.before(&mut self.conn, &self.replica).await;
         let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
+        self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;
         self.midway().await;
         applied

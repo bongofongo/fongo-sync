@@ -91,90 +91,9 @@ fn registry(upgraded: bool) -> Registry {
     .unwrap()
 }
 
-fn gid(collection: &str, column: &str) -> String {
-    format!(
-        "CASE WHEN {column} IS NULL THEN '-' ELSE COALESCE((SELECT hex(gid) FROM fongo_ids
-             WHERE collection = '{collection}' AND key = json_array({column})), 'UNMAPPED') END"
-    )
-}
-
-fn dump() -> String {
-    format!(
-        "SELECT 'shelf ' || {} || ' ' || s.name FROM shelves s
-         UNION ALL
-         SELECT 'author ' || {} || ' ' || COALESCE(a.name, '-') || ' f=' || {} FROM authors a
-         UNION ALL
-         SELECT 'book ' || {} || ' s=' || {} || ' ' || COALESCE(b.title, '-')
-                || ' i=' || COALESCE(b.isbn, '-') || ' a=' || {}
-                || ' st=' || COALESCE(b.status, '-') || ' f=' || COALESCE(b.finished, '-')
-                || ' x=' || COALESCE(b.extra, '-')
-           FROM books b
-         UNION ALL
-         SELECT 'note ' || {} || ' b=' || {} || ' ' || COALESCE(n.body, '-') FROM notes n
-         UNION ALL
-         SELECT 'mark ' || {} || ' n=' || {} || ' ' || COALESCE(m.place, '-') FROM marks m
-         UNION ALL
-         SELECT 'tag ' || {} || ' ' || t.tag || ' ' || COALESCE(t.note, '-') FROM tags t
-         UNION ALL
-         SELECT 'setting ' || key || '=' || value FROM settings
-         ORDER BY 1",
-        gid("shelves", "s.id"),
-        gid("authors", "a.id"),
-        gid("books", "a.favourite"),
-        gid("books", "b.id"),
-        gid("shelves", "b.shelf_id"),
-        gid("authors", "b.author_id"),
-        gid("notes", "n.id"),
-        gid("books", "n.book_id"),
-        gid("marks", "m.id"),
-        gid("notes", "m.note_id"),
-        gid("books", "t.book_id"),
-    )
-}
-
-const SHADOW: &str = "
-    SELECT collection || ' ' || hex(gid) || ' ' || field || ' ' || quote(value) || ' '
-           || is_ref || ' ' || clock
-      FROM fongo_shadow ORDER BY 1";
-const ALIASES: &str =
-    "SELECT collection || ' ' || hex(gid) || ' ' || hex(canon) FROM fongo_alias ORDER BY 1";
-const PENDING: &str = "SELECT collection || ' ' || hex(gid) FROM fongo_pending ORDER BY 1";
-
-/// What must hold on every replica once everything is exchanged: every mapped id names a row
-/// and its group, no value the kernel only parked a row on is left in a row or in the shadow, and
-/// a book holds a finish date exactly when it is done.
-const BROKEN: &str = "
-    SELECT 'stale ' || i.collection || ' ' || i.key FROM fongo_ids i
-     WHERE (i.collection = 'shelves'
-            AND NOT EXISTS (SELECT 1 FROM shelves WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'authors'
-            AND NOT EXISTS (SELECT 1 FROM authors WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'books'
-            AND NOT EXISTS (SELECT 1 FROM books WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'notes'
-            AND NOT EXISTS (SELECT 1 FROM notes WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'marks'
-            AND NOT EXISTS (SELECT 1 FROM marks WHERE id = json_extract(i.key, '$[0]')))
-    UNION ALL
-    SELECT 'not canonical ' || i.collection || ' ' || i.key
-      FROM fongo_ids i JOIN fongo_alias a ON a.collection = i.collection AND a.gid = i.gid
-     WHERE a.canon <> a.gid
-    UNION ALL
-    SELECT 'alias to a member ' || hex(a.gid)
-      FROM fongo_alias a
-      JOIN fongo_alias b ON b.collection = a.collection AND b.gid = a.canon
-     WHERE b.canon <> b.gid
-    UNION ALL
-    SELECT 'parked ' || id || ' ' || quote(isbn) FROM books WHERE isbn LIKE 'fongo:%'
-    UNION ALL
-    SELECT 'parked shelf ' || id FROM shelves WHERE name LIKE 'fongo:%'
-    UNION ALL
-    SELECT 'parked mark ' || id FROM marks WHERE place < 0
-    UNION ALL
-    SELECT 'parked in shadow ' || field || ' ' || quote(value) FROM fongo_shadow
-     WHERE (typeof(value) = 'text' AND value LIKE 'fongo:%')
-        OR (typeof(value) IN ('integer', 'real') AND value < 0)
-    UNION ALL
+/// What must hold on every replica once everything is exchanged, of the application's own
+/// tables: a book holds a finish date exactly when it is done.
+const MIXED: &str = "
     SELECT 'mixed ' || id FROM books
      WHERE (COALESCE(status, '') = 'done') <> (finished IS NOT NULL)";
 
@@ -186,6 +105,7 @@ struct Peer {
     sent: Option<(usize, i64)>,
     /// Every change applied here or sent from here.
     taken: Vec<Change>,
+    writes: support::writes::Writes,
 }
 
 impl Peer {
@@ -203,6 +123,7 @@ impl Peer {
             seen: Vec::new(),
             sent: None,
             taken: Vec::new(),
+            writes: Default::default(),
         }
     }
 
@@ -214,7 +135,11 @@ impl Peer {
         if !self.upgraded {
             self.upgraded = true;
             self.replica = Replica::new(registry(true));
+            let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
             self.replica.install(&mut self.conn).await.unwrap();
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
             self.midway().await?;
         }
         Ok(())
@@ -248,20 +173,38 @@ impl Peer {
         (!ids.is_empty()).then(|| ids[n % ids.len()])
     }
 
-    async fn state(&mut self) -> Vec<String> {
-        let mut all = self.lines(&dump()).await;
-        all.extend(self.lines(SHADOW).await);
-        all.extend(self.lines(ALIASES).await);
-        all
+    /// The rows and what the replica holds.
+    async fn state(&mut self) -> String {
+        let kernel = support::read(&mut self.conn, &self.replica).await;
+        let inspection = self.replica.inspect(&mut self.conn).await.unwrap();
+        format!("{:?}\n{:?}", kernel.view, inspection)
+    }
+
+    async fn apply(&mut self, batch: &[Change]) -> Result<(), String> {
+        self.taken.extend(batch.iter().cloned());
+        self.writes.before(&mut self.conn, &self.replica).await;
+        let applied = self.replica.apply(&mut self.conn, batch).await.unwrap();
+        self.writes.touched(&applied.touched);
+        self.writes.after(&mut self.conn, &self.replica).await;
+        self.midway().await
     }
 
     async fn push(&mut self, hub: &mut Vec<Change>) -> Result<(), String> {
+        self.writes.before(&mut self.conn, &self.replica).await;
         self.replica.collect(&mut self.conn).await.unwrap();
+        self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
             .replica
             .outbox(&mut self.conn, 1_000_000)
             .await
             .unwrap();
+        let unwritten = self
+            .writes
+            .unwritten(&mut self.conn, &self.replica, &self.taken, &outbox.changes)
+            .await;
+        if !unwritten.is_empty() {
+            return Err(unwritten.join("\n"));
+        }
         if !outbox.changes.is_empty() {
             self.taken.extend(outbox.changes.iter().cloned());
             hub.extend(outbox.changes);
@@ -295,9 +238,7 @@ impl Peer {
         for i in chosen {
             self.seen[i] = true;
         }
-        self.taken.extend(batch.iter().cloned());
-        self.replica.apply(&mut self.conn, &batch).await.unwrap();
-        self.midway().await?;
+        self.apply(&batch).await?;
         if let Some((end, through)) = self.sent
             && self.seen[..end].iter().all(|s| *s)
         {
@@ -320,8 +261,7 @@ impl Peer {
                 .filter(|&i| self.seen[i])
                 .map(|i| hub[i].clone())
                 .collect();
-            self.replica.apply(&mut self.conn, &again).await.unwrap();
-            self.midway().await?;
+            self.apply(&again).await?;
         }
         Ok(())
     }
@@ -370,6 +310,9 @@ enum Op {
     Sync,
     Push,
     Deliver(u64, bool, bool),
+    /// Takes everything one device has sent that this peer has not seen, as a device that reads
+    /// each device's log in turn does.
+    Log(usize, bool),
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -409,6 +352,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         4 => Just(Op::Sync),
         2 => Just(Op::Push),
         6 => (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
+        4 => (0usize..5, any::<bool>()).prop_map(|(a, b)| Op::Log(a, b)),
     ]
 }
 
@@ -431,7 +375,11 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
                 ))
                 .await;
             }
+            let waiting = peer.writes.installing(&mut peer.conn, &peer.replica).await;
             replica.resume(&mut peer.conn, Resume::Send).await.unwrap();
+            peer.writes
+                .installed(&mut peer.conn, &peer.replica, waiting)
+                .await;
             return peer.midway().await;
         }
         Op::Sync => {
@@ -442,6 +390,20 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
         Op::Deliver(seed, reverse, twice) => {
             return peer
                 .deliver(hub, |i| !mix(seed, i).is_multiple_of(3), reverse, twice)
+                .await;
+        }
+        Op::Log(device, reverse) => {
+            let mut devices = Vec::new();
+            for change in hub.iter() {
+                if !devices.contains(&change.clock.node) {
+                    devices.push(change.clock.node);
+                }
+            }
+            let Some(&node) = devices.get(device % devices.len().max(1)) else {
+                return Ok(());
+            };
+            return peer
+                .deliver(hub, |i| hub[i].clock.node == node, reverse, false)
                 .await;
         }
         Op::AddShelf(v) => format!("INSERT OR IGNORE INTO shelves (name) VALUES ('shelf{v}')"),
@@ -663,46 +625,22 @@ async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) -> Result<(), String>
 }
 
 async fn check(peers: &mut [Peer]) -> Result<(), String> {
-    let mut first = None;
+    let mut first: Option<fongo_sync_sqlite::core::model::View> = None;
     for (i, peer) in peers.iter_mut().enumerate() {
-        let state = (
-            peer.lines(&dump()).await,
-            peer.lines(SHADOW).await,
-            peer.lines(ALIASES).await,
-            peer.lines(PENDING).await,
-        );
-        if state.0.iter().any(|l| l.contains("UNMAPPED")) {
-            return Err(format!("peer {i} has a row with no id: {:#?}", state.0));
-        }
-        let broken = peer.lines(BROKEN).await;
-        if !broken.is_empty() {
-            return Err(format!("peer {i}: {broken:#?}\n{:#?}", state.0));
-        }
         support::settled(&mut peer.conn, &peer.replica, &peer.taken)
             .await
             .map_err(|e| format!("peer {i}: {e}"))?;
-        if !state.3.is_empty() {
-            return Err(format!(
-                "peer {i} left waiting: {:#?}\n{:#?}",
-                state.3, state.0
-            ));
+        let mixed = peer.lines(MIXED).await;
+        if !mixed.is_empty() {
+            return Err(format!("peer {i}: {mixed:#?}"));
         }
+        let view = support::read(&mut peer.conn, &peer.replica).await.view;
         match &first {
-            None => first = Some(state),
-            Some(first) => {
-                if state.0 != first.0 {
-                    return Err(format!(
-                        "rows differ, 0 and {i}:\n{:#?}\n{:#?}",
-                        first.0, state.0
-                    ));
-                }
-                if state.1 != first.1 {
-                    return Err(format!("shadows differ, 0 and {i}"));
-                }
-                if state.2 != first.2 {
-                    return Err(format!("aliases differ, 0 and {i}"));
-                }
+            None => first = Some(view),
+            Some(first) if *first != view => {
+                return Err(format!("rows differ, 0 and {i}:\n{first:#?}\n{view:#?}"));
             }
+            Some(_) => {}
         }
     }
     Ok(())

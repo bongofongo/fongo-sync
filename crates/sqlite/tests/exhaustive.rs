@@ -170,6 +170,7 @@ struct Peer {
     taken: Vec<Change>,
     /// Which batches this peer has taken.
     has: Vec<bool>,
+    writes: support::writes::Writes,
 }
 
 impl Peer {
@@ -185,12 +186,22 @@ impl Peer {
             replica,
             taken: Vec::new(),
             has: Vec::new(),
+            writes: Default::default(),
         }
     }
 
     async fn send(&mut self, batches: &mut Vec<Vec<Change>>) -> Result<(), String> {
+        self.writes.before(&mut self.conn, &self.replica).await;
         self.replica.collect(&mut self.conn).await.unwrap();
+        self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+        let unwritten = self
+            .writes
+            .unwritten(&mut self.conn, &self.replica, &self.taken, &outbox.changes)
+            .await;
+        if !unwritten.is_empty() {
+            return Err(unwritten.join("\n"));
+        }
         self.replica
             .acknowledge(&mut self.conn, outbox.through)
             .await
@@ -204,10 +215,14 @@ impl Peer {
         self.has.resize(batches.len(), false);
         self.has[n] = true;
         self.taken.extend(batches[n].iter().cloned());
-        self.replica
+        self.writes.before(&mut self.conn, &self.replica).await;
+        let applied = self
+            .replica
             .apply(&mut self.conn, &batches[n])
             .await
             .unwrap();
+        self.writes.touched(&applied.touched);
+        self.writes.after(&mut self.conn, &self.replica).await;
         support::midway(&mut self.conn, &self.replica, &self.taken).await
     }
 }

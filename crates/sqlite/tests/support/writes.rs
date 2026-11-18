@@ -1,5 +1,6 @@
 //! What the application wrote, told apart from what the kernel wrote, by comparing its tables
-//! before each kernel step with how the previous step left them. A replica may send a field of an
+//! before each kernel step with how the previous step left them, and by triggers of the test's
+//! own that see a row deleted and made again at the same key. A replica may send a field of an
 //! entity only when the application wrote that field of its row, or wrote any part of a set the
 //! field changes with, or made or removed the row; besides that it sends aliases, and what an
 //! install adopts. Anything else it sends is a value the application did not write, such as a
@@ -9,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_sqlite::core::model;
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
-use fongo_sync_sqlite::{Key, Replica};
+use fongo_sync_sqlite::{Key, Kind, Replica};
 use sqlx::SqliteConnection;
 
 use super::{key_columns, quoted, rows, text};
@@ -45,17 +46,52 @@ async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
     out
 }
 
+/// Triggers that log each row made at a key, whoever makes it.
+async fn witness(conn: &mut SqliteConnection, replica: &Replica) {
+    sqlx::query("CREATE TABLE IF NOT EXISTS witness_made (collection TEXT, key TEXT)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    for c in replica.registry().collections() {
+        let key = |row: &str| {
+            let parts: Vec<String> = key_columns(c)
+                .iter()
+                .map(|k| format!("{row}.{}", quoted(k)))
+                .collect();
+            format!("json_array({})", parts.join(", "))
+        };
+        let (new, old) = (key("NEW"), key("OLD"));
+        let made = format!("INSERT INTO witness_made VALUES ('{}', {new});", c.name);
+        for sql in [
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS witness_{}_ai AFTER INSERT ON {} BEGIN {made} END",
+                c.name,
+                quoted(&c.table)
+            ),
+            format!(
+                "CREATE TRIGGER IF NOT EXISTS witness_{}_au AFTER UPDATE ON {} WHEN {old} <> {new}
+                 BEGIN {made} END",
+                c.name,
+                quoted(&c.table)
+            ),
+        ] {
+            sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+        }
+    }
+}
+
 impl Writes {
     /// Before a kernel step: what changed since the last is the application's.
     pub async fn before(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+        witness(conn, replica).await;
         let current = now(conn, replica).await;
         let registry = replica.registry();
-        // A row deleted and made again with the same values differs in nothing but the change
-        // capture's record of it, which is the only witness here.
-        let remade: BTreeSet<(String, String)> = match replica.inspect(conn).await {
-            Ok(inspection) => inspection.uncollected.into_iter().collect(),
-            Err(_) => BTreeSet::new(),
-        };
+        let remade: BTreeSet<(String, String)> =
+            rows(conn, "SELECT collection, key FROM witness_made", &[])
+                .await
+                .iter()
+                .map(|row| (text(&row[0]), text(&row[1])))
+                .collect();
         for (at, values) in &current {
             let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
                 continue;
@@ -67,11 +103,11 @@ impl Writes {
                     touched.insert(f.name.clone());
                 }
             }
-            if touched.is_empty() {
-                if !remade.contains(at) {
-                    continue;
-                }
+            if remade.contains(at) {
                 touched.extend(c.fields.iter().map(|f| f.name.clone()));
+            }
+            if touched.is_empty() {
+                continue;
             }
             for set in &c.together {
                 if set.iter().any(|f| touched.contains(f)) {
@@ -86,25 +122,76 @@ impl Writes {
                 self.written.insert((at.0.clone(), at.1.clone(), f));
             }
         }
-        for at in self.after.keys() {
-            if !current.contains_key(at) {
-                self.written
-                    .insert((at.0.clone(), at.1.clone(), DELETED.to_string()));
-                self.removed.insert(at.clone());
+        for (collection, key) in current.keys() {
+            self.remember(conn, replica, collection, key).await;
+        }
+        let gone: BTreeSet<&(String, String)> = self
+            .after
+            .keys()
+            .filter(|at| !current.contains_key(*at))
+            .collect();
+        for at in &gone {
+            self.written
+                .insert((at.0.clone(), at.1.clone(), DELETED.to_string()));
+            // A row that went with its owner is judged by its owner: its entity may live on
+            // in another member of its group, under another owner.
+            let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
+                continue;
+            };
+            let with_owner = c.fields.iter().enumerate().any(|(i, f)| {
+                let owning = matches!(f.kind, Kind::Ref { owned: true, .. })
+                    || matches!(&c.key, Key::Natural { fields } if fields.contains(&f.name));
+                match (&f.kind, self.after[*at].get(i)) {
+                    (Kind::Ref { collection, .. }, Some(Value::Int(local))) if owning => {
+                        gone.contains(&(collection.clone(), format!("[{local}]")))
+                    }
+                    _ => false,
+                }
+            });
+            if !with_owner {
+                self.removed.insert((*at).clone());
             }
         }
     }
 
     /// After a kernel step: the rows as it left them.
     pub async fn after(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+        witness(conn, replica).await;
+        sqlx::query("DELETE FROM witness_made")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
         self.after = now(conn, replica).await;
-        for (collection, key) in self.after.keys() {
-            if let Some(gid) = replica.gid_for_key(conn, collection, key).await.unwrap() {
-                self.gids
-                    .entry((collection.clone(), key.clone()))
-                    .or_default()
-                    .insert(gid);
-            }
+        let keys: Vec<(String, String)> = self.after.keys().cloned().collect();
+        for (collection, key) in keys {
+            self.remember(conn, replica, &collection, &key).await;
+        }
+    }
+
+    /// After an apply, which reports the rows it wrote and removed with their entities, among
+    /// them rows the application made that the apply collected and then removed.
+    pub fn touched(&mut self, touched: &[fongo_sync_sqlite::Touched]) {
+        for t in touched {
+            self.gids
+                .entry((t.collection.clone(), t.key.clone()))
+                .or_default()
+                .insert(t.gid);
+        }
+    }
+
+    async fn remember(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        collection: &str,
+        key: &str,
+    ) {
+        // Before the first install there is nothing to look up.
+        if let Ok(Some(gid)) = replica.gid_for_key(conn, collection, key).await {
+            self.gids
+                .entry((collection.to_string(), key.to_string()))
+                .or_default()
+                .insert(gid);
         }
     }
 
@@ -178,20 +265,23 @@ impl Writes {
                 ));
             }
         }
-        // A row the application removed is gone everywhere, unless its entity still has a row
-        // here or the row was not an entity of its own: what this replica sends leaves the
-        // entity not live, by a tombstone or because an owner is gone.
+        // A row the application deleted, itself and not with its owner, is deleted everywhere:
+        // what this replica has seen and sent leaves every member of its group with a tombstone,
+        // unless the group still has a row here or the row was not an entity of its own. That
+        // the group is merely not live is not enough, since an owner yet to arrive revives it.
         let leftover: BTreeSet<(String, String)> = inspection.leftover.into_iter().collect();
         let mut all = seen.to_vec();
         all.extend(sent.iter().cloned());
         let merge = model::merge(&replica.registry().model_schema(), &all);
-        let live = |gid: &Gid| {
-            merge.entities.get(gid).is_some_and(|e| {
-                merge
-                    .entities
-                    .values()
-                    .any(|m| m.live && m.collection == e.collection && m.canonical == e.canonical)
-            })
+        let tombstoned = |gid: &Gid| {
+            let Some(e) = merge.entities.get(gid) else {
+                return true;
+            };
+            merge
+                .entities
+                .values()
+                .filter(|m| m.collection == e.collection && m.canonical == e.canonical)
+                .all(|m| matches!(m.registers.get(DELETED), Some((Value::Int(1), _))))
         };
         for at in &self.removed {
             let Some(held) = self.gids.get(at) else {
@@ -205,9 +295,9 @@ impl Writes {
                             .any(|g| targets.contains(&canonical(&other.0, *g)))
                     })
             });
-            if !still && !leftover.contains(at) && held.iter().any(live) {
+            if !still && !leftover.contains(at) && !held.iter().all(tombstoned) {
                 wrong.push(format!(
-                    "the application removed {} row {} and its entity lives on",
+                    "the application deleted {} row {} and its entity was not deleted",
                     at.0, at.1
                 ));
             }
