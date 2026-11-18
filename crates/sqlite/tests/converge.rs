@@ -830,6 +830,7 @@ async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
     peers[2]
         .run("INSERT INTO loans (book_id, borrower) SELECT id, 'Celia' FROM books WHERE isbn IS NULL")
         .await;
+    let loan_book: i64 = count(&mut peers[2], "SELECT book_id FROM loans").await;
 
     // The second replica gives its book the same isbn before it has seen the first's.
     peers[1]
@@ -840,14 +841,18 @@ async fn a_merge_reports_the_row_given_up_and_the_rows_moved_off_it() {
     let applied = peers[2].sync(&mut hub).await;
 
     let rows = touched(&applied);
-    let books: Vec<_> = rows.iter().filter(|r| r.0 == "books").collect();
-    assert_eq!(books.len(), 2, "{rows:#?}");
-    assert_eq!(books[0].2, books[1].2, "{rows:#?}");
-    assert_ne!(books[0].3, books[1].3, "{rows:#?}");
+    let removed: Vec<_> = rows.iter().filter(|r| r.0 == "books" && r.3).collect();
+    assert_eq!(removed.len(), 1, "{rows:#?}");
     let kept: i64 = count(&mut peers[2], "SELECT id FROM books").await;
-    assert!(rows.contains(&("books", &format!("[{kept}]"), books[0].2, false)));
+    assert_ne!(removed[0].1, format!("[{kept}]"), "{rows:#?}");
+    assert_eq!(removed[0].2, peers[2].gid("books", kept).await);
+    // The loan is reported if it had to be moved off the row given up.
     let loan = peers[2].gid("loans", 1).await;
-    assert!(rows.contains(&("loans", "[1]", loan, false)), "{rows:#?}");
+    assert_eq!(
+        rows.contains(&("loans", "[1]", loan, false)),
+        removed[0].1 == format!("[{loan_book}]"),
+        "{rows:#?}"
+    );
     assert_eq!(
         count(&mut peers[2], "SELECT book_id FROM loans").await,
         kept
@@ -1254,6 +1259,40 @@ async fn a_local_id_given_to_another_entity_in_the_same_apply_reports_both() {
         touched(&applied),
         vec![("books", "[1]", old, true), ("books", "[1]", new, false)]
     );
+}
+
+#[tokio::test]
+async fn a_row_left_waiting_is_not_reported_again_until_it_changes() {
+    let schema = ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT UNIQUE, year INTEGER)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("year"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+    ];
+    peers[0]
+        .run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peers[1]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[0].push(&mut hub).await;
+    let applied = peers[1].sync(&mut hub).await;
+    assert_eq!(applied.waiting, 1);
+    let again = peers[1]
+        .replica
+        .apply(&mut peers[1].conn, &[])
+        .await
+        .unwrap();
+    assert_eq!(again.waiting, 1);
+    assert!(again.touched.is_empty(), "{:#?}", again.touched);
 }
 
 /// Lets the wall clock move on, so the next edit is stamped later than the last.

@@ -513,6 +513,15 @@ async fn spellings(conn: &mut SqliteConnection, value: &Value) -> Result<Vec<Val
     }
 }
 
+/// A condition true when a row does not already hold the values bound for `fields`, so an update
+/// that would change nothing leaves the row alone and is not reported.
+fn differs<'a>(fields: impl Iterator<Item = &'a Field>) -> String {
+    let same: Vec<String> = fields
+        .map(|f| format!("{} IS ?", quoted(&f.name)))
+        .collect();
+    format!("NOT ({})", same.join(" AND "))
+}
+
 /// Every way of picking one value from each list.
 fn choices(options: &[Vec<Value>]) -> Vec<Vec<Value>> {
     let mut out = vec![Vec::new()];
@@ -1241,12 +1250,20 @@ impl Replica {
         for (d_idx, key, gid) in self.dependents(conn, c, lose).await? {
             pass.touch(d_idx, key, gid, true);
         }
-        for d in self.registry.collections() {
+        for (d_idx, d) in self.registry.collections().iter().enumerate() {
             for f in &d.fields {
                 if !matches!(&f.kind, Kind::Ref { collection, .. } if *collection == c.name) {
                     continue;
                 }
                 let (table, column) = (quoted(&d.table), quoted(&f.name));
+                let referring = format!(
+                    "SELECT json_array({}) FROM {table} WHERE {column} = json_extract(?1, '$[0]')",
+                    d.key_columns()
+                        .iter()
+                        .map(|k| quoted(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 if matches!(&d.key, Key::Natural { fields } if fields.contains(&f.name)) {
                     exec(
                         conn,
@@ -1255,6 +1272,7 @@ impl Replica {
                     )
                     .await?;
                 } else {
+                    let before = query(conn, &referring, &[Value::Text(lose.into())]).await?;
                     exec(
                         conn,
                         &format!(
@@ -1264,6 +1282,13 @@ impl Replica {
                         &[Value::Text(lose.into()), Value::Text(keep.into())],
                     )
                     .await?;
+                    let after = query(conn, &referring, &[Value::Text(lose.into())]).await?;
+                    for row in before.iter().filter(|row| !after.contains(row)) {
+                        let key = as_text(&row[0])?;
+                        if let Some(gid) = self.row_gid(conn, d, key).await? {
+                            pass.touch(d_idx, key.to_string(), gid, false);
+                        }
+                    }
                 }
             }
         }
@@ -1823,15 +1848,18 @@ impl Replica {
                                 .iter()
                                 .map(|(f, _)| format!("{} = ?", quoted(&f.name)))
                                 .collect();
-                            let mut params: Vec<Value> =
+                            let values: Vec<Value> =
                                 columns.iter().map(|(_, v)| v.clone()).collect();
+                            let mut params = values.clone();
                             params.push(Value::Text(key));
+                            params.extend(values);
                             exec(
                                 conn,
                                 &format!(
-                                    "UPDATE {table} SET {} WHERE {} = json_extract(?, '$[0]')",
+                                    "UPDATE {table} SET {} WHERE {} = json_extract(?, '$[0]') AND {}",
                                     sets.join(", "),
-                                    quoted(column)
+                                    quoted(column),
+                                    differs(columns.iter().map(|(f, _)| *f))
                                 ),
                                 &params,
                             )
@@ -1913,12 +1941,17 @@ impl Replica {
                                 .iter()
                                 .map(|(f, _)| format!("{} = ?", quoted(&f.name)))
                                 .collect();
-                            let mut params: Vec<Value> =
-                                rest.iter().map(|(_, v)| v.clone()).collect();
+                            let values: Vec<Value> = rest.iter().map(|(_, v)| v.clone()).collect();
+                            let mut params = values.clone();
                             params.extend(key);
+                            params.extend(values);
                             exec(
                                 conn,
-                                &format!("UPDATE {table} SET {} WHERE {matches}", sets.join(", ")),
+                                &format!(
+                                    "UPDATE {table} SET {} WHERE {matches} AND {}",
+                                    sets.join(", "),
+                                    differs(rest.iter().map(|(f, _)| *f))
+                                ),
                                 &params,
                             )
                             .await
@@ -2043,6 +2076,22 @@ impl Replica {
             }
         }
         Ok(found)
+    }
+
+    /// The id of the entity a local row holds.
+    async fn row_gid(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        key: &str,
+    ) -> Result<Option<Gid>> {
+        match &c.key {
+            Key::Minted { .. } => match minted_gid(conn, &c.name, key).await? {
+                Some(gid) => Ok(Some(canon_of(conn, gid).await?)),
+                None => Ok(None),
+            },
+            Key::Natural { fields } => self.gone_natural_gid(conn, c, fields, key).await,
+        }
     }
 
     async fn row_exists(
