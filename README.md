@@ -8,6 +8,7 @@ The kernel knows nothing about any particular application.
 |---|---|
 | `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules. No I/O. |
 | `fongo-sync-sqlite` | change capture by trigger, and applying remote changes to an application's own tables. |
+| `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
 
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
 its database, `Replica::collect` to turn local writes into changes, and `Replica::apply` to merge
@@ -18,7 +19,12 @@ The merge rules are also stated as laws and proven in [Bend](https://bend-lang.c
 restates them, `LAWS.bend` says what they must guarantee, and `PROOF.bend` proves it. The proofs
 are about the model, which mirrors `crates/core/src/change.rs` and `clock.rs` by hand.
 
-Not yet here: the wire protocol, encryption, and a server.
+Devices exchange changes through a server that stores encrypted batches and learns nothing about
+their content: it sees a library id, a device id, a key epoch, a size and an arrival time.
+`fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
+by depending on it.
+
+Not yet here: an HTTP client, a server, and blob transfer.
 
 ```
 make check
