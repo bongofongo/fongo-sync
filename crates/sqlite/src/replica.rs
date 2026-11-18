@@ -1942,6 +1942,17 @@ impl Replica {
             }
             for (field, value) in c.fields.iter().zip(values) {
                 let unchanged = match merged.get(&field.name) {
+                    // A reference to a row this replica does not have was written as null.
+                    Some((Value::Ref(target), _)) if value == Value::Null => {
+                        let target = canon_of(conn, *target).await?;
+                        query(
+                            conn,
+                            "SELECT 1 FROM fongo_ids WHERE gid = ?",
+                            &[Value::Ref(target)],
+                        )
+                        .await?
+                        .is_empty()
+                    }
                     Some((held, _)) => same(conn, held, &value).await?,
                     None => value == Value::Null,
                 };

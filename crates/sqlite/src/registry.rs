@@ -182,10 +182,13 @@ impl Collection {
     }
 }
 
-/// The synced tables, parents before the collections that refer to them.
+/// The synced tables. A reference may name any minted collection; ownership may not go round in
+/// a circle between collections, though a collection may own its own rows.
 #[derive(Debug, Clone)]
 pub struct Registry {
     collections: Vec<Collection>,
+    /// Each collection's place when rows are written owners first.
+    ranks: Vec<usize>,
 }
 
 fn is_identifier(text: &str) -> bool {
@@ -272,18 +275,51 @@ impl Registry {
                     ));
                 }
             }
+        }
+        for c in &collections {
             for f in &c.fields {
                 if let Kind::Ref { collection, .. } = &f.kind
                     && !minted.contains(collection.as_str())
                 {
                     return bad(format!(
-                        "`{}.{}` refers to `{collection}`, which is not a minted collection declared before it",
+                        "`{}.{}` refers to `{collection}`, which is not a minted collection",
                         c.name, f.name
                     ));
                 }
             }
         }
-        Ok(Registry { collections })
+        let owners: Vec<BTreeSet<usize>> = collections
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                c.fields
+                    .iter()
+                    .filter(|f| c.owns_through(f))
+                    .filter_map(|f| match &f.kind {
+                        Kind::Ref { collection, .. } => {
+                            collections.iter().position(|o| o.name == *collection)
+                        }
+                        Kind::Plain => None,
+                    })
+                    .filter(|&o| o != i)
+                    .collect()
+            })
+            .collect();
+        let mut ranks = vec![usize::MAX; collections.len()];
+        for next in 0..collections.len() {
+            let ready = (0..collections.len()).find(|&i| {
+                ranks[i] == usize::MAX && owners[i].iter().all(|&o| ranks[o] != usize::MAX)
+            });
+            let Some(ready) = ready else {
+                let stuck = (0..collections.len()).find(|&i| ranks[i] == usize::MAX);
+                return bad(format!(
+                    "`{}` is owned, through others, by itself",
+                    stuck.map_or("", |i| collections[i].name.as_str())
+                ));
+            };
+            ranks[ready] = next;
+        }
+        Ok(Registry { collections, ranks })
     }
 
     pub fn collections(&self) -> &[Collection] {
@@ -292,7 +328,7 @@ impl Registry {
 
     /// Where a collection comes when rows are written parents first.
     pub(crate) fn rank(&self, idx: usize) -> usize {
-        idx
+        self.ranks[idx]
     }
 
     pub(crate) fn index(&self, name: &str) -> Option<usize> {
@@ -317,11 +353,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_reference_must_point_at_an_earlier_minted_collection() {
+    fn a_reference_names_a_minted_collection_declared_anywhere() {
         let books = Collection::minted("books", "books", "id").reference("author_id", "authors");
-        let authors = Collection::minted("authors", "authors", "id").field("name");
-        assert!(Registry::new(vec![books.clone(), authors.clone()]).is_err());
-        assert!(Registry::new(vec![authors, books]).is_ok());
+        let authors = Collection::minted("authors", "authors", "id").reference("best", "books");
+        let registry = Registry::new(vec![books.clone(), authors.clone()]).unwrap();
+        assert_eq!(registry.rank(0), 0);
+        let tags = Collection::natural("tags", "tags", &["tag"]).field("tag");
+        let wrong = Collection::minted("books", "books", "id").reference("tag", "tags");
+        assert!(Registry::new(vec![tags, wrong]).is_err());
+    }
+
+    #[test]
+    fn owners_come_first_and_may_not_go_round() {
+        let notes = Collection::minted("notes", "notes", "id").owner("book_id", "books");
+        let books = Collection::minted("books", "books", "id").owner("parent", "books");
+        let registry = Registry::new(vec![notes.clone(), books]).unwrap();
+        assert!(registry.rank(1) < registry.rank(0));
+        let circle = Collection::minted("books", "books", "id").owner("note_id", "notes");
+        assert!(Registry::new(vec![notes, circle]).is_err());
     }
 
     #[test]

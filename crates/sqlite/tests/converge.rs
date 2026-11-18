@@ -11,6 +11,7 @@ const SCHEMA: &[&str] = &[
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         born INTEGER NOT NULL DEFAULT 0,
+        favourite INTEGER REFERENCES books(id) ON DELETE SET NULL,
         UNIQUE (name, born))",
     "CREATE TABLE books (
         id INTEGER PRIMARY KEY,
@@ -58,6 +59,7 @@ fn registry() -> Registry {
         Collection::minted("authors", "authors", "id")
             .field("name")
             .field("born")
+            .reference("favourite", "books")
             .identity(&["name", "born"]),
         Collection::minted("books", "books", "id")
             .field("title")
@@ -102,6 +104,8 @@ fn registry() -> Registry {
 
 const DUMP: &str = "
     SELECT 'author ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || a.name || ' ' || a.born
+           || ' f=' || COALESCE((SELECT hex(gid) FROM fongo_ids
+                                 WHERE collection = 'books' AND key = json_array(a.favourite)), '-')
       FROM authors a LEFT JOIN fongo_ids i ON i.collection = 'authors' AND i.key = json_array(a.id)
     UNION ALL
     SELECT 'book ' || COALESCE(hex(i.gid), 'UNMAPPED')
@@ -1618,6 +1622,35 @@ async fn the_application_resolves_what_the_kernel_reports_waiting() {
     }
 }
 
+#[tokio::test]
+async fn two_tables_that_refer_to_each_other_arrive_together() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO authors (name) VALUES ('Eliot')")
+        .await;
+    peers[0]
+        .run("INSERT INTO books (title, author_id) VALUES ('Middlemarch', 1)")
+        .await;
+    peers[0].run("UPDATE authors SET favourite = 1").await;
+    settle(&mut peers, &mut hub).await;
+
+    let state = assert_converged(&mut peers).await;
+    let book = peers[0].gid("books", 1).await.to_hex().to_uppercase();
+    let author = peers[0].gid("authors", 1).await.to_hex().to_uppercase();
+    assert!(
+        state.contains(&format!("author {author} Eliot 0 f={book}")),
+        "{state:#?}"
+    );
+    assert!(
+        state.iter().any(|l| l.ends_with(&format!(" a={author}"))),
+        "{state:#?}"
+    );
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM fongo_pending").await, 0);
+    }
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1715,6 +1748,7 @@ async fn an_edit_made_after_seeing_another_is_not_a_conflict() {
 enum Op {
     AddAuthor(u8),
     RenameAuthor(usize, u8),
+    SetFavourite(usize, usize),
     SetBorn(usize, u8),
     AddBook(u8, usize),
     SetTitle(usize, u8),
@@ -1751,6 +1785,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         v.clone().prop_map(Op::AddAuthor),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::RenameAuthor(a, b)),
+        (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetFavourite(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetBorn(a, b)),
         (v.clone(), n.clone()).prop_map(|(a, b)| Op::AddBook(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTitle(a, b)),
@@ -1838,6 +1873,13 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             return;
         }
         Op::AddAuthor(v) => format!("INSERT OR IGNORE INTO authors (name) VALUES ('author{v}')"),
+        Op::SetFavourite(n, m) => {
+            let (Some(a), Some(b)) = (peer.pick("authors", n).await, peer.pick("books", m).await)
+            else {
+                return;
+            };
+            format!("UPDATE authors SET favourite = {b} WHERE id = {a}")
+        }
         Op::RenameAuthor(n, v) | Op::SetBorn(n, v) => {
             let Some(id) = peer.pick("authors", n).await else {
                 return;
