@@ -1,4 +1,5 @@
 import FongoSync.Examples
+import FongoSync.Model
 
 /-!
 # The laws
@@ -176,5 +177,32 @@ theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
     (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
     view sc cs₁ = view sc cs₂ :=
   view_eq_of_mem_iff sc same unique
+
+/-! ## The view over several collections, with `together` sets -/
+
+/-- **The view over several collections depends only on the set of changes**, given unique
+clocks per register. -/
+theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    Full.view sc cs₁ = Full.view sc cs₂ :=
+  Full.view_eq_of_mem_iff sc same unique
+
+/-- A change whose clock the text form cannot hold is ignored. -/
+theorem full_view_ignores_unencodable (sc : Full.Schema) (c : Change Value)
+    (cs : List (Change Value)) (h : ¬ c.clock.encodable) :
+    Full.view sc (c :: cs) = Full.view sc cs :=
+  Full.view_ignores_unencodable sc c cs h
+
+/-- A change to a collection the schema does not declare is ignored. -/
+theorem full_view_ignores_unknown_collection (sc : Full.Schema) (c : Change Value)
+    (cs : List (Change Value)) (h : sc.find c.collection = none) :
+    Full.view sc (c :: cs) = Full.view sc cs :=
+  Full.view_ignores_unknown_collection sc c cs h
+
+/-- An alias that does not name another gid is ignored. -/
+theorem full_view_ignores_bad_alias (sc : Full.Schema) (c : Change Value)
+    (cs : List (Change Value)) (h : Full.aliasOk c = false) :
+    Full.view sc (c :: cs) = Full.view sc cs :=
+  Full.view_ignores_bad_alias sc c cs h
 
 end FongoSync.Laws

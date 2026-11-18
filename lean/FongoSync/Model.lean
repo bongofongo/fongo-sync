@@ -1,0 +1,341 @@
+import FongoSync.View
+
+/-!
+# The view over several collections
+
+Closer to `model::view`: a schema of several collections, references and owners naming a target
+collection, the rule for which collection a gid belongs to, the changes ignored as invalid, and
+`together` field sets. Natural keys are not covered.
+
+1. A change is ignored if its clock is not encodable, it is an alias whose value is not a
+   reference to another gid, or its collection is unknown. Of the rest, a gid belongs to the
+   collection of its change with the smallest clock, ties going to the smaller collection name,
+   and a change to that gid in another collection is ignored.
+2. Each (collection, gid, field) holds the winner among its changes; `$deleted` and undeclared
+   fields merge `Lww`.
+3. An alias whose target belongs to the same collection joins the two gids; the canonical gid of
+   a group is its smallest member.
+4. A member is live if it is not deleted and every owner field it holds is unset, null, or names
+   a gid of the owner collection whose group has a live member: the least such set.
+5. A live group shows, for each field outside a `together` set, the strategy winner among its
+   live members, and for each `together` set, the fields of the live member holding the latest
+   clock written to any of them, a field not written at that clock reading as null.
+-/
+
+namespace FongoSync.Full
+
+open Std Classical FongoSync
+
+set_option linter.unusedSectionVars false
+
+inductive Kind where
+  | plain
+  | reference (target : String)
+  | owner (target : String)
+  deriving DecidableEq, Repr
+
+structure Field where
+  name : String
+  kind : Kind
+  strategy : Strategy
+
+structure Collection where
+  name : String
+  fields : List Field
+  together : List (List String)
+
+structure Schema where
+  collections : List Collection
+
+def Schema.find (sc : Schema) (name : String) : Option Collection :=
+  sc.collections.find? (·.name = name)
+
+def Collection.declared (c : Collection) (field : String) : Option Field :=
+  c.fields.find? (·.name = field)
+
+def Collection.inTogether (c : Collection) (field : String) : Bool :=
+  c.together.any (·.contains field)
+
+/-- How a field merges: `$deleted` and undeclared fields merge `Lww`. -/
+def Schema.strategyOf (sc : Schema) (collection field : String) : Strategy :=
+  match sc.find collection with
+  | some c => ((c.declared field).map (·.strategy)).getD .lww
+  | none => .lww
+
+/-- Three of the rules `Schema::check` enforces. The convergence theorem does not need them;
+they keep liveness well-founded and `together` sets meaningful. -/
+def Schema.Restricted (sc : Schema) : Prop :=
+  (∀ c ∈ sc.collections, ∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
+  (∀ c ∈ sc.collections, ∀ set ∈ c.together, ∀ name ∈ set, ∀ f ∈ c.fields, f.name = name →
+    f.strategy = .lww ∧ ∀ t, f.kind ≠ .owner t)
+
+/-! ## From changes to inputs -/
+
+/-- An alias change is valid only if it names another gid. -/
+def aliasOk (c : Change Value) : Bool :=
+  if c.field = ALIAS then
+    match c.value with
+    | .ref t => t ≠ c.gid
+    | _ => false
+  else true
+
+section Inputs
+
+variable (sc : Schema) (cs : List (Change Value))
+
+/-- The changes not ignored outright. -/
+def candidates : List (Change Value) :=
+  cs.filter fun c => decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome
+
+/-- Claims compare by clock, then collection name. -/
+def claimCmp (a b : Hlc × String) : Ordering :=
+  compareLex (compareOn (·.1)) (compareOn (·.2)) a b
+
+/-- Keeping the smaller claim: `keep` keeps the greater key, so compare the other way round. -/
+def claimFirst (a b : Hlc × String) : Ordering := claimCmp b a
+
+/-- The collection a gid belongs to: that of its change with the smallest claim. -/
+def home (g : Gid) : Option String :=
+  ((((candidates sc cs).filter (·.gid = g)).map fun c => (c.clock, c.collection)).foldl
+    (keep claimFirst id) none).map (·.2)
+
+/-- The changes that count: valid, and to the collection their gid belongs to. -/
+def claimed : List (Change Value) :=
+  (candidates sc cs).filter fun c => home sc cs c.gid = some c.collection
+
+def registers : State Value :=
+  merged sc.strategyOf ((claimed sc cs).filter fun c => c.field ≠ ALIAS)
+
+/-- Every gid that belongs to a collection, ascending. -/
+def gids : List Gid := gidSet ((claimed sc cs).map (·.gid))
+
+/-- Every alias whose target belongs to the alias's own collection. -/
+def edges : List Edge :=
+  (claimed sc cs).filterMap fun c =>
+    if c.field = ALIAS then
+      match c.value with
+      | .ref t => if home sc cs t = some c.collection then some (c.gid, t) else none
+      | _ => none
+    else none
+
+structure Inputs where
+  registers : State Value
+  home : Gid → Option String
+  gids : List Gid
+  canon : Gid → Gid
+
+def inputs : Inputs := ⟨registers sc cs, home sc cs, gids sc cs, canonical (edges sc cs)⟩
+
+end Inputs
+
+/-! ## From inputs to rows -/
+
+section Present
+
+variable (sc : Schema) (inp : Inputs)
+
+def register (g : Gid) (field : String) : Option (Entry Value) :=
+  match inp.home g with
+  | some c => inp.registers (c, g, field)
+  | none => none
+
+def deleted (g : Gid) : Prop :=
+  ∃ e, register inp g DELETED = some e ∧ e.value = .int 1
+
+/-- `names_live`: `o` belongs to `target` and its group has a member in `live`. -/
+def namesLive (live : Gid → Prop) (target : String) (o : Gid) : Prop :=
+  inp.home o = some target ∧ ∃ m ∈ inp.gids, inp.canon m = inp.canon o ∧ live m
+
+def ownerAllows (live : Gid → Prop) (target : String) : Option (Entry Value) → Prop
+  | none => True
+  | some e =>
+    match e.value with
+    | .null => True
+    | .ref o => namesLive inp live target o
+    | _ => False
+
+def liveAt : Nat → Gid → Prop
+  | 0, _ => False
+  | k + 1, g =>
+    liveAt k g ∨
+      (g ∈ inp.gids ∧ ¬ deleted inp g ∧
+        ∃ c, (inp.home g).bind sc.find = some c ∧
+          ∀ f ∈ c.fields, ∀ t, f.kind = .owner t →
+            ownerAllows inp (liveAt k) t (register inp g f.name))
+
+def Live (g : Gid) : Prop := ∃ k, liveAt sc inp k g
+
+noncomputable def liveMembers (r : Gid) : List Gid :=
+  inp.gids.filter fun m => decide (inp.canon m = r ∧ Live sc inp m)
+
+noncomputable def read (f : Field) (v : Value) : Value :=
+  match f.kind with
+  | .plain => v
+  | .reference t | .owner t =>
+    match v with
+    | .ref o => if namesLive inp (Live sc inp) t o then .ref (inp.canon o) else .null
+    | _ => .null
+
+/-- A field outside any `together` set: the strategy winner among the live members. -/
+noncomputable def plainValue (f : Field) (r : Gid) : Value :=
+  match ((liveMembers sc inp r).filterMap fun m => register inp m f.name).foldl
+      (apply f.strategy) none with
+  | some e => read sc inp f e.value
+  | none => .null
+
+/-- The latest clock a member has written to any field of a set. -/
+def latest (set : List String) (m : Gid) : Option Hlc :=
+  (set.filterMap fun name => (register inp m name).map (·.clock)).foldl
+    (fun best k => match best with
+      | none => some k
+      | some b => if b < k then some k else some b) none
+
+/-- The live member holding the latest clock across a set, and that clock. The first member in
+ascending order wins a tie. -/
+noncomputable def setHolder (set : List String) (r : Gid) : Option (Hlc × Gid) :=
+  (liveMembers sc inp r).foldl (fun best m =>
+    match latest inp set m with
+    | none => best
+    | some at_ =>
+      match best with
+      | none => some (at_, m)
+      | some (held, _) => if held < at_ then some (at_, m) else best) none
+
+/-- A field of a `together` set: the holder's value if written at the holder's clock. -/
+noncomputable def setValue (c : Collection) (set : List String) (name : String) (r : Gid) : Value :=
+  match setHolder sc inp set r, c.declared name with
+  | some (at_, m), some f =>
+    match register inp m name with
+    | some e => if e.clock = at_ then read sc inp f e.value else .null
+    | none => .null
+  | _, _ => .null
+
+abbrev Row := List (String × Value)
+
+noncomputable def row (c : Collection) (r : Gid) : Row :=
+  (c.fields.filter fun f => !c.inTogether f.name).map (fun f => (f.name, plainValue sc inp f r)) ++
+    c.together.flatMap fun set => set.map fun name => (name, setValue sc inp c set name r)
+
+/-- The rows of one collection, by canonical gid. -/
+noncomputable def present (collection : String) (r : Gid) : Option Row :=
+  match sc.find collection with
+  | none => none
+  | some c =>
+    if inp.home r = some collection ∧ ∃ m ∈ inp.gids, inp.canon m = r ∧ Live sc inp m then
+      some (row sc inp c r)
+    else none
+
+end Present
+
+/-- **The view** of the changes `cs`: for each collection, its live groups' rows. -/
+noncomputable def view (sc : Schema) (cs : List (Change Value)) : String → Gid → Option Row :=
+  present sc (inputs sc cs)
+
+/-! ## The view depends only on the set of changes -/
+
+instance : TransCmp claimCmp :=
+  inferInstanceAs (TransCmp (compareLex (compareOn (fun p : Hlc × String => p.1))
+    (compareOn (fun p : Hlc × String => p.2))))
+
+instance : LawfulEqCmp claimCmp where
+  eq_of_compare {a b} h := by
+    simp only [claimCmp, compareLex_eq_eq, compareOn] at h
+    exact Prod.ext (LawfulEqOrd.eq_of_compare h.1) (LawfulEqOrd.eq_of_compare h.2)
+
+instance : TransCmp claimFirst := inferInstanceAs (TransCmp fun a b => claimCmp b a)
+
+instance : LawfulEqCmp claimFirst := inferInstanceAs (LawfulEqCmp fun a b => claimCmp b a)
+
+section Invariance
+
+variable (sc : Schema) {cs₁ cs₂ : List (Change Value)} (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂)
+
+include same
+
+theorem mem_candidates_iff (c : Change Value) :
+    c ∈ candidates sc cs₁ ↔ c ∈ candidates sc cs₂ := by
+  simp [candidates, same]
+
+theorem home_eq : home sc cs₁ = home sc cs₂ := by
+  funext g
+  simp only [home]
+  congr 1
+  exact fold_keep_eq_of_mem_iff (cmp := claimFirst) (key := id) _ _ (fun x => by
+    simp only [List.mem_map, List.mem_filter, mem_candidates_iff sc same])
+    (fun a _ b _ h => h)
+
+theorem mem_claimed_iff (c : Change Value) : c ∈ claimed sc cs₁ ↔ c ∈ claimed sc cs₂ := by
+  simp only [claimed, List.mem_filter, mem_candidates_iff sc same, home_eq sc same]
+
+theorem gids_eq : gids sc cs₁ = gids sc cs₂ :=
+  gidSet_eq_of_mem_iff fun g => by simp only [List.mem_map, mem_claimed_iff sc same]
+
+theorem mem_edges_iff (e : Edge) : e ∈ edges sc cs₁ ↔ e ∈ edges sc cs₂ := by
+  simp only [edges, List.mem_filterMap, mem_claimed_iff sc same, home_eq sc same]
+
+theorem registers_eq (unique : ClockDetermines cs₁) : registers sc cs₁ = registers sc cs₂ := by
+  apply merged_eq_of_mem_iff
+  · intro c; simp only [List.mem_filter, mem_claimed_iff sc same]
+  · intro a ha b hb
+    have hsub : ∀ x, x ∈ (claimed sc cs₁).filter (fun c => c.field ≠ ALIAS) → x ∈ cs₁ := by
+      intro x hx
+      simp only [List.mem_filter, claimed, candidates] at hx
+      exact hx.1.1.1
+    exact unique a (hsub a ha) b (hsub b hb)
+
+theorem inputs_eq (unique : ClockDetermines cs₁) : inputs sc cs₁ = inputs sc cs₂ := by
+  simp only [inputs, registers_eq sc same unique, home_eq sc same, gids_eq sc same,
+    canonical_eq_of_mem_iff _ _ (mem_edges_iff sc same)]
+
+/-- **The view over several collections depends only on the set of changes**, given that no two
+changes to one register share a clock with different values. -/
+theorem view_eq_of_mem_iff (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ := by
+  simp only [view, inputs_eq sc same unique]
+
+end Invariance
+
+theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂)
+    (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ :=
+  view_eq_of_mem_iff sc (fun _ => p.mem_iff) unique
+
+theorem view_dup (sc : Schema) (cs : List (Change Value)) (unique : ClockDetermines cs) :
+    view sc (cs ++ cs) = view sc cs :=
+  view_eq_of_mem_iff sc (by simp) (by
+    intro a ha b hb; simp only [List.mem_append, or_self] at ha hb; exact unique a ha b hb)
+
+/-! ## Changes that are ignored -/
+
+/-- A change that is not a candidate does not change the view. -/
+theorem view_ignores (sc : Schema) (c : Change Value) (cs : List (Change Value))
+    (h : ¬ (c.clock.encodable ∧ aliasOk c = true ∧ (sc.find c.collection).isSome)) :
+    view sc (c :: cs) = view sc cs := by
+  have hc : candidates sc (c :: cs) = candidates sc cs := by
+    simp only [candidates, List.filter_cons]
+    have : (decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome) = false := by
+      simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
+      by_cases h₁ : c.clock.encodable
+      · by_cases h₂ : aliasOk c = true
+        · exact .inr (by simpa [h₁, h₂] using h)
+        · exact .inl (.inr (by simpa using h₂))
+      · exact .inl (.inl h₁)
+    simp [this]
+  have hh : home sc (c :: cs) = home sc cs := by funext g; simp only [home, hc]
+  have hcl : claimed sc (c :: cs) = claimed sc cs := by simp only [claimed, hc, hh]
+  simp only [view, inputs, registers, gids, edges, hcl, hh]
+
+/-- A change whose clock the text form cannot hold is ignored. -/
+theorem view_ignores_unencodable (sc : Schema) (c : Change Value) (cs : List (Change Value))
+    (h : ¬ c.clock.encodable) : view sc (c :: cs) = view sc cs :=
+  view_ignores sc c cs fun h' => h h'.1
+
+/-- A change to a collection the schema does not declare is ignored. -/
+theorem view_ignores_unknown_collection (sc : Schema) (c : Change Value) (cs : List (Change Value))
+    (h : sc.find c.collection = none) : view sc (c :: cs) = view sc cs :=
+  view_ignores sc c cs fun h' => by simp [h] at h'
+
+/-- An alias that does not name another gid is ignored. -/
+theorem view_ignores_bad_alias (sc : Schema) (c : Change Value) (cs : List (Change Value))
+    (h : aliasOk c = false) : view sc (c :: cs) = view sc cs :=
+  view_ignores sc c cs fun h' => by simp [h] at h'
+
+end FongoSync.Full

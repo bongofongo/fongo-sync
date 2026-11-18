@@ -1,7 +1,8 @@
 import FongoSync
 
 /-! Prints the axioms each law in `FongoSync/Laws.lean` rests on, in the order stated there.
-`make lean` fails if this list differs from that file or if `sorryAx` appears. -/
+`make lean` fails if this list differs from that file, or if a law rests on any axiom other than
+`propext`, `Classical.choice` and `Quot.sound`. -/
 
 #print axioms FongoSync.Laws.tick_later
 #print axioms FongoSync.Laws.observe_ignores_unencodable
@@ -29,3 +30,7 @@ import FongoSync
 #print axioms FongoSync.Laws.view_swap_alias
 #print axioms FongoSync.Laws.view_twice
 #print axioms FongoSync.Laws.view_set
+#print axioms FongoSync.Laws.full_view_set
+#print axioms FongoSync.Laws.full_view_ignores_unencodable
+#print axioms FongoSync.Laws.full_view_ignores_unknown_collection
+#print axioms FongoSync.Laws.full_view_ignores_bad_alias

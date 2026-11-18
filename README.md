@@ -35,7 +35,7 @@ One chain, each link checked against the one above it:
 
 1. **Laws, in [Lean 4](https://lean-lang.org).** `lean/` restates the core: clocks, registers
    under both strategies, a replica's state as a fold over the changes it received, alias groups,
-   liveness through owners, and the view. `lean/FongoSync/Laws.lean` states every law in one
+   liveness through owners, and the view over several collections. `lean/FongoSync/Laws.lean` states every law in one
    place; the other files prove them. Among them: a replica's registers, groups and view do not
    depend on the order changes arrive in or on duplicates, given that no two changes to one
    register share a clock with different values (an example shows that condition is needed); the
@@ -52,8 +52,8 @@ One chain, each link checked against the one above it:
 
 Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
 `clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
-faithful. The Lean view also covers less than `model::view`: one collection, no natural keys, no
-`together` sets, no `Real` values, and no filter on clocks `Hlc::encode` cannot hold.
+faithful. The Lean view covers several collections, which collection a gid belongs to, the
+changes `model::view` ignores, and `together` sets, but not natural keys or `Real` values.
 
 ## Licence
 

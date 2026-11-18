@@ -6,3 +6,4 @@ import FongoSync.Alias
 import FongoSync.View
 import FongoSync.Examples
 import FongoSync.Laws
+import FongoSync.Model
