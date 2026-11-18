@@ -918,6 +918,17 @@ impl Replica {
             if !wins(strategy, held, &change.value, &change.clock) {
                 continue;
             }
+            // Fields that change together take the newest write as a whole: a change older than
+            // what any of them holds belongs to a write already overtaken.
+            if let Some(c) = idx.map(|i| &self.registry.collections()[i])
+                && let Some(set) = c.together_of(&change.field)
+                && c.together[set]
+                    .iter()
+                    .filter_map(|f| shadow.get(f))
+                    .any(|(_, clock)| *clock > change.clock)
+            {
+                continue;
+            }
             shadow_put(&mut tx, change).await?;
             applied.accepted += 1;
             if let Some(idx) = idx {
@@ -2091,7 +2102,10 @@ impl Replica {
                 merged = shadow_of(conn, gid).await?;
                 merged.remove(DELETED);
             }
-            for (field, value) in c.fields.iter().zip(values) {
+            let row: Vec<(&Field, Value)> = c.fields.iter().zip(values).collect();
+            let mut changed: BTreeSet<&str> = BTreeSet::new();
+            for (field, value) in &row {
+                let value = value.clone();
                 let unchanged = match merged.get(&field.name) {
                     // A reference to a row this replica does not have was written as null.
                     Some((Value::Ref(target), _)) if value == Value::Null => {
@@ -2108,11 +2122,25 @@ impl Replica {
                     None => value == Value::Null,
                 };
                 if !unchanged {
+                    changed.insert(&field.name);
+                }
+            }
+            for set in &c.together {
+                if set.iter().any(|f| changed.contains(f.as_str())) {
+                    changed.extend(set.iter().map(String::as_str));
+                }
+            }
+            for (field, value) in row {
+                if changed.contains(field.name.as_str()) {
                     changes.push((field.name.clone(), value));
                 }
             }
+            let mut stamps: BTreeMap<usize, Hlc> = BTreeMap::new();
             for (field, value) in changes {
-                let stamp = pass.clock.tick(e.at);
+                let stamp = match c.together_of(&field) {
+                    Some(set) => *stamps.entry(set).or_insert_with(|| pass.clock.tick(e.at)),
+                    None => pass.clock.tick(e.at),
+                };
                 let strategy = self.registry.strategy(&c.name, &field);
                 let held = merged.get(&field).map(|(v, c)| (v, c));
                 if field != DELETED && !wins(strategy, held, &value, &stamp) {

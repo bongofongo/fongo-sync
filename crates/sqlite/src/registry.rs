@@ -52,6 +52,8 @@ pub struct Collection {
     pub local_defaults: Vec<(String, LocalDefault)>,
     /// Which rows are synced, as an SQL condition over the table's columns.
     pub filter: Option<String>,
+    /// Sets of fields that change together.
+    pub together: Vec<Vec<String>>,
 }
 
 /// What the kernel writes into a column it does not sync when it inserts a row.
@@ -76,6 +78,7 @@ impl Collection {
             local_dependents: Vec::new(),
             local_defaults: Vec::new(),
             filter: None,
+            together: Vec::new(),
         }
     }
 
@@ -91,6 +94,7 @@ impl Collection {
             local_dependents: Vec::new(),
             local_defaults: Vec::new(),
             filter: None,
+            together: Vec::new(),
         }
     }
 
@@ -151,6 +155,16 @@ impl Collection {
         self
     }
 
+    /// Declares fields that only make sense together, such as a status and the dates that go
+    /// with it. A write to any of them records all of them at one clock, and the newest such
+    /// write wins as a whole, so merging never yields a combination no replica wrote. The fields
+    /// must be plain or references merged by clock, and outside the key.
+    pub fn together(mut self, fields: &[&str]) -> Collection {
+        self.together
+            .push(fields.iter().map(|f| (*f).into()).collect());
+        self
+    }
+
     pub fn identity(mut self, fields: &[&str]) -> Collection {
         self.identity
             .push(fields.iter().map(|f| (*f).into()).collect());
@@ -198,6 +212,13 @@ impl Collection {
         self.filter
             .as_ref()
             .map_or_else(String::new, |f| format!(" AND ({f})"))
+    }
+
+    /// Which set of fields changing together holds `field`, if any.
+    pub(crate) fn together_of(&self, field: &str) -> Option<usize> {
+        self.together
+            .iter()
+            .position(|set| set.iter().any(|f| f == field))
     }
 
     pub(crate) fn field_index(&self, name: &str) -> Option<usize> {
@@ -278,6 +299,23 @@ impl Registry {
                     }
                     if let Some(missing) = key.iter().find(|k| !fields.contains(k.as_str())) {
                         return bad(format!("key field `{}.{missing}` is not declared", c.name));
+                    }
+                }
+            }
+            let mut grouped: BTreeSet<&str> = BTreeSet::new();
+            for set in &c.together {
+                for name in set {
+                    let Some(field) = c.fields.iter().find(|f| f.name == *name) else {
+                        return bad(format!("`{}.{name}` is not declared", c.name));
+                    };
+                    if field.strategy != Strategy::Lww || c.key_columns().contains(&name.as_str()) {
+                        return bad(format!(
+                            "`{}.{name}` cannot change together with others",
+                            c.name
+                        ));
+                    }
+                    if !grouped.insert(name) {
+                        return bad(format!("`{}.{name}` is in two sets", c.name));
                     }
                 }
             }
@@ -410,6 +448,23 @@ mod tests {
             .field("key")
             .field("value");
         assert!(Registry::new(vec![c]).is_ok());
+    }
+
+    #[test]
+    fn fields_that_change_together_are_declared_merged_by_clock_and_in_one_set() {
+        let books = || {
+            Collection::minted("books", "books", "id")
+                .field("status")
+                .field("finished")
+                .field_with("pages", Strategy::Max)
+        };
+        assert!(Registry::new(vec![books().together(&["status", "finished"])]).is_ok());
+        assert!(Registry::new(vec![books().together(&["status", "started"])]).is_err());
+        assert!(Registry::new(vec![books().together(&["status", "pages"])]).is_err());
+        let twice = books()
+            .together(&["status", "finished"])
+            .together(&["finished"]);
+        assert!(Registry::new(vec![twice]).is_err());
     }
 
     #[test]

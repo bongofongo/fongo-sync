@@ -21,7 +21,9 @@ const SCHEMA: &[&str] = &[
         author_id INTEGER REFERENCES authors(id) ON DELETE SET NULL,
         isbn TEXT UNIQUE,
         isbn10 TEXT UNIQUE,
-        current INTEGER)",
+        current INTEGER,
+        status TEXT,
+        finished INTEGER)",
     "CREATE UNIQUE INDEX one_current_book ON books (current) WHERE current = 1",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
@@ -70,6 +72,9 @@ fn registry() -> Registry {
             .field("isbn")
             .field("isbn10")
             .field("current")
+            .field("status")
+            .field("finished")
+            .together(&["status", "finished"])
             .identity(&["isbn"])
             .identity(&["isbn10"])
             .local_dependent("positions", "book_id")
@@ -111,7 +116,8 @@ const DUMP: &str = "
       FROM authors a LEFT JOIN fongo_ids i ON i.collection = 'authors' AND i.key = json_array(a.id)
     UNION ALL
     SELECT 'book ' || COALESCE(hex(i.gid), 'UNMAPPED')
-           || ' i=' || COALESCE(b.isbn, '-') || ' j=' || COALESCE(b.isbn10, '-') || ' ' || b.title
+           || ' i=' || COALESCE(b.isbn, '-') || ' j=' || COALESCE(b.isbn10, '-')
+           || ' s=' || COALESCE(b.status, '-') || ' f=' || COALESCE(b.finished, '-') || ' ' || b.title
            || ' y=' || COALESCE(b.year, '-') || ' p=' || COALESCE(b.pages, '-') || ' a='
            || COALESCE((SELECT hex(gid) FROM fongo_ids
                         WHERE collection = 'authors' AND key = json_array(b.author_id)), '-')
@@ -383,6 +389,9 @@ async fn check(peers: &mut [Peer]) {
         assert!(broken.is_empty(), "{broken:#?}");
         let pending = peer.lines(PENDING).await;
         assert!(pending.is_empty(), "{pending:#?}\n{:#?}", peer.dump().await);
+        let mixed = "SELECT count(*) FROM books
+                     WHERE (COALESCE(status, '') = 'done') <> (finished IS NOT NULL)";
+        assert_eq!(count(peer, mixed).await, 0, "{:#?}", peer.dump().await);
     }
 }
 
@@ -1883,6 +1892,7 @@ enum Op {
     SetTitle(usize, u8),
     SetYear(usize, u8),
     SetPages(usize, u8),
+    SetStatus(usize, u8),
     SetAuthor(usize, usize),
     DeleteBook(usize),
     DeleteAuthor(usize),
@@ -1921,6 +1931,8 @@ fn arb_op() -> impl Strategy<Value = Op> {
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTitle(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetYear(a, b)),
         (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetPages(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetStatus(a, b)),
+        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetStatus(a, b)),
         (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetAuthor(a, b)),
         n.clone().prop_map(Op::DeleteBook),
         n.clone().prop_map(Op::DeleteAuthor),
@@ -2100,6 +2112,18 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             Some(id) => format!("DELETE FROM tags WHERE rowid = {id}"),
             None => return,
         },
+        Op::SetStatus(n, v) => {
+            let Some(id) = peer.pick("books", n).await else {
+                return;
+            };
+            // A book is finished on a day exactly when it is done.
+            let set = match v {
+                0 => "status = 'reading', finished = NULL".to_string(),
+                1 => "status = 'abandoned', finished = NULL".to_string(),
+                _ => format!("status = 'done', finished = {v}"),
+            };
+            format!("UPDATE OR IGNORE books SET {set} WHERE id = {id}")
+        }
         Op::SetTitle(n, _)
         | Op::SetYear(n, _)
         | Op::SetPages(n, _)
