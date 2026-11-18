@@ -5,6 +5,6 @@ mod change;
 mod clock;
 mod value;
 
-pub use change::{Change, DELETED, State, Strategy, wins};
+pub use change::{ALIAS, Change, DELETED, State, Strategy, wins};
 pub use clock::{Clock, Hlc};
 pub use value::{Gid, Value};

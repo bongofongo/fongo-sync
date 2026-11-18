@@ -7,6 +7,10 @@ use crate::value::{Gid, Value};
 /// The field that carries an entity's tombstone: `Int(1)` deleted, `Int(0)` restored.
 pub const DELETED: &str = "$deleted";
 
+/// The field that says an entity is the same as another: its value is `Ref` of the other. Aliases
+/// only accumulate, so it is never resolved by clock like an ordinary field.
+pub const ALIAS: &str = "$alias";
+
 /// One field of one entity took a value at a moment. The whole of what replicas exchange.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
