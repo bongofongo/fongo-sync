@@ -1699,6 +1699,87 @@ async fn a_row_outside_the_filter_is_not_synced_and_crossing_it_makes_or_deletes
     assert_converged(&mut peers).await;
 }
 
+#[tokio::test]
+async fn writes_while_suspended_are_not_collected() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let replica = peers[0].replica.clone();
+    replica.suspend(&mut peers[0].conn).await.unwrap();
+    peers[0].run("UPDATE books SET title = upper(title)").await;
+    replica.resume(&mut peers[0].conn).await.unwrap();
+    assert_eq!(replica.collect(&mut peers[0].conn).await.unwrap(), 0);
+    // A later write to the row carries what it holds along, the suspended write included.
+    peers[0].run("UPDATE books SET year = 1871").await;
+    assert_eq!(replica.collect(&mut peers[0].conn).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn uninstalling_leaves_only_the_application_tables() {
+    let mut peer = Peer::new().await;
+    peer.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peer.replica.collect(&mut peer.conn).await.unwrap();
+    let replica = peer.replica.clone();
+    replica.uninstall(&mut peer.conn).await.unwrap();
+    let kernel = "SELECT name FROM sqlite_master WHERE name LIKE 'fongo!_%' ESCAPE '!'";
+    assert!(peer.lines(kernel).await.is_empty());
+    peer.run("INSERT INTO books (title) VALUES ('Romola')")
+        .await;
+    assert_eq!(count(&mut peer, "SELECT count(*) FROM books").await, 2);
+}
+
+#[tokio::test]
+async fn a_field_added_later_takes_what_rows_hold_and_one_removed_is_ignored() {
+    let schema =
+        ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, year INTEGER, pages INTEGER)"];
+    let before = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("pages"),
+        ])
+        .unwrap()
+    };
+    let after = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("year"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::with(&schema, before()).await,
+        Peer::with(&schema, before()).await,
+    ];
+    peers[0]
+        .run("INSERT INTO books (title, year, pages) VALUES ('Middlemarch', 1871, 880)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let years = "SELECT COALESCE(year, '-') || ' ' || COALESCE(pages, '-') FROM books";
+    assert_eq!(peers[1].lines(years).await, ["- 880"]);
+
+    for peer in peers.iter_mut() {
+        peer.replica = Replica::new(after());
+        peer.install().await;
+    }
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[1].lines(years).await, ["1871 880"]);
+    assert_eq!(peers[0].lines(SHADOW).await, peers[1].lines(SHADOW).await);
+
+    // A value adopted that way gives way to any real write.
+    peers[1]
+        .run("UPDATE books SET year = 1872, pages = 1")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[0].lines(years).await, ["1872 880"]);
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));

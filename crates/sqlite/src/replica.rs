@@ -338,6 +338,21 @@ fn triggers(c: &Collection) -> Vec<String> {
     ]
 }
 
+/// Drops every object of a type the kernel made: its triggers, or its tables.
+async fn drop_kernel(conn: &mut SqliteConnection, kind: &str) -> Result<()> {
+    let names = query(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type = ? AND name LIKE 'fongo!_%' ESCAPE '!'",
+        &[Value::Text(kind.into())],
+    )
+    .await?;
+    for row in names {
+        let name = quoted(as_text(&row[0])?);
+        exec(conn, &format!("DROP {kind} IF EXISTS {name}"), &[]).await?;
+    }
+    Ok(())
+}
+
 async fn meta_set(conn: &mut SqliteConnection, key: &str, value: Value) -> Result<()> {
     exec(
         conn,
@@ -661,28 +676,31 @@ impl Replica {
             &[],
         )
         .await?;
-        let existing = query(
-            &mut tx,
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'fongo!_%' ESCAPE '!'",
-            &[],
-        )
-        .await?;
-        for row in existing {
-            exec(
-                &mut tx,
-                &format!("DROP TRIGGER {}", quoted(as_text(&row[0])?)),
-                &[],
-            )
-            .await?;
-        }
+        drop_kernel(&mut tx, "trigger").await?;
         for c in self.registry.collections() {
             for sql in triggers(c) {
                 exec(&mut tx, &sql, &[]).await?;
             }
             let adopted = format!("adopted:{}", c.name);
+            let known = format!("fields:{}", c.name);
+            let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+            let fields = Value::Text(names.join(","));
             if meta_get(&mut tx, &adopted).await?.is_some() {
+                if let Some(Value::Text(held)) = meta_get(&mut tx, &known).await? {
+                    let held: BTreeSet<&str> = held.split(',').collect();
+                    let added: Vec<&Field> = c
+                        .fields
+                        .iter()
+                        .filter(|f| !held.contains(f.name.as_str()))
+                        .collect();
+                    if !added.is_empty() {
+                        self.adopt_fields(&mut tx, c, &added).await?;
+                    }
+                }
+                meta_set(&mut tx, &known, fields).await?;
                 continue;
             }
+            meta_set(&mut tx, &known, fields).await?;
             let key: Vec<String> = c.key_columns().iter().map(|k| quoted(k)).collect();
             exec(
                 &mut tx,
@@ -701,6 +719,122 @@ impl Replica {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Removes the triggers that notice local writes, so an application can change its schema or
+    /// rewrite its rows without the writes being collected. [`Replica::resume`] puts them back.
+    /// A row written meanwhile is collected whole the next time it is written, since a write is
+    /// collected as the difference between the row and the merged state.
+    pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
+        let mut tx = conn.begin().await?;
+        drop_kernel(&mut tx, "trigger").await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Puts the triggers back after [`Replica::suspend`]. It installs again, so collections and
+    /// fields the registry gained meanwhile are adopted.
+    pub async fn resume(&self, conn: &mut SqliteConnection) -> Result<()> {
+        self.install(conn).await
+    }
+
+    /// Removes the triggers and every table the kernel keeps, leaving the application's own.
+    pub async fn uninstall(&self, conn: &mut SqliteConnection) -> Result<()> {
+        let mut tx = conn.begin().await?;
+        drop_kernel(&mut tx, "trigger").await?;
+        drop_kernel(&mut tx, "table").await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Records the values rows already hold for fields new to an adopted collection, as the
+    /// oldest possible writes, so they fill gaps but never overwrite what any replica wrote.
+    async fn adopt_fields(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        added: &[&Field],
+    ) -> Result<()> {
+        let Some(node) = meta_get(conn, "node").await? else {
+            return corrupt("the replica is not installed");
+        };
+        let node = as_gid(&node)?;
+        let mut seq = match meta_get(conn, "adopted_seq").await? {
+            Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        let keys: Vec<String> = c.key_columns().iter().map(|k| quoted(k)).collect();
+        let rows = query(
+            conn,
+            &format!(
+                "SELECT json_array({}) FROM {} WHERE 1{}",
+                keys.join(", "),
+                quoted(&c.table),
+                c.visible()
+            ),
+            &[],
+        )
+        .await?;
+        for row in rows {
+            let key = as_text(&row[0])?;
+            let Some(values) = self.read_row(conn, c, key).await? else {
+                continue;
+            };
+            let gid = match &c.key {
+                Key::Minted { .. } => minted_gid(conn, &c.name, key).await?,
+                Key::Natural { fields } => self.resolve_natural(conn, c, fields, &values).await?,
+            };
+            // A row not yet collected is collected whole, new fields and all.
+            let Some(gid) = gid else {
+                continue;
+            };
+            if matches!(c.key, Key::Natural { .. }) && !has_shadow(conn, gid).await? {
+                continue;
+            }
+            let group = self.group(conn, c, gid).await?;
+            let target = group.target();
+            let mut behind = false;
+            for field in added {
+                let Some(value) = c.field_index(&field.name).and_then(|i| values.get(i)) else {
+                    continue;
+                };
+                if *value == Value::Null {
+                    continue;
+                }
+                seq = seq.saturating_add(1);
+                let change = Change {
+                    collection: c.name.clone(),
+                    gid: target,
+                    field: field.name.clone(),
+                    value: value.clone(),
+                    clock: Hlc {
+                        wall_ms: 0,
+                        counter: seq,
+                        node,
+                    },
+                };
+                let own = shadow_of(conn, target).await?;
+                let held = own.get(&field.name).map(|(v, c)| (v, c));
+                if wins(field.strategy, held, &change.value, &change.clock) {
+                    emit(conn, &change).await?;
+                }
+                behind |= self
+                    .group(conn, c, gid)
+                    .await?
+                    .merged
+                    .get(&field.name)
+                    .is_none_or(|(merged, _)| merged != value);
+            }
+            if behind {
+                exec(
+                    conn,
+                    "INSERT OR IGNORE INTO fongo_pending (gid, collection) VALUES (?, ?)",
+                    &[Value::Ref(group.canon), Value::Text(c.name.clone())],
+                )
+                .await?;
+            }
+        }
+        meta_set(conn, "adopted_seq", Value::Int(i64::from(seq))).await
     }
 
     /// Turns the local writes made since the last call into changes in the outbox. Returns how
