@@ -14,8 +14,22 @@ its database, `Replica::collect` to turn local writes into changes, and `Replica
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
 `fongo_`.
 
+The merge rules are also stated as laws and proven in [Bend](https://bend-lang.com): `model.bend`
+restates them, `LAWS.bend` says what they must guarantee, and `PROOF.bend` proves it. The proofs
+are about the model, which mirrors `crates/core/src/change.rs` and `clock.rs` by hand.
+
 Not yet here: the wire protocol, encryption, and a server.
 
 ```
 make check
 ```
+
+## Licence
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE) or the
+[MIT licence](LICENSE-MIT), at your option.
+
+## Contributing
+
+This repository is not accepting contributions at the moment. Pull requests will be closed
+unread; bug reports are welcome as issues.
