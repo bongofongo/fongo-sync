@@ -6,7 +6,7 @@ The kernel knows nothing about any particular application.
 
 | crate | holds |
 |---|---|
-| `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules. No I/O. |
+| `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules; the reference model; the evaluator and row planner that make every merge decision. No I/O. |
 | `fongo-sync-sqlite` | change capture by trigger, and applying remote changes to an application's own tables. |
 | `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
 
@@ -28,6 +28,37 @@ Not yet here: an HTTP client, a server, and blob transfer.
 ```
 make check
 ```
+
+## Structure
+
+Three layers, each tested against the one above it:
+
+1. **Specification.** `model::view` says what every replica must show for a set of changes. It
+   is slow and plain on purpose.
+2. **Decisions, as pure functions in `fongo-sync-core`.**
+   - `source`: what a replica keeps of each change (`admit`), and the `Source` trait: the
+     indexed questions the evaluator asks of those facts.
+   - `eval`: `Session::target` computes one entity's group, liveness and row on demand, pulling
+     only the facts it needs, within explicit `Limits`. `Evaluator::affected` names the entities
+     whose rows may change when a batch is merged.
+   - `plan`: `edits` and `record` turn an application's row edits (a row compared with its
+     image) into changes; `write` turns a target into a row action; `clashes` finds groups an
+     identity key says are one; `order` orders row actions for tables with unique and
+     foreign-key constraints, parking a row where writes form a cycle.
+3. **Mechanics.** A storage adapter keeps facts, rows, row images and a mapping from entities to
+   local rows; it asks the core what to do and does it. `crates/core/tests/sim` is such an
+   adapter over in-memory tables, with no SQL: the executable design of one.
+
+What is tested against what (`crates/core/tests`):
+
+| test | checks |
+|---|---|
+| `eval.rs` | `target` for every gid equals `model::view`, over random schemas from a small family and hostile change sets; answers under tight limits do not depend on what was asked before |
+| `affected.rs` | the incremental law: re-evaluating only what `affected` names after each batch, delivered in random order with repeats, keeps the rows equal to `model::view` |
+| `plan.rs` | recorded edits round-trip; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps the tables' constraints |
+| `sim` | several replicas, random edits and partial, reordered, repeated delivery: rows equal `model::view` of what each replica merged after every step, and are identical once everything is delivered; also every short script over a small alphabet |
+
+`FONGO_SIM_CASES` and `FONGO_EXHAUSTIVE_LENGTH` raise the volume of the last two.
 
 ## Verification
 

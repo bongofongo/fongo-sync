@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::change::Change;
 use crate::eval::{Evaluator, Undetermined};
 use crate::model::{FieldKind, Identity};
-use crate::source::{Body, Overlay, Source, admit};
+use crate::source::{Body, Overlay, Source, admit, alters};
 use crate::value::{Gid, Value};
 
 impl Evaluator<'_> {
@@ -16,7 +16,8 @@ impl Evaluator<'_> {
     /// pairs to their new [`Target`](crate::eval::Target) (a row under the canonical gid when it
     /// is live and canonical, no row otherwise) turns the view before into the view after.
     ///
-    /// Works outward from the gids the batch names, comparing each gid's target before and after
+    /// Works outward from the gids named by the changes that alter what `before` keeps (a change
+    /// already merged, or one that loses to what is kept, affects nothing), comparing each gid's target before and after
     /// and, where it differs, visiting every member of both groups and every gid holding a
     /// reference to one of them in a reference, owner or natural key field. Cost: proportional
     /// to the size of the groups whose targets change and the number of gids referring to them,
@@ -30,7 +31,12 @@ impl Evaluator<'_> {
         batch: &[Change],
     ) -> Result<BTreeSet<(String, Gid)>, Undetermined> {
         let schema = self.schema;
-        let after = Overlay::new(schema, before, batch);
+        let batch: Vec<Change> = batch
+            .iter()
+            .filter(|c| admit(schema, c).is_some_and(|f| alters(before, &f)))
+            .cloned()
+            .collect();
+        let after = Overlay::new(schema, before, &batch);
         let mut was = self.session(before);
         let mut will = self.session(&after);
 
@@ -50,7 +56,7 @@ impl Evaluator<'_> {
         }
 
         let mut queue: Vec<Gid> = Vec::new();
-        for change in batch {
+        for change in &batch {
             if let Some(fact) = admit(schema, change) {
                 queue.push(fact.gid);
                 if let Body::Alias { target } = fact.body {

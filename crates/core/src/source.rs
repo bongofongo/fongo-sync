@@ -147,6 +147,33 @@ fn keep(
     }
 }
 
+/// Whether keeping `fact` would change anything `base` keeps.
+pub(crate) fn alters<S: Source>(base: &S, fact: &Fact) -> bool {
+    let claimed = base
+        .claims(fact.gid)
+        .into_iter()
+        .any(|c| c.collection == fact.collection && c.first <= fact.clock);
+    if !claimed {
+        return true;
+    }
+    match &fact.body {
+        Body::Alias { target } => !base.aliases(fact.gid).contains(&Alias {
+            collection: fact.collection.clone(),
+            from: fact.gid,
+            to: *target,
+        }),
+        Body::Field { field, value, slot } => {
+            let mut kept: Vec<(Value, Hlc)> = base
+                .entries(&fact.collection, fact.gid)
+                .into_iter()
+                .filter(|e| &e.field == field)
+                .map(|e| (e.value, e.clock))
+                .collect();
+            keep(*slot, &mut kept, value, fact.clock).0
+        }
+    }
+}
+
 /// The questions the evaluator asks. A database adapter answers them with indexed queries over
 /// the facts [`admit`] describes; [`Store`] answers them in memory.
 pub trait Source {
