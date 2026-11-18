@@ -911,6 +911,18 @@ async fn a_change_too_large_for_any_envelope_is_an_error_naming_it() {
 }
 
 #[tokio::test]
+async fn a_maximum_below_any_envelope_is_named_as_such() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_batch_bytes = Some(100));
+    let [mut a, _] = pair(&server).await;
+    a.run("INSERT INTO settings VALUES ('theme', 'dark')").await;
+    assert!(matches!(
+        a.sync(&server).await,
+        Err(Error::MaxBatchTooSmall { max: 100 })
+    ));
+}
+
+#[tokio::test]
 async fn a_concurrent_edit_to_a_field_that_reports_conflicts_reaches_the_report() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;

@@ -35,6 +35,10 @@ pub enum Error {
         bytes: usize,
         max: u64,
     },
+    /// The server's maximum envelope size is below that of any envelope carrying a change, so
+    /// nothing can be sent until it is raised.
+    #[error("the server accepts envelopes of at most {max} bytes, smaller than any envelope")]
+    MaxBatchTooSmall { max: u64 },
     #[error("recovery code: {0}")]
     RecoveryCode(#[from] RecoveryError),
     #[error("the operating system's randomness source failed")]

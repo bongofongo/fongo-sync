@@ -6,7 +6,7 @@ use fongo_sync_protocol::api::{
 use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
-use fongo_sync_sqlite::core::Change;
+use fongo_sync_sqlite::core::{ALIAS, Change, DELETED};
 use fongo_sync_sqlite::{Applied, Replica};
 use sqlx::{Connection, SqliteConnection};
 
@@ -24,6 +24,8 @@ const APPLY_CHUNK: usize = 50_000;
 const MAX_PAGES: usize = 1_000;
 /// Refusals listed in [`SyncReport::refused`]; [`SyncReport::refused_total`] counts them all.
 const REFUSALS_LISTED: usize = 100;
+/// The encoded size of a batch of one change with an empty collection and field and a null value.
+const SMALLEST_BATCH: usize = 3 + 1 + 16 + 1 + 1 + 8 + 4 + 16;
 /// Most changes sealed into one envelope.
 const OUTBOX_PAGE: u32 = 1_000;
 
@@ -194,11 +196,16 @@ pub async fn sync<T: Transport>(
         let mut n = fitting(&full.changes, max);
         let (outbox, envelope) = loop {
             if n == 0 {
+                let max = max.unwrap_or(u64::MAX);
+                let internal = first.field == DELETED || first.field == ALIAS;
+                if internal || max < envelope_len(SMALLEST_BATCH) as u64 {
+                    return Err(Error::MaxBatchTooSmall { max });
+                }
                 return Err(Error::ChangeTooLarge {
                     collection: first.collection.clone(),
                     field: first.field.clone(),
                     bytes: envelope_len(encode_batch(std::slice::from_ref(first)).len()),
-                    max: max.unwrap_or(u64::MAX),
+                    max,
                 });
             }
             let outbox = if n < full.changes.len() {
@@ -626,6 +633,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_smallest_batch_is_one_empty_change() {
+        let empty = Change {
+            collection: String::new(),
+            gid: Gid([1; 16]),
+            field: String::new(),
+            value: Value::Null,
+            clock: Hlc::zero(Gid([2; 16])),
+        };
+        assert_eq!(encode_batch(&[empty]).len(), SMALLEST_BATCH);
     }
 
     #[test]
