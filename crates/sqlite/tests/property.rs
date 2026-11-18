@@ -762,3 +762,48 @@ fn a_half_delivered_set_is_not_sent_by_an_unrelated_edit() {
         run(seed, &script).unwrap();
     }
 }
+
+/// Found by a long run. A tag the application deletes belongs to a book whose group has a deleted
+/// member and one whose tombstone has not arrived. Its owner's fate is undecided here, so the
+/// kernel sends no tombstone for the tag, which comes back once the book's tombstone arrives.
+#[test]
+#[ignore = "a delete of a row whose owner's fate is undecided sends no tombstone"]
+fn a_deleted_tag_whose_books_fate_is_undecided_stays_deleted() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 1)),
+        (4, AddShelf(0)),
+        (0, AddBook(0, 0, 2)),
+        (0, DeleteBook(0)),
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 2)),
+        (0, SetExtra(0, 0)),
+        (0, AddShelf(1)),
+        (0, Upgrade),
+        (0, Sync),
+        (0, SetTitle(0, 0)),
+        (4, AddBook(0, 0, 2)),
+        (2, AddShelf(0)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (0, AddShelf(0)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (1, Log(0, false)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (4, Deliver(17723131892693417154, false, false)),
+        (0, AddShelf(0)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (1, DeleteBook(0)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (4, SetSetting(0, 0)),
+        (0, AddTag(0, 0)),
+        (4, Sync),
+        (0, AddBook(0, 0, 0)),
+        (0, AddShelf(0)),
+        (1, Sync),
+        (0, Deliver(16183820145487851227, false, false)),
+        (0, DeleteTag(0)),
+    ];
+    run(488962404733629702, &script).unwrap();
+}

@@ -49,6 +49,21 @@ async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
     out
 }
 
+/// Whether a member is gone for good as far as `merge` knows: tombstoned, or not live while
+/// every entity it names is known. One whose tombstone has not arrived, or that waits for an
+/// owner yet to arrive, may yet show.
+fn gone_for_good(merge: &model::Merge, m: &model::Entity) -> bool {
+    let known = m.registers.values().all(|(v, _)| match v {
+        Value::Ref(o) => merge.entities.contains_key(o),
+        _ => true,
+    });
+    match m.registers.get(DELETED) {
+        Some((Value::Int(1), _)) => true,
+        Some((Value::Int(0), _)) => !m.live && known,
+        _ => true,
+    }
+}
+
 /// Triggers that log each row made at a key and each field set, whoever does it: a field set
 /// back to the value it had, such as a reference to a row at a reused local id, leaves no trace
 /// in the table.
@@ -223,7 +238,7 @@ impl Writes {
                     if m.collection == e.collection
                         && m.canonical == e.canonical
                         && canonical(&m.collection, *g) == here
-                        && matches!(m.registers.get(DELETED), Some((Value::Int(0), _)))
+                        && !gone_for_good(&merge, m)
                     {
                         members.insert(*g);
                     }
@@ -424,20 +439,13 @@ impl Writes {
                         .get(other)
                         .is_some_and(|g| canonical(&other.0, *g) == target)
             });
-            // A member is gone once tombstoned, or not live with every owner it names known:
-            // one waiting for an owner yet to arrive comes back with it.
             let alive: Vec<&Gid> = members
                 .iter()
                 .filter(|g| {
-                    let Some(m) = after.entities.get(g) else {
-                        return false;
-                    };
-                    let tombstoned = matches!(m.registers.get(DELETED), Some((Value::Int(1), _)));
-                    let owners_known = m.registers.values().all(|(v, _)| match v {
-                        Value::Ref(o) => after.entities.contains_key(o),
-                        _ => true,
-                    });
-                    !tombstoned && (m.live || !owners_known)
+                    after
+                        .entities
+                        .get(g)
+                        .is_some_and(|m| !gone_for_good(&after, m))
                 })
                 .collect();
             if !still && !leftover.contains(at) && !alive.is_empty() {
