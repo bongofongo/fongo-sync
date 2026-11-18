@@ -69,7 +69,8 @@ impl Clock {
         self.last
     }
 
-    /// A reading for an event that happened at `wall_ms`, which may be in the past.
+    /// A reading for an event that happened at `wall_ms`, which may be in the past. It is later
+    /// than every reading issued or observed before, and the text form holds it.
     pub fn tick(&mut self, wall_ms: u64) -> Hlc {
         let wall_ms = wall_ms.min(WALL_MAX);
         if wall_ms > self.last.wall_ms {
@@ -77,16 +78,20 @@ impl Clock {
             self.last.counter = 0;
         } else if let Some(next) = self.last.counter.checked_add(1) {
             self.last.counter = next;
-        } else {
+        } else if self.last.wall_ms < WALL_MAX {
             self.last.wall_ms += 1;
             self.last.counter = 0;
         }
+        // Past the last reading the text form holds, the clock issues that reading again rather
+        // than one others would read back as another. Since `observe` never adopts the last
+        // millisecond, reaching it takes billions of ticks after any reading observed.
         self.last
     }
 
-    /// Moves past a reading from elsewhere. A reading the text form cannot hold is ignored.
+    /// Moves past a reading from elsewhere. A reading the text form cannot hold is ignored, and
+    /// so is one in the last millisecond it holds, so that the clock always has room to tick.
     pub fn observe(&mut self, remote: &Hlc) {
-        if remote.encodable()
+        if remote.wall_ms < WALL_MAX
             && (remote.wall_ms, remote.counter) > (self.last.wall_ms, self.last.counter)
         {
             self.last.wall_ms = remote.wall_ms;
@@ -168,6 +173,51 @@ mod tests {
             });
             assert_eq!(clock.last(), last);
             assert!(clock.tick(0) > last);
+        }
+    }
+
+    #[test]
+    fn a_reading_at_the_last_millisecond_is_not_observed_so_the_next_tick_is_encodable() {
+        let top = Hlc {
+            wall_ms: WALL_MAX,
+            counter: u32::MAX,
+            node: node(7),
+        };
+        assert!(top.encodable());
+        let mut clock = Clock::new(node(1));
+        let before = clock.tick(1000);
+        clock.observe(&top);
+        let next = clock.tick(1000);
+        assert!(next > before && next.encodable());
+        assert_eq!(Hlc::decode(&next.encode()), Some(next));
+    }
+
+    #[test]
+    fn a_clock_just_short_of_the_last_millisecond_ticks_into_it() {
+        let mut clock = Clock::new(node(1));
+        let near = Hlc {
+            wall_ms: WALL_MAX - 1,
+            counter: u32::MAX,
+            node: node(2),
+        };
+        clock.observe(&near);
+        let next = clock.tick(0);
+        assert_eq!((next.wall_ms, next.counter), (WALL_MAX, 0));
+        assert!(next > near && next.encodable());
+    }
+
+    #[test]
+    fn a_clock_that_has_issued_every_reading_never_issues_an_unencodable_one() {
+        let last = Hlc {
+            wall_ms: WALL_MAX,
+            counter: u32::MAX,
+            node: node(1),
+        };
+        let mut clock = Clock::resume(last);
+        for wall_ms in [0, WALL_MAX, u64::MAX] {
+            let next = clock.tick(wall_ms);
+            assert!(next.encodable());
+            assert_eq!(Hlc::decode(&next.encode()), Some(next));
         }
     }
 

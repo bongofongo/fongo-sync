@@ -4,161 +4,9 @@
 
 mod support;
 
-use std::str::FromStr;
-
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Hlc, Value};
-use fongo_sync_sqlite::{Applied, Collection, Registry, Replica, Resume};
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{ConnectOptions, SqliteConnection};
-
-struct Peer {
-    conn: SqliteConnection,
-    replica: Replica,
-    cursor: usize,
-    /// Every change applied here or sent from here.
-    taken: Vec<Change>,
-}
-
-impl Peer {
-    async fn new(schema: &[&str], registry: Registry) -> Peer {
-        let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .foreign_keys(true)
-            .connect()
-            .await
-            .unwrap();
-        for sql in schema {
-            sqlx::query(sql).execute(&mut conn).await.unwrap();
-        }
-        let replica = Replica::new(registry);
-        replica.install(&mut conn).await.unwrap();
-        Peer {
-            conn,
-            replica,
-            cursor: 0,
-            taken: Vec::new(),
-        }
-    }
-
-    async fn midway(&mut self) {
-        if let Err(e) = support::midway(&mut self.conn, &self.replica, &self.taken).await {
-            panic!("{e}");
-        }
-    }
-
-    async fn settled(&mut self) {
-        if let Err(e) = support::settled(&mut self.conn, &self.replica, &self.taken).await {
-            panic!("{e}");
-        }
-    }
-
-    async fn run(&mut self, sql: &str) {
-        sqlx::query(sql).execute(&mut self.conn).await.unwrap();
-    }
-
-    async fn lines(&mut self, sql: &str) -> Vec<String> {
-        sqlx::query_scalar(sql)
-            .fetch_all(&mut self.conn)
-            .await
-            .unwrap()
-    }
-
-    async fn int(&mut self, sql: &str) -> i64 {
-        sqlx::query_scalar(sql)
-            .fetch_one(&mut self.conn)
-            .await
-            .unwrap()
-    }
-
-    async fn gid(&mut self, collection: &str, id: i64) -> Gid {
-        let gid = self.replica.gid_of(&mut self.conn, collection, id).await;
-        gid.unwrap().unwrap()
-    }
-
-    /// Collects and sends, returning what was sent.
-    async fn push(&mut self, hub: &mut Vec<Change>) -> Vec<Change> {
-        self.replica.collect(&mut self.conn).await.unwrap();
-        let outbox = self
-            .replica
-            .outbox(&mut self.conn, 1_000_000)
-            .await
-            .unwrap();
-        hub.extend(outbox.changes.iter().cloned());
-        self.taken.extend(outbox.changes.iter().cloned());
-        self.replica
-            .acknowledge(&mut self.conn, outbox.through)
-            .await
-            .unwrap();
-        self.midway().await;
-        outbox.changes
-    }
-
-    async fn apply(&mut self, changes: &[Change]) -> Applied {
-        self.taken.extend(changes.iter().cloned());
-        let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
-        self.midway().await;
-        applied
-    }
-
-    async fn pull(&mut self, hub: &[Change]) -> Applied {
-        let applied = self.apply(&hub[self.cursor..]).await;
-        self.cursor = hub.len();
-        applied
-    }
-
-    async fn sync(&mut self, hub: &mut Vec<Change>) -> Applied {
-        self.push(hub).await;
-        self.pull(hub).await
-    }
-}
-
-async fn make(n: usize, schema: &[&str], registry: impl Fn() -> Registry) -> Vec<Peer> {
-    let mut all = Vec::new();
-    for _ in 0..n {
-        all.push(Peer::new(schema, registry()).await);
-    }
-    all
-}
-
-/// Every peer sends and takes everything, until a round sends nothing.
-async fn settle(peers: &mut [Peer], hub: &mut Vec<Change>) {
-    for _ in 0..20 {
-        let before = hub.len();
-        for peer in peers.iter_mut() {
-            peer.sync(hub).await;
-        }
-        if hub.len() == before && peers.iter().all(|p| p.cursor == hub.len()) {
-            return;
-        }
-    }
-    panic!("the peers never stopped sending");
-}
-
-/// The rows, the shadow and the alias groups are the same on every peer, and each shows the
-/// model's view of what it has seen.
-async fn same_everywhere(peers: &mut [Peer], rows: &str) -> Vec<String> {
-    for peer in peers.iter_mut() {
-        peer.settled().await;
-    }
-    let shadow = "SELECT collection || hex(gid) || field || quote(value) || clock
-                    FROM fongo_shadow ORDER BY 1";
-    let aliases = "SELECT collection || hex(gid) || hex(canon) FROM fongo_alias ORDER BY 1";
-    let first = (
-        peers[0].lines(rows).await,
-        peers[0].lines(shadow).await,
-        peers[0].lines(aliases).await,
-    );
-    for peer in peers.iter_mut().skip(1) {
-        assert_eq!(peer.lines(rows).await, first.0);
-        assert_eq!(peer.lines(shadow).await, first.1);
-        assert_eq!(peer.lines(aliases).await, first.2);
-    }
-    first.0
-}
-
-fn later() {
-    std::thread::sleep(std::time::Duration::from_millis(5));
-}
+use fongo_sync_sqlite::{Collection, Registry, Resume};
+use support::peer::{Peer, later, make, same_everywhere, settle};
 
 fn change(collection: &str, gid: Gid, field: &str, value: Value, wall_ms: u64) -> Change {
     Change {
@@ -574,29 +422,6 @@ async fn changes_that_cross_collections_change_nothing_here() {
     assert_eq!(rows.len(), before.len());
 }
 
-/// A gid belongs to the collection that used it first, so a reference to it from a field that
-/// names another collection names nothing: the reference reads as null, and a row owned through
-/// it is gone. The kernel keys entities by collection and gid and never decides which collection
-/// a gid belongs to, so it waits for the referenced entity forever, keeping the row as it was.
-#[tokio::test]
-#[ignore = "the kernel does not claim gids for collections, so it waits on such references"]
-async fn a_reference_to_a_gid_of_another_collection_names_nothing() {
-    let mut hub = Vec::new();
-    let (mut peers, [_, _, other, note]) = library_peers(&mut hub).await;
-    hub.push(change("books", other, "author_id", Value::Ref(note), SOON));
-    hub.push(change("notes", note, "book_id", Value::Ref(note), SOON));
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        [
-            "author Eliot",
-            "author Gaskell",
-            "book Cranford by -",
-            "book Middlemarch by Eliot",
-        ]
-    );
-}
-
 #[tokio::test]
 async fn a_clock_beyond_what_can_be_stored_is_ignored_everywhere() {
     let mut hub = Vec::new();
@@ -624,6 +449,54 @@ async fn a_clock_beyond_what_can_be_stored_is_ignored_everywhere() {
     );
 }
 
+/// A change stamped with the last reading the text form holds is kept, but its clock is not
+/// adopted: a replica that adopted it could issue no later reading the text form holds, and
+/// would send readings others read back as other ones.
+#[tokio::test]
+async fn a_clock_at_the_last_reading_is_kept_and_leaves_room_to_tick() {
+    let mut hub = Vec::new();
+    let (mut peers, [_, book, _, _]) = library_peers(&mut hub).await;
+    hub.push(Change {
+        collection: "books".into(),
+        gid: book,
+        field: "title".into(),
+        value: Value::Text("last".into()),
+        clock: Hlc {
+            wall_ms: 0xFFFF_FFFF_FFFF,
+            counter: u32::MAX,
+            node: Gid([7; 16]),
+        },
+    });
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET title = 'mine' WHERE isbn = 'y'")
+        .await;
+    let first = peers[1].push(&mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET title = 'mine again' WHERE isbn = 'y'")
+        .await;
+    let second = peers[1].push(&mut hub).await;
+    let clocks: Vec<Hlc> = first.iter().chain(&second).map(|c| c.clock).collect();
+    assert!(
+        clocks
+            .iter()
+            .all(|c| c.encodable() && c.wall_ms < 0xFFFF_FFFF_FFFF)
+    );
+    assert!(clocks.windows(2).all(|w| w[0] < w[1]), "{clocks:?}");
+    settle(&mut peers, &mut hub).await;
+    let rows = same_everywhere(&mut peers, LIBRARY_ROWS).await;
+    assert!(
+        rows.contains(&"book last by Eliot".to_string()),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.contains(&"book mine again by Gaskell".to_string()),
+        "{rows:#?}"
+    );
+}
+
 // What happens while the triggers are off.
 
 #[tokio::test]
@@ -647,14 +520,12 @@ async fn rows_removed_and_added_while_suspended_are_deleted_and_made() {
             .await;
         settle(&mut peers, &mut hub).await;
         let two = peers[0].gid("books", 2).await;
-        let replica = peers[0].replica.clone();
-        replica.suspend(&mut peers[0].conn).await.unwrap();
+        peers[0].suspend().await;
         peers[0].run("DELETE FROM books WHERE id = 2").await;
         peers[0]
             .run("INSERT INTO books (id, title, isbn) VALUES (3, 'three', 't')")
             .await;
-        replica.resume(&mut peers[0].conn, how).await.unwrap();
-        peers[0].midway().await;
+        peers[0].resume(how).await;
         // A row made after resuming takes the freed local id, and is a new entity.
         peers[0]
             .run("INSERT INTO books (id, title, isbn) VALUES (2, 'new', 'n')")
@@ -670,9 +541,8 @@ async fn rows_removed_and_added_while_suspended_are_deleted_and_made() {
 
 // Work that grows with what an apply touches, not with its square.
 
-#[tokio::test]
-async fn deleting_an_owner_of_many_rows_takes_time_in_proportion() {
-    const NOTES: i64 = 20_000;
+/// The work SQLite does on the replica that takes a book's delete, the book owning `notes`.
+async fn work_to_delete_an_owner_of(notes: i64) -> u64 {
     let schema = [
         "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
         "CREATE TABLE notes (
@@ -691,26 +561,39 @@ async fn deleting_an_owner_of_many_rows_takes_time_in_proportion() {
     };
     let mut hub = Vec::new();
     let mut peers = make(2, &schema, registry).await;
+    for peer in peers.iter_mut() {
+        peer.checking = false;
+    }
     peers[0]
         .run("INSERT INTO books (id, title) VALUES (1, 'Middlemarch')")
         .await;
     peers[0]
         .run(&format!(
-            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {NOTES})
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {notes})
              INSERT INTO notes (book_id, body) SELECT 1, 'note ' || x FROM n"
         ))
         .await;
     settle(&mut peers, &mut hub).await;
-    assert_eq!(peers[1].int("SELECT count(*) FROM notes").await, NOTES);
-
+    assert_eq!(peers[1].int("SELECT count(*) FROM notes").await, notes);
     peers[0].run("DELETE FROM books").await;
     peers[0].push(&mut hub).await;
-    let started = std::time::Instant::now();
+    let work = peers[1].count_work().await;
     peers[1].pull(&hub).await;
-    let took = started.elapsed();
+    let done = work.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(peers[1].int("SELECT count(*) FROM notes").await, 0);
-    // Removing the rows one by one against all the others took minutes.
-    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+    for peer in peers.iter_mut() {
+        peer.settled().await;
+    }
+    done
+}
+
+/// Removing the rows one by one against all the others once took minutes: work that grows with
+/// the square of the rows grows sixteenfold when they grow fourfold.
+#[tokio::test]
+async fn deleting_an_owner_of_many_rows_takes_work_in_proportion() {
+    let small = work_to_delete_an_owner_of(1_000).await;
+    let large = work_to_delete_an_owner_of(4_000).await;
+    assert!(large < small * 8, "{small} then {large}");
 }
 
 // A merge whose given-up row another table holds.
@@ -838,9 +721,7 @@ const RATED_ROWS: &str = "SELECT title || ' ' || COALESCE(status, '-') || ' '
                                  || COALESCE(finished, '-') FROM books ORDER BY 1";
 
 async fn upgrade(peer: &mut Peer, registry: Registry) {
-    peer.replica = Replica::new(registry);
-    peer.replica.install(&mut peer.conn).await.unwrap();
-    peer.midway().await;
+    peer.upgrade(registry).await;
 }
 
 #[tokio::test]

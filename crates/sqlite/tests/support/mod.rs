@@ -3,13 +3,14 @@
 //!
 //! Two strengths. Once nothing is waiting anywhere, [`settled`] requires the rows to be exactly
 //! the model's view. After any apply or collect, [`midway`] requires what must hold even while
-//! the kernel holds rows back: its registers and alias groups are the model's, its own tables
-//! are consistent, and every row it is not holding back is the model's row.
+//! the kernel holds rows back: its registers and alias groups are the model's, every row it maps
+//! exists, and every row it is not holding back is the model's row.
 //!
-//! A row is held back when its entity waits in `fongo_pending`, when it is a row a merge gave up
-//! (`fongo_leftover`), or when it holds local writes not yet collected (`fongo_dirty`), which
-//! holds back its entity too. The model
-//! has no notion of waiting, so those rows are compared only once they are settled. Fields of a
+//! What the kernel holds is read only through `Replica::inspect` and the public lookups, never
+//! from its tables, so these checks hold any implementation to the same account. A row is held
+//! back when its entity waits, when it is a row a merge gave up and another table holds, or when
+//! it holds local writes not yet collected, which holds back its entity too. The model has no
+//! notion of waiting, so those rows are compared only once they are settled. Fields of a
 //! set that changes together are also left out midway while the set's newest write has not all
 //! arrived, since the kernel keeps what the row held until then; so are groups with a live member
 //! whose tombstone has not arrived (see [`unconfirmed`]). A field the application pinned
@@ -17,7 +18,9 @@
 
 #![allow(dead_code)]
 
+pub mod peer;
 pub mod world;
+pub mod writes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,7 +29,11 @@ use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Strategy, Value, wins};
 use fongo_sync_sqlite::{Collection, Key, Kind, Registry, Replica};
 use sqlx::SqliteConnection;
 
-async fn rows(conn: &mut SqliteConnection, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+pub(crate) async fn rows(
+    conn: &mut SqliteConnection,
+    sql: &str,
+    params: &[Value],
+) -> Vec<Vec<Value>> {
     use sqlx::{Row as _, ValueRef};
     let mut query = sqlx::query(sql);
     for p in params {
@@ -69,31 +76,34 @@ fn gid_of(value: &Value) -> Gid {
     }
 }
 
-fn text(value: &Value) -> String {
+pub(crate) fn text(value: &Value) -> String {
     match value {
         Value::Text(t) => t.clone(),
         other => panic!("not text: {other:?}"),
     }
 }
 
-fn quoted(name: &str) -> String {
+pub(crate) fn quoted(name: &str) -> String {
     format!("\"{name}\"")
 }
 
-fn key_columns(c: &Collection) -> Vec<String> {
+pub(crate) fn key_columns(c: &Collection) -> Vec<String> {
     match &c.key {
         Key::Minted { column } => vec![column.clone()],
         Key::Natural { fields } => fields.clone(),
     }
 }
 
-/// What a replica holds, read from its tables.
+/// What a replica holds: what `Replica::inspect` reports, and its rows read as the model reads
+/// them. Nothing here reads the kernel's own tables.
 #[derive(Debug, Default)]
 pub struct Kernel {
-    /// The shadow of each registered collection: (collection, gid) to field to entry.
+    /// The registers of each registered collection: (collection, gid) to field to entry.
     pub registers: BTreeMap<(String, Gid), BTreeMap<String, (Value, Hlc)>>,
     /// Each aliased gid's canonical gid, by collection.
     pub canon: BTreeMap<(String, Gid), Gid>,
+    /// The entity each minted row holds, by collection and key.
+    pub ids: Vec<(String, String, Gid)>,
     /// The rows the application can read, by canonical gid.
     pub view: View,
     /// The local key of each row in `view`.
@@ -105,8 +115,8 @@ pub struct Kernel {
     pub dirty: BTreeSet<(String, String)>,
     /// Entities a row not yet collected belongs to, by canonical gid.
     pub uncollected: BTreeSet<(String, Gid)>,
-    /// Rows by key and field holding what the kernel left there, and whether pinned.
-    pub deviations: BTreeMap<(String, String, String), bool>,
+    /// Fields the application kept as its own, by collection, key and field.
+    pub pinned: BTreeSet<(String, String, String)>,
     /// Problems found while reading: rows with no id, two rows for one entity.
     pub broken: Vec<String>,
 }
@@ -127,80 +137,43 @@ pub async fn read(conn: &mut SqliteConnection, replica: &Replica) -> Kernel {
         .iter()
         .map(|c| c.name.as_str())
         .collect();
+    let inspection = replica.inspect(conn).await.unwrap();
     let mut kernel = Kernel::default();
-    for row in rows(
-        conn,
-        "SELECT collection, gid, field, value, is_ref, clock FROM fongo_shadow",
-        &[],
-    )
-    .await
-    {
-        let collection = text(&row[0]);
-        if !known.contains(collection.as_str()) {
-            continue;
-        }
-        let value = if row[4] == Value::Int(1) {
-            Value::Ref(gid_of(&row[3]))
-        } else {
-            row[3].clone()
-        };
-        let clock = Hlc::decode(&text(&row[5])).expect("a clock parses");
-        kernel
-            .registers
-            .entry((collection, gid_of(&row[1])))
-            .or_default()
-            .insert(text(&row[2]), (value, clock));
-    }
-    for row in rows(conn, "SELECT collection, gid, canon FROM fongo_alias", &[]).await {
-        let collection = text(&row[0]);
+    for (collection, gid, field, value, clock) in inspection.registers {
         if known.contains(collection.as_str()) {
             kernel
-                .canon
-                .insert((collection, gid_of(&row[1])), gid_of(&row[2]));
+                .registers
+                .entry((collection, gid))
+                .or_default()
+                .insert(field, (value, clock));
         }
     }
-    for row in rows(conn, "SELECT collection, gid FROM fongo_pending", &[]).await {
-        let collection = text(&row[0]);
-        let gid = kernel.canonical(&collection, gid_of(&row[1]));
-        kernel.pending.insert((collection, gid));
+    for (collection, gid, canon) in inspection.aliases {
+        if known.contains(collection.as_str()) {
+            kernel.canon.insert((collection, gid), canon);
+        }
     }
-    for row in rows(conn, "SELECT collection, key FROM fongo_leftover", &[]).await {
-        kernel.leftover.insert((text(&row[0]), text(&row[1])));
-    }
-    for row in rows(conn, "SELECT collection, key FROM fongo_dirty", &[]).await {
-        let (collection, key) = (text(&row[0]), text(&row[1]));
+    kernel.pending = inspection.held.into_iter().collect();
+    kernel.leftover = inspection.leftover.into_iter().collect();
+    kernel.pinned = inspection.pinned.into_iter().collect();
+    for (collection, key) in inspection.uncollected {
         if let Some(gid) = replica.gid_for_key(conn, &collection, &key).await.unwrap() {
             kernel.uncollected.insert((collection.clone(), gid));
         }
         kernel.dirty.insert((collection, key));
     }
-    for row in rows(
-        conn,
-        "SELECT collection, key, field, pinned FROM fongo_deviations",
-        &[],
-    )
-    .await
-    {
-        kernel.deviations.insert(
-            (text(&row[0]), text(&row[1]), text(&row[2])),
-            row[3] == Value::Int(1),
-        );
-    }
     // Minted ids by local id, read once: a lookup per row is slow for large tables.
     let mut minted: BTreeMap<(String, i64), Gid> = BTreeMap::new();
-    for row in rows(
-        conn,
-        "SELECT collection, json_extract(key, '$[0]'), gid FROM fongo_ids",
-        &[],
-    )
-    .await
-    {
-        let collection = text(&row[0]);
-        let gid = kernel.canonical(&collection, gid_of(&row[2]));
-        if let Value::Int(local) = row[1] {
-            minted.insert((collection, local), gid);
+    for (collection, key, gid) in &inspection.ids {
+        let local: Option<i64> = key.trim_matches(|ch| ch == '[' || ch == ']').parse().ok();
+        if let Some(local) = local {
+            minted.insert(
+                (collection.clone(), local),
+                kernel.canonical(collection, *gid),
+            );
         }
     }
+    kernel.ids = inspection.ids;
     for c in registry.collections() {
         let keys: Vec<String> = key_columns(c).iter().map(|k| quoted(k)).collect();
         let mut columns = vec![format!("json_array({})", keys.join(", "))];
@@ -212,13 +185,13 @@ pub async fn read(conn: &mut SqliteConnection, replica: &Replica) -> Kernel {
             if kernel.leftover.contains(&at) || kernel.dirty.contains(&at) {
                 continue;
             }
-            let gid = match (&c.key, &row[1..]) {
-                (Key::Minted { .. }, _) => {
+            let gid = match &c.key {
+                Key::Minted { .. } => {
                     let local: Option<i64> =
                         key.trim_matches(|ch| ch == '[' || ch == ']').parse().ok();
                     local.and_then(|l| minted.get(&(c.name.clone(), l)).copied())
                 }
-                (Key::Natural { .. }, _) => replica.gid_for_key(conn, &c.name, &key).await.unwrap(),
+                Key::Natural { .. } => replica.gid_for_key(conn, &c.name, &key).await.unwrap(),
             };
             let Some(gid) = gid else {
                 kernel
@@ -376,53 +349,36 @@ fn bookkeeping(
     wrong
 }
 
+/// Every minted row the kernel names exists, under the canonical gid of its group.
 async fn tables(conn: &mut SqliteConnection, replica: &Replica, kernel: &Kernel) -> Vec<String> {
     let mut wrong = Vec::new();
-    for c in replica.registry().collections() {
-        let found = |key: &str| {
-            let columns = key_columns(c);
-            let matches: Vec<String> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, k)| format!("{} = json_extract(?1, '$[{i}]')", quoted(k)))
-                .collect();
-            (
-                format!(
-                    "SELECT 1 FROM {} WHERE {}",
-                    quoted(&c.table),
-                    matches.join(" AND ")
-                ),
-                Value::Text(key.to_string()),
-            )
+    for (collection, key, gid) in &kernel.ids {
+        let Some(c) = replica
+            .registry()
+            .collections()
+            .iter()
+            .find(|c| c.name == *collection)
+        else {
+            continue;
         };
-        if let Key::Minted { column } = &c.key {
-            let sql = format!(
-                "SELECT key, gid, EXISTS (SELECT 1 FROM {} WHERE {} = json_extract(key, '$[0]'))
-                   FROM fongo_ids WHERE collection = ?",
-                quoted(&c.table),
-                quoted(column)
-            );
-            for row in rows(conn, &sql, &[Value::Text(c.name.clone())]).await {
-                let (key, gid) = (text(&row[0]), gid_of(&row[1]));
-                let uncollected = kernel.dirty.contains(&(c.name.clone(), key.clone()));
-                if !uncollected && row[2] == Value::Int(0) {
-                    wrong.push(format!("{} id {key} names no row", c.name));
-                }
-                if kernel.canonical(&c.name, gid) != gid {
-                    wrong.push(format!("{} id {key} maps to a non-canonical gid", c.name));
-                }
-            }
+        let Key::Minted { column } = &c.key else {
+            continue;
+        };
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE {} = json_extract(?1, '$[0]')",
+            quoted(&c.table),
+            quoted(column)
+        );
+        let uncollected = kernel.dirty.contains(&(collection.clone(), key.clone()));
+        if !uncollected
+            && rows(conn, &sql, &[Value::Text(key.clone())])
+                .await
+                .is_empty()
+        {
+            wrong.push(format!("{collection} id {key} names no row"));
         }
-        for (collection, key, field) in kernel.deviations.keys() {
-            if *collection != c.name {
-                continue;
-            }
-            let (sql, param) = found(key);
-            if rows(conn, &sql, &[param]).await.is_empty() {
-                wrong.push(format!(
-                    "{collection} {key} has a deviation in {field} but no row"
-                ));
-            }
+        if kernel.canonical(collection, *gid) != *gid {
+            wrong.push(format!("{collection} id {key} maps to a non-canonical gid"));
         }
     }
     wrong
@@ -519,10 +475,7 @@ fn unconfirmed(schema: &model::Schema, merge: &Merge) -> BTreeSet<(String, Gid)>
 
 fn pinned(kernel: &Kernel) -> BTreeSet<(String, Gid, String)> {
     let mut out = BTreeSet::new();
-    for ((collection, key, field), pinned) in &kernel.deviations {
-        if !pinned {
-            continue;
-        }
+    for (collection, key, field) in &kernel.pinned {
         if let Some(((_, gid), _)) = kernel
             .keys
             .iter()
@@ -642,7 +595,7 @@ fn context(merge: &Merge, kernel: &Kernel) -> String {
     }
     out.push(format!("-- kernel pending: {:?}", kernel.pending));
     out.push(format!("-- kernel keys: {:?}", kernel.keys));
-    out.push(format!("-- kernel deviations: {:?}", kernel.deviations));
+    out.push(format!("-- kernel pinned: {:?}", kernel.pinned));
     out.join("\n")
 }
 
@@ -668,28 +621,6 @@ pub async fn settled(
     ] {
         if left != "{}" {
             wrong.push(format!("{what}: {left}"));
-        }
-    }
-    // A reference to an entity that is gone reads as null, which the kernel records as left in
-    // the row since its register still names the entity. Anything else left is a row that has
-    // not caught up.
-    for ((collection, key, field), pinned) in &kernel.deviations {
-        let gone_reference = registry
-            .collections()
-            .iter()
-            .find(|c| c.name == *collection)
-            .and_then(|c| c.fields.iter().find(|f| f.name == *field))
-            .is_some_and(|f| matches!(f.kind, Kind::Ref { .. }))
-            && kernel
-                .keys
-                .iter()
-                .find(|((c, _), k)| c == collection && *k == key)
-                .and_then(|((c, g), _)| expected.row(c, *g))
-                .is_some_and(|row| row.get(field) == Some(&Value::Null));
-        if !pinned && !gone_reference {
-            wrong.push(format!(
-                "{collection} {key}.{field} still holds what the kernel left"
-            ));
         }
     }
     let pinned = pinned(&kernel);

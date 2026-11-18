@@ -156,6 +156,28 @@ pub struct Conflict {
     pub remote_won: bool,
 }
 
+/// What a replica holds, in a form that does not depend on how it is stored, so tests can compare
+/// it with what it should hold. Every list is sorted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Inspection {
+    /// The winning entry of each field of each entity, `$deleted` included, as (collection, gid,
+    /// field, value, clock).
+    pub registers: Vec<(String, Gid, String, Value, Hlc)>,
+    /// Each entity known to be one with others, as (collection, gid, canonical gid of its group).
+    pub aliases: Vec<(String, Gid, Gid)>,
+    /// The entity each row of a minted collection holds, as (collection, key, gid).
+    pub ids: Vec<(String, String, Gid)>,
+    /// Entities whose rows wait, as (collection, gid).
+    pub held: Vec<(String, Gid)>,
+    /// Rows a merge gave up that another table still holds, as (collection, key).
+    pub leftover: Vec<(String, String)>,
+    /// Rows written, or removed, since the last collect, as (collection, key).
+    pub uncollected: Vec<(String, String)>,
+    /// Fields whose value the application kept as this replica's own on resuming, as
+    /// (collection, key, field).
+    pub pinned: Vec<(String, String, String)>,
+}
+
 /// A row an apply wrote or removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Touched {
@@ -1877,6 +1899,95 @@ impl Replica {
         };
         let json = json.to_string();
         Ok(self.row_exists(conn, c, &json).await?.then_some(json))
+    }
+
+    /// Everything this replica holds that decides what its rows show; see [`Inspection`].
+    pub async fn inspect(&self, conn: &mut SqliteConnection) -> Result<Inspection> {
+        let mut out = Inspection::default();
+        for row in query(
+            conn,
+            "SELECT collection, gid, field, value, is_ref, clock FROM fongo_shadow
+              ORDER BY collection, gid, field",
+            &[],
+        )
+        .await?
+        {
+            out.registers.push((
+                as_text(&row[0])?.to_string(),
+                as_gid(&row[1])?,
+                as_text(&row[2])?.to_string(),
+                loaded(&row[3], &row[4])?,
+                as_clock(&row[5])?,
+            ));
+        }
+        for row in query(
+            conn,
+            "SELECT collection, gid, canon FROM fongo_alias ORDER BY collection, gid",
+            &[],
+        )
+        .await?
+        {
+            out.aliases.push((
+                as_text(&row[0])?.to_string(),
+                as_gid(&row[1])?,
+                as_gid(&row[2])?,
+            ));
+        }
+        for row in query(
+            conn,
+            "SELECT collection, key, gid FROM fongo_ids ORDER BY collection, key",
+            &[],
+        )
+        .await?
+        {
+            out.ids.push((
+                as_text(&row[0])?.to_string(),
+                as_text(&row[1])?.to_string(),
+                as_gid(&row[2])?,
+            ));
+        }
+        for row in query(
+            conn,
+            "SELECT collection, gid FROM fongo_pending ORDER BY collection, gid",
+            &[],
+        )
+        .await?
+        {
+            let collection = as_text(&row[0])?.to_string();
+            let gid = canon_of(conn, &collection, as_gid(&row[1])?).await?;
+            out.held.push((collection, gid));
+        }
+        out.held.sort();
+        out.held.dedup();
+        for (sql, list) in [
+            (
+                "SELECT collection, key FROM fongo_leftover ORDER BY collection, key",
+                &mut out.leftover,
+            ),
+            (
+                "SELECT collection, key FROM fongo_dirty ORDER BY collection, key",
+                &mut out.uncollected,
+            ),
+        ] {
+            for row in query(conn, sql, &[]).await? {
+                list.push((as_text(&row[0])?.to_string(), as_text(&row[1])?.to_string()));
+            }
+        }
+        for row in query(
+            conn,
+            "SELECT collection, key, field FROM fongo_deviations WHERE pinned = 1
+              ORDER BY collection, key, field",
+            &[],
+        )
+        .await?
+        {
+            out.pinned.push((
+                as_text(&row[0])?.to_string(),
+                as_text(&row[1])?.to_string(),
+                as_text(&row[2])?.to_string(),
+            ));
+        }
+        Ok(out)
     }
 
     /// The global id of a row in a minted collection, once it has been collected or applied.

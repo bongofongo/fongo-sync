@@ -164,6 +164,7 @@ struct Peer {
     sent: Option<(usize, i64)>,
     /// Every change applied here or sent from here.
     taken: Vec<Change>,
+    writes: support::writes::Writes,
 }
 
 impl Peer {
@@ -187,6 +188,7 @@ impl Peer {
             cursor: 0,
             sent: None,
             taken: Vec::new(),
+            writes: Default::default(),
         }
     }
 
@@ -203,7 +205,11 @@ impl Peer {
     }
 
     async fn install(&mut self) {
+        let waiting = self.writes.installing(&mut self.conn, &self.replica).await;
         self.replica.install(&mut self.conn).await.unwrap();
+        self.writes
+            .installed(&mut self.conn, &self.replica, waiting)
+            .await;
         self.midway().await;
     }
 
@@ -221,7 +227,9 @@ impl Peer {
 
     async fn apply(&mut self, changes: &[Change]) -> Applied {
         self.taken.extend(changes.iter().cloned());
+        self.writes.before(&mut self.conn, &self.replica).await;
         let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
+        self.writes.after(&mut self.conn, &self.replica).await;
         self.midway().await;
         applied
     }
@@ -287,12 +295,19 @@ impl Peer {
 
 impl Peer {
     async fn push(&mut self, hub: &mut Vec<Change>) {
+        self.writes.before(&mut self.conn, &self.replica).await;
         self.replica.collect(&mut self.conn).await.unwrap();
+        self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
             .replica
             .outbox(&mut self.conn, 1_000_000)
             .await
             .unwrap();
+        let unwritten = self
+            .writes
+            .unwritten(&mut self.conn, &self.replica, &self.taken, &outbox.changes)
+            .await;
+        assert!(unwritten.is_empty(), "{}", unwritten.join("\n"));
         if !outbox.changes.is_empty() {
             self.taken.extend(outbox.changes.iter().cloned());
             hub.extend(outbox.changes);
