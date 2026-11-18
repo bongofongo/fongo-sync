@@ -143,11 +143,25 @@ struct Entry {
 
 type Shadow = BTreeMap<String, (Value, Hlc)>;
 
-/// Every entity known to be the same as one, and their merged state: for each field, the entry
-/// its strategy prefers among all of them.
+/// Every entity known to be the same as one, and their merged state. The group is alive while any
+/// member is, and then each field takes the entry its strategy prefers among the live members
+/// only, so a deleted member's values do not come back with it. With no live member, among all.
 struct Group {
     canon: Gid,
     merged: Shadow,
+    /// The members not deleted, smallest first.
+    live: Vec<Gid>,
+}
+
+impl Group {
+    /// The member a local write is recorded on: the group's own id while it is alive, else the
+    /// smallest live member.
+    fn target(&self) -> Gid {
+        match self.live.first() {
+            Some(first) if !self.live.contains(&self.canon) => *first,
+            _ => self.canon,
+        }
+    }
 }
 
 /// State carried through one round of bringing rows in line with the shadow.
@@ -862,9 +876,21 @@ impl Replica {
     /// An entity, every other known to be the same, and their merged state.
     async fn group(&self, conn: &mut SqliteConnection, c: &Collection, gid: Gid) -> Result<Group> {
         let canon = canon_of(conn, gid).await?;
-        let mut merged = Shadow::new();
+        let mut shadows = Vec::new();
+        let mut live = Vec::new();
         for member in members_of(conn, canon).await? {
-            for (field, (value, clock)) in shadow_of(conn, member).await? {
+            let shadow = shadow_of(conn, member).await?;
+            if matches!(shadow.get(DELETED), Some((Value::Int(0), _))) {
+                live.push(member);
+            }
+            shadows.push((member, shadow));
+        }
+        let mut merged = Shadow::new();
+        for (member, shadow) in shadows {
+            if !live.is_empty() && !live.contains(&member) {
+                continue;
+            }
+            for (field, (value, clock)) in shadow {
                 let strategy = self.registry.strategy(&c.name, &field);
                 let held = merged.get(&field).map(|(v, c)| (v, c));
                 if wins(strategy, held, &value, &clock) {
@@ -872,7 +898,11 @@ impl Replica {
                 }
             }
         }
-        Ok(Group { canon, merged })
+        Ok(Group {
+            canon,
+            merged,
+            live,
+        })
     }
 
     /// Makes `a` and `b` one entity, with one row. Rows that referred to the row given up are
@@ -1592,11 +1622,16 @@ impl Replica {
                 Key::Natural { fields } => self.resolve_natural(conn, c, fields, &values).await?,
             };
             let Some(gid) = gid else { continue };
-            let Group { canon: gid, merged } = self.group(conn, c, gid).await?;
-            present.insert(gid);
+            let group = self.group(conn, c, gid).await?;
+            present.insert(group.canon);
+            let gid = group.target();
+            let mut merged = group.merged;
             let mut changes = Vec::new();
-            if merged.is_empty() || is_deleted(&merged) {
+            if group.live.is_empty() {
+                // Brought back to life: the member revived holds only what it held itself.
                 changes.push((DELETED.to_string(), Value::Int(0)));
+                merged = shadow_of(conn, gid).await?;
+                merged.remove(DELETED);
             }
             for (field, value) in c.fields.iter().zip(values) {
                 let unchanged = match merged.get(&field.name) {
@@ -1645,22 +1680,24 @@ impl Replica {
 
         for (idx, gid, at) in tombstones {
             let c = &collections[idx];
-            let Group { canon, merged } = self.group(conn, c, gid).await?;
-            if present.contains(&canon) || merged.is_empty() || is_deleted(&merged) {
+            let group = self.group(conn, c, gid).await?;
+            if present.contains(&group.canon) {
                 continue;
             }
-            emit(
-                conn,
-                &Change {
-                    collection: c.name.clone(),
-                    gid: canon,
-                    field: DELETED.into(),
-                    value: Value::Int(1),
-                    clock: pass.clock.tick(at),
-                },
-            )
-            .await?;
-            produced += 1;
+            for member in group.live {
+                emit(
+                    conn,
+                    &Change {
+                        collection: c.name.clone(),
+                        gid: member,
+                        field: DELETED.into(),
+                        value: Value::Int(1),
+                        clock: pass.clock.tick(at),
+                    },
+                )
+                .await?;
+                produced += 1;
+            }
         }
 
         exec(conn, "DELETE FROM fongo_dirty", &[]).await?;
@@ -1689,7 +1726,7 @@ impl Replica {
     ) -> Result<Outcome> {
         let c = &self.registry.collections()[idx];
         loop {
-            let Group { canon, merged } = self.group(conn, c, gid).await?;
+            let Group { canon, merged, .. } = self.group(conn, c, gid).await?;
             if merged.is_empty() {
                 return Ok(Outcome::Settled);
             }
@@ -1700,8 +1737,13 @@ impl Replica {
             let mut leaving: BTreeMap<&str, Value> = BTreeMap::new();
             let mut unresolved = false;
             let mut orphaned = false;
+            // A field no live member holds is null, even if the row took a value from a member
+            // since deleted; an insert leaves it to the table's default.
+            let mut absent: BTreeSet<&str> = BTreeSet::new();
             for field in &c.fields {
                 let Some((shared, _)) = merged.get(&field.name) else {
+                    absent.insert(&field.name);
+                    columns.push((field, Value::Null));
                     continue;
                 };
                 match self.to_local(conn, field, shared, pass).await? {
@@ -1775,7 +1817,7 @@ impl Replica {
                             .await
                         }
                         None => {
-                            let inserted = self.insert(conn, c, &columns).await;
+                            let inserted = self.insert(conn, c, &columns, &absent).await;
                             if inserted.is_ok() {
                                 let key =
                                     query(conn, "SELECT json_array(last_insert_rowid())", &[])
@@ -1861,7 +1903,7 @@ impl Replica {
                             .await
                         }
                     } else {
-                        self.insert(conn, c, &columns).await
+                        self.insert(conn, c, &columns, &absent).await
                     }
                 }
             };
@@ -1885,7 +1927,12 @@ impl Replica {
         conn: &mut SqliteConnection,
         c: &Collection,
         columns: &[(&Field, Value)],
+        absent: &BTreeSet<&str>,
     ) -> sqlx::Result<u64> {
+        let columns: Vec<&(&Field, Value)> = columns
+            .iter()
+            .filter(|(f, _)| !absent.contains(f.name.as_str()))
+            .collect();
         let table = quoted(&c.table);
         if columns.is_empty() {
             return exec(conn, &format!("INSERT INTO {table} DEFAULT VALUES"), &[]).await;

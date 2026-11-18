@@ -1087,6 +1087,84 @@ async fn a_reference_held_while_its_group_had_no_row_is_restored_when_the_row_re
     );
 }
 
+#[tokio::test]
+async fn a_deleted_member_lends_nothing_to_its_group() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title, isbn, year) VALUES ('old', 'v', 1871)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    peers[0].run("DELETE FROM books").await;
+    peers[0].push(&mut hub).await;
+    let deleted = hub[peers[2].cursor..].to_vec();
+    peers[1].pull(&hub).await;
+    later();
+    peers[1]
+        .run("INSERT INTO books (title, isbn) VALUES ('new', 'v')")
+        .await;
+    let from = hub.len();
+    peers[1].push(&mut hub).await;
+    // The third replica meets the new book before the delete, so merges the two.
+    let made = hub[from..].to_vec();
+    peers[2]
+        .replica
+        .apply(&mut peers[2].conn, &made)
+        .await
+        .unwrap();
+    peers[2]
+        .replica
+        .apply(&mut peers[2].conn, &deleted)
+        .await
+        .unwrap();
+    peers[2].cursor = hub.len();
+    settle(&mut peers, &mut hub).await;
+
+    let state = assert_converged(&mut peers).await;
+    let books: Vec<&String> = state.iter().filter(|l| l.starts_with("book ")).collect();
+    assert_eq!(books.len(), 1, "{state:#?}");
+    assert!(books[0].contains(" new y=- "), "{state:#?}");
+}
+
+#[tokio::test]
+async fn deleting_one_member_keeps_another_made_without_seeing_it() {
+    for third_saw_both in [false, true] {
+        let mut hub = Vec::new();
+        let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+        peers[0]
+            .run("INSERT INTO books (title, isbn) VALUES ('a', 'v')")
+            .await;
+        peers[1]
+            .run("INSERT INTO books (title, isbn) VALUES ('b', 'v')")
+            .await;
+        peers[1]
+            .run("INSERT INTO notes (book_id, body) VALUES (1, 'kept')")
+            .await;
+        peers[0].push(&mut hub).await;
+        peers[1].push(&mut hub).await;
+        if third_saw_both {
+            peers[2].pull(&hub).await;
+        }
+        later();
+        peers[0].run("DELETE FROM books").await;
+        peers[0].push(&mut hub).await;
+        settle(&mut peers, &mut hub).await;
+
+        let state = assert_converged(&mut peers).await;
+        assert_eq!(
+            state.iter().filter(|l| l.starts_with("book ")).count(),
+            1,
+            "{state:#?}"
+        );
+        assert!(
+            state
+                .iter()
+                .any(|l| l.starts_with("note ") && l.contains(" kept b=")),
+            "{state:#?}"
+        );
+    }
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
