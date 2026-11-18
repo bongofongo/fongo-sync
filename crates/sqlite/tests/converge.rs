@@ -1,3 +1,8 @@
+//! What replicas show, case by case. Every apply and collect is checked against the reference
+//! model, and every settled replica must show its view.
+
+mod support;
+
 use std::str::FromStr;
 
 use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
@@ -157,6 +162,8 @@ struct Peer {
     cursor: usize,
     /// Where this peer's last sent changes end in the hub, and their last outbox sequence.
     sent: Option<(usize, i64)>,
+    /// Every change applied here or sent from here.
+    taken: Vec<Change>,
 }
 
 impl Peer {
@@ -179,6 +186,7 @@ impl Peer {
             replica: Replica::new(registry),
             cursor: 0,
             sent: None,
+            taken: Vec::new(),
         }
     }
 
@@ -196,6 +204,26 @@ impl Peer {
 
     async fn install(&mut self) {
         self.replica.install(&mut self.conn).await.unwrap();
+        self.midway().await;
+    }
+
+    async fn midway(&mut self) {
+        if let Err(e) = support::midway(&mut self.conn, &self.replica, &self.taken).await {
+            panic!("{e}");
+        }
+    }
+
+    async fn settled(&mut self) {
+        if let Err(e) = support::settled(&mut self.conn, &self.replica, &self.taken).await {
+            panic!("{e}");
+        }
+    }
+
+    async fn apply(&mut self, changes: &[Change]) -> Applied {
+        self.taken.extend(changes.iter().cloned());
+        let applied = self.replica.apply(&mut self.conn, changes).await.unwrap();
+        self.midway().await;
+        applied
     }
 
     async fn run(&mut self, sql: &str) {
@@ -233,11 +261,7 @@ impl Peer {
     /// Takes what the hub has without sending first, so local edits are still unsent when the
     /// incoming changes are applied.
     async fn pull(&mut self, hub: &[Change]) -> Applied {
-        let applied = self
-            .replica
-            .apply(&mut self.conn, &hub[self.cursor..])
-            .await
-            .unwrap();
+        let applied = self.apply(&hub[self.cursor..]).await;
         self.cursor = hub.len();
         let cursor = self.cursor;
         self.release(|end| end <= cursor).await;
@@ -270,6 +294,7 @@ impl Peer {
             .await
             .unwrap();
         if !outbox.changes.is_empty() {
+            self.taken.extend(outbox.changes.iter().cloned());
             hub.extend(outbox.changes);
             self.sent = Some((hub.len(), outbox.through));
         }
@@ -277,6 +302,7 @@ impl Peer {
             .acknowledge(&mut self.conn, outbox.through)
             .await
             .unwrap();
+        self.midway().await;
     }
 }
 
@@ -302,6 +328,9 @@ async fn settle(peers: &mut [Peer], hub: &mut Vec<Change>) {
 }
 
 async fn assert_converged(peers: &mut [Peer]) -> Vec<String> {
+    for peer in peers.iter_mut() {
+        peer.settled().await;
+    }
     let first = peers[0].dump().await;
     let shadow = peers[0].lines(SHADOW).await;
     assert!(
@@ -667,7 +696,7 @@ async fn identities_found_on_different_replicas_at_once_make_one_group() {
     peers[1].sync(&mut hub).await;
     for who in [0, 2] {
         let peer = &mut peers[who];
-        peer.replica.apply(&mut peer.conn, &hub).await.unwrap();
+        peer.apply(&hub).await;
         peer.cursor = hub.len();
         assert_eq!(peer.lines(ALIASES).await.len(), 2);
         assert_eq!(count(peer, "SELECT count(*) FROM books").await, 1);
@@ -1005,11 +1034,7 @@ async fn a_reference_held_while_its_group_had_no_row_is_restored_when_the_row_re
         .await;
     peers[0].push(&mut hub).await;
     let created = take(&mut peers[0], &hub);
-    peers[1]
-        .replica
-        .apply(&mut peers[1].conn, &created)
-        .await
-        .unwrap();
+    peers[1].apply(&created).await;
     peers[1]
         .run("INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES (1, 'Celia', 0, 'here')")
         .await;
@@ -1030,21 +1055,13 @@ async fn a_reference_held_while_its_group_had_no_row_is_restored_when_the_row_re
     peers[2].push(&mut hub).await;
     let remade = take(&mut peers[2], &hub);
     // Still holding the first book alive, the second replica meets the new one and merges them.
-    peers[1]
-        .replica
-        .apply(&mut peers[1].conn, &remade)
-        .await
-        .unwrap();
+    peers[1].apply(&remade).await;
     peers[1].cursor = hub.len();
     peers[1].push(&mut hub).await;
     let alias = take(&mut peers[1], &hub);
 
     for batch in [&created, &loan, &deleted, &alias, &remade] {
-        peers[3]
-            .replica
-            .apply(&mut peers[3].conn, batch)
-            .await
-            .unwrap();
+        peers[3].apply(batch).await;
     }
     for peer in peers.iter_mut() {
         peer.cursor = 0;
@@ -1079,16 +1096,8 @@ async fn a_deleted_member_lends_nothing_to_its_group() {
     peers[1].push(&mut hub).await;
     // The third replica meets the new book before the delete, so merges the two.
     let made = hub[from..].to_vec();
-    peers[2]
-        .replica
-        .apply(&mut peers[2].conn, &made)
-        .await
-        .unwrap();
-    peers[2]
-        .replica
-        .apply(&mut peers[2].conn, &deleted)
-        .await
-        .unwrap();
+    peers[2].apply(&made).await;
+    peers[2].apply(&deleted).await;
     peers[2].cursor = hub.len();
     settle(&mut peers, &mut hub).await;
 
@@ -1174,11 +1183,7 @@ async fn a_swap_of_not_null_unique_identities_converges_and_one_that_cannot_wait
         peers[0].push(&mut hub).await;
         let mut batch = hub[peers[1].cursor..].to_vec();
         batch.reverse();
-        let applied = peers[1]
-            .replica
-            .apply(&mut peers[1].conn, &batch)
-            .await
-            .unwrap();
+        let applied = peers[1].apply(&batch).await;
         peers[1].cursor = hub.len();
         let rows = peers[1]
             .lines("SELECT title || ' ' || isbn FROM books ORDER BY 1")
@@ -1253,11 +1258,7 @@ async fn a_row_left_waiting_is_not_reported_again_until_it_changes() {
     peers[0].push(&mut hub).await;
     let applied = peers[1].sync(&mut hub).await;
     assert_eq!(applied.waiting, 1);
-    let again = peers[1]
-        .replica
-        .apply(&mut peers[1].conn, &[])
-        .await
-        .unwrap();
+    let again = peers[1].apply(&[]).await;
     assert_eq!(again.waiting, 1);
     assert!(again.touched.is_empty(), "{:#?}", again.touched);
 }
@@ -1286,6 +1287,7 @@ async fn a_conflict_is_found_in_a_later_page_reported_once_and_not_after_release
         .cloned()
         .partition(|c| c.collection == "settings");
     peers[1].cursor = hub.len();
+    peers[1].taken.extend(first.iter().chain(&second).cloned());
     let replica = peers[1].replica.clone();
     let conn = &mut peers[1].conn;
     assert!(
@@ -1315,8 +1317,10 @@ async fn a_conflict_is_found_in_a_later_page_reported_once_and_not_after_release
     let from = hub.len();
     peers[0].push(&mut hub).await;
     let late = hub[from..].to_vec();
+    peers[1].taken.extend(late.iter().cloned());
     let applied = replica.apply(&mut peers[1].conn, &late).await.unwrap();
     assert!(applied.conflicts.is_empty(), "{:#?}", applied.conflicts);
+    peers[1].midway().await;
 }
 
 #[tokio::test]
@@ -1438,11 +1442,7 @@ async fn a_delete_another_table_refuses_waits_until_it_is_let_go() {
     assert_eq!(applied.waiting, 1);
     assert_eq!(count(&mut peers[1], "SELECT count(*) FROM books").await, 1);
     peers[1].run("DELETE FROM shelf").await;
-    let applied = peers[1]
-        .replica
-        .apply(&mut peers[1].conn, &[])
-        .await
-        .unwrap();
+    let applied = peers[1].apply(&[]).await;
     assert_eq!(applied.waiting, 0);
     settle(&mut peers, &mut hub).await;
     assert!(assert_converged(&mut peers).await.is_empty());
@@ -1577,6 +1577,7 @@ async fn rows_changed_while_suspended_are_sent_or_kept_as_asked() {
         replica.suspend(&mut peers[0].conn).await.unwrap();
         peers[0].run("UPDATE books SET title = upper(title)").await;
         replica.resume(&mut peers[0].conn, how).await.unwrap();
+        peers[0].midway().await;
         let sent = replica.collect(&mut peers[0].conn).await.unwrap();
         let titles = "SELECT title FROM books";
         match how {

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use fongo_sync_core::model;
 use fongo_sync_core::{DELETED, Strategy, Value};
 
 use crate::error::{Error, Result};
@@ -213,7 +214,7 @@ impl Collection {
 }
 
 /// The synced tables. A reference may name any minted collection; ownership may not go round in
-/// a circle between collections, though a collection may own its own rows.
+/// a circle, and a collection may not own its own rows.
 #[derive(Debug, Clone)]
 pub struct Registry {
     collections: Vec<Collection>,
@@ -290,6 +291,9 @@ impl Registry {
             }
             let mut grouped: BTreeSet<&str> = BTreeSet::new();
             for set in &c.together {
+                if set.is_empty() {
+                    return bad(format!("`{}` has an empty set of fields", c.name));
+                }
                 for name in set {
                     let Some(field) = c.fields.iter().find(|f| f.name == *name) else {
                         return bad(format!("`{}.{name}` is not declared", c.name));
@@ -372,7 +376,46 @@ impl Registry {
             };
             ranks[ready] = next;
         }
-        Ok(Registry { collections, ranks })
+        let registry = Registry { collections, ranks };
+        registry.model_schema().check().map_err(Error::Registry)?;
+        Ok(registry)
+    }
+
+    /// The reference model's schema for these collections, which says what replicas using this
+    /// registry must converge to. A field in a natural key that refers to another collection owns
+    /// the row, since the row's identity goes with its target.
+    pub fn model_schema(&self) -> model::Schema {
+        let collections = self
+            .collections
+            .iter()
+            .map(|c| model::Collection {
+                name: c.name.clone(),
+                identity: match &c.key {
+                    Key::Minted { .. } => model::Identity::Minted,
+                    Key::Natural { fields } => model::Identity::Natural(fields.clone()),
+                },
+                fields: c
+                    .fields
+                    .iter()
+                    .map(|f| model::Field {
+                        name: f.name.clone(),
+                        kind: match &f.kind {
+                            Kind::Plain => model::FieldKind::Plain,
+                            Kind::Ref { collection, .. } if c.owns_through(f) => {
+                                model::FieldKind::Owner(collection.clone())
+                            }
+                            Kind::Ref { collection, .. } => {
+                                model::FieldKind::Reference(collection.clone())
+                            }
+                        },
+                        strategy: f.strategy,
+                    })
+                    .collect(),
+                identity_keys: c.identity.clone(),
+                together: c.together.clone(),
+            })
+            .collect();
+        model::Schema::new(collections)
     }
 
     pub fn collections(&self) -> &[Collection] {
@@ -469,6 +512,43 @@ mod tests {
             .together(&["status", "finished"])
             .together(&["finished"]);
         assert!(Registry::new(vec![twice]).is_err());
+        assert!(Registry::new(vec![books().together(&[])]).is_err());
+    }
+
+    #[test]
+    fn the_model_schema_keeps_keys_owners_and_sets() {
+        let registry = Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("isbn")
+                .field_with("pages", Strategy::Max)
+                .reference("sequel", "books")
+                .field("status")
+                .field("finished")
+                .together(&["status", "finished"])
+                .identity(&["isbn"]),
+            Collection::natural("tags", "tags", &["book_id", "tag"])
+                .reference("book_id", "books")
+                .field("tag"),
+            Collection::minted("notes", "notes", "id").owner("book_id", "books"),
+        ])
+        .unwrap();
+        let schema = registry.model_schema();
+        assert_eq!(schema.check(), Ok(()));
+        let expected = model::Schema::new(vec![
+            model::Collection::minted("books")
+                .plain("isbn", Strategy::Lww)
+                .plain("pages", Strategy::Max)
+                .reference("sequel", "books")
+                .plain("status", Strategy::Lww)
+                .plain("finished", Strategy::Lww)
+                .identity_key(&["isbn"])
+                .together(&["status", "finished"]),
+            model::Collection::natural("tags", &["book_id", "tag"])
+                .owner("book_id", "books")
+                .plain("tag", Strategy::Lww),
+            model::Collection::minted("notes").owner("book_id", "books"),
+        ]);
+        assert_eq!(schema, expected);
     }
 
     #[test]

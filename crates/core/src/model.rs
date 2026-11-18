@@ -291,8 +291,9 @@ impl PartialEq for View {
 /// [`Schema::check`].
 ///
 /// 1. A change is ignored if its collection is unknown, its clock does not survive
-///    `Hlc::encode`, it is an [`ALIAS`] whose value is not a reference to another gid, or its gid
-///    belongs to another collection. A gid belongs to the collection of its change with the
+///    `Hlc::encode`, it is an [`ALIAS`] whose value is not a reference to another gid, it is a
+///    `$deleted` whose value is neither `Int(0)` nor `Int(1)`, or its gid belongs to another
+///    collection. A gid belongs to the collection of its change with the
 ///    smallest clock, ties going to the smaller collection name. Changes to undeclared fields
 ///    are kept: they claim the gid, but are not shown. In a natural collection, a change to a
 ///    key field is ignored unless its value is part of a key that derives the entity's gid: one
@@ -316,6 +317,56 @@ impl PartialEq for View {
 ///    References read as described on [`FieldKind`].
 pub fn view(schema: &Schema, changes: &[Change]) -> View {
     Merged::new(schema, changes).present()
+}
+
+/// What [`view`] is computed from, for comparison with a store's own bookkeeping: every gid that
+/// survived step 1 of [`view`], with the collection it belongs to, the entry each of its fields
+/// holds after step 2, and the canonical gid of its group after step 3.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Merge {
+    pub entities: BTreeMap<Gid, Entity>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entity {
+    pub collection: String,
+    /// Every field written, `$deleted` and undeclared fields included; never [`ALIAS`].
+    pub registers: BTreeMap<String, (Value, Hlc)>,
+    pub canonical: Gid,
+    /// For a natural collection, whether a key deriving the gid has been seen; else true.
+    pub keyed: bool,
+    /// Whether this member is live, by step 4.
+    pub live: bool,
+}
+
+/// The registers and groups behind [`view`] of the same arguments.
+pub fn merge(schema: &Schema, changes: &[Change]) -> Merge {
+    let merged = Merged::new(schema, changes);
+    let entities = merged
+        .home
+        .iter()
+        .map(|(&gid, coll)| {
+            let registers = merged
+                .registers
+                .get(&gid)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(f, entry)| (f.to_string(), entry.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let entity = Entity {
+                collection: coll.name.clone(),
+                registers,
+                canonical: merged.find(gid),
+                keyed: !merged.unverified.contains(&gid),
+                live: merged.live.contains(&gid),
+            };
+            (gid, entity)
+        })
+        .collect();
+    Merge { entities }
 }
 
 /// Pairs of rows in `view` that an identity key says are one entity, as (collection, smaller
@@ -382,6 +433,7 @@ impl<'a> Merged<'a> {
             .iter()
             .filter(|c| encodable(&c.clock))
             .filter(|c| c.field != ALIAS || matches!(c.value, Value::Ref(t) if t != c.gid))
+            .filter(|c| c.field != DELETED || matches!(c.value, Value::Int(0 | 1)))
             .filter_map(|c| Some((c, schema.collection(&c.collection)?)))
             .collect();
 

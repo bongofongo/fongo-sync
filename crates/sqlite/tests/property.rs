@@ -1,13 +1,14 @@
 //! Replicas that use every feature at once, exchange changes in any order, part by part and more
-//! than once, and change their registry midway, end up identical.
+//! than once, and change their registry midway, agree with the reference model after every step
+//! and show exactly its view once everything is exchanged.
 
-use std::str::FromStr;
+mod support;
 
 use fongo_sync_sqlite::core::Change;
 use fongo_sync_sqlite::{Collection, LocalDefault, Registry, Replica, Resume};
 use proptest::prelude::*;
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{ConnectOptions, SqliteConnection};
+use sqlx::SqliteConnection;
+use support::world::World;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE shelves (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -183,16 +184,13 @@ struct Peer {
     upgraded: bool,
     seen: Vec<bool>,
     sent: Option<(usize, i64)>,
+    /// Every change applied here or sent from here.
+    taken: Vec<Change>,
 }
 
 impl Peer {
-    async fn new() -> Peer {
-        let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .foreign_keys(true)
-            .connect()
-            .await
-            .unwrap();
+    async fn new(world: &World, n: u64) -> Peer {
+        let mut conn = world.connect(n).await;
         for sql in SCHEMA {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
@@ -204,15 +202,22 @@ impl Peer {
             upgraded: false,
             seen: Vec::new(),
             sent: None,
+            taken: Vec::new(),
         }
     }
 
-    async fn upgrade(&mut self) {
+    async fn midway(&mut self) -> Result<(), String> {
+        support::midway(&mut self.conn, &self.replica, &self.taken).await
+    }
+
+    async fn upgrade(&mut self) -> Result<(), String> {
         if !self.upgraded {
             self.upgraded = true;
             self.replica = Replica::new(registry(true));
             self.replica.install(&mut self.conn).await.unwrap();
+            self.midway().await?;
         }
+        Ok(())
     }
 
     /// Runs the application's own write, which a constraint may refuse.
@@ -250,7 +255,7 @@ impl Peer {
         all
     }
 
-    async fn push(&mut self, hub: &mut Vec<Change>) {
+    async fn push(&mut self, hub: &mut Vec<Change>) -> Result<(), String> {
         self.replica.collect(&mut self.conn).await.unwrap();
         let outbox = self
             .replica
@@ -258,6 +263,7 @@ impl Peer {
             .await
             .unwrap();
         if !outbox.changes.is_empty() {
+            self.taken.extend(outbox.changes.iter().cloned());
             hub.extend(outbox.changes);
             self.sent = Some((hub.len(), outbox.through));
         }
@@ -265,6 +271,7 @@ impl Peer {
             .acknowledge(&mut self.conn, outbox.through)
             .await
             .unwrap();
+        self.midway().await
     }
 
     /// Takes the changes `pick` chooses among those not yet seen, in order or reversed. `twice`
@@ -276,7 +283,7 @@ impl Peer {
         pick: impl Fn(usize) -> bool,
         reverse: bool,
         twice: bool,
-    ) {
+    ) -> Result<(), String> {
         self.seen.resize(hub.len(), false);
         let mut chosen: Vec<usize> = (0..hub.len())
             .filter(|&i| !self.seen[i] && pick(i))
@@ -288,7 +295,9 @@ impl Peer {
         for i in chosen {
             self.seen[i] = true;
         }
+        self.taken.extend(batch.iter().cloned());
         self.replica.apply(&mut self.conn, &batch).await.unwrap();
+        self.midway().await?;
         if let Some((end, through)) = self.sent
             && self.seen[..end].iter().all(|s| *s)
         {
@@ -312,7 +321,9 @@ impl Peer {
                 .map(|i| hub[i].clone())
                 .collect();
             self.replica.apply(&mut self.conn, &again).await.unwrap();
+            self.midway().await?;
         }
+        Ok(())
     }
 }
 
@@ -401,7 +412,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
+async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), String> {
     let isbn = |v: u8| {
         if v == 3 {
             "NULL".to_string()
@@ -410,10 +421,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
         }
     };
     let sql = match op {
-        Op::Upgrade => {
-            peer.upgrade().await;
-            return;
-        }
+        Op::Upgrade => return peer.upgrade().await,
         Op::Suspended(n, v) => {
             let replica = peer.replica.clone();
             replica.suspend(&mut peer.conn).await.unwrap();
@@ -424,30 +432,26 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                 .await;
             }
             replica.resume(&mut peer.conn, Resume::Send).await.unwrap();
-            return;
+            return peer.midway().await;
         }
         Op::Sync => {
-            peer.push(hub).await;
-            peer.deliver(hub, |_| true, false, false).await;
-            return;
+            peer.push(hub).await?;
+            return peer.deliver(hub, |_| true, false, false).await;
         }
-        Op::Push => {
-            peer.push(hub).await;
-            return;
-        }
+        Op::Push => return peer.push(hub).await,
         Op::Deliver(seed, reverse, twice) => {
-            peer.deliver(hub, |i| !mix(seed, i).is_multiple_of(3), reverse, twice)
+            return peer
+                .deliver(hub, |i| !mix(seed, i).is_multiple_of(3), reverse, twice)
                 .await;
-            return;
         }
         Op::AddShelf(v) => format!("INSERT OR IGNORE INTO shelves (name) VALUES ('shelf{v}')"),
         Op::RenameShelf(n, v) => match peer.pick("shelves", n).await {
             Some(id) => format!("UPDATE OR IGNORE shelves SET name = 'shelf{v}' WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::DeleteShelf(n) => match peer.pick("shelves", n).await {
             Some(id) => format!("DELETE FROM shelves WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::AddBook(n, v, i) => match peer.pick("shelves", n).await {
             Some(s) => format!(
@@ -455,18 +459,18 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                  VALUES ({s}, 'title{v}', {}, 0)",
                 isbn(i)
             ),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetTitle(n, v) => match peer.pick("books", n).await {
             Some(id) => format!("UPDATE books SET title = 'title{v}' WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetIsbn(n, v) => match peer.pick("books", n).await {
             Some(id) => format!(
                 "UPDATE OR IGNORE books SET isbn = {} WHERE id = {id}",
                 isbn(v)
             ),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetStatus(n, v) => match peer.pick("books", n).await {
             // A book holds a finish date exactly when it is done.
@@ -478,31 +482,31 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                 };
                 format!("UPDATE books SET {set} WHERE id = {id}")
             }
-            None => return,
+            None => return Ok(()),
         },
         Op::SetAuthor(n, m) => match (peer.pick("books", n).await, peer.pick("authors", m).await) {
             (Some(b), Some(a)) => format!("UPDATE books SET author_id = {a} WHERE id = {b}"),
-            _ => return,
+            _ => return Ok(()),
         },
         Op::SetExtra(n, v) => match peer.pick("books", n).await {
             Some(id) => format!("UPDATE books SET extra = 'x{v}' WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::DeleteBook(n) => match peer.pick("books", n).await {
             Some(id) => format!("DELETE FROM books WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::MoveBookDeleteShelf(n, m) => {
             let (Some(b), Some(s)) = (peer.pick("books", n).await, peer.pick("shelves", m).await)
             else {
-                return;
+                return Ok(());
             };
             let Some(from) = peer
                 .one(&format!("SELECT shelf_id FROM books WHERE id = {b}"))
                 .await
                 .filter(|from| *from != s)
             else {
-                return;
+                return Ok(());
             };
             peer.run(&format!("UPDATE books SET shelf_id = {s} WHERE id = {b}"))
                 .await;
@@ -511,7 +515,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
         Op::MoveNoteDeleteShelf(n, m) => {
             let (Some(note), Some(b)) = (peer.pick("notes", n).await, peer.pick("books", m).await)
             else {
-                return;
+                return Ok(());
             };
             let from = peer
                 .one(&format!(
@@ -523,10 +527,10 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                 .one(&format!("SELECT shelf_id FROM books WHERE id = {b}"))
                 .await;
             let (Some(from), Some(to)) = (from, to) else {
-                return;
+                return Ok(());
             };
             if from == to {
-                return;
+                return Ok(());
             }
             peer.run(&format!("UPDATE notes SET book_id = {b} WHERE id = {note}"))
                 .await;
@@ -541,14 +545,14 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
             };
             let (Some(id), Some(to)) = (peer.pick(child, n).await, peer.pick(parent, m).await)
             else {
-                return;
+                return Ok(());
             };
             let Some(from) = peer
                 .one(&format!("SELECT {column} FROM {child} WHERE id = {id}"))
                 .await
                 .filter(|from| *from != to)
             else {
-                return;
+                return Ok(());
             };
             peer.run(&format!(
                 "UPDATE OR IGNORE {child} SET {column} = {to} WHERE id = {id}"
@@ -560,7 +564,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
                     .await
                 {
                     Some(book) => book,
-                    None => return,
+                    None => return Ok(()),
                 }
             } else {
                 from
@@ -570,45 +574,45 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
         Op::AddAuthor(v) => format!("INSERT INTO authors (name) VALUES ('author{v}')"),
         Op::DeleteAuthor(n) => match peer.pick("authors", n).await {
             Some(id) => format!("DELETE FROM authors WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetFavourite(n, m) => {
             match (peer.pick("authors", n).await, peer.pick("books", m).await) {
                 (Some(a), Some(b)) => format!("UPDATE authors SET favourite = {b} WHERE id = {a}"),
-                _ => return,
+                _ => return Ok(()),
             }
         }
         Op::AddNote(n, v) => match peer.pick("books", n).await {
             Some(b) => format!("INSERT INTO notes (book_id, body) VALUES ({b}, 'body{v}')"),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetNote(n, v) => match peer.pick("notes", n).await {
             Some(id) => format!("UPDATE notes SET body = 'body{v}' WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::DeleteNote(n) => match peer.pick("notes", n).await {
             Some(id) => format!("DELETE FROM notes WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::AddMark(n, v) => match peer.pick("notes", n).await {
             Some(id) => format!("INSERT OR IGNORE INTO marks (note_id, place) VALUES ({id}, {v})"),
-            None => return,
+            None => return Ok(()),
         },
         Op::DeleteMark(n) => match peer.pick("marks", n).await {
             Some(id) => format!("DELETE FROM marks WHERE id = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::AddTag(n, v) => match peer.pick("books", n).await {
             Some(b) => format!("INSERT OR IGNORE INTO tags (book_id, tag) VALUES ({b}, 'tag{v}')"),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetTagNote(n, v) => match peer.pick("tags", n).await {
             Some(id) => format!("UPDATE tags SET note = 'note{v}' WHERE rowid = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::DeleteTag(n) => match peer.pick("tags", n).await {
             Some(id) => format!("DELETE FROM tags WHERE rowid = {id}"),
-            None => return,
+            None => return Ok(()),
         },
         Op::SetSetting(k, v) => format!(
             "INSERT INTO settings VALUES ('key{k}', 'value{v}')
@@ -617,23 +621,30 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
         Op::DeleteSetting(k) => format!("DELETE FROM settings WHERE key = 'key{k}'"),
         Op::AddCover(n) => match peer.pick("books", n).await {
             Some(b) => format!("INSERT OR IGNORE INTO covers (book_id, path) VALUES ({b}, 'c')"),
-            None => return,
+            None => return Ok(()),
         },
     };
     peer.run(&sql).await;
+    Ok(())
 }
 
 /// Upgrades every peer, then exchanges until a round sends nothing and every peer has seen
 /// everything, and a last collect on each finds nothing left to send.
 async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) -> Result<(), String> {
-    for peer in peers.iter_mut() {
-        peer.upgrade().await;
+    for (i, peer) in peers.iter_mut().enumerate() {
+        peer.upgrade()
+            .await
+            .map_err(|e| format!("peer {i}, upgrading: {e}"))?;
     }
     for _ in 0..40 {
         let before = hub.len();
-        for peer in peers.iter_mut() {
-            peer.push(hub).await;
-            peer.deliver(hub, |_| true, false, false).await;
+        for (i, peer) in peers.iter_mut().enumerate() {
+            peer.push(hub)
+                .await
+                .map_err(|e| format!("peer {i}, sending: {e}"))?;
+            peer.deliver(hub, |_| true, false, false)
+                .await
+                .map_err(|e| format!("peer {i}, taking: {e}"))?;
         }
         let mut quiet = hub.len() == before
             && peers
@@ -667,6 +678,9 @@ async fn check(peers: &mut [Peer]) -> Result<(), String> {
         if !broken.is_empty() {
             return Err(format!("peer {i}: {broken:#?}\n{:#?}", state.0));
         }
+        support::settled(&mut peer.conn, &peer.replica, &peer.taken)
+            .await
+            .map_err(|e| format!("peer {i}: {e}"))?;
         if !state.3.is_empty() {
             return Err(format!(
                 "peer {i} left waiting: {:#?}\n{:#?}",
@@ -694,31 +708,52 @@ async fn check(peers: &mut [Peer]) -> Result<(), String> {
     Ok(())
 }
 
-fn run(script: &[(usize, Op)]) -> Result<(), String> {
+/// Runs a script on five peers of a world made from `seed`. The same seed and script always do
+/// the same thing.
+fn run(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    let outcome = runtime.block_on(async {
+        let world = World::new(seed);
         let mut hub = Vec::new();
         let mut peers = Vec::new();
-        for _ in 0..5 {
-            peers.push(Peer::new().await);
+        for n in 0..5 {
+            peers.push(Peer::new(&world, n).await);
         }
-        for (who, op) in script.iter().cloned() {
-            perform(&mut peers[who], op, &mut hub).await;
+        for (step, (who, op)) in script.iter().cloned().enumerate() {
+            perform(&mut peers[who], op, &mut hub)
+                .await
+                .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
-        finish(&mut peers, &mut hub).await?;
+        finish(&mut peers, &mut hub)
+            .await
+            .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers).await
-    })
+    });
+    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(seed, script)))
+}
+
+/// A failing case as a test to paste below.
+fn reproduction(seed: u64, script: &[(usize, Op)]) -> String {
+    let steps: Vec<String> = script
+        .iter()
+        .map(|(who, op)| format!("        ({who}, {op:?}),"))
+        .collect();
+    format!(
+        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    run({seed}, &script).unwrap();\n}}",
+        steps.join("\n")
+    )
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
     #[test]
-    fn replicas_that_have_exchanged_everything_are_identical(
+    fn replicas_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
+        seed in any::<u64>(),
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
-        if let Err(error) = run(&script) {
+        if let Err(error) = run(seed, &script) {
             prop_assert!(false, "{}", error);
         }
     }
@@ -748,7 +783,7 @@ fn a_half_delivered_set_is_not_sent_by_an_unrelated_edit() {
         (1, Deliver(7153892181697962845, false, false)),
         (1, SetTitle(1, 2)),
     ];
-    for _ in 0..10 {
-        run(&script).unwrap();
+    for seed in 0..10 {
+        run(seed, &script).unwrap();
     }
 }
