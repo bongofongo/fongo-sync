@@ -1364,6 +1364,66 @@ async fn a_conflict_is_found_in_a_later_page_reported_once_and_not_after_release
     assert!(applied.conflicts.is_empty(), "{:#?}", applied.conflicts);
 }
 
+#[tokio::test]
+async fn installing_again_changes_nothing() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('a', 'v')")
+        .await;
+    peers[1]
+        .run("INSERT INTO books (title, isbn) VALUES ('b', 'v')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let before = peers[1].dump().await;
+    peers[1].install().await;
+    let produced = peers[1].replica.collect(&mut peers[1].conn).await.unwrap();
+    assert_eq!(produced, 0);
+    assert_eq!(peers[1].dump().await, before);
+}
+
+#[tokio::test]
+async fn two_local_rows_with_one_identity_become_one_without_a_unique_constraint() {
+    let schema = [
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT)",
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
+            body TEXT)",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("isbn")
+                .identity(&["isbn"]),
+            Collection::minted("notes", "notes", "id")
+                .owner("book_id", "books")
+                .field("body"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = [
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+    ];
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('a', 'v'), ('b', 'v')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'one'), (2, 'two')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let rows = "SELECT n.body || ' ' || b.isbn FROM notes n JOIN books b ON b.id = n.book_id
+                ORDER BY 1";
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM books").await, 1);
+        assert_eq!(peer.lines(rows).await, ["one v", "two v"]);
+    }
+    assert_eq!(peers[0].lines(SHADOW).await, peers[1].lines(SHADOW).await);
+}
+
 /// Lets the wall clock move on, so the next edit is stamped later than the last.
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
