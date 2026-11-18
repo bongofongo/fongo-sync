@@ -11,6 +11,7 @@ mod change;
 mod clock;
 pub mod eval;
 pub mod model;
+pub mod plan;
 pub mod source;
 mod total;
 mod value;
