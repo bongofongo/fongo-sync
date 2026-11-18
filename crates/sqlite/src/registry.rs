@@ -31,6 +31,8 @@ pub struct Field {
     pub name: String,
     pub kind: Kind,
     pub strategy: Strategy,
+    /// Whether an apply reports a local edit and a remote one made without seeing each other.
+    pub reports_conflicts: bool,
 }
 
 /// One synced table.
@@ -40,6 +42,9 @@ pub struct Collection {
     pub table: String,
     pub key: Key,
     pub fields: Vec<Field>,
+    /// Sets of fields that name the thing itself. Two entities whose values for every field of one
+    /// set are equal and not null are the same entity, and become one on every replica.
+    pub identity: Vec<Vec<String>>,
 }
 
 impl Collection {
@@ -51,6 +56,7 @@ impl Collection {
                 column: key_column.into(),
             },
             fields: Vec::new(),
+            identity: Vec::new(),
         }
     }
 
@@ -62,6 +68,7 @@ impl Collection {
                 fields: key_fields.iter().map(|f| (*f).into()).collect(),
             },
             fields: Vec::new(),
+            identity: Vec::new(),
         }
     }
 
@@ -74,7 +81,29 @@ impl Collection {
             name: name.into(),
             kind: Kind::Plain,
             strategy,
+            reports_conflicts: false,
         });
+        self
+    }
+
+    /// A field whose concurrent edits [`crate::Replica::apply`] reports in
+    /// [`crate::Applied::conflicts`], so the application can combine them. The later edit is
+    /// still the one kept until the application writes something else.
+    pub fn field_reporting_conflicts(mut self, name: &str) -> Collection {
+        self.fields.push(Field {
+            name: name.into(),
+            kind: Kind::Plain,
+            strategy: Strategy::Lww,
+            reports_conflicts: true,
+        });
+        self
+    }
+
+    /// Declares an identity: entities equal on all of `fields` are merged. Only a minted
+    /// collection can have one, and the table should hold the fields `UNIQUE` together.
+    pub fn identity(mut self, fields: &[&str]) -> Collection {
+        self.identity
+            .push(fields.iter().map(|f| (*f).into()).collect());
         self
     }
 
@@ -96,6 +125,7 @@ impl Collection {
                 owned,
             },
             strategy: Strategy::Lww,
+            reports_conflicts: false,
         });
         self
     }
@@ -172,6 +202,23 @@ impl Registry {
                     }
                 }
             }
+            for identity in &c.identity {
+                if !matches!(c.key, Key::Minted { .. }) {
+                    return bad(format!(
+                        "`{}` has an identity but is not a minted collection",
+                        c.name
+                    ));
+                }
+                if identity.is_empty() {
+                    return bad(format!("`{}` has an empty identity", c.name));
+                }
+                if let Some(missing) = identity.iter().find(|k| !fields.contains(k.as_str())) {
+                    return bad(format!(
+                        "identity field `{}.{missing}` is not declared",
+                        c.name
+                    ));
+                }
+            }
             for f in &c.fields {
                 if let Kind::Ref { collection, .. } = &f.kind
                     && !minted.contains(collection.as_str())
@@ -195,6 +242,9 @@ impl Registry {
     }
 
     pub(crate) fn strategy(&self, collection: &str, field: &str) -> Strategy {
+        if field == DELETED {
+            return Strategy::Lww;
+        }
         self.index(collection)
             .and_then(|i| {
                 let c = &self.collections[i];
@@ -230,5 +280,18 @@ mod tests {
             .field("key")
             .field("value");
         assert!(Registry::new(vec![c]).is_ok());
+    }
+
+    #[test]
+    fn an_identity_names_declared_fields_of_a_minted_collection() {
+        let books = || Collection::minted("books", "books", "id").field("isbn");
+        assert!(Registry::new(vec![books().identity(&["isbn"])]).is_ok());
+        assert!(Registry::new(vec![books().identity(&["issn"])]).is_err());
+        assert!(Registry::new(vec![books().identity(&[])]).is_err());
+        let settings = Collection::natural("settings", "settings", &["key"])
+            .field("key")
+            .field("value")
+            .identity(&["value"]);
+        assert!(Registry::new(vec![settings]).is_err());
     }
 }

@@ -15,6 +15,10 @@ its database, `Replica::collect` to turn local writes into changes, and `Replica
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
 `fongo_`.
 
+A collection can declare identities, such as an ISBN column. When two replicas create the same
+thing independently, the two entities become one on every replica: the kernel records that their
+ids are aliases, keeps one row, points every reference at it, and merges their fields by clock.
+
 The merge rules are also stated as laws and proven in [Bend](https://bend-lang.com): `model.bend`
 restates them, `LAWS.bend` says what they must guarantee, and `PROOF.bend` proves it. The proofs
 are about the model, which mirrors `crates/core/src/change.rs` and `clock.rs` by hand.
