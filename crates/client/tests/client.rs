@@ -15,7 +15,7 @@ use fongo_sync_client::{
     worth_syncing,
 };
 use sqlx::SqliteConnection;
-use support::{Peer, Server, assert_converged, assert_no_change_sent_twice, now, settle};
+use support::{Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch, settle};
 
 /// A library made on one device and joined from its recovery code on another.
 async fn pair(server: &Server) -> [Peer; 2] {
@@ -174,6 +174,58 @@ async fn a_new_database_with_old_credentials_takes_back_what_the_device_sent() {
     assert!(report.received > 0);
     assert!(report.refused.is_empty());
     assert_converged(&mut [a, again]).await;
+}
+
+#[tokio::test]
+async fn a_database_restored_from_a_backup_takes_back_what_the_device_sent_since() {
+    let dir = scratch("restore");
+    let backup = dir.join("backup.db");
+    let server = Server::new();
+    let [made, mut b] = pair(&server).await;
+    let mut a = Peer::new_at(&dir.join("live.db"), made.credentials).await;
+    a.run("INSERT INTO settings VALUES ('early', 'x')").await;
+    a.sync(&server).await.unwrap();
+    a.back_up(&backup).await;
+    a.run("INSERT INTO settings VALUES ('later', 'x')").await;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.run("INSERT INTO settings VALUES ('theirs', 'x')").await;
+    b.sync(&server).await.unwrap();
+
+    let mut restored = Peer::open(&backup, a.credentials.clone()).await;
+    let report = restored.sync(&server).await.unwrap();
+    assert!(report.refused.is_empty(), "{report:#?}");
+    assert_eq!(
+        restored.settings().await,
+        ["early=x", "later=x", "theirs=x"]
+    );
+    let mut peers = [a, b, restored];
+    settle(&mut peers, &server).await;
+    assert_converged(&mut peers).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn two_databases_sharing_one_set_of_credentials_converge() {
+    let server = Server::new();
+    let [a, b] = pair(&server).await;
+    let twin = Peer::new(a.credentials.clone()).await;
+    let mut peers = [a, b, twin];
+    for (who, sql) in [
+        (0, "INSERT INTO settings VALUES ('one', 'x')"),
+        (2, "INSERT INTO settings VALUES ('two', 'x')"),
+        (1, "INSERT INTO books (title) VALUES ('Middlemarch')"),
+        (2, "UPDATE settings SET value = 'y' WHERE key = 'one'"),
+        (0, "INSERT INTO settings VALUES ('three', 'x')"),
+    ] {
+        peers[who].run(sql).await;
+        peers[who].sync(&server).await.unwrap();
+        peers[(who + 2) % 3].sync(&server).await.unwrap();
+    }
+    settle(&mut peers, &server).await;
+    let state = assert_converged(&mut peers).await;
+    assert_eq!(state.len(), 4, "{state:#?}");
 }
 
 fn setting(name: &str, clock: u64) -> Vec<Change> {

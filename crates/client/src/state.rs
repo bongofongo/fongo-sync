@@ -1,7 +1,7 @@
 //! What the client keeps in the database, one row per library: its position in the server's log
 //! and the envelope it is about to append. No secret is stored here.
 
-use fongo_sync_protocol::{DeviceId, LibraryId};
+use fongo_sync_protocol::LibraryId;
 use sqlx::{Row, SqliteConnection};
 
 use crate::error::Error;
@@ -9,14 +9,11 @@ use crate::error::Error;
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS fongo_client_state (
     library BLOB PRIMARY KEY,
     cursor INTEGER NOT NULL DEFAULT 0,
-    author BLOB,
     through INTEGER,
     envelope BLOB)";
 
 pub(crate) struct State {
     pub(crate) cursor: u64,
-    /// The device this database has sent envelopes as, if any.
-    pub(crate) author: Option<DeviceId>,
     pub(crate) sending: Option<Sending>,
 }
 
@@ -36,27 +33,16 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
         .bind(&library.0[..])
         .execute(&mut *conn)
         .await?;
-    let row = sqlx::query(
-        "SELECT cursor, author, through, envelope FROM fongo_client_state WHERE library = ?",
-    )
-    .bind(&library.0[..])
-    .fetch_one(&mut *conn)
-    .await?;
+    let row =
+        sqlx::query("SELECT cursor, through, envelope FROM fongo_client_state WHERE library = ?")
+            .bind(&library.0[..])
+            .fetch_one(&mut *conn)
+            .await?;
     let cursor: i64 = row.try_get(0)?;
-    let author: Option<Vec<u8>> = row.try_get(1)?;
-    let through: Option<i64> = row.try_get(2)?;
-    let envelope: Option<Vec<u8>> = row.try_get(3)?;
-    let author = match author {
-        None => None,
-        Some(bytes) => Some(DeviceId(
-            bytes
-                .try_into()
-                .map_err(|_| corrupt("a device id is not 16 bytes"))?,
-        )),
-    };
+    let through: Option<i64> = row.try_get(1)?;
+    let envelope: Option<Vec<u8>> = row.try_get(2)?;
     Ok(State {
         cursor: u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))?,
-        author,
         sending: through
             .zip(envelope)
             .map(|(through, envelope)| Sending { through, envelope }),
@@ -81,18 +67,14 @@ pub(crate) async fn advance(
 pub(crate) async fn record_sending(
     conn: &mut SqliteConnection,
     library: LibraryId,
-    author: DeviceId,
     sending: &Sending,
 ) -> Result<(), Error> {
-    sqlx::query(
-        "UPDATE fongo_client_state SET author = ?, through = ?, envelope = ? WHERE library = ?",
-    )
-    .bind(&author.0[..])
-    .bind(sending.through)
-    .bind(&sending.envelope[..])
-    .bind(&library.0[..])
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query("UPDATE fongo_client_state SET through = ?, envelope = ? WHERE library = ?")
+        .bind(sending.through)
+        .bind(&sending.envelope[..])
+        .bind(&library.0[..])
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 

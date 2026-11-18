@@ -82,9 +82,10 @@ pub struct SyncReport {
 /// once makes that harmless, and otherwise the duplicate is applied idempotently by every device.
 /// Changes are never re-sealed into a second, different envelope.
 ///
-/// An envelope this database wrote itself is skipped. One that names this device but that this
-/// database did not write, such as after the application's database was replaced while the
-/// credentials were kept, is applied like any other.
+/// Envelopes this device signed are applied like any other: applying a change already held is a
+/// no-op, and a database restored from a backup, or a second database sharing these credentials,
+/// may not hold them. An append the server places right after the cursor moves the cursor past
+/// it, so a device does not usually read back what it sent.
 pub async fn sync<T: Transport>(
     conn: &mut SqliteConnection,
     replica: &Replica,
@@ -101,7 +102,6 @@ pub async fn sync<T: Transport>(
     let me = credentials.device_id();
     let saved = state::load(conn, library).await?;
     let mut cursor = saved.cursor;
-    let skip_own = saved.author == Some(me);
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
     let mut keys = Keys::new(credentials);
     let mut report = SyncReport::default();
@@ -125,10 +125,9 @@ pub async fn sync<T: Transport>(
             .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
         check_page(&page, read, limit)?;
         for batch in &page.batches {
-            match keys.open(&rpc, batch, skip_own).await? {
-                Some(Ok(changes)) => received.extend(changes),
-                Some(Err(refused)) => report.refused.push(refused),
-                None => {}
+            match keys.open(&rpc, batch).await? {
+                Ok(changes) => received.extend(changes),
+                Err(refused) => report.refused.push(refused),
             }
             read = batch.seq;
         }
@@ -203,7 +202,7 @@ pub async fn sync<T: Transport>(
             through: outbox.through,
             envelope,
         };
-        state::record_sending(conn, library, me, &sending).await?;
+        state::record_sending(conn, library, &sending).await?;
         let seq = append(&rpc, credentials, sending.envelope).await?;
         acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
         report.sent += outbox.changes.len();
@@ -249,7 +248,7 @@ struct Keys<'a> {
     refreshed: bool,
 }
 
-type Opened = Option<Result<Vec<Change>, Refused>>;
+type Opened = Result<Vec<Change>, Refused>;
 
 impl<'a> Keys<'a> {
     fn new(credentials: &'a Credentials) -> Keys<'a> {
@@ -262,27 +261,23 @@ impl<'a> Keys<'a> {
         }
     }
 
-    /// The changes in one stored envelope, its refusal, or `None` for one this database wrote.
+    /// The changes in one stored envelope, or its refusal.
     async fn open<T: Transport, N: Fn() -> u64 + Sync>(
         &mut self,
         rpc: &Rpc<'_, T, N>,
         batch: &StoredBatch,
-        skip_own: bool,
     ) -> Result<Opened, Error> {
         let refuse = |device, reason| {
-            Ok(Some(Err(Refused {
+            Ok(Err(Refused {
                 seq: batch.seq,
                 device,
                 reason,
-            })))
+            }))
         };
         let Ok(envelope) = Envelope::decode(&batch.envelope) else {
             return refuse(None, Refusal::Malformed);
         };
         let device = envelope.device;
-        if skip_own && device == self.credentials.device_id() {
-            return Ok(None);
-        }
         if envelope.library != self.credentials.library_id() {
             return refuse(Some(device), Refusal::WrongLibrary);
         }
@@ -291,7 +286,7 @@ impl<'a> Keys<'a> {
             Err(reason) => return refuse(Some(device), reason),
         };
         match open(&batch.envelope, self.credentials.library(), |_| Some(key)) {
-            Ok(opened) => Ok(Some(Ok(opened.changes))),
+            Ok(opened) => Ok(Ok(opened.changes)),
             Err(error) => refuse(Some(device), refusal(error)),
         }
     }

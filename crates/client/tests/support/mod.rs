@@ -445,12 +445,20 @@ pub struct Peer {
 
 impl Peer {
     pub async fn new(credentials: Credentials) -> Peer {
-        let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .foreign_keys(true)
-            .connect()
-            .await
-            .unwrap();
+        let options = SqliteConnectOptions::from_str("sqlite::memory:").unwrap();
+        Peer::create(options, credentials).await
+    }
+
+    /// A new replica over a database file.
+    pub async fn new_at(path: &std::path::Path, credentials: Credentials) -> Peer {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        Peer::create(options, credentials).await
+    }
+
+    async fn create(options: SqliteConnectOptions, credentials: Credentials) -> Peer {
+        let mut conn = options.foreign_keys(true).connect().await.unwrap();
         for sql in SCHEMA {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
@@ -461,6 +469,34 @@ impl Peer {
             replica,
             credentials,
         }
+    }
+
+    /// A replica over a database file that already holds the schema, such as a backup.
+    pub async fn open(path: &std::path::Path, credentials: Credentials) -> Peer {
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .unwrap();
+        let replica = Replica::new(registry());
+        replica.install(&mut conn).await.unwrap();
+        Peer {
+            conn,
+            replica,
+            credentials,
+        }
+    }
+
+    /// Writes a copy of the database to `path`.
+    pub async fn back_up(&mut self, path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let path = path.to_str().unwrap();
+        assert!(!path.contains('\''));
+        sqlx::query(&format!("VACUUM INTO '{path}'"))
+            .execute(&mut self.conn)
+            .await
+            .unwrap();
     }
 
     pub async fn run(&mut self, sql: &str) {
@@ -499,6 +535,15 @@ impl Peer {
         self.lines("SELECT key || '=' || value FROM settings ORDER BY key")
             .await
     }
+}
+
+/// A directory of its own for one test's files.
+pub fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("client-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// Syncs every peer in turn until a whole round moves nothing.
