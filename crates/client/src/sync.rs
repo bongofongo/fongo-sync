@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use fongo_sync_protocol::api::{
-    Appended, BatchPage, Devices, ReadBatches, StoredBatch, batches_path, devices_path,
+    Appended, BatchPage, Devices, ErrorCode, ReadBatches, StoredBatch, batches_path, devices_path,
 };
 use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
@@ -108,7 +108,11 @@ pub struct SyncReport {
 /// stops between the two, whether or not the server stored the envelope, the next sync appends
 /// the same recorded bytes again before anything new; a server that stores an identical envelope
 /// once makes that harmless, and otherwise the duplicate is applied idempotently by every device.
-/// Changes are never re-sealed into a second, different envelope.
+/// Changes are not re-sealed into a second, different envelope, with one exception: when the
+/// server refuses the recorded envelope itself, as too large or not one it accepts, the record is
+/// dropped and its changes, still in the outbox because they were never acknowledged, are sealed
+/// afresh under the server's current limits. Should the server in fact hold the earlier envelope,
+/// its changes then arrive twice, which every device applies idempotently.
 ///
 /// Envelopes this device signed are applied like any other: applying a change already held is a
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
@@ -165,10 +169,17 @@ pub async fn sync<T: Transport>(
                 Some(credentials.device().verifying_key())
             })
             .map_or(0, |opened| opened.changes.len());
-            let seq = append(&rpc, credentials, sending.envelope).await?;
-            acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
-            report.sent += count;
-            report.head = report.head.max(seq);
+            match append(&rpc, credentials, sending.envelope).await {
+                Ok(seq) => {
+                    acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
+                    report.sent += count;
+                    report.head = report.head.max(seq);
+                }
+                Err(Error::Server { code, .. }) if refuses_the_envelope(code) => {
+                    state::clear_sending(conn, library).await?;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             state::clear_sending(conn, library).await?;
         }
@@ -454,6 +465,19 @@ impl<'a> Keys<'a> {
             .map(|d| (DeviceId::of(&d.public_key), (d.public_key, d.recovery)))
             .collect())
     }
+}
+
+/// Whether the server refused an append for what the envelope is, which sending the same bytes
+/// again cannot change, rather than for the request or the moment.
+fn refuses_the_envelope(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::TooLarge
+            | ErrorCode::MalformedEnvelope
+            | ErrorCode::EnvelopeWrongLibrary
+            | ErrorCode::EnvelopeWrongDevice
+            | ErrorCode::EnvelopeBadSignature
+    )
 }
 
 fn refusal(error: EnvelopeError) -> Refusal {

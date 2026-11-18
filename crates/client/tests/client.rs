@@ -790,6 +790,43 @@ async fn a_lost_append_is_sent_again_byte_for_byte_before_anything_new() {
 }
 
 #[tokio::test]
+async fn a_recorded_envelope_the_server_now_refuses_as_too_large_is_sealed_again_to_fit() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    for n in 0..10 {
+        a.run(&format!(
+            "INSERT INTO settings VALUES ('key{n}', 'value{n}')"
+        ))
+        .await;
+    }
+    // Capabilities, a page, then the append never arrives: the envelope stays recorded.
+    server.fail_at(3);
+    assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+    // A passing failure keeps the record for next time.
+    server.behave();
+    server.respond(|r| {
+        let internal = serde_json::to_vec(&ErrorBody::new(ErrorCode::Internal)).unwrap();
+        answer_if(r.method == Method::Post, 500, &internal)
+    });
+    assert!(matches!(
+        a.sync(&server).await,
+        Err(Error::Server { status: 500, .. })
+    ));
+    server.behave();
+    server.with(|s| s.caps.max_batch_bytes = Some(400));
+
+    let report = a.sync(&server).await.unwrap();
+    let keys = a.credentials.library().clone();
+    let log = server.log(keys.id);
+    assert!(log.len() > 1 && log.iter().all(|e| e.len() <= 400));
+    assert_eq!(report.sent, server.changes(&keys).len());
+    assert_no_change_sent_twice(&server, &keys);
+    b.sync(&server).await.unwrap();
+    assert_eq!(b.settings().await.len(), 10);
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
 async fn a_large_outbox_is_split_to_fit_the_servers_limit() {
     let server = Server::new();
     server.with(|s| s.caps.max_batch_bytes = Some(400));
