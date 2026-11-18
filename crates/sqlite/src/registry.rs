@@ -121,12 +121,12 @@ impl Collection {
         self
     }
 
-    /// Declares an identity: entities equal on all of `fields` are merged. Only a minted
-    /// collection can have one, and the table should hold the fields `UNIQUE` together.
     /// Declares a table the kernel does not sync whose `column` refers to this collection's rows.
     /// When two entities merge and one of their rows is given up, rows of `table` that point at
-    /// it are moved to the row kept, unless that would break a constraint of `table`, in which
-    /// case they are left to its `ON DELETE` action.
+    /// it are moved to the row kept, unless that would break a constraint of `table`; those are
+    /// left to its `ON DELETE` action. If that action refuses the deletion, the merge of the two
+    /// rows waits, reported in [`crate::Applied::held`], and is tried again by every apply until
+    /// the application lets the row go; meanwhile nothing written to that row is sent.
     pub fn local_dependent(mut self, table: &str, column: &str) -> Collection {
         self.local_dependents.push((table.into(), column.into()));
         self
@@ -141,14 +141,23 @@ impl Collection {
 
     /// Declares fields that only make sense together, such as a status and the dates that go
     /// with it. A write to any of them records all of them at one clock, and the newest such
-    /// write wins as a whole, so merging never yields a combination no replica wrote. The fields
-    /// must be plain or references merged by clock, and outside the key.
+    /// write wins as a whole, so merging never yields a combination no replica wrote; until all
+    /// of a write has arrived the row keeps what it held. The fields must be plain fields or
+    /// references merged by clock, neither owners nor part of the key. When a field joins a set
+    /// that already holds writes, each replica whose rows hold a value for the set records the
+    /// whole set again on install, and the newest of those wins.
     pub fn together(mut self, fields: &[&str]) -> Collection {
         self.together
             .push(fields.iter().map(|f| (*f).into()).collect());
         self
     }
 
+    /// Declares an identity: two live entities equal on all of `fields`, none of them null, are
+    /// the same entity, and become one on every replica, with one row. Only a minted collection
+    /// can have one, and the table should hold the fields `UNIQUE` together. A row that holds an
+    /// identity only because it is out of date gives it up for the rest of an apply, taking null
+    /// or, where null is refused, a stand-in value; if a `CHECK` on the table refuses that too,
+    /// the rows wait for the application rather than swap.
     pub fn identity(mut self, fields: &[&str]) -> Collection {
         self.identity
             .push(fields.iter().map(|f| (*f).into()).collect());

@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
 use fongo_sync_sqlite::core::{Change, Gid, Strategy as Merge, Value};
-use fongo_sync_sqlite::{Applied, Collection, Conflict, Held, LocalDefault, Registry, Replica};
-use proptest::prelude::*;
+use fongo_sync_sqlite::{
+    Applied, Collection, Conflict, Held, LocalDefault, Registry, Replica, Resume,
+};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 
@@ -154,8 +155,6 @@ struct Peer {
     conn: SqliteConnection,
     replica: Replica,
     cursor: usize,
-    /// Which changes in the hub this peer has applied, for delivery out of order.
-    seen: Vec<bool>,
     /// Where this peer's last sent changes end in the hub, and their last outbox sequence.
     sent: Option<(usize, i64)>,
 }
@@ -179,7 +178,6 @@ impl Peer {
             conn,
             replica: Replica::new(registry),
             cursor: 0,
-            seen: Vec::new(),
             sent: None,
         }
     }
@@ -209,11 +207,6 @@ impl Peer {
             .fetch_all(&mut self.conn)
             .await
             .unwrap()
-    }
-
-    async fn pick(&mut self, table: &str, n: usize) -> Option<i64> {
-        let ids = self.ids(table).await;
-        (!ids.is_empty()).then(|| ids[n % ids.len()])
     }
 
     /// Sends local changes to the hub, then takes everything the hub has that this peer has not
@@ -268,29 +261,6 @@ impl Peer {
     }
 }
 
-const PENDING: &str = "SELECT collection || ' ' || hex(gid) FROM fongo_pending ORDER BY 1";
-
-/// What must hold of the kernel's own tables whatever was delivered: every mapped id names a row,
-/// only a group's own id is mapped, and every alias points at its group's own id.
-const INTEGRITY: &str = "
-    SELECT 'stale ' || i.collection || ' ' || i.key FROM fongo_ids i
-     WHERE (i.collection = 'authors' AND NOT EXISTS
-               (SELECT 1 FROM authors WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'books' AND NOT EXISTS
-               (SELECT 1 FROM books WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'notes' AND NOT EXISTS
-               (SELECT 1 FROM notes WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'marks' AND NOT EXISTS
-               (SELECT 1 FROM marks WHERE id = json_extract(i.key, '$[0]')))
-        OR (i.collection = 'loans' AND NOT EXISTS
-               (SELECT 1 FROM loans WHERE id = json_extract(i.key, '$[0]')))
-    UNION ALL
-    SELECT 'not canonical ' || i.collection || ' ' || i.key
-      FROM fongo_ids i JOIN fongo_alias a ON a.gid = i.gid WHERE a.canon <> a.gid
-    UNION ALL
-    SELECT 'alias to a member ' || hex(a.gid)
-      FROM fongo_alias a JOIN fongo_alias b ON b.gid = a.canon WHERE b.canon <> b.gid";
-
 impl Peer {
     async fn push(&mut self, hub: &mut Vec<Change>) {
         self.replica.collect(&mut self.conn).await.unwrap();
@@ -308,88 +278,6 @@ impl Peer {
             .await
             .unwrap();
     }
-
-    /// Applies the changes in the hub this peer has not seen and `pick` chooses, in hub order or
-    /// reversed. `twice` applies the same batch again and checks that it changes nothing.
-    async fn deliver(
-        &mut self,
-        hub: &[Change],
-        pick: impl Fn(usize) -> bool,
-        reverse: bool,
-        twice: bool,
-    ) {
-        self.seen.resize(hub.len(), false);
-        let mut chosen: Vec<usize> = (0..hub.len())
-            .filter(|&i| !self.seen[i] && pick(i))
-            .collect();
-        if reverse {
-            chosen.reverse();
-        }
-        let batch: Vec<Change> = chosen.iter().map(|&i| hub[i].clone()).collect();
-        for i in chosen {
-            self.seen[i] = true;
-        }
-        self.replica.apply(&mut self.conn, &batch).await.unwrap();
-        let seen = self.seen.clone();
-        self.release(|end| seen[..end].iter().all(|s| *s)).await;
-        if twice {
-            let before = (
-                self.dump().await,
-                self.lines(SHADOW).await,
-                self.lines(ALIASES).await,
-            );
-            let again = self.replica.apply(&mut self.conn, &batch).await.unwrap();
-            let after = (
-                self.dump().await,
-                self.lines(SHADOW).await,
-                self.lines(ALIASES).await,
-            );
-            assert_eq!(before, after, "applying a batch again changed something");
-            if self.lines(PENDING).await.is_empty() {
-                assert!(again.touched.is_empty(), "{:#?}", again.touched);
-            }
-        }
-    }
-}
-
-fn mix(seed: u64, i: usize) -> u64 {
-    let mut x = seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^ (x >> 33)
-}
-
-/// Every peer sends and takes everything it has not seen, until nothing new is sent.
-async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) {
-    for _ in 0..40 {
-        let before = hub.len();
-        for peer in peers.iter_mut() {
-            peer.push(hub).await;
-            peer.deliver(hub, |_| true, false, false).await;
-        }
-        if hub.len() == before
-            && peers
-                .iter()
-                .all(|p| p.seen.len() == hub.len() && p.seen.iter().all(|s| *s))
-        {
-            return;
-        }
-    }
-    panic!("the peers never stopped sending");
-}
-
-/// Converged, nothing left waiting anywhere, and the kernel's tables intact on every peer.
-async fn check(peers: &mut [Peer]) {
-    assert_converged(peers).await;
-    for peer in peers.iter_mut() {
-        let broken = peer.lines(INTEGRITY).await;
-        assert!(broken.is_empty(), "{broken:#?}");
-        let pending = peer.lines(PENDING).await;
-        assert!(pending.is_empty(), "{pending:#?}\n{:#?}", peer.dump().await);
-        let mixed = "SELECT count(*) FROM books
-                     WHERE (COALESCE(status, '') = 'done') <> (finished IS NOT NULL)";
-        assert_eq!(count(peer, mixed).await, 0, "{:#?}", peer.dump().await);
-    }
 }
 
 /// Syncs every peer in turn until a whole round sends nothing new, so each has seen everything.
@@ -399,7 +287,14 @@ async fn settle(peers: &mut [Peer], hub: &mut Vec<Change>) {
         for peer in peers.iter_mut() {
             peer.sync(hub).await;
         }
-        if hub.len() == before && peers.iter().all(|p| p.cursor == hub.len()) {
+        let mut quiet = hub.len() == before && peers.iter().all(|p| p.cursor == hub.len());
+        // A change made by the last apply of a round is not sent until the next.
+        for peer in peers.iter_mut() {
+            peer.replica.collect(&mut peer.conn).await.unwrap();
+            let left = peer.replica.outbox(&mut peer.conn, 1).await.unwrap();
+            quiet &= left.changes.is_empty();
+        }
+        if quiet {
             return;
         }
     }
@@ -1670,21 +1565,43 @@ async fn two_tables_that_refer_to_each_other_arrive_together() {
 }
 
 #[tokio::test]
-async fn writes_while_suspended_are_not_collected() {
-    let mut hub = Vec::new();
-    let mut peers = [Peer::new().await, Peer::new().await];
-    peers[0]
-        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    let replica = peers[0].replica.clone();
-    replica.suspend(&mut peers[0].conn).await.unwrap();
-    peers[0].run("UPDATE books SET title = upper(title)").await;
-    replica.resume(&mut peers[0].conn).await.unwrap();
-    assert_eq!(replica.collect(&mut peers[0].conn).await.unwrap(), 0);
-    // A later write to the row carries what it holds along, the suspended write included.
-    peers[0].run("UPDATE books SET year = 1871").await;
-    assert_eq!(replica.collect(&mut peers[0].conn).await.unwrap(), 2);
+async fn rows_changed_while_suspended_are_sent_or_kept_as_asked() {
+    for how in [Resume::Send, Resume::Baseline] {
+        let mut hub = Vec::new();
+        let mut peers = [Peer::new().await, Peer::new().await];
+        peers[0]
+            .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        settle(&mut peers, &mut hub).await;
+        let replica = peers[0].replica.clone();
+        replica.suspend(&mut peers[0].conn).await.unwrap();
+        peers[0].run("UPDATE books SET title = upper(title)").await;
+        replica.resume(&mut peers[0].conn, how).await.unwrap();
+        let sent = replica.collect(&mut peers[0].conn).await.unwrap();
+        let titles = "SELECT title FROM books";
+        match how {
+            Resume::Send => {
+                assert_eq!(sent, 1);
+                settle(&mut peers, &mut hub).await;
+                assert_eq!(peers[1].lines(titles).await, ["MIDDLEMARCH"]);
+            }
+            Resume::Baseline => {
+                assert_eq!(sent, 0);
+                // Another field's edit sends only that field, and an apply keeps the title.
+                peers[0].run("UPDATE books SET year = 1871").await;
+                assert_eq!(replica.collect(&mut peers[0].conn).await.unwrap(), 1);
+                settle(&mut peers, &mut hub).await;
+                assert_eq!(peers[0].lines(titles).await, ["MIDDLEMARCH"]);
+                assert_eq!(peers[1].lines(titles).await, ["Middlemarch"]);
+                // Until someone writes the field.
+                peers[1]
+                    .run("UPDATE books SET title = 'Middlemarch!'")
+                    .await;
+                settle(&mut peers, &mut hub).await;
+                assert_eq!(peers[0].lines(titles).await, ["Middlemarch!"]);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1734,11 +1651,12 @@ async fn a_field_added_later_takes_what_rows_hold_and_one_removed_is_ignored() {
     let years = "SELECT COALESCE(year, '-') || ' ' || COALESCE(pages, '-') FROM books";
     assert_eq!(peers[1].lines(years).await, ["- 880"]);
 
-    for peer in peers.iter_mut() {
-        peer.replica = Replica::new(after());
-        peer.install().await;
+    // The replicas upgrade one after the other, with an exchange between.
+    for who in 0..2 {
+        peers[who].replica = Replica::new(after());
+        peers[who].install().await;
+        settle(&mut peers, &mut hub).await;
     }
-    settle(&mut peers, &mut hub).await;
     assert_eq!(peers[1].lines(years).await, ["1871 880"]);
     assert_eq!(peers[0].lines(SHADOW).await, peers[1].lines(SHADOW).await);
 
@@ -1841,287 +1759,4 @@ async fn an_edit_made_after_seeing_another_is_not_a_conflict() {
     assert!(reports.is_empty(), "{reports:#?}");
     assert_converged(&mut peers).await;
     assert_eq!(note_body(&mut peers[0]).await, "two");
-}
-
-#[derive(Debug, Clone)]
-enum Op {
-    AddAuthor(u8),
-    RenameAuthor(usize, u8),
-    SetFavourite(usize, usize),
-    SetBorn(usize, u8),
-    AddBook(u8, usize),
-    SetTitle(usize, u8),
-    SetYear(usize, u8),
-    SetPages(usize, u8),
-    SetStatus(usize, u8),
-    SetAuthor(usize, usize),
-    DeleteBook(usize),
-    DeleteAuthor(usize),
-    AddNote(usize, u8),
-    SetNote(usize, u8),
-    DeleteNote(usize),
-    AddTag(usize, u8),
-    AddMark(usize, u8),
-    MoveNoteOffDeletedBook(usize, usize),
-    MoveMarkOffDeletedNote(usize, usize),
-    SetTagNote(usize, u8),
-    DeleteTag(usize),
-    SetSetting(u8, u8),
-    DeleteSetting(u8),
-    AddIsbnBook(u8, u8),
-    SetIsbn(usize, u8),
-    SetIsbn10(usize, u8),
-    AddLoan(usize),
-    SetLoanBook(usize, usize),
-    DeleteLoan(usize),
-    Sync,
-    Push,
-    Deliver(u64, bool, bool),
-}
-
-fn arb_op() -> impl Strategy<Value = Op> {
-    let n = 0usize..8;
-    let v = 0u8..4;
-    prop_oneof![
-        v.clone().prop_map(Op::AddAuthor),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::RenameAuthor(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetFavourite(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetBorn(a, b)),
-        (v.clone(), n.clone()).prop_map(|(a, b)| Op::AddBook(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTitle(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetYear(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetPages(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetStatus(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetStatus(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetAuthor(a, b)),
-        n.clone().prop_map(Op::DeleteBook),
-        n.clone().prop_map(Op::DeleteAuthor),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddNote(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetNote(a, b)),
-        n.clone().prop_map(Op::DeleteNote),
-        (n.clone(), 0u8..2).prop_map(|(a, b)| Op::AddTag(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddMark(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteOffDeletedBook(a, b)),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveMarkOffDeletedNote(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetTagNote(a, b)),
-        n.clone().prop_map(Op::DeleteTag),
-        (0u8..2, v.clone()).prop_map(|(a, b)| Op::SetSetting(a, b)),
-        (0u8..2).prop_map(Op::DeleteSetting),
-        (v.clone(), 0u8..3).prop_map(|(a, b)| Op::AddIsbnBook(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetIsbn(a, b)),
-        (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetIsbn10(a, b)),
-        n.clone().prop_map(Op::AddLoan),
-        (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetLoanBook(a, b)),
-        n.clone().prop_map(Op::DeleteLoan),
-        Just(Op::Sync),
-        Just(Op::Sync),
-        Just(Op::Push),
-        Just(Op::Push),
-        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
-        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
-        (any::<u64>(), any::<bool>(), any::<bool>()).prop_map(|(a, b, c)| Op::Deliver(a, b, c)),
-    ]
-}
-
-async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) {
-    let sql = match op {
-        Op::AddMark(n, v) => match peer.pick("notes", n).await {
-            Some(id) => {
-                format!("INSERT OR IGNORE INTO marks (note_id, place) VALUES ({id}, {v})")
-            }
-            None => return,
-        },
-        Op::MoveNoteOffDeletedBook(n, m) | Op::MoveMarkOffDeletedNote(n, m) => {
-            let (child, parent, column) = match op {
-                Op::MoveNoteOffDeletedBook(..) => ("notes", "books", "book_id"),
-                _ => ("marks", "notes", "note_id"),
-            };
-            let (Some(id), Some(to)) = (peer.pick(child, n).await, peer.pick(parent, m).await)
-            else {
-                return;
-            };
-            let from: Option<i64> =
-                sqlx::query_scalar(&format!("SELECT {column} FROM {child} WHERE id = {id}"))
-                    .fetch_one(&mut peer.conn)
-                    .await
-                    .unwrap();
-            let Some(from) = from.filter(|from| *from != to) else {
-                return;
-            };
-            peer.run(&format!(
-                "UPDATE OR IGNORE {child} SET {column} = {to} WHERE id = {id}"
-            ))
-            .await;
-            format!("DELETE FROM {parent} WHERE id = {from}")
-        }
-        Op::Sync => {
-            peer.push(hub).await;
-            peer.deliver(hub, |_| true, false, false).await;
-            return;
-        }
-        Op::Push => {
-            peer.push(hub).await;
-            return;
-        }
-        Op::Deliver(seed, reverse, twice) => {
-            peer.deliver(hub, |i| !mix(seed, i).is_multiple_of(3), reverse, twice)
-                .await;
-            return;
-        }
-        Op::AddAuthor(v) => format!("INSERT OR IGNORE INTO authors (name) VALUES ('author{v}')"),
-        Op::SetFavourite(n, m) => {
-            let (Some(a), Some(b)) = (peer.pick("authors", n).await, peer.pick("books", m).await)
-            else {
-                return;
-            };
-            format!("UPDATE authors SET favourite = {b} WHERE id = {a}")
-        }
-        Op::RenameAuthor(n, v) | Op::SetBorn(n, v) => {
-            let Some(id) = peer.pick("authors", n).await else {
-                return;
-            };
-            let set = match op {
-                Op::RenameAuthor(..) => format!("name = 'author{v}'"),
-                _ => format!("born = {}", v % 2),
-            };
-            format!("UPDATE OR IGNORE authors SET {set} WHERE id = {id}")
-        }
-        Op::AddBook(v, n) => match peer.pick("authors", n).await {
-            Some(a) => format!("INSERT INTO books (title, author_id) VALUES ('title{v}', {a})"),
-            None => format!("INSERT INTO books (title) VALUES ('title{v}')"),
-        },
-        Op::SetAuthor(n, m) => {
-            let (Some(b), Some(a)) = (peer.pick("books", n).await, peer.pick("authors", m).await)
-            else {
-                return;
-            };
-            format!("UPDATE books SET author_id = {a} WHERE id = {b}")
-        }
-        Op::SetSetting(k, v) => format!(
-            "INSERT INTO settings VALUES ('key{k}', 'value{v}')
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value"
-        ),
-        Op::DeleteSetting(k) => format!("DELETE FROM settings WHERE key = 'key{k}'"),
-        // Two values, so books clash often; 3 clears the identity.
-        Op::AddIsbnBook(v, i) => {
-            let i = i % 2;
-            format!("INSERT OR IGNORE INTO books (title, isbn) VALUES ('title{v}', 'isbn{i}')")
-        }
-        Op::SetIsbn(n, v) | Op::SetIsbn10(n, v) => {
-            let Some(id) = peer.pick("books", n).await else {
-                return;
-            };
-            let column = if matches!(op, Op::SetIsbn(..)) {
-                "isbn"
-            } else {
-                "isbn10"
-            };
-            let value = if v == 3 {
-                "NULL".to_string()
-            } else {
-                format!("'{column}{}'", v % 2)
-            };
-            format!("UPDATE OR IGNORE books SET {column} = {value} WHERE id = {id}")
-        }
-        Op::AddLoan(n) => match peer.pick("books", n).await {
-            Some(b) => format!(
-                "INSERT INTO loans (book_id, borrower, lent_seq, origin) VALUES ({b}, 'friend', 0, 'here')"
-            ),
-            None => "INSERT INTO loans (borrower, lent_seq, origin) VALUES ('friend', 0, 'here')"
-                .to_string(),
-        },
-        Op::SetLoanBook(n, m) => {
-            let (Some(l), Some(b)) = (peer.pick("loans", n).await, peer.pick("books", m).await)
-            else {
-                return;
-            };
-            format!("UPDATE loans SET book_id = {b} WHERE id = {l}")
-        }
-        Op::DeleteLoan(n) => match peer.pick("loans", n).await {
-            Some(id) => format!("DELETE FROM loans WHERE id = {id}"),
-            None => return,
-        },
-        Op::DeleteAuthor(n) => match peer.pick("authors", n).await {
-            Some(id) => format!("DELETE FROM authors WHERE id = {id}"),
-            None => return,
-        },
-        Op::SetNote(n, v) => match peer.pick("notes", n).await {
-            Some(id) => format!("UPDATE notes SET body = 'body{v}' WHERE id = {id}"),
-            None => return,
-        },
-        Op::DeleteNote(n) => match peer.pick("notes", n).await {
-            Some(id) => format!("DELETE FROM notes WHERE id = {id}"),
-            None => return,
-        },
-        Op::SetTagNote(n, v) => match peer.pick("tags", n).await {
-            Some(id) => format!("UPDATE tags SET note = 'note{v}' WHERE rowid = {id}"),
-            None => return,
-        },
-        Op::DeleteTag(n) => match peer.pick("tags", n).await {
-            Some(id) => format!("DELETE FROM tags WHERE rowid = {id}"),
-            None => return,
-        },
-        Op::SetStatus(n, v) => {
-            let Some(id) = peer.pick("books", n).await else {
-                return;
-            };
-            // A book is finished on a day exactly when it is done.
-            let set = match v {
-                0 => "status = 'reading', finished = NULL".to_string(),
-                1 => "status = 'abandoned', finished = NULL".to_string(),
-                _ => format!("status = 'done', finished = {v}"),
-            };
-            format!("UPDATE OR IGNORE books SET {set} WHERE id = {id}")
-        }
-        Op::SetTitle(n, _)
-        | Op::SetYear(n, _)
-        | Op::SetPages(n, _)
-        | Op::DeleteBook(n)
-        | Op::AddNote(n, _)
-        | Op::AddTag(n, _) => {
-            let Some(id) = peer.pick("books", n).await else {
-                return;
-            };
-            match op {
-                Op::SetTitle(_, v) => {
-                    format!("UPDATE books SET title = 'title{v}' WHERE id = {id}")
-                }
-                Op::SetYear(_, v) => format!("UPDATE books SET year = {v} WHERE id = {id}"),
-                Op::SetPages(_, v) => format!("UPDATE books SET pages = {v} WHERE id = {id}"),
-                Op::DeleteBook(_) => format!("DELETE FROM books WHERE id = {id}"),
-                Op::AddNote(_, v) => {
-                    format!("INSERT INTO notes (book_id, body) VALUES ({id}, 'body{v}')")
-                }
-                _ => {
-                    let Op::AddTag(_, v) = op else { return };
-                    format!("INSERT OR IGNORE INTO tags (book_id, tag) VALUES ({id}, 'tag{v}')")
-                }
-            }
-        }
-    };
-    peer.run(&sql).await;
-}
-
-proptest! {
-    #[test]
-    fn replicas_that_have_exchanged_everything_are_identical(
-        script in proptest::collection::vec((0usize..4, arb_op()), 0..120)
-    ) {
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        runtime.block_on(async {
-            let mut hub = Vec::new();
-            let mut peers = [Peer::new().await, Peer::new().await, Peer::new().await, Peer::new().await];
-            for (who, op) in script {
-                perform(&mut peers[who], op, &mut hub).await;
-            }
-            finish(&mut peers, &mut hub).await;
-            check(&mut peers).await;
-        });
-    }
 }

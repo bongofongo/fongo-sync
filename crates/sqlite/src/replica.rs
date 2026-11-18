@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use fongo_sync_core::{ALIAS, Change, Clock, DELETED, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
@@ -22,16 +24,17 @@ const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_ids (
         collection TEXT NOT NULL,
         key TEXT NOT NULL,
-        gid BLOB NOT NULL UNIQUE,
-        PRIMARY KEY (collection, key))",
+        gid BLOB NOT NULL,
+        PRIMARY KEY (collection, key),
+        UNIQUE (collection, gid))",
     "CREATE TABLE IF NOT EXISTS fongo_shadow (
+        collection TEXT NOT NULL,
         gid BLOB NOT NULL,
         field TEXT NOT NULL,
-        collection TEXT NOT NULL,
         value,
         is_ref INTEGER NOT NULL DEFAULT 0,
         clock TEXT NOT NULL,
-        PRIMARY KEY (gid, field))",
+        PRIMARY KEY (collection, gid, field))",
     "CREATE TABLE IF NOT EXISTS fongo_outbox (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         collection TEXT NOT NULL,
@@ -41,12 +44,28 @@ const TABLES: &[&str] = &[
         is_ref INTEGER NOT NULL DEFAULT 0,
         clock TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS fongo_shadow_refs ON fongo_shadow (value) WHERE is_ref = 1",
-    "CREATE TABLE IF NOT EXISTS fongo_pending (gid BLOB PRIMARY KEY, collection TEXT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS fongo_alias (gid BLOB PRIMARY KEY, canon BLOB NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS fongo_pending (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        PRIMARY KEY (collection, gid))",
+    "CREATE TABLE IF NOT EXISTS fongo_alias (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        canon BLOB NOT NULL,
+        PRIMARY KEY (collection, gid))",
+    "CREATE TABLE IF NOT EXISTS fongo_deviations (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        field TEXT NOT NULL,
+        value,
+        is_ref INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        against TEXT,
+        PRIMARY KEY (collection, key, field))",
     "CREATE TABLE IF NOT EXISTS fongo_bases (
+        collection TEXT NOT NULL,
         gid BLOB NOT NULL,
         field TEXT NOT NULL,
-        collection TEXT NOT NULL,
         key TEXT NOT NULL,
         base,
         base_is_ref INTEGER NOT NULL DEFAULT 0,
@@ -56,9 +75,29 @@ const TABLES: &[&str] = &[
         local_clock TEXT NOT NULL,
         seq INTEGER NOT NULL,
         reported TEXT,
-        PRIMARY KEY (gid, field))",
-    "CREATE INDEX IF NOT EXISTS fongo_alias_canon ON fongo_alias (canon)",
+        PRIMARY KEY (collection, gid, field))",
+    "CREATE INDEX IF NOT EXISTS fongo_alias_canon ON fongo_alias (collection, canon)",
+    "CREATE TABLE IF NOT EXISTS fongo_leftover (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        PRIMARY KEY (collection, key))",
+    "CREATE TABLE IF NOT EXISTS fongo_alias_pairs (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        other BLOB NOT NULL,
+        PRIMARY KEY (collection, other, gid))",
 ];
+
+/// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// They are the application's edits, sent like any other.
+    Send,
+    /// They are this replica's own baseline: not sent, and kept in the row until this replica or
+    /// another next writes the field.
+    Baseline,
+}
 
 /// Local changes waiting to be sent, oldest first.
 #[derive(Debug, Clone, Default)]
@@ -86,10 +125,11 @@ pub struct Applied {
     pub held: Vec<Held>,
 }
 
-/// An entity whose row could not be written. When the kernel cannot resolve what holds it back,
-/// such as a partial unique index another row already satisfies, the application can read the
-/// entity's merged values with [`Replica::merged`], change its own rows, and call
-/// [`Replica::apply`] with no changes to try again.
+/// An entity whose row could not be written, or a row a merge gave up that another table will
+/// not let go of. When the kernel cannot resolve what holds it back, such as a partial unique
+/// index another row already satisfies, the application can read the entity's merged values with
+/// [`Replica::merged`], change its own rows, and call [`Replica::apply`] with no changes to try
+/// again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub collection: String,
@@ -159,11 +199,45 @@ const OWNER_LIMIT: usize = 10_000;
 /// Rounds of bringing rows in line in one apply, after which what is left waits for the next.
 const SETTLE_ROUNDS: usize = 1_000;
 
+/// A group's fate, and whether it leaned on a guess about a group still being worked out.
+type Walk<'a> = Pin<Box<dyn Future<Output = Result<(Fate, bool)>> + Send + 'a>>;
+
+/// Whether an entity has a row in its merged state. A member is live when its tombstone says so
+/// and every owner it names is alive; a group is alive when any member is. The answer is the
+/// greatest one consistent with that, so owners that own each other are alive unless a deleted
+/// one can be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fate {
     Alive,
     Dead,
+    /// A member's tombstone, or an owner, has not arrived, so whether it lives is not known yet.
+    Unknown,
     /// The owner graph was too large to follow to the end.
     Undecided,
+}
+
+impl Fate {
+    /// Of several members, the most alive.
+    fn any(self, other: Fate) -> Fate {
+        use Fate::{Alive, Dead, Undecided, Unknown};
+        match (self, other) {
+            (Alive, _) | (_, Alive) => Alive,
+            (Undecided, _) | (_, Undecided) => Undecided,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Dead, Dead) => Dead,
+        }
+    }
+
+    /// Of several owners, the least alive.
+    fn all(self, other: Fate) -> Fate {
+        use Fate::{Alive, Dead, Undecided, Unknown};
+        match (self, other) {
+            (Dead, _) | (_, Dead) => Dead,
+            (Undecided, _) | (_, Undecided) => Undecided,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Alive, Alive) => Alive,
+        }
+    }
 }
 
 struct Entry {
@@ -181,8 +255,9 @@ type Shadow = BTreeMap<String, (Value, Hlc)>;
 struct Group {
     canon: Gid,
     merged: Shadow,
-    /// The members not deleted, smallest first.
+    /// The live members, smallest first.
     live: Vec<Gid>,
+    fate: Fate,
 }
 
 impl Group {
@@ -202,8 +277,15 @@ struct Pass {
     /// Entities a merge of identities touched, to be brought in line before the round ends.
     more: BTreeSet<(usize, Gid)>,
     rows: Rows,
-    /// Whether each entity looked at is deleted or owned by one that is. Valid until groups merge.
-    dead: BTreeMap<(usize, Gid), bool>,
+    /// The fate of each group looked at. Valid until groups merge.
+    fates: BTreeMap<(usize, Gid), Fate>,
+    /// The groups whose fate is being worked out, and how many have been looked at, in one walk.
+    walking: BTreeSet<(usize, Gid)>,
+    walked: usize,
+    /// Entities whose fate may have changed, so whose referrers' may have too.
+    suspect: BTreeSet<(usize, Gid)>,
+    /// The suspects whose referrers have been queued, once each pass.
+    told: BTreeSet<(usize, Gid)>,
     /// Rows written or removed and groups merged so far.
     writes: usize,
 }
@@ -224,7 +306,11 @@ impl Pass {
             clock,
             more: BTreeSet::new(),
             rows: Rows::new(),
-            dead: BTreeMap::new(),
+            fates: BTreeMap::new(),
+            walking: BTreeSet::new(),
+            walked: 0,
+            suspect: BTreeSet::new(),
+            told: BTreeSet::new(),
             writes: 0,
         }
     }
@@ -338,6 +424,99 @@ fn triggers(c: &Collection) -> Vec<String> {
     ]
 }
 
+/// The version of the kernel's own tables.
+const LAYOUT: i64 = 2;
+
+/// Brings tables kept by an earlier version to the present layout, in which every entity is
+/// keyed by its collection as well as its id.
+async fn migrate(conn: &mut SqliteConnection) -> Result<()> {
+    let installed = !query(
+        conn,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
+        &[],
+    )
+    .await?
+    .is_empty();
+    if !installed || meta_get(conn, "layout").await? == Some(Value::Int(LAYOUT)) {
+        return Ok(());
+    }
+    let moved = [
+        "fongo_ids",
+        "fongo_shadow",
+        "fongo_pending",
+        "fongo_alias",
+        "fongo_bases",
+    ];
+    for table in moved {
+        let exists = !query(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            &[Value::Text(table.into())],
+        )
+        .await?
+        .is_empty();
+        if exists {
+            exec(
+                conn,
+                &format!("ALTER TABLE {table} RENAME TO {table}_old"),
+                &[],
+            )
+            .await?;
+        }
+    }
+    exec(conn, "DROP INDEX IF EXISTS fongo_shadow_refs", &[]).await?;
+    exec(conn, "DROP INDEX IF EXISTS fongo_alias_canon", &[]).await?;
+    for sql in TABLES {
+        exec(conn, sql, &[]).await?;
+    }
+    let copies = [
+        (
+            "fongo_ids",
+            "INSERT OR IGNORE INTO fongo_ids (collection, key, gid)
+             SELECT collection, key, gid FROM fongo_ids_old",
+        ),
+        (
+            "fongo_shadow",
+            "INSERT OR IGNORE INTO fongo_shadow (collection, gid, field, value, is_ref, clock)
+             SELECT collection, gid, field, value, is_ref, clock FROM fongo_shadow_old",
+        ),
+        (
+            "fongo_pending",
+            "INSERT OR IGNORE INTO fongo_pending (collection, gid)
+             SELECT collection, gid FROM fongo_pending_old",
+        ),
+        (
+            "fongo_alias",
+            "INSERT OR IGNORE INTO fongo_alias (collection, gid, canon)
+             SELECT COALESCE((SELECT collection FROM fongo_shadow s WHERE s.gid = o.gid LIMIT 1), ''),
+                    gid, canon
+               FROM fongo_alias_old o",
+        ),
+        (
+            "fongo_bases",
+            "INSERT OR IGNORE INTO fongo_bases
+             SELECT collection, gid, field, key, base, base_is_ref, base_clock, local,
+                    local_is_ref, local_clock, seq, reported
+               FROM fongo_bases_old",
+        ),
+    ];
+    for (table, copy) in copies {
+        let old = format!("{table}_old");
+        let exists = !query(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            &[Value::Text(old.clone())],
+        )
+        .await?
+        .is_empty();
+        if exists {
+            exec(conn, copy, &[]).await?;
+            exec(conn, &format!("DROP TABLE {old}"), &[]).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Drops every object of a type the kernel made: its triggers, or its tables.
 async fn drop_kernel(conn: &mut SqliteConnection, kind: &str) -> Result<()> {
     let names = query(
@@ -397,11 +576,11 @@ async fn set_applying(conn: &mut SqliteConnection, on: bool) -> Result<()> {
     .await
 }
 
-async fn shadow_of(conn: &mut SqliteConnection, gid: Gid) -> Result<Shadow> {
+async fn shadow_of(conn: &mut SqliteConnection, collection: &str, gid: Gid) -> Result<Shadow> {
     let rows = query(
         conn,
-        "SELECT field, value, is_ref, clock FROM fongo_shadow WHERE gid = ?",
-        &[Value::Ref(gid)],
+        "SELECT field, value, is_ref, clock FROM fongo_shadow WHERE collection = ? AND gid = ?",
+        &[Value::Text(collection.into()), Value::Ref(gid)],
     )
     .await?;
     let mut fields = BTreeMap::new();
@@ -418,15 +597,14 @@ async fn shadow_put(conn: &mut SqliteConnection, change: &Change) -> Result<()> 
     let (value, is_ref) = stored(&change.value);
     exec(
         conn,
-        "INSERT INTO fongo_shadow (gid, field, collection, value, is_ref, clock)
+        "INSERT INTO fongo_shadow (collection, gid, field, value, is_ref, clock)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (gid, field) DO UPDATE SET
-            collection = excluded.collection, value = excluded.value,
-            is_ref = excluded.is_ref, clock = excluded.clock",
+         ON CONFLICT (collection, gid, field) DO UPDATE SET
+            value = excluded.value, is_ref = excluded.is_ref, clock = excluded.clock",
         &[
+            Value::Text(change.collection.clone()),
             Value::Ref(change.gid),
             Value::Text(change.field.clone()),
-            Value::Text(change.collection.clone()),
             value,
             is_ref,
             Value::Text(change.clock.encode()),
@@ -434,10 +612,6 @@ async fn shadow_put(conn: &mut SqliteConnection, change: &Change) -> Result<()> 
     )
     .await?;
     Ok(())
-}
-
-fn is_deleted(shadow: &Shadow) -> bool {
-    matches!(shadow.get(DELETED), Some((Value::Int(1), _)))
 }
 
 async fn emit(conn: &mut SqliteConnection, change: &Change) -> Result<()> {
@@ -491,7 +665,7 @@ async fn remember_base(
         "INSERT INTO fongo_bases (gid, field, collection, key, base, base_is_ref, base_clock,
                                   local, local_is_ref, local_clock, seq)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (gid, field) DO UPDATE SET
+         ON CONFLICT (collection, gid, field) DO UPDATE SET
             key = excluded.key, local = excluded.local, local_is_ref = excluded.local_is_ref,
             local_clock = excluded.local_clock, seq = excluded.seq",
         &[
@@ -512,32 +686,59 @@ async fn remember_base(
     Ok(())
 }
 
-async fn has_shadow(conn: &mut SqliteConnection, gid: Gid) -> Result<bool> {
+/// Whether a natural-key entity's shadow holds its whole key, which is what joins it to others
+/// with the same key. A member written before its key arrived joins once it has.
+async fn has_key(conn: &mut SqliteConnection, c: &Collection, gid: Gid) -> Result<bool> {
+    let Key::Natural { .. } = &c.key else {
+        return has_shadow(conn, &c.name, gid).await;
+    };
+    let shadow = shadow_of(conn, &c.name, gid).await?;
+    Ok(own_key(c, &shadow) == Some(gid))
+}
+
+/// The id a natural-key entity's own key fields derive, once all are written.
+fn own_key(c: &Collection, shadow: &Shadow) -> Option<Gid> {
+    let Key::Natural { fields } = &c.key else {
+        return None;
+    };
+    let mut key = Vec::with_capacity(fields.len());
+    for name in fields {
+        match shadow.get(name) {
+            Some((value, _)) if *value != Value::Null => key.push(value.clone()),
+            _ => return None,
+        }
+    }
+    Some(Gid::derive(&c.name, &key))
+}
+
+async fn has_shadow(conn: &mut SqliteConnection, collection: &str, gid: Gid) -> Result<bool> {
     let rows = query(
         conn,
-        "SELECT 1 FROM fongo_shadow WHERE gid = ? LIMIT 1",
-        &[Value::Ref(gid)],
+        "SELECT 1 FROM fongo_shadow WHERE collection = ? AND gid = ? LIMIT 1",
+        &[Value::Text(collection.into()), Value::Ref(gid)],
     )
     .await?;
     Ok(!rows.is_empty())
 }
 
-/// The smallest id among those known to be the same entity as `gid`.
-async fn canon_of(conn: &mut SqliteConnection, gid: Gid) -> Result<Gid> {
+/// The smallest id among those known to be the same entity as `gid` in `collection`. An entity
+/// is its collection and its id together, so ids that name things in different collections are
+/// never confused, whatever another replica claims.
+async fn canon_of(conn: &mut SqliteConnection, collection: &str, gid: Gid) -> Result<Gid> {
     let rows = query(
         conn,
-        "SELECT canon FROM fongo_alias WHERE gid = ?",
-        &[Value::Ref(gid)],
+        "SELECT canon FROM fongo_alias WHERE collection = ? AND gid = ?",
+        &[Value::Text(collection.into()), Value::Ref(gid)],
     )
     .await?;
     rows.first().map_or(Ok(gid), |row| as_gid(&row[0]))
 }
 
-async fn members_of(conn: &mut SqliteConnection, canon: Gid) -> Result<Vec<Gid>> {
+async fn members_of(conn: &mut SqliteConnection, collection: &str, canon: Gid) -> Result<Vec<Gid>> {
     let rows = query(
         conn,
-        "SELECT gid FROM fongo_alias WHERE canon = ? ORDER BY gid",
-        &[Value::Ref(canon)],
+        "SELECT gid FROM fongo_alias WHERE collection = ? AND canon = ? ORDER BY gid",
+        &[Value::Text(collection.into()), Value::Ref(canon)],
     )
     .await?;
     if rows.is_empty() {
@@ -548,48 +749,188 @@ async fn members_of(conn: &mut SqliteConnection, canon: Gid) -> Result<Vec<Gid>>
 
 /// Records that `a` and `b` are one entity. Returns the merged group's id when they were not
 /// already one.
-async fn union(conn: &mut SqliteConnection, a: Gid, b: Gid) -> Result<Option<Gid>> {
-    let (a, b) = (canon_of(conn, a).await?, canon_of(conn, b).await?);
+async fn union(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    a: Gid,
+    b: Gid,
+) -> Result<Option<Gid>> {
+    let (a, b) = (
+        canon_of(conn, collection, a).await?,
+        canon_of(conn, collection, b).await?,
+    );
     if a == b {
         return Ok(None);
     }
     let canon = a.min(b);
-    let mut all = members_of(conn, a).await?;
-    all.extend(members_of(conn, b).await?);
+    let mut all = members_of(conn, collection, a).await?;
+    all.extend(members_of(conn, collection, b).await?);
     for gid in all {
         exec(
             conn,
-            "INSERT INTO fongo_alias (gid, canon) VALUES (?, ?)
-             ON CONFLICT (gid) DO UPDATE SET canon = excluded.canon",
-            &[Value::Ref(gid), Value::Ref(canon)],
+            "INSERT INTO fongo_alias (collection, gid, canon) VALUES (?, ?, ?)
+             ON CONFLICT (collection, gid) DO UPDATE SET canon = excluded.canon",
+            &[
+                Value::Text(collection.into()),
+                Value::Ref(gid),
+                Value::Ref(canon),
+            ],
         )
         .await?;
     }
     Ok(Some(canon))
 }
 
-async fn same(conn: &mut SqliteConnection, a: &Value, b: &Value) -> Result<bool> {
-    match (a, b) {
-        (Value::Ref(x), Value::Ref(y)) if x != y => {
-            Ok(canon_of(conn, *x).await? == canon_of(conn, *y).await?)
+/// Whether two values of a field are the same, references to members of one group included.
+async fn same(conn: &mut SqliteConnection, field: &Field, a: &Value, b: &Value) -> Result<bool> {
+    match (&field.kind, a, b) {
+        (Kind::Ref { collection, .. }, Value::Ref(x), Value::Ref(y)) if x != y => {
+            Ok(canon_of(conn, collection, *x).await? == canon_of(conn, collection, *y).await?)
         }
         _ => Ok(a == b),
     }
 }
 
 /// Each value a key part could have been written as: a reference by any member of its group.
-async fn spellings(conn: &mut SqliteConnection, value: &Value) -> Result<Vec<Value>> {
-    match value {
-        Value::Ref(gid) => {
-            let canon = canon_of(conn, *gid).await?;
-            Ok(members_of(conn, canon)
+async fn spellings(
+    conn: &mut SqliteConnection,
+    field: &Field,
+    value: &Value,
+) -> Result<Vec<Value>> {
+    match (&field.kind, value) {
+        (Kind::Ref { collection, .. }, Value::Ref(gid)) => {
+            let canon = canon_of(conn, collection, *gid).await?;
+            Ok(members_of(conn, collection, canon)
                 .await?
                 .into_iter()
                 .map(Value::Ref)
                 .collect())
         }
-        other => Ok(vec![other.clone()]),
+        (_, other) => Ok(vec![other.clone()]),
     }
+}
+
+/// The fields of sets that change together whose newest write has not all arrived. Every write
+/// records the whole set at one clock, so a set is complete when all its fields hold entries of
+/// one clock, or none hold any.
+fn incomplete_sets<'a>(c: &'a Collection, merged: &Shadow) -> BTreeSet<&'a str> {
+    let mut held = BTreeSet::new();
+    for set in &c.together {
+        let clocks: Vec<Option<Hlc>> = set
+            .iter()
+            .map(|f| merged.get(f).map(|(_, clock)| *clock))
+            .collect();
+        if clocks.iter().any(|clock| *clock != clocks[0]) {
+            held.extend(set.iter().map(String::as_str));
+        }
+    }
+    held
+}
+
+async fn deviations(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    key: &str,
+) -> Result<BTreeMap<String, Value>> {
+    let rows = query(
+        conn,
+        "SELECT field, value, is_ref FROM fongo_deviations WHERE collection = ? AND key = ?",
+        &[Value::Text(collection.into()), Value::Text(key.into())],
+    )
+    .await?;
+    let mut held = BTreeMap::new();
+    for row in rows {
+        held.insert(as_text(&row[0])?.to_string(), loaded(&row[1], &row[2])?);
+    }
+    Ok(held)
+}
+
+/// Records a value left in a row's field. A pinned one stands against the merged entry it was
+/// recorded against, and is neither sent nor written over until that entry changes.
+async fn note(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    key: &str,
+    field: &str,
+    value: &Value,
+    pinned: Option<Option<&(Value, Hlc)>>,
+) -> Result<()> {
+    let (value, is_ref) = stored(value);
+    let against = match pinned {
+        Some(Some((_, clock))) => Value::Text(clock.encode()),
+        _ => Value::Null,
+    };
+    exec(
+        conn,
+        "INSERT INTO fongo_deviations (collection, key, field, value, is_ref, pinned, against)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (collection, key, field) DO UPDATE SET
+            value = excluded.value, is_ref = excluded.is_ref, pinned = excluded.pinned,
+            against = excluded.against",
+        &[
+            Value::Text(collection.into()),
+            Value::Text(key.into()),
+            Value::Text(field.into()),
+            value,
+            is_ref,
+            Value::Int(i64::from(pinned.is_some())),
+            against,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The pinned values of a row that still stand: those whose merged entry has not changed since.
+async fn pins(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    key: &str,
+    merged: &Shadow,
+) -> Result<BTreeMap<String, Value>> {
+    let rows = query(
+        conn,
+        "SELECT field, value, is_ref, against FROM fongo_deviations
+          WHERE collection = ? AND key = ? AND pinned = 1",
+        &[Value::Text(collection.into()), Value::Text(key.into())],
+    )
+    .await?;
+    let mut standing = BTreeMap::new();
+    for row in rows {
+        let field = as_text(&row[0])?.to_string();
+        let against = match &row[3] {
+            Value::Null => None,
+            clock => Some(as_clock(clock)?),
+        };
+        if merged.get(&field).map(|(_, clock)| *clock) == against {
+            standing.insert(field, loaded(&row[1], &row[2])?);
+        }
+    }
+    Ok(standing)
+}
+
+/// Forgets what the kernel left in a row's fields, or in one of them.
+async fn forget_deviations(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    key: &str,
+    field: Option<&str>,
+) -> Result<()> {
+    let mut params = vec![Value::Text(collection.into()), Value::Text(key.into())];
+    let only = match field {
+        Some(field) => {
+            params.push(Value::Text(field.into()));
+            " AND field = ?"
+        }
+        None => "",
+    };
+    exec(
+        conn,
+        &format!("DELETE FROM fongo_deviations WHERE collection = ? AND key = ?{only}"),
+        &params,
+    )
+    .await?;
+    Ok(())
 }
 
 /// A condition true when a row does not already hold the values bound for `fields`, so an update
@@ -667,9 +1008,11 @@ impl Replica {
     /// possible writes, so they fill gaps in a library but never overwrite it.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         let mut tx = conn.begin().await?;
+        migrate(&mut tx).await?;
         for sql in TABLES {
             exec(&mut tx, sql, &[]).await?;
         }
+        meta_set(&mut tx, "layout", Value::Int(LAYOUT)).await?;
         exec(
             &mut tx,
             "INSERT OR IGNORE INTO fongo_meta (key, value) VALUES ('node', randomblob(16))",
@@ -685,17 +1028,54 @@ impl Replica {
             let known = format!("fields:{}", c.name);
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
             let fields = Value::Text(names.join(","));
+            let sets = format!("together:{}", c.name);
+            let together: Vec<String> = c.together.iter().map(|set| set.join("+")).collect();
+            let together = Value::Text(together.join(","));
+            let was_together = meta_get(&mut tx, &sets).await?;
+            meta_set(&mut tx, &sets, together.clone()).await?;
             if meta_get(&mut tx, &adopted).await?.is_some() {
-                if let Some(Value::Text(held)) = meta_get(&mut tx, &known).await? {
-                    let held: BTreeSet<&str> = held.split(',').collect();
-                    let added: Vec<&Field> = c
-                        .fields
-                        .iter()
-                        .filter(|f| !held.contains(f.name.as_str()))
-                        .collect();
-                    if !added.is_empty() {
-                        self.adopt_fields(&mut tx, c, &added).await?;
+                let regrouped = match was_together {
+                    Some(was) => was != together,
+                    None => !c.together.is_empty(),
+                };
+                if regrouped {
+                    self.complete_sets(&mut tx, c).await?;
+                }
+                // A database installed before fields were recorded knew those it holds values
+                // for; any other is new to it.
+                let held = match meta_get(&mut tx, &known).await? {
+                    Some(Value::Text(held)) => Some(held),
+                    _ => None,
+                };
+                let mut added: Vec<&Field> = Vec::new();
+                for field in &c.fields {
+                    let new = match &held {
+                        Some(held) => !held.split(',').any(|f| f == field.name),
+                        None => query(
+                            &mut tx,
+                            "SELECT 1 FROM fongo_shadow WHERE collection = ? AND field = ? LIMIT 1",
+                            &[Value::Text(c.name.clone()), Value::Text(field.name.clone())],
+                        )
+                        .await?
+                        .is_empty(),
+                    };
+                    if new {
+                        added.push(field);
                     }
+                }
+                for field in &added {
+                    // Values for it may have arrived while this replica did not know it.
+                    exec(
+                        &mut tx,
+                        "INSERT OR IGNORE INTO fongo_pending (collection, gid)
+                         SELECT DISTINCT collection, gid FROM fongo_shadow
+                          WHERE collection = ? AND field = ?",
+                        &[Value::Text(c.name.clone()), Value::Text(field.name.clone())],
+                    )
+                    .await?;
+                }
+                if !added.is_empty() {
+                    self.adopt_fields(&mut tx, c, &added).await?;
                 }
                 meta_set(&mut tx, &known, fields).await?;
                 continue;
@@ -721,9 +1101,8 @@ impl Replica {
     }
 
     /// Removes the triggers that notice local writes, so an application can change its schema or
-    /// rewrite its rows without the writes being collected. [`Replica::resume`] puts them back.
-    /// A row written meanwhile is collected whole the next time it is written, since a write is
-    /// collected as the difference between the row and the merged state.
+    /// rewrite its rows without each write being collected. [`Replica::resume`] puts them back
+    /// and says what the rows written meanwhile mean.
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
         let mut tx = conn.begin().await?;
         drop_kernel(&mut tx, "trigger").await?;
@@ -731,13 +1110,193 @@ impl Replica {
         Ok(())
     }
 
-    /// Puts the triggers back after [`Replica::suspend`]. It installs again, so collections and
-    /// fields the registry gained meanwhile are adopted.
-    pub async fn resume(&self, conn: &mut SqliteConnection) -> Result<()> {
-        self.install(conn).await
+    /// Puts the triggers back after [`Replica::suspend`], installing again so that collections
+    /// and fields the registry gained meanwhile are adopted, and compares every table with what
+    /// the kernel knows. A row added meanwhile is a new entity and a row removed is deleted,
+    /// whichever `how`; a row whose local id was reused meanwhile is the old entity changed. A row
+    /// changed meanwhile is, by `how`, an edit to send, or the replica's own baseline.
+    pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
+        self.install(conn).await?;
+        let mut tx = conn.begin().await?;
+        let mut pass = Pass::new(load_clock(&mut tx).await?);
+        let dirty = |gone: bool| {
+            format!(
+                "INSERT INTO fongo_dirty (collection, key, at, gone) VALUES (?, ?, {NOW}, {})
+                 ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at,
+                    gone = max(gone, excluded.gone)",
+                i64::from(gone)
+            )
+        };
+        for (idx, c) in self.registry.collections().iter().enumerate() {
+            let keys: Vec<String> = c.key_columns().iter().map(|k| quoted(k)).collect();
+            if let Key::Minted { column } = &c.key {
+                exec(
+                    &mut tx,
+                    &format!(
+                        "INSERT INTO fongo_dirty (collection, key, at, gone)
+                         SELECT collection, key, {NOW}, 1 FROM fongo_ids
+                          WHERE collection = ?1 AND NOT EXISTS (
+                            SELECT 1 FROM {} WHERE {} = json_extract(fongo_ids.key, '$[0]'))
+                         ON CONFLICT (collection, key) DO UPDATE SET gone = 1",
+                        quoted(&c.table),
+                        quoted(column)
+                    ),
+                    &[Value::Text(c.name.clone())],
+                )
+                .await?;
+            }
+            let rows = query(
+                &mut tx,
+                &format!(
+                    "SELECT json_array({}) FROM {}",
+                    keys.join(", "),
+                    quoted(&c.table)
+                ),
+                &[],
+            )
+            .await?;
+            for row in rows {
+                let key = as_text(&row[0])?.to_string();
+                let Some(values) = self.read_row(&mut tx, c, &key).await? else {
+                    continue;
+                };
+                let gid = match &c.key {
+                    Key::Minted { .. } => minted_gid(&mut tx, &c.name, &key).await?,
+                    Key::Natural { fields } => {
+                        self.resolve_natural(&mut tx, c, fields, &values).await?
+                    }
+                };
+                let known = match gid {
+                    Some(gid) => {
+                        let canon = canon_of(&mut tx, &c.name, gid).await?;
+                        has_shadow(&mut tx, &c.name, canon).await?
+                    }
+                    None => false,
+                };
+                if !known {
+                    exec(
+                        &mut tx,
+                        &dirty(false),
+                        &[Value::Text(c.name.clone()), Value::Text(key)],
+                    )
+                    .await?;
+                    continue;
+                }
+                let Some(gid) = gid else { continue };
+                let merged = self.group(&mut tx, c, gid, &mut pass).await?.merged;
+                let left = deviations(&mut tx, &c.name, &key).await?;
+                let mut changed = Vec::new();
+                for (field, value) in c.fields.iter().zip(values) {
+                    let held = merged
+                        .get(&field.name)
+                        .map_or(Value::Null, |(v, _)| v.clone());
+                    let kept = match left.get(&field.name) {
+                        Some(left) => same(&mut tx, field, left, &value).await?,
+                        None => false,
+                    };
+                    if !kept && !same(&mut tx, field, &held, &value).await? {
+                        changed.push((field, value));
+                    }
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                match how {
+                    Resume::Send => {
+                        exec(
+                            &mut tx,
+                            &dirty(false),
+                            &[Value::Text(c.name.clone()), Value::Text(key)],
+                        )
+                        .await?;
+                    }
+                    Resume::Baseline => {
+                        for (field, value) in changed {
+                            note(
+                                &mut tx,
+                                &c.name,
+                                &key,
+                                &field.name,
+                                &value,
+                                Some(merged.get(&field.name)),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            if let Key::Natural { .. } = &c.key {
+                self.natural_rows_gone(&mut tx, idx, &mut pass).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Marks as removed each live natural-key entity whose row is not in its table, unless it is
+    /// waiting to be written.
+    async fn natural_rows_gone(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: usize,
+        pass: &mut Pass,
+    ) -> Result<()> {
+        let c = &self.registry.collections()[idx];
+        let mut seen = BTreeSet::new();
+        let gids = query(
+            conn,
+            "SELECT DISTINCT gid FROM fongo_shadow WHERE collection = ?",
+            &[Value::Text(c.name.clone())],
+        )
+        .await?;
+        for row in gids {
+            let canon = canon_of(conn, &c.name, as_gid(&row[0])?).await?;
+            if !seen.insert(canon) {
+                continue;
+            }
+            let waiting = !query(
+                conn,
+                "SELECT 1 FROM fongo_pending WHERE collection = ? AND gid = ?",
+                &[Value::Text(c.name.clone()), Value::Ref(canon)],
+            )
+            .await?
+            .is_empty();
+            let group = self.group(conn, c, canon, pass).await?;
+            if waiting || group.fate != Fate::Alive {
+                continue;
+            }
+            let mut columns: Vec<(&Field, Value)> = Vec::new();
+            for field in &c.fields {
+                if let Some((shared, _)) = group.merged.get(&field.name)
+                    && let Local::Value(value) = self.to_local(conn, field, shared, pass).await?
+                {
+                    columns.push((field, value));
+                }
+            }
+            let Some(key) = self
+                .key_of(conn, c, canon, &columns, &BTreeMap::new())
+                .await?
+            else {
+                continue;
+            };
+            if !self.row_exists(conn, c, &key).await? {
+                exec(
+                    conn,
+                    &format!(
+                        "INSERT INTO fongo_dirty (collection, key, at, gone) VALUES (?, ?, {NOW}, 1)
+                         ON CONFLICT (collection, key) DO UPDATE SET gone = 1"
+                    ),
+                    &[Value::Text(c.name.clone()), Value::Text(key)],
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Removes the triggers and every table the kernel keeps, leaving the application's own.
+    /// Installing again afterwards is a fresh join: every row becomes a new entity, so syncing
+    /// with replicas that knew the old ones gives two copies of each row that has no identity.
     pub async fn uninstall(&self, conn: &mut SqliteConnection) -> Result<()> {
         let mut tx = conn.begin().await?;
         drop_kernel(&mut tx, "trigger").await?;
@@ -758,6 +1317,7 @@ impl Replica {
             return corrupt("the replica is not installed");
         };
         let node = as_gid(&node)?;
+        let mut pass = Pass::new(Clock::new(node));
         let mut seq = match meta_get(conn, "adopted_seq").await? {
             Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
             _ => 0,
@@ -786,13 +1346,14 @@ impl Replica {
             let Some(gid) = gid else {
                 continue;
             };
-            if matches!(c.key, Key::Natural { .. }) && !has_shadow(conn, gid).await? {
+            if matches!(c.key, Key::Natural { .. }) && !has_shadow(conn, &c.name, gid).await? {
                 continue;
             }
-            let group = self.group(conn, c, gid).await?;
+            let group = self.group(conn, c, gid, &mut pass).await?;
             let target = group.target();
             let mut behind = false;
-            for field in added {
+            // A field in a set is recorded with its set, never alone.
+            for field in added.iter().filter(|f| c.together_of(&f.name).is_none()) {
                 let Some(value) = c.field_index(&field.name).and_then(|i| values.get(i)) else {
                     continue;
                 };
@@ -811,13 +1372,13 @@ impl Replica {
                         node,
                     },
                 };
-                let own = shadow_of(conn, target).await?;
+                let own = shadow_of(conn, &c.name, target).await?;
                 let held = own.get(&field.name).map(|(v, c)| (v, c));
                 if wins(field.strategy, held, &change.value, &change.clock) {
                     emit(conn, &change).await?;
                 }
                 behind |= self
-                    .group(conn, c, gid)
+                    .group(conn, c, gid, &mut pass)
                     .await?
                     .merged
                     .get(&field.name)
@@ -826,13 +1387,91 @@ impl Replica {
             if behind {
                 exec(
                     conn,
-                    "INSERT OR IGNORE INTO fongo_pending (gid, collection) VALUES (?, ?)",
-                    &[Value::Ref(group.canon), Value::Text(c.name.clone())],
+                    "INSERT OR IGNORE INTO fongo_pending (collection, gid) VALUES (?, ?)",
+                    &[Value::Text(c.name.clone()), Value::Ref(group.canon)],
                 )
                 .await?;
             }
         }
         meta_set(conn, "adopted_seq", Value::Int(i64::from(seq))).await
+    }
+
+    /// After the sets of fields that change together are redrawn, writes made before hold only
+    /// some fields of a set, so the set is never complete and never written. Each row that holds
+    /// a value for such a set records the whole set afresh, and the newest of those wins.
+    async fn complete_sets(&self, conn: &mut SqliteConnection, c: &Collection) -> Result<()> {
+        let mut clock = load_clock(conn).await?;
+        let mut pass = Pass::new(clock.clone());
+        let now = query(conn, &format!("SELECT {NOW}"), &[]).await?;
+        let now = match now.first().map(|row| &row[0]) {
+            Some(Value::Int(now)) => u64::try_from(*now).unwrap_or(0),
+            _ => 0,
+        };
+        let keys: Vec<String> = c.key_columns().iter().map(|k| quoted(k)).collect();
+        let rows = query(
+            conn,
+            &format!(
+                "SELECT json_array({}) FROM {}",
+                keys.join(", "),
+                quoted(&c.table)
+            ),
+            &[],
+        )
+        .await?;
+        for row in rows {
+            let key = as_text(&row[0])?;
+            let Some(values) = self.read_row(conn, c, key).await? else {
+                continue;
+            };
+            let gid = match &c.key {
+                Key::Minted { .. } => minted_gid(conn, &c.name, key).await?,
+                Key::Natural { fields } => self.resolve_natural(conn, c, fields, &values).await?,
+            };
+            let Some(gid) = gid else {
+                continue;
+            };
+            let group = self.group(conn, c, gid, &mut pass).await?;
+            let held = incomplete_sets(c, &group.merged);
+            let target = group.target();
+            let mut wrote = false;
+            for set in &c.together {
+                let fields: Vec<(&str, &Value)> = set
+                    .iter()
+                    .filter_map(|f| {
+                        let i = c.field_index(f)?;
+                        Some((f.as_str(), values.get(i)?))
+                    })
+                    .collect();
+                if !held.contains(set[0].as_str()) || fields.iter().all(|(_, v)| **v == Value::Null)
+                {
+                    continue;
+                }
+                let stamp = clock.tick(now);
+                for (field, value) in fields {
+                    emit(
+                        conn,
+                        &Change {
+                            collection: c.name.clone(),
+                            gid: target,
+                            field: field.into(),
+                            value: value.clone(),
+                            clock: stamp,
+                        },
+                    )
+                    .await?;
+                }
+                wrote = true;
+            }
+            if wrote {
+                exec(
+                    conn,
+                    "INSERT OR IGNORE INTO fongo_pending (collection, gid) VALUES (?, ?)",
+                    &[Value::Text(c.name.clone()), Value::Ref(group.canon)],
+                )
+                .await?;
+            }
+        }
+        save_clock(conn, &clock).await
     }
 
     /// Turns the local writes made since the last call into changes in the outbox. Returns how
@@ -890,6 +1529,14 @@ impl Replica {
         let mut applied = Applied::default();
         let mut touched: BTreeSet<(usize, Gid)> = BTreeSet::new();
         for change in changes {
+            // A change no honest replica makes is ignored, and alike everywhere: a clock beyond
+            // what the text form holds would be read back as another, and a tombstone is 0 or 1.
+            if !change.clock.encodable()
+                || (change.field == DELETED
+                    && !matches!(change.value, Value::Int(0) | Value::Int(1)))
+            {
+                continue;
+            }
             pass.clock.observe(&change.clock);
             let idx = self.registry.index(&change.collection);
             if change.field == ALIAS {
@@ -897,53 +1544,79 @@ impl Replica {
                 let Value::Ref(other) = &change.value else {
                     continue;
                 };
-                let joined = match idx {
-                    Some(idx) => {
-                        self.join(&mut tx, idx, change.gid, *other, &mut pass)
-                            .await?
-                    }
-                    None => {
-                        pass.dead.clear();
-                        union(&mut tx, change.gid, *other).await?.is_some()
-                    }
-                };
-                applied.accepted += usize::from(joined);
+                exec(
+                    &mut tx,
+                    "INSERT OR IGNORE INTO fongo_alias_pairs (collection, gid, other) VALUES (?, ?, ?)",
+                    &[
+                        Value::Text(change.collection.clone()),
+                        Value::Ref(change.gid),
+                        Value::Ref(*other),
+                    ],
+                )
+                .await?;
+                // An alias to an entity not seen here waits for that entity's own changes.
+                if has_shadow(&mut tx, &change.collection, *other).await? {
+                    let joined = self
+                        .alias(
+                            &mut tx,
+                            idx,
+                            &change.collection,
+                            change.gid,
+                            *other,
+                            &mut pass,
+                        )
+                        .await?;
+                    applied.accepted += usize::from(joined);
+                }
                 continue;
             }
             let strategy = self.registry.strategy(&change.collection, &change.field);
-            let shadow = shadow_of(&mut tx, change.gid).await?;
+            let shadow = shadow_of(&mut tx, &change.collection, change.gid).await?;
             let held = shadow.get(&change.field).map(|(v, c)| (v, c));
-            if !wins(strategy, held, &change.value, &change.clock) {
-                continue;
+            if wins(strategy, held, &change.value, &change.clock) {
+                shadow_put(&mut tx, change).await?;
+                applied.accepted += 1;
+                if let Some(idx) = idx {
+                    touched.insert((idx, change.gid));
+                    let c = &self.registry.collections()[idx];
+                    let owning = c
+                        .field_index(&change.field)
+                        .is_some_and(|f| c.owns_through(&c.fields[f]));
+                    if change.field == DELETED || owning {
+                        pass.suspect.insert((idx, change.gid));
+                    }
+                }
             }
-            // Fields that change together take the newest write as a whole: a change older than
-            // what any of them holds belongs to a write already overtaken.
-            if let Some(c) = idx.map(|i| &self.registry.collections()[i])
-                && let Some(set) = c.together_of(&change.field)
-                && c.together[set]
-                    .iter()
-                    .filter_map(|f| shadow.get(f))
-                    .any(|(_, clock)| *clock > change.clock)
-            {
-                continue;
-            }
-            shadow_put(&mut tx, change).await?;
-            applied.accepted += 1;
+            // Whatever path a key field took into the shadow, the aliases it implies follow.
             if let Some(idx) = idx {
-                touched.insert((idx, change.gid));
                 self.settle_natural(&mut tx, idx, change.gid, &mut pass)
                     .await?;
             }
+            let waiting = query(
+                &mut tx,
+                "SELECT gid FROM fongo_alias_pairs WHERE collection = ? AND other = ?",
+                &[
+                    Value::Text(change.collection.clone()),
+                    Value::Ref(change.gid),
+                ],
+            )
+            .await?;
+            for row in waiting {
+                let gid = as_gid(&row[0])?;
+                self.alias(&mut tx, idx, &change.collection, gid, change.gid, &mut pass)
+                    .await?;
+            }
         }
-        for row in query(&mut tx, "SELECT gid, collection FROM fongo_pending", &[]).await? {
-            if let Some(idx) = self.registry.index(as_text(&row[1])?) {
-                touched.insert((idx, as_gid(&row[0])?));
+        for row in query(&mut tx, "SELECT collection, gid FROM fongo_pending", &[]).await? {
+            if let Some(idx) = self.registry.index(as_text(&row[0])?) {
+                touched.insert((idx, as_gid(&row[1])?));
             }
         }
 
         let waiting = self.settle(&mut tx, touched, &mut pass).await?;
         exec(&mut tx, "DELETE FROM fongo_pending", &[]).await?;
         applied.waiting = self.hold(&mut tx, waiting).await?;
+        let leftovers = self.retry_leftovers(&mut tx, &mut pass).await?;
         for row in query(
             &mut tx,
             "SELECT collection, gid FROM fongo_pending ORDER BY collection, gid",
@@ -960,6 +1633,8 @@ impl Replica {
                 key,
             });
         }
+        applied.waiting += leftovers.len();
+        applied.held.extend(leftovers);
         applied.conflicts = self.conflicts(&mut tx, changes).await?;
         set_applying(&mut tx, false).await?;
         save_clock(&mut tx, &pass.clock).await?;
@@ -988,7 +1663,7 @@ impl Replica {
     ) -> Result<Vec<Conflict>> {
         let node = meta_get(conn, "node").await?;
         let node = node.as_ref().map(as_gid).transpose()?;
-        let mut latest: BTreeMap<(Vec<u8>, String), &Change> = BTreeMap::new();
+        let mut latest: BTreeMap<(String, Vec<u8>, String), &Change> = BTreeMap::new();
         for change in changes {
             if Some(change.clock.node) == node {
                 continue;
@@ -1006,13 +1681,17 @@ impl Replica {
             {
                 continue;
             }
-            let canon = canon_of(conn, change.gid).await?;
-            for member in members_of(conn, canon).await? {
+            let canon = canon_of(conn, &c.name, change.gid).await?;
+            for member in members_of(conn, &c.name, canon).await? {
                 let rows = query(
                     conn,
                     "SELECT base_clock, local_clock, reported FROM fongo_bases
-                     WHERE gid = ? AND field = ?",
-                    &[Value::Ref(member), Value::Text(change.field.clone())],
+                     WHERE collection = ? AND gid = ? AND field = ?",
+                    &[
+                        Value::Text(c.name.clone()),
+                        Value::Ref(member),
+                        Value::Text(change.field.clone()),
+                    ],
                 )
                 .await?;
                 let Some(row) = rows.first() else {
@@ -1027,7 +1706,7 @@ impl Replica {
                 if !after(&row[0])? || as_clock(&row[1])? == change.clock || !after(&row[2])? {
                     continue;
                 }
-                let slot = (member.0.to_vec(), change.field.clone());
+                let slot = (c.name.clone(), member.0.to_vec(), change.field.clone());
                 if latest
                     .get(&slot)
                     .is_none_or(|held| held.clock < change.clock)
@@ -1037,13 +1716,15 @@ impl Replica {
             }
         }
         let mut conflicts = Vec::new();
-        for ((member, field), remote) in latest {
+        for ((collection, member, field), remote) in latest {
             let member = Value::Blob(member);
+            let collection = Value::Text(collection);
             exec(
                 conn,
-                "UPDATE fongo_bases SET reported = ? WHERE gid = ? AND field = ?",
+                "UPDATE fongo_bases SET reported = ? WHERE collection = ? AND gid = ? AND field = ?",
                 &[
                     Value::Text(remote.clock.encode()),
+                    collection.clone(),
                     member.clone(),
                     Value::Text(field.clone()),
                 ],
@@ -1053,8 +1734,8 @@ impl Replica {
                 conn,
                 "SELECT collection, key, base, base_is_ref, local, local_is_ref, local_clock,
                         base_clock
-                 FROM fongo_bases WHERE gid = ? AND field = ?",
-                &[member, Value::Text(field.clone())],
+                 FROM fongo_bases WHERE collection = ? AND gid = ? AND field = ?",
+                &[collection, member, Value::Text(field.clone())],
             )
             .await?;
             let Some(row) = rows.first() else {
@@ -1064,12 +1745,12 @@ impl Replica {
                 continue;
             };
             let c = &self.registry.collections()[idx];
-            let canon = canon_of(conn, remote.gid).await?;
+            let canon = canon_of(conn, &c.name, remote.gid).await?;
             let key = match &c.key {
                 Key::Minted { .. } => query(
                     conn,
-                    "SELECT key FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(canon)],
+                    "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(canon)],
                 )
                 .await?
                 .first()
@@ -1128,8 +1809,9 @@ impl Replica {
         let Some(idx) = self.registry.index(collection) else {
             return Ok(BTreeMap::new());
         };
+        let mut pass = Pass::new(Clock::new(gid));
         let group = self
-            .group(conn, &self.registry.collections()[idx], gid)
+            .group(conn, &self.registry.collections()[idx], gid, &mut pass)
             .await?;
         Ok(group
             .merged
@@ -1164,20 +1846,20 @@ impl Replica {
             return Ok(None);
         };
         let c = &self.registry.collections()[idx];
-        let canon = canon_of(conn, gid).await?;
+        let canon = canon_of(conn, &c.name, gid).await?;
         let Key::Natural { fields } = &c.key else {
             return query(
                 conn,
-                "SELECT key FROM fongo_ids WHERE gid = ?",
-                &[Value::Ref(canon)],
+                "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                &[Value::Text(c.name.clone()), Value::Ref(canon)],
             )
             .await?
             .first()
             .map(|row| as_text(&row[0]).map(str::to_string))
             .transpose();
         };
-        let group = self.group(conn, c, canon).await?;
         let mut pass = Pass::new(Clock::new(canon));
+        let group = self.group(conn, c, canon, &mut pass).await?;
         let mut key = Vec::with_capacity(fields.len());
         for name in fields {
             let (Some(i), Some((shared, _))) = (c.field_index(name), group.merged.get(name)) else {
@@ -1226,6 +1908,7 @@ impl Replica {
             // that goes in the same batch is moved before the parent's removal can cascade to it.
             let mut removals = Vec::new();
             for (idx, gid) in order {
+                self.pass_on(conn, idx, gid, pass).await?;
                 match self.materialise(conn, idx, gid, pass).await? {
                     Outcome::Settled => progressed = true,
                     Outcome::Waiting => {
@@ -1236,12 +1919,17 @@ impl Replica {
             }
             removals
                 .sort_by_key(|&(idx, gid, _)| (std::cmp::Reverse(self.registry.rank(idx)), gid));
+            let removing = !removals.is_empty();
             for (idx, gid, doomed) in removals {
                 if self.remove(conn, idx, gid, doomed, pass).await? {
                     progressed = true;
                 } else {
                     waiting.insert((idx, gid));
                 }
+            }
+            // Once for all the removals: a removal's cascade is found by what is no longer there.
+            if removing {
+                self.forget_cascaded(conn, pass).await?;
             }
             // Entities are queued again only by a write, so a round that wrote nothing and
             // settled nothing would repeat itself.
@@ -1263,14 +1951,12 @@ impl Replica {
     ) -> Result<usize> {
         let mut held = 0;
         for (idx, gid) in waiting {
-            let gid = canon_of(conn, gid).await?;
+            let name = &self.registry.collections()[idx].name;
+            let gid = canon_of(conn, name, gid).await?;
             held += exec(
                 conn,
-                "INSERT OR IGNORE INTO fongo_pending (gid, collection) VALUES (?, ?)",
-                &[
-                    Value::Ref(gid),
-                    Value::Text(self.registry.collections()[idx].name.clone()),
-                ],
+                "INSERT OR IGNORE INTO fongo_pending (collection, gid) VALUES (?, ?)",
+                &[Value::Text(name.clone()), Value::Ref(gid)],
             )
             .await?;
         }
@@ -1278,19 +1964,32 @@ impl Replica {
     }
 
     /// An entity, every other known to be the same, and their merged state.
-    async fn group(&self, conn: &mut SqliteConnection, c: &Collection, gid: Gid) -> Result<Group> {
-        let canon = canon_of(conn, gid).await?;
-        let mut shadows = Vec::new();
-        let mut live = Vec::new();
-        for member in members_of(conn, canon).await? {
-            let shadow = shadow_of(conn, member).await?;
-            if matches!(shadow.get(DELETED), Some((Value::Int(0), _))) {
-                live.push(member);
-            }
-            shadows.push((member, shadow));
-        }
+    async fn group(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        gid: Gid,
+        pass: &mut Pass,
+    ) -> Result<Group> {
+        let canon = canon_of(conn, &c.name, gid).await?;
+        let Some(idx) = self.registry.index(&c.name) else {
+            return corrupt("a collection is not in the registry");
+        };
+        pass.walked = 0;
+        pass.walking.insert((idx, canon));
+        let members = self.members_fates(conn, idx, canon, pass, 0).await;
+        pass.walking.remove(&(idx, canon));
+        let members = members?;
+        let fate = members
+            .iter()
+            .fold(Fate::Dead, |fate, (_, _, member, _)| fate.any(*member));
+        let live: Vec<Gid> = members
+            .iter()
+            .filter(|(_, _, member, _)| *member == Fate::Alive)
+            .map(|(gid, _, _, _)| *gid)
+            .collect();
         let mut merged = Shadow::new();
-        for (member, shadow) in shadows {
+        for (member, shadow, _, _) in members {
             if !live.is_empty() && !live.contains(&member) {
                 continue;
             }
@@ -1306,7 +2005,126 @@ impl Replica {
             canon,
             merged,
             live,
+            fate,
         })
+    }
+
+    /// Each member of a group, its shadow, its fate, and whether that fate assumed a group still
+    /// being worked out was alive.
+    async fn members_fates(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: usize,
+        canon: Gid,
+        pass: &mut Pass,
+        depth: usize,
+    ) -> Result<Vec<(Gid, Shadow, Fate, bool)>> {
+        let c = &self.registry.collections()[idx];
+        let mut out = Vec::new();
+        for member in members_of(conn, &c.name, canon).await? {
+            let shadow = shadow_of(conn, &c.name, member).await?;
+            // A natural-key entity whose key does not derive its id is no entity at all.
+            if matches!(c.key, Key::Natural { .. })
+                && own_key(c, &shadow).is_some_and(|derived| derived != member)
+            {
+                continue;
+            }
+            let (fate, assumed) = match shadow.get(DELETED) {
+                Some((Value::Int(1), _)) => (Fate::Dead, false),
+                Some((Value::Int(0), _)) => {
+                    let mut fate = Fate::Alive;
+                    let mut assumed = false;
+                    for field in c.fields.iter().filter(|f| c.owns_through(f)) {
+                        let Kind::Ref { collection, .. } = &field.kind else {
+                            continue;
+                        };
+                        let in_key = matches!(&c.key, Key::Natural { fields } if fields.contains(&field.name));
+                        let owner = match shadow.get(&field.name) {
+                            Some((Value::Ref(target), _)) => {
+                                match self.registry.index(collection) {
+                                    Some(t) => {
+                                        let (owner, guess) =
+                                            self.fate(conn, t, *target, pass, depth + 1).await?;
+                                        assumed |= guess;
+                                        owner
+                                    }
+                                    None => Fate::Unknown,
+                                }
+                            }
+                            // A key that names no row is not a key yet.
+                            _ if in_key => Fate::Unknown,
+                            _ => Fate::Alive,
+                        };
+                        fate = fate.all(owner);
+                        if fate == Fate::Dead {
+                            break;
+                        }
+                    }
+                    (fate, assumed)
+                }
+                _ => (Fate::Unknown, false),
+            };
+            out.push((member, shadow, fate, assumed));
+        }
+        Ok(out)
+    }
+
+    /// The fate of the group an entity belongs to. Each group is worked out once per walk and
+    /// remembered for the pass; a walk that goes too deep or too wide is left undecided.
+    fn fate<'a>(
+        &'a self,
+        conn: &'a mut SqliteConnection,
+        idx: usize,
+        gid: Gid,
+        pass: &'a mut Pass,
+        depth: usize,
+    ) -> Walk<'a> {
+        Box::pin(async move {
+            let c = &self.registry.collections()[idx];
+            let canon = canon_of(conn, &c.name, gid).await?;
+            if let Some(fate) = pass.fates.get(&(idx, canon)) {
+                return Ok((*fate, false));
+            }
+            if pass.walking.contains(&(idx, canon)) {
+                return Ok((Fate::Alive, true));
+            }
+            pass.walked += 1;
+            if depth > OWNER_DEPTH || pass.walked > OWNER_LIMIT {
+                return Ok((Fate::Undecided, false));
+            }
+            pass.walking.insert((idx, canon));
+            let members = self.members_fates(conn, idx, canon, pass, depth).await;
+            pass.walking.remove(&(idx, canon));
+            let members = members?;
+            let fate = members
+                .iter()
+                .fold(Fate::Dead, |fate, (_, _, member, _)| fate.any(*member));
+            let assumed = members.iter().any(|(_, _, _, assumed)| *assumed);
+            // An answer that leaned on a guess about a group still open is not kept.
+            if !assumed && fate != Fate::Undecided {
+                pass.fates.insert((idx, canon), fate);
+            }
+            Ok((fate, assumed))
+        })
+    }
+
+    /// Takes an alias into account, in a collection this registry may not have.
+    async fn alias(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: Option<usize>,
+        collection: &str,
+        a: Gid,
+        b: Gid,
+        pass: &mut Pass,
+    ) -> Result<bool> {
+        match idx {
+            Some(idx) => self.join(conn, idx, a, b, pass).await,
+            None => {
+                pass.fates.clear();
+                Ok(union(conn, collection, a, b).await?.is_some())
+            }
+        }
     }
 
     /// Makes `a` and `b` one entity, with one row. Rows that referred to the row given up are
@@ -1319,24 +2137,24 @@ impl Replica {
         b: Gid,
         pass: &mut Pass,
     ) -> Result<bool> {
-        let Some(canon) = union(conn, a, b).await? else {
+        let c = &self.registry.collections()[idx];
+        let Some(canon) = union(conn, &c.name, a, b).await? else {
             return Ok(false);
         };
         pass.writes += 1;
-        pass.dead.clear();
+        pass.fates.clear();
         pass.more.insert((idx, canon));
-        let c = &self.registry.collections()[idx];
-        let Key::Minted { column } = &c.key else {
+        let Key::Minted { .. } = &c.key else {
             return Ok(true);
         };
-        let members = members_of(conn, canon).await?;
+        let members = members_of(conn, &c.name, canon).await?;
 
         let mut rows: Vec<(Gid, String)> = Vec::new();
         for &member in &members {
             let found = query(
                 conn,
-                "SELECT key FROM fongo_ids WHERE gid = ?",
-                &[Value::Ref(member)],
+                "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                &[Value::Text(c.name.clone()), Value::Ref(member)],
             )
             .await?;
             if let Some(row) = found.first() {
@@ -1346,43 +2164,26 @@ impl Replica {
         rows.sort_by_key(|(gid, _)| (*gid != canon, *gid));
         if let Some(((_, keep), losers)) = rows.split_first() {
             for (_, lose) in losers {
-                self.repoint(conn, c, lose, keep, pass).await?;
-                for (table, column) in &c.local_dependents {
-                    let column = quoted(column);
-                    exec(
-                        conn,
-                        &format!(
-                            "UPDATE OR IGNORE {} SET {column} = json_extract(?2, '$[0]')
-                             WHERE {column} = json_extract(?1, '$[0]')",
-                            quoted(table)
-                        ),
-                        &[Value::Text(lose.clone()), Value::Text(keep.clone())],
-                    )
-                    .await?;
-                }
-                let gone = exec(
-                    conn,
-                    &format!(
-                        "DELETE FROM {} WHERE {} = json_extract(?1, '$[0]')",
-                        quoted(&c.table),
-                        quoted(column)
-                    ),
-                    &[Value::Text(lose.clone())],
-                )
-                .await;
-                // A row another table will not let go of stays, no longer the group's.
-                match gone {
-                    Ok(_) => {}
-                    Err(error) if is_constraint(&error) => {}
-                    Err(error) => return Err(error.into()),
-                }
+                let given = self.give_up_row(conn, idx, lose, keep, canon, pass).await?;
                 exec(
                     conn,
                     "DELETE FROM fongo_ids WHERE collection = ? AND key = ?",
                     &[Value::Text(c.name.clone()), Value::Text(lose.clone())],
                 )
                 .await?;
-                pass.touch(idx, lose.clone(), canon, true);
+                if !given {
+                    // Another table will not let the row go: the merge of the two rows waits.
+                    exec(
+                        conn,
+                        "INSERT OR REPLACE INTO fongo_leftover (collection, key, gid) VALUES (?, ?, ?)",
+                        &[
+                            Value::Text(c.name.clone()),
+                            Value::Text(lose.clone()),
+                            Value::Ref(canon),
+                        ],
+                    )
+                    .await?;
+                }
             }
             if !losers.is_empty() {
                 self.forget_cascaded(conn, pass).await?;
@@ -1427,27 +2228,57 @@ impl Replica {
                 }
             }
         }
-        self.refer_again(conn, canon, pass).await?;
+        self.refer_again(conn, &c.name, canon, pass).await?;
         Ok(true)
+    }
+
+    /// When an entity's fate may have changed, so may that of everything referring to it, which
+    /// is queued in turn; each entity is looked at once a pass.
+    async fn pass_on(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: usize,
+        gid: Gid,
+        pass: &mut Pass,
+    ) -> Result<()> {
+        let c = &self.registry.collections()[idx];
+        let canon = canon_of(conn, &c.name, gid).await?;
+        let suspect = pass.suspect.remove(&(idx, gid)) | pass.suspect.remove(&(idx, canon));
+        if suspect && pass.told.insert((idx, canon)) {
+            self.refer_again(conn, &c.name, canon, pass).await?;
+        }
+        Ok(())
     }
 
     /// Queues every entity that refers to a group, to be brought in line again.
     async fn refer_again(
         &self,
         conn: &mut SqliteConnection,
+        collection: &str,
         canon: Gid,
         pass: &mut Pass,
     ) -> Result<()> {
-        for member in members_of(conn, canon).await? {
+        for member in members_of(conn, collection, canon).await? {
             let referring = query(
                 conn,
-                "SELECT DISTINCT collection, gid FROM fongo_shadow WHERE is_ref = 1 AND value = ?",
+                "SELECT DISTINCT collection, gid, field FROM fongo_shadow
+                 WHERE is_ref = 1 AND value = ?",
                 &[Value::Ref(member)],
             )
             .await?;
             for row in referring {
-                if let Some(i) = self.registry.index(as_text(&row[0])?) {
-                    pass.more.insert((i, as_gid(&row[1])?));
+                let Some(i) = self.registry.index(as_text(&row[0])?) else {
+                    continue;
+                };
+                let d = &self.registry.collections()[i];
+                let field = as_text(&row[2])?;
+                let names_it = d.field_index(field).is_some_and(|f| {
+                    matches!(&d.fields[f].kind, Kind::Ref { collection: target, .. } if target == collection)
+                });
+                if names_it {
+                    let referrer = (i, as_gid(&row[1])?);
+                    pass.more.insert(referrer);
+                    pass.suspect.insert(referrer);
                 }
             }
         }
@@ -1466,96 +2297,35 @@ impl Replica {
             (Kind::Plain, Value::Ref(_)) => Ok(Local::Value(Value::Null)),
             (Kind::Plain, value) => Ok(Local::Value(value.clone())),
             (Kind::Ref { collection, .. }, Value::Ref(gid)) => {
-                let canon = canon_of(conn, *gid).await?;
+                let canon = canon_of(conn, collection, *gid).await?;
                 let rows = query(
                     conn,
-                    "SELECT json_extract(key, '$[0]') FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(canon)],
+                    "SELECT json_extract(key, '$[0]') FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(collection.clone()), Value::Ref(canon)],
                 )
                 .await?;
                 let local = rows.into_iter().next().and_then(|mut row| row.pop());
                 let fate = match self.registry.index(collection) {
-                    Some(target) => self.fate(conn, target, canon, pass).await?,
-                    None => Fate::Alive,
+                    Some(target) => {
+                        pass.walked = 0;
+                        self.fate(conn, target, canon, pass, 0).await?.0
+                    }
+                    None => Fate::Unknown,
                 };
                 Ok(match (fate, local) {
                     (Fate::Undecided, _) => Local::Undecided,
                     (Fate::Dead, local) => Local::Gone(local.unwrap_or(Value::Null)),
                     (Fate::Alive, Some(local)) => Local::Value(local),
-                    (Fate::Alive, None) => Local::Unknown,
+                    (Fate::Alive | Fate::Unknown, _) => Local::Unknown,
                 })
             }
             (Kind::Ref { .. }, _) => Ok(Local::Value(Value::Null)),
         }
     }
 
-    /// Whether an entity's merged state has no row: it is deleted, or something it is owned by,
-    /// directly or through other owners, is. Each entity in the owner graph is looked at once,
-    /// and answers are kept for the rest of the pass. A graph too deep or too wide to finish is
-    /// left undecided, so the entity waits rather than being removed on a guess.
-    async fn fate(
-        &self,
-        conn: &mut SqliteConnection,
-        idx: usize,
-        gid: Gid,
-        pass: &mut Pass,
-    ) -> Result<Fate> {
-        let start = (idx, canon_of(conn, gid).await?);
-        if let Some(&dead) = pass.dead.get(&start) {
-            return Ok(if dead { Fate::Dead } else { Fate::Alive });
-        }
-        let mut seen = BTreeSet::from([start]);
-        let mut frontier = vec![start];
-        for _ in 0..=OWNER_DEPTH {
-            if frontier.is_empty() {
-                for entity in seen {
-                    pass.dead.insert(entity, false);
-                }
-                return Ok(Fate::Alive);
-            }
-            let mut next = Vec::new();
-            for (i, g) in frontier {
-                match pass.dead.get(&(i, g)) {
-                    Some(true) => {
-                        pass.dead.insert(start, true);
-                        return Ok(Fate::Dead);
-                    }
-                    Some(false) => continue,
-                    None => {}
-                }
-                let c = &self.registry.collections()[i];
-                let group = self.group(conn, c, g).await?;
-                if is_deleted(&group.merged) {
-                    pass.dead.insert((i, g), true);
-                    pass.dead.insert(start, true);
-                    return Ok(Fate::Dead);
-                }
-                for field in c.fields.iter().filter(|f| c.owns_through(f)) {
-                    let (Kind::Ref { collection, .. }, Some((Value::Ref(target), _))) =
-                        (&field.kind, group.merged.get(&field.name))
-                    else {
-                        continue;
-                    };
-                    let Some(t) = self.registry.index(collection) else {
-                        continue;
-                    };
-                    let owner = (t, canon_of(conn, *target).await?);
-                    if seen.insert(owner) {
-                        if seen.len() > OWNER_LIMIT {
-                            return Ok(Fate::Undecided);
-                        }
-                        next.push(owner);
-                    }
-                }
-            }
-            next.sort();
-            frontier = next;
-        }
-        Ok(Fate::Undecided)
-    }
-
-    /// Removes an entity's row. Rows the removal cascaded to or nulled are brought in line again,
-    /// in case their merged state says otherwise. Returns false when the row must wait.
+    /// Removes an entity's row. Rows that referred to it are brought in line again, in case their
+    /// merged state says otherwise than the database did; rows it cascaded to are found once the
+    /// round's removals are done. Returns false when the row must wait.
     async fn remove(
         &self,
         conn: &mut SqliteConnection,
@@ -1565,17 +2335,22 @@ impl Replica {
         pass: &mut Pass,
     ) -> Result<bool> {
         let c = &self.registry.collections()[idx];
-        let canon = canon_of(conn, gid).await?;
+        let canon = canon_of(conn, &c.name, gid).await?;
         let table = quoted(&c.table);
         match (&c.key, doomed) {
             (Key::Minted { column }, _) => {
                 let rows = query(
                     conn,
-                    "SELECT key FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(canon)],
+                    "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(canon)],
                 )
                 .await?;
                 let Some(key) = rows.first().map(|row| as_text(&row[0])).transpose()? else {
+                    // No row, but what refers to it may hold its fields or be owned by it.
+                    if !pass.told.contains(&(idx, canon)) {
+                        pass.suspect.insert((idx, canon));
+                        pass.more.insert((idx, canon));
+                    }
                     return Ok(true);
                 };
                 let key = key.to_string();
@@ -1597,21 +2372,22 @@ impl Replica {
                 };
                 exec(
                     conn,
-                    "DELETE FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(canon)],
+                    "DELETE FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(canon)],
                 )
                 .await?;
+                forget_deviations(conn, &c.name, &key, None).await?;
                 if removed > 0 {
                     pass.touch(idx, key, canon, true);
                 }
                 for (d_idx, d_key, d_gid) in doomed {
                     let d = &self.registry.collections()[d_idx];
                     if !self.row_exists(conn, d, &d_key).await? {
+                        forget_deviations(conn, &d.name, &d_key, None).await?;
                         pass.touch(d_idx, d_key, d_gid, true);
                     }
                 }
-                self.forget_cascaded(conn, pass).await?;
-                self.refer_again(conn, canon, pass).await?;
+                self.refer_again(conn, &c.name, canon, pass).await?;
             }
             (Key::Natural { fields }, Doomed::Natural(key)) => {
                 let matches: Vec<String> = fields
@@ -1633,13 +2409,117 @@ impl Replica {
                     let marks = vec!["?"; key.len()].join(", ");
                     let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
                     if let Some(row) = json.first() {
-                        pass.touch(idx, as_text(&row[0])?.to_string(), canon, true);
+                        let json = as_text(&row[0])?.to_string();
+                        forget_deviations(conn, &c.name, &json, None).await?;
+                        pass.touch(idx, json, canon, true);
                     }
                 }
             }
             (Key::Natural { .. }, Doomed::Minted) => {}
         }
         Ok(true)
+    }
+
+    /// Moves what refers to row `lose` to row `keep`, then deletes `lose`. Returns false when a
+    /// table the kernel does not know will not let it go.
+    async fn give_up_row(
+        &self,
+        conn: &mut SqliteConnection,
+        idx: usize,
+        lose: &str,
+        keep: &str,
+        canon: Gid,
+        pass: &mut Pass,
+    ) -> Result<bool> {
+        let c = &self.registry.collections()[idx];
+        let Key::Minted { column } = &c.key else {
+            return Ok(true);
+        };
+        let column = column.clone();
+        self.repoint(conn, c, lose, keep, pass).await?;
+        for (table, column) in &c.local_dependents {
+            let column = quoted(column);
+            exec(
+                conn,
+                &format!(
+                    "UPDATE OR IGNORE {} SET {column} = json_extract(?2, '$[0]')
+                     WHERE {column} = json_extract(?1, '$[0]')",
+                    quoted(table)
+                ),
+                &[Value::Text(lose.into()), Value::Text(keep.into())],
+            )
+            .await?;
+        }
+        let gone = exec(
+            conn,
+            &format!(
+                "DELETE FROM {} WHERE {} = json_extract(?1, '$[0]')",
+                quoted(&c.table),
+                quoted(&column)
+            ),
+            &[Value::Text(lose.into())],
+        )
+        .await;
+        match gone {
+            Ok(_) => {}
+            Err(error) if is_constraint(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        forget_deviations(conn, &c.name, lose, None).await?;
+        exec(
+            conn,
+            "DELETE FROM fongo_leftover WHERE collection = ? AND key = ?",
+            &[Value::Text(c.name.clone()), Value::Text(lose.into())],
+        )
+        .await?;
+        pass.touch(idx, lose.into(), canon, true);
+        Ok(true)
+    }
+
+    /// Tries again each row a merge gave up but could not delete. Returns those still left.
+    async fn retry_leftovers(
+        &self,
+        conn: &mut SqliteConnection,
+        pass: &mut Pass,
+    ) -> Result<Vec<Held>> {
+        let mut left = Vec::new();
+        let rows = query(
+            conn,
+            "SELECT collection, key, gid FROM fongo_leftover ORDER BY collection, key",
+            &[],
+        )
+        .await?;
+        for row in rows {
+            let (name, lose) = (as_text(&row[0])?.to_string(), as_text(&row[1])?.to_string());
+            let Some(idx) = self.registry.index(&name) else {
+                continue;
+            };
+            let canon = canon_of(conn, &name, as_gid(&row[2])?).await?;
+            let keep = query(
+                conn,
+                "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                &[Value::Text(name.clone()), Value::Ref(canon)],
+            )
+            .await?
+            .first()
+            .map(|row| as_text(&row[0]).map(str::to_string))
+            .transpose()?;
+            let done = match keep {
+                Some(keep) => {
+                    self.give_up_row(conn, idx, &lose, &keep, canon, pass)
+                        .await?
+                }
+                None => false,
+            };
+            if !done {
+                left.push(Held {
+                    collection: name,
+                    gid: canon,
+                    key: Some(lose),
+                });
+            }
+        }
+        Ok(left)
     }
 
     /// Points every reference to row `lose` of `c` at row `keep`. A natural-key row whose key holds
@@ -1654,6 +2534,7 @@ impl Replica {
         pass: &mut Pass,
     ) -> Result<()> {
         for (d_idx, key, gid) in self.dependents(conn, c, lose).await? {
+            forget_deviations(conn, &self.registry.collections()[d_idx].name, &key, None).await?;
             pass.touch(d_idx, key, gid, true);
         }
         for (d_idx, d) in self.registry.collections().iter().enumerate() {
@@ -1721,22 +2602,25 @@ impl Replica {
         if !refers {
             return Ok(());
         }
-        let shadow = shadow_of(conn, gid).await?;
+        let shadow = shadow_of(conn, &c.name, gid).await?;
+        if own_key(c, &shadow) != Some(gid) {
+            return Ok(());
+        }
         let mut options = Vec::with_capacity(fields.len());
         for name in fields {
-            let Some((value, _)) = shadow.get(name) else {
+            let (Some((value, _)), Some(i)) = (shadow.get(name), c.field_index(name)) else {
                 return Ok(());
             };
-            options.push(spellings(conn, value).await?);
+            options.push(spellings(conn, &c.fields[i], value).await?);
         }
         for key in choices(&options) {
             let other = Gid::derive(&c.name, &key);
             if other != gid
-                && has_shadow(conn, other).await?
-                && let Some(canon) = union(conn, gid, other).await?
+                && has_key(conn, c, other).await?
+                && let Some(canon) = union(conn, &c.name, gid, other).await?
             {
                 pass.writes += 1;
-                pass.dead.clear();
+                pass.fates.clear();
                 pass.more.insert((idx, canon));
             }
         }
@@ -1789,12 +2673,12 @@ impl Replica {
                 let Some(other) = minted_gid(conn, &c.name, &key).await? else {
                     continue;
                 };
-                let other = canon_of(conn, other).await?;
+                let other = canon_of(conn, &c.name, other).await?;
                 if other == canon {
                     continue;
                 }
-                let theirs = self.group(conn, c, other).await?;
-                if !is_deleted(&theirs.merged) {
+                let theirs = self.group(conn, c, other, pass).await?;
+                if theirs.fate == Fate::Alive {
                     let mut held = Vec::with_capacity(identity.len());
                     for name in identity {
                         let local = match (theirs.merged.get(name), c.field_index(name)) {
@@ -1955,6 +2839,118 @@ impl Replica {
         self.resolve_natural(conn, c, key_fields, &values).await
     }
 
+    /// Records, for each field of a row the kernel just wrote or tried to, the value it left there
+    /// when that is not the merged value: a row waiting on a constraint, a reference to a row not
+    /// here, a stand-in for an identity, part of a set not yet written whole. Collecting compares
+    /// a row with these, so none of them is taken for an edit by the application.
+    async fn note_deviations(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        key: &str,
+        merged: &Shadow,
+    ) -> Result<()> {
+        let pins = pins(conn, &c.name, key, merged).await?;
+        forget_deviations(conn, &c.name, key, None).await?;
+        let Some(values) = self.read_row(conn, c, key).await? else {
+            return Ok(());
+        };
+        for (field, value) in c.fields.iter().zip(values) {
+            let held = merged
+                .get(&field.name)
+                .map_or(Value::Null, |(v, _)| v.clone());
+            if same(conn, field, &held, &value).await? {
+                continue;
+            }
+            let pinned = match pins.get(&field.name) {
+                Some(pin) => same(conn, field, pin, &value).await?,
+                None => false,
+            };
+            note(
+                conn,
+                &c.name,
+                key,
+                &field.name,
+                &value,
+                pinned.then(|| merged.get(&field.name)),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a row names an owner that holds no id here.
+    async fn owner_unknown(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        key: &str,
+    ) -> Result<bool> {
+        for field in c.fields.iter().filter(|f| c.owns_through(f)) {
+            if !matches!(field.kind, Kind::Ref { .. }) {
+                continue;
+            }
+            let rows = query(
+                conn,
+                &format!(
+                    "SELECT {} FROM {} WHERE {}",
+                    quoted(&field.name),
+                    quoted(&c.table),
+                    where_key_json(c)
+                ),
+                &[Value::Text(key.into())],
+            )
+            .await?;
+            let Some(local) = rows.into_iter().next().and_then(|mut row| row.pop()) else {
+                continue;
+            };
+            if local != Value::Null && to_shared(conn, field, local).await? == Value::Null {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The key of the row an entity has or would have here.
+    async fn key_of(
+        &self,
+        conn: &mut SqliteConnection,
+        c: &Collection,
+        canon: Gid,
+        columns: &[(&Field, Value)],
+        leaving: &BTreeMap<&str, Value>,
+    ) -> Result<Option<String>> {
+        match &c.key {
+            Key::Minted { .. } => query(
+                conn,
+                "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                &[Value::Text(c.name.clone()), Value::Ref(canon)],
+            )
+            .await?
+            .first()
+            .map(|row| as_text(&row[0]).map(str::to_string))
+            .transpose(),
+            Key::Natural { fields } => {
+                let mut key = Vec::with_capacity(fields.len());
+                for name in fields {
+                    let value = match columns.iter().find(|(f, _)| f.name == *name) {
+                        Some((_, Value::Null)) | None => leaving.get(name.as_str()),
+                        Some((_, value)) => Some(value),
+                    };
+                    match value {
+                        Some(value) if *value != Value::Null => key.push(value.clone()),
+                        _ => return Ok(None),
+                    }
+                }
+                let marks = vec!["?"; key.len()].join(", ");
+                let json = query(conn, &format!("SELECT json_array({marks})"), &key).await?;
+                json.first()
+                    .map(|row| as_text(&row[0]).map(str::to_string))
+                    .transpose()
+            }
+        }
+    }
+
     /// The id a natural-key row's entity is known by. Another replica may have named a reference
     /// in the key by another member of its group, so each such spelling of the key is tried.
     async fn resolve_natural(
@@ -1967,21 +2963,21 @@ impl Replica {
         let Some(derived) = Self::natural_gid(c, key_fields, values) else {
             return Ok(None);
         };
-        if has_shadow(conn, derived).await? {
-            return Ok(Some(canon_of(conn, derived).await?));
+        if has_key(conn, c, derived).await? {
+            return Ok(Some(canon_of(conn, &c.name, derived).await?));
         }
         let mut options = Vec::with_capacity(key_fields.len());
         for name in key_fields {
-            let value = c
-                .field_index(name)
-                .and_then(|i| values.get(i))
-                .unwrap_or(&Value::Null);
-            options.push(spellings(conn, value).await?);
+            let Some(i) = c.field_index(name) else {
+                return Ok(None);
+            };
+            let value = values.get(i).unwrap_or(&Value::Null);
+            options.push(spellings(conn, &c.fields[i], value).await?);
         }
         for key in choices(&options) {
             let gid = Gid::derive(&c.name, &key);
-            if has_shadow(conn, gid).await? {
-                return Ok(Some(canon_of(conn, gid).await?));
+            if has_key(conn, c, gid).await? {
+                return Ok(Some(canon_of(conn, &c.name, gid).await?));
             }
         }
         Ok(Some(derived))
@@ -2026,6 +3022,7 @@ impl Replica {
         let mut tombstones: Vec<(usize, Gid, u64)> = Vec::new();
         for e in entries.iter().filter(|e| e.gone) {
             let c = &collections[e.idx];
+            forget_deviations(conn, &c.name, &e.key, None).await?;
             if let Key::Natural { fields } = &c.key
                 && let Some(gid) = self.gone_natural_gid(conn, c, fields, &e.key).await?
             {
@@ -2033,9 +3030,30 @@ impl Replica {
             }
         }
 
+        let mut outside: BTreeSet<(usize, String)> = BTreeSet::new();
         for e in &entries {
             let c = &collections[e.idx];
             if !matches!(c.key, Key::Minted { .. }) {
+                continue;
+            }
+            // A row a merge gave up is not an entity of its own, whatever is done to it.
+            let leftover = !query(
+                conn,
+                "SELECT 1 FROM fongo_leftover WHERE collection = ? AND key = ?",
+                &[Value::Text(c.name.clone()), Value::Text(e.key.clone())],
+            )
+            .await?
+            .is_empty();
+            if leftover {
+                if self.read_row(conn, c, &e.key).await?.is_none() {
+                    exec(
+                        conn,
+                        "DELETE FROM fongo_leftover WHERE collection = ? AND key = ?",
+                        &[Value::Text(c.name.clone()), Value::Text(e.key.clone())],
+                    )
+                    .await?;
+                }
+                outside.insert((e.idx, e.key.clone()));
                 continue;
             }
             let mut mapped = minted_gid(conn, &c.name, &e.key).await?;
@@ -2045,12 +3063,14 @@ impl Replica {
                 tombstones.push((e.idx, gid, e.at));
                 exec(
                     conn,
-                    "DELETE FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(gid)],
+                    "DELETE FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(gid)],
                 )
                 .await?;
             }
             if mapped.is_none() && self.read_row(conn, c, &e.key).await?.is_some() {
+                // A new entity: whatever was left in a row once at this key is not its.
+                forget_deviations(conn, &c.name, &e.key, None).await?;
                 exec(
                     conn,
                     "INSERT INTO fongo_ids (collection, key, gid) VALUES (?, ?, randomblob(16))",
@@ -2063,44 +3083,60 @@ impl Replica {
         let mut produced = 0;
         let mut present: BTreeSet<Gid> = BTreeSet::new();
         let mut overruled: BTreeSet<(usize, Gid)> = BTreeSet::new();
+        let mut unowned: Vec<&Entry> = Vec::new();
         for e in &entries {
             let c = &collections[e.idx];
+            if outside.contains(&(e.idx, e.key.clone())) {
+                continue;
+            }
             let Some(values) = self.read_row(conn, c, &e.key).await? else {
                 continue;
             };
+            // A row owned by one the kernel has no id for is outside sync until its owner is in.
+            if self.owner_unknown(conn, c, &e.key).await? {
+                unowned.push(e);
+                continue;
+            }
             let gid = match &c.key {
                 Key::Minted { .. } => minted_gid(conn, &c.name, &e.key).await?,
                 Key::Natural { fields } => self.resolve_natural(conn, c, fields, &values).await?,
             };
             let Some(gid) = gid else { continue };
-            let group = self.group(conn, c, gid).await?;
+            let group = self.group(conn, c, gid, &mut pass).await?;
             present.insert(group.canon);
-            let gid = group.target();
+            // A natural-key row's writes go to the id its own key derives, which holds that key.
+            let gid = match &c.key {
+                Key::Natural { fields } => {
+                    Self::natural_gid(c, fields, &values).unwrap_or_else(|| group.target())
+                }
+                Key::Minted { .. } => group.target(),
+            };
             let mut merged = group.merged;
             let mut changes = Vec::new();
-            if group.live.is_empty() {
-                // Brought back to life: the member revived holds only what it held itself.
+            // A row the application writes is alive, whatever the kernel made of its group.
+            let fresh = merged.is_empty() || group.fate != Fate::Alive;
+            if fresh {
+                // Made, or brought back to life: the member revived holds only what it held.
                 changes.push((DELETED.to_string(), Value::Int(0)));
-                merged = shadow_of(conn, gid).await?;
+                merged = shadow_of(conn, &c.name, gid).await?;
                 merged.remove(DELETED);
             }
+            if fresh {
+                forget_deviations(conn, &c.name, &e.key, None).await?;
+            }
+            let left = deviations(conn, &c.name, &e.key).await?;
             let row: Vec<(&Field, Value)> = c.fields.iter().zip(values).collect();
             let mut changed: BTreeSet<&str> = BTreeSet::new();
             for (field, value) in &row {
                 let value = value.clone();
+                // What the kernel left in the field is not an edit, unless written over.
+                if let Some(left) = left.get(&field.name)
+                    && same(conn, field, left, &value).await?
+                {
+                    continue;
+                }
                 let unchanged = match merged.get(&field.name) {
-                    // A reference to a row this replica does not have was written as null.
-                    Some((Value::Ref(target), _)) if value == Value::Null => {
-                        let target = canon_of(conn, *target).await?;
-                        query(
-                            conn,
-                            "SELECT 1 FROM fongo_ids WHERE gid = ?",
-                            &[Value::Ref(target)],
-                        )
-                        .await?
-                        .is_empty()
-                    }
-                    Some((held, _)) => same(conn, held, &value).await?,
+                    Some((held, _)) => same(conn, field, held, &value).await?,
                     None => value == Value::Null,
                 };
                 if !unchanged {
@@ -2108,8 +3144,24 @@ impl Replica {
                 }
             }
             for set in &c.together {
+                // A set is recorded whole, so a write to it is never partial.
                 if set.iter().any(|f| changed.contains(f.as_str())) {
                     changed.extend(set.iter().map(String::as_str));
+                }
+            }
+            // A natural-key member written to holds its own key and tombstone, so it can be
+            // joined, and counted alive, anywhere.
+            if let Key::Natural { fields } = &c.key
+                && (!changes.is_empty() || !changed.is_empty())
+            {
+                let own = shadow_of(conn, &c.name, gid).await?;
+                for name in fields {
+                    if !own.contains_key(name) {
+                        changed.insert(name.as_str());
+                    }
+                }
+                if !fresh && !own.contains_key(DELETED) {
+                    changes.insert(0, (DELETED.to_string(), Value::Int(0)));
                 }
             }
             for (field, value) in row {
@@ -2140,17 +3192,29 @@ impl Replica {
                     clock: stamp,
                 };
                 emit(conn, &change).await?;
+                pass.fates.clear();
+                if change.field == DELETED
+                    || c.field_index(&change.field)
+                        .is_some_and(|f| c.owns_through(&c.fields[f]))
+                {
+                    // What refers to it here may live or die with it.
+                    pass.suspect.insert((e.idx, gid));
+                    overruled.insert((e.idx, gid));
+                }
                 if reports {
                     let base = merged.get(&change.field);
                     remember_base(conn, group.canon, &e.key, base, &change).await?;
                 }
                 produced += 1;
             }
+            self.settle_natural(conn, e.idx, gid, &mut pass).await?;
+            let merged = self.group(conn, c, gid, &mut pass).await?.merged;
+            self.note_deviations(conn, c, &e.key, &merged).await?;
         }
 
         for (idx, gid, at) in tombstones {
             let c = &collections[idx];
-            let group = self.group(conn, c, gid).await?;
+            let group = self.group(conn, c, gid, &mut pass).await?;
             if present.contains(&group.canon) {
                 continue;
             }
@@ -2166,13 +3230,29 @@ impl Replica {
                     },
                 )
                 .await?;
+                pass.fates.clear();
+                pass.suspect.insert((idx, member));
+                overruled.insert((idx, member));
                 produced += 1;
             }
         }
 
         exec(conn, "DELETE FROM fongo_dirty", &[]).await?;
+        for e in unowned {
+            exec(
+                conn,
+                "INSERT INTO fongo_dirty (collection, key, at) VALUES (?, ?, ?)",
+                &[
+                    Value::Text(collections[e.idx].name.clone()),
+                    Value::Text(e.key.clone()),
+                    Value::Int(i64::try_from(e.at).unwrap_or(0)),
+                ],
+            )
+            .await?;
+        }
         if !overruled.is_empty() {
-            // A local write its field's strategy refused: the row goes back to the merged value.
+            // A local write its field's strategy refused goes back to the merged value, and what
+            // refers to an entity made, revived or deleted here is brought in line.
             set_applying(conn, true).await?;
             let waiting = self.settle(conn, overruled, &mut pass).await?;
             self.hold(conn, waiting).await?;
@@ -2195,11 +3275,32 @@ impl Replica {
     ) -> Result<Outcome> {
         let c = &self.registry.collections()[idx];
         loop {
-            let Group { canon, merged, .. } = self.group(conn, c, gid).await?;
+            let Group {
+                canon,
+                merged,
+                fate,
+                ..
+            } = self.group(conn, c, gid, pass).await?;
             if merged.is_empty() {
                 return Ok(Outcome::Settled);
             }
-            let deleted = is_deleted(&merged);
+            if matches!(fate, Fate::Unknown | Fate::Undecided) {
+                // Not known yet to have a row: whatever row there is stays as it is.
+                if let Key::Minted { .. } = &c.key
+                    && let Some(key) = query(
+                        conn,
+                        "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                        &[Value::Text(c.name.clone()), Value::Ref(canon)],
+                    )
+                    .await?
+                    .first()
+                {
+                    let key = as_text(&key[0])?.to_string();
+                    self.note_deviations(conn, c, &key, &merged).await?;
+                }
+                return Ok(Outcome::Waiting);
+            }
+            let deleted = fate == Fate::Dead;
             let table = quoted(&c.table);
 
             let mut columns: Vec<(&Field, Value)> = Vec::new();
@@ -2233,6 +3334,17 @@ impl Replica {
             // A row whose owner is deleted is deleted too, whether or not this database cascades.
             let deleted = deleted || orphaned;
 
+            // Fields that change together are written only once one write holds all of them;
+            // until then the row keeps what it has.
+            let mut held_back: BTreeSet<String> = incomplete_sets(c, &merged)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if let Some(key) = self.key_of(conn, c, canon, &columns, &leaving).await? {
+                held_back.extend(pins(conn, &c.name, &key, &merged).await?.into_keys());
+            }
+            columns.retain(|(f, _)| !held_back.contains(&f.name));
+
             if !deleted && let Some(other) = self.clash(conn, idx, canon, &columns, pass).await? {
                 send(
                     conn,
@@ -2254,8 +3366,8 @@ impl Replica {
                 Key::Minted { column } => {
                     let rows = query(
                         conn,
-                        "SELECT key FROM fongo_ids WHERE gid = ?",
-                        &[Value::Ref(canon)],
+                        "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                        &[Value::Text(c.name.clone()), Value::Ref(canon)],
                     )
                     .await?;
                     let key = rows.first().map(|row| as_text(&row[0])).transpose()?;
@@ -2311,7 +3423,7 @@ impl Replica {
                                 }
                                 written_key = key;
                                 // Rows that referred to the group while it had no row hold null.
-                                self.refer_again(conn, canon, pass).await?;
+                                self.refer_again(conn, &c.name, canon, pass).await?;
                             }
                             inserted
                         }
@@ -2385,10 +3497,28 @@ impl Replica {
                 }
             };
 
-            if let (Ok(n), Some(key)) = (&written, written_key)
+            if let (Ok(n), Some(key)) = (&written, &written_key)
                 && *n > 0
             {
-                pass.touch(idx, key, canon, false);
+                pass.touch(idx, key.clone(), canon, false);
+            }
+            let row = match &c.key {
+                Key::Minted { .. } => query(
+                    conn,
+                    "SELECT key FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(canon)],
+                )
+                .await?
+                .first()
+                .map(|row| as_text(&row[0]).map(str::to_string))
+                .transpose()?,
+                Key::Natural { .. } => match written_key {
+                    Some(key) if self.row_exists(conn, c, &key).await? => Some(key),
+                    _ => None,
+                },
+            };
+            if let Some(row) = row {
+                self.note_deviations(conn, c, &row, &merged).await?;
             }
             return match written {
                 Ok(_) if unresolved => Ok(Outcome::Waiting),
@@ -2460,12 +3590,14 @@ impl Replica {
             .await?;
             for row in gone {
                 let gid = as_gid(&row[1])?;
-                pass.touch(idx, as_text(&row[0])?.to_string(), gid, true);
+                let key = as_text(&row[0])?.to_string();
+                forget_deviations(conn, &c.name, &key, None).await?;
+                pass.touch(idx, key, gid, true);
                 pass.more.insert((idx, gid));
                 exec(
                     conn,
-                    "DELETE FROM fongo_ids WHERE gid = ?",
-                    &[Value::Ref(gid)],
+                    "DELETE FROM fongo_ids WHERE collection = ? AND gid = ?",
+                    &[Value::Text(c.name.clone()), Value::Ref(gid)],
                 )
                 .await?;
             }
@@ -2521,7 +3653,7 @@ impl Replica {
     ) -> Result<Option<Gid>> {
         match &c.key {
             Key::Minted { .. } => match minted_gid(conn, &c.name, key).await? {
-                Some(gid) => Ok(Some(canon_of(conn, gid).await?)),
+                Some(gid) => Ok(Some(canon_of(conn, &c.name, gid).await?)),
                 None => Ok(None),
             },
             Key::Natural { fields } => self.gone_natural_gid(conn, c, fields, key).await,

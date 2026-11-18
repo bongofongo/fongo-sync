@@ -27,8 +27,9 @@ reference may own its row, which then goes with its target. A collection can als
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 
-`Replica::suspend` and `resume` let an application migrate its schema without its writes being
-collected, and `uninstall` removes everything the kernel added.
+`Replica::suspend` and `resume` let an application migrate its schema without each write being
+collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
+the application asks. `uninstall` removes everything the kernel added.
 
 The merge rules are also stated as laws and proven in [Bend](https://bend-lang.com): `model.bend`
 restates them, `LAWS.bend` says what they must guarantee, and `PROOF.bend` proves it. The proofs
