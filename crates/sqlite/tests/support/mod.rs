@@ -469,15 +469,51 @@ fn incomplete_sets(registry: &Registry, merge: &Merge) -> BTreeSet<(String, Gid,
     out
 }
 
-/// Groups with a live member whose tombstone has not arrived. The model counts such a member
-/// live, having no notion of waiting; the kernel waits for the tombstone, which every replica
-/// writes when it makes an entity, before it shows the member or lends its fields to the group.
-fn unconfirmed(merge: &Merge) -> BTreeSet<(String, Gid)> {
+/// Groups with a live member the kernel cannot yet count live: its tombstone has not arrived, or
+/// an owner it names has no member that can be. The model counts a member with no tombstone live,
+/// having no notion of waiting; the kernel waits for the tombstone, which every replica writes
+/// when it makes an entity, before it shows the member or lends its fields to the group.
+fn unconfirmed(schema: &model::Schema, merge: &Merge) -> BTreeSet<(String, Gid)> {
+    let mut confirmed: BTreeSet<Gid> = BTreeSet::new();
+    loop {
+        let groups: BTreeSet<(&str, Gid)> = confirmed
+            .iter()
+            .map(|g| {
+                let e = &merge.entities[g];
+                (e.collection.as_str(), e.canonical)
+            })
+            .collect();
+        let more: Vec<Gid> = merge
+            .entities
+            .iter()
+            .filter(|(gid, e)| !confirmed.contains(gid) && e.live)
+            .filter(|(_, e)| matches!(e.registers.get(DELETED), Some((Value::Int(0), _))))
+            .filter(|(_, e)| {
+                let Some(c) = schema.collection(&e.collection) else {
+                    return false;
+                };
+                c.fields
+                    .iter()
+                    .all(|f| match (&f.kind, e.registers.get(&f.name)) {
+                        (model::FieldKind::Owner(t), Some((Value::Ref(owner), _))) => merge
+                            .entities
+                            .get(owner)
+                            .is_some_and(|o| groups.contains(&(t.as_str(), o.canonical))),
+                        _ => true,
+                    })
+            })
+            .map(|(gid, _)| *gid)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        confirmed.extend(more);
+    }
     merge
         .entities
-        .values()
-        .filter(|e| e.live && !e.registers.contains_key(DELETED))
-        .map(|e| (e.collection.clone(), e.canonical))
+        .iter()
+        .filter(|(gid, e)| e.live && !confirmed.contains(gid))
+        .map(|(_, e)| (e.collection.clone(), e.canonical))
         .collect()
 }
 
@@ -573,7 +609,7 @@ pub async fn midway(
     wrong.extend(tables(conn, replica, &kernel).await);
     let incomplete = incomplete_sets(registry, &merge);
     let pinned = pinned(&kernel);
-    let unconfirmed = unconfirmed(&merge);
+    let unconfirmed = unconfirmed(&schema, &merge);
     wrong.extend(rows_differ(
         &expected,
         &kernel.view,

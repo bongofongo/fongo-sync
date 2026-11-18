@@ -746,8 +746,20 @@ fn reproduction(seed: u64, script: &[(usize, Op)]) -> String {
     )
 }
 
+/// A modest number of cases unless `PROPTEST_CASES` asks for more; `make deep` does.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(32)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: cases(),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
     #[test]
     fn replicas_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
         seed in any::<u64>(),
