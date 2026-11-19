@@ -1,6 +1,7 @@
 import FongoSync.Examples
 import FongoSync.Model
 import FongoSync.Run
+import FongoSync.RunModel
 
 /-!
 # The laws
@@ -216,6 +217,12 @@ theorem key_write_dropped_for_good {l₁ l₂ : List (Hlc × Value)} (sub : ∀ 
     {x : Hlc × Value} (hx : x ∈ l₁) (out : x ∉ earliest l₁) : x ∉ earliest l₂ :=
   not_mem_earliest_of_subset sub hx out
 
+/-- The view over several collections can be computed from computed inputs: `Full.runView` gives
+the rows of those inputs as `Full.view` gives the rows of its own, liveness computed in as many
+rounds as there are gids. That the computed inputs are `Full.view`'s is not proven here. -/
+theorem full_view_runs_from_inputs (sc : Full.Schema) (cs : List (Change Value)) :
+    Full.runView sc cs = Full.present sc (Full.runInputs sc (Full.candidates sc cs)).toInputs :=
+  Full.runView_eq sc cs
 
 /-- **The view over several collections depends only on the set of changes**, given unique
 clocks per register. -/
