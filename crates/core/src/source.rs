@@ -409,7 +409,19 @@ impl<S: Source> Source for Overlay<'_, S> {
 
     fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
         let mut found: BTreeSet<Gid> = self.base.holding(collection, fields).into_iter().collect();
-        for gid in self.batch.touched(collection) {
+        // A gid that qualifies only once the batch is merged holds at least one of the pairs
+        // through an entry of the batch.
+        let mut candidates = BTreeSet::new();
+        if fields.is_empty() {
+            candidates.extend(self.batch.touched(collection));
+        }
+        for pair in fields {
+            candidates.extend(self.batch.holding(collection, std::slice::from_ref(pair)));
+        }
+        for gid in candidates {
+            if found.contains(&gid) {
+                continue;
+            }
             let entries = self.entries(collection, gid);
             let holds = fields.iter().all(|(field, value)| {
                 entries

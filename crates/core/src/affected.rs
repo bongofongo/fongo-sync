@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::Change;
 use crate::eval::{Evaluator, Undetermined};
@@ -17,9 +17,11 @@ impl Evaluator<'_> {
     /// is live and canonical, no row otherwise) turns the view before into the view after.
     ///
     /// Works outward from the gids named by the changes that alter what `before` keeps (a change
-    /// already merged, or one that loses to what is kept, affects nothing), comparing each gid's target before and after
-    /// and, where it differs, visiting every member of both groups and every gid holding a
-    /// reference to one of them in a reference, owner or natural key field. Cost: proportional
+    /// already merged, or one that loses to what is kept, affects nothing). For each gid it
+    /// compares the target before and after; where they differ it visits every member of both
+    /// groups, and where the gid's canonical gid, its collection or its group's liveness differs
+    /// it also visits every gid holding a reference to it in a reference, owner or natural key
+    /// field, since those read nothing else about it. Cost: proportional
     /// to the size of the groups whose targets change and the number of gids referring to them,
     /// times the cost of [`Session::target`](crate::eval::Session::target) for each, which a
     /// session shares among a group's members.
@@ -66,6 +68,7 @@ impl Evaluator<'_> {
         }
         let mut seen = BTreeSet::new();
         let mut expanded = BTreeSet::new();
+        let mut compared = BTreeMap::new();
         let mut found = BTreeSet::new();
         while let Some(x) = queue.pop() {
             if !seen.insert(x) {
@@ -75,23 +78,36 @@ impl Evaluator<'_> {
             homes.extend(was.home(x)?.map(|c| c.name.clone()));
             homes.extend(will.home(x)?.map(|c| c.name.clone()));
             for collection in homes {
-                let old = was.target(&collection, x)?;
-                let new = will.target(&collection, x)?;
-                if old == new {
+                let old = was.shared(&collection, x)?;
+                let new = will.shared(&collection, x)?;
+                // Every member of a group shares its target, so a pair of groups is compared,
+                // and its members queued, once.
+                let pair = (
+                    collection.clone(),
+                    (old.canonical, old.members.is_empty()),
+                    (new.canonical, new.members.is_empty()),
+                );
+                let first = !compared.contains_key(&pair);
+                let differs = *compared.entry(pair).or_insert_with(|| old != new);
+                if !differs {
                     continue;
                 }
-                for t in [&old, &new] {
-                    if !t.members.is_empty() {
-                        found.insert((collection.clone(), t.canonical));
+                if first {
+                    for t in [&old, &new] {
+                        if !t.members.is_empty() {
+                            found.insert((collection.clone(), t.canonical));
+                        }
                     }
+                    queue.extend(old.members.iter().chain(&new.members));
                 }
-                for &m in old.members.iter().chain(&new.members) {
-                    queue.push(m);
-                    if !expanded.insert(m) {
-                        continue;
-                    }
+                // A reference to x reads x's canonical gid while its group is live, and a natural
+                // key naming x reads its canonical gid: nothing else about x reaches them.
+                let read_differently = old.canonical != new.canonical
+                    || old.members.is_empty() != new.members.is_empty()
+                    || old.row.is_some() != new.row.is_some();
+                if read_differently && expanded.insert(x) {
                     for (c, f) in &referring {
-                        queue.extend(after.holding(c, &[(f, &Value::Ref(m))]));
+                        queue.extend(after.holding(c, &[(f, &Value::Ref(x))]));
                     }
                 }
             }

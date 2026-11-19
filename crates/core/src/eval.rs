@@ -178,7 +178,7 @@ pub struct Session<'a, S> {
     groups: BTreeMap<Gid, Answer<Rc<Group>>>,
     member_live: BTreeMap<Gid, Answer<bool>>,
     group_live: BTreeMap<Gid, Answer<bool>>,
-    targets: BTreeMap<Gid, Answer<Target>>,
+    targets: BTreeMap<Gid, Answer<Rc<Target>>>,
 }
 
 impl<S: Source> Session<'_, S> {
@@ -191,22 +191,27 @@ impl<S: Source> Session<'_, S> {
     /// natural keys, in data that does not contrive otherwise); then O(m) to decide liveness,
     /// each member asking once about each of its owners' groups, which are found the same way.
     pub fn target(&mut self, collection: &str, gid: Gid) -> Answer<Target> {
+        self.shared(collection, gid).map(|t| (*t).clone())
+    }
+
+    /// [`Session::target`] without copying the target out of the session's cache.
+    pub(crate) fn shared(&mut self, collection: &str, gid: Gid) -> Answer<Rc<Target>> {
         let Some(home) = self
             .schema
             .collections
             .iter()
             .position(|c| c.name == collection)
         else {
-            return Ok(Target::absent(collection, gid));
+            return Ok(Rc::new(Target::absent(collection, gid)));
         };
         if self.info(gid)?.home != Some(home) {
-            return Ok(Target::absent(collection, gid));
+            return Ok(Rc::new(Target::absent(collection, gid)));
         }
         let group = self.group(gid)?;
         if let Some(t) = self.targets.get(&group.canonical) {
             return t.clone();
         }
-        let target = self.compute_target(home, &group);
+        let target = self.compute_target(home, &group).map(Rc::new);
         self.targets.insert(group.canonical, target.clone());
         target
     }
@@ -561,6 +566,10 @@ impl<S: Source> Session<'_, S> {
             }
 
             let classes = uf.classes();
+            // Natural entities that share a collection, a reference position, the values at the
+            // other positions and the class that reference falls in ask the same questions, so
+            // each such shape asks once per member of the class.
+            let mut shapes: BTreeSet<Shape> = BTreeSet::new();
             for &(_, h, key) in &naturals {
                 let Some(p) = key.iter().position(|v| matches!(v, Value::Ref(_))) else {
                     continue;
@@ -577,7 +586,13 @@ impl<S: Source> Session<'_, S> {
                     .filter(|(_, v)| !matches!(v, Value::Ref(_)))
                     .map(|(f, v)| (f.clone(), Total(v.clone())))
                     .collect();
-                for &m in &classes[&uf.find(region.pos[&y])] {
+                shapes.insert((h, p, fixed, uf.find(region.pos[&y])));
+            }
+            for (h, p, fixed, root) in shapes {
+                let Identity::Natural(fields) = &schema.collections[h].identity else {
+                    continue;
+                };
+                for &m in &classes[&root] {
                     let mut question = vec![(fields[p].clone(), Total(Value::Ref(region.gids[m])))];
                     question.extend(fixed.iter().cloned());
                     if !asked.insert((h, question.clone())) {
@@ -633,6 +648,10 @@ fn deriving<'v>(
     }
     None
 }
+
+/// A natural collection, the position of the reference its key asks by, the values at the key's
+/// other positions, and the class that reference falls in.
+type Shape = (usize, usize, Vec<(String, Total)>, usize);
 
 #[derive(Default)]
 struct Region {
