@@ -72,6 +72,7 @@ impl Evaluator<'_> {
         let mut queued = BTreeSet::new();
         let mut found = BTreeSet::new();
         while let Some(x) = queue.pop() {
+            crate::work::add(1);
             if !seen.insert(x) {
                 continue;
             }
@@ -88,7 +89,14 @@ impl Evaluator<'_> {
                     (old.canonical, old.members.is_empty()),
                     (new.canonical, new.members.is_empty()),
                 );
-                let differs = *compared.entry(pair).or_insert_with(|| old != new);
+                let differs = *compared.entry(pair).or_insert_with(|| {
+                    // Targets differ at the canonical gid or the number of members before the
+                    // member lists are read.
+                    let read =
+                        old.canonical == new.canonical && old.members.len() == new.members.len();
+                    crate::work::add(1 + if read { old.members.len() } else { 0 });
+                    old != new
+                });
                 if !differs {
                     continue;
                 }
@@ -98,7 +106,6 @@ impl Evaluator<'_> {
                     }
                     if queued.insert((collection.clone(), t.canonical, was_before)) {
                         found.insert((collection.clone(), t.canonical));
-                        crate::work::add(t.members.len());
                         queue.extend(t.members.iter());
                     }
                 }
