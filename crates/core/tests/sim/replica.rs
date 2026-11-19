@@ -605,7 +605,8 @@ impl<'s> Replica<'s> {
         match (before, after, new) {
             (Some(_), None, _) => out.extend(old.map(|o| deleted(o, 1))),
             (_, Some(a), Some(n)) => {
-                if before.is_some() {
+                // A key that changes to one deriving the same gid re-creates the same entity.
+                if before.is_some() && old != Some(n) {
                     out.extend(old.map(|o| deleted(o, 1)));
                 }
                 out.push(deleted(n, 0));
