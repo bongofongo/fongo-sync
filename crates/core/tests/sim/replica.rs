@@ -7,8 +7,7 @@
 //! every row the core names to its target, in an order the core gives, refusing writes the
 //! tables' constraints refuse and retrying those later.
 //!
-//! Three things an adapter must do that are about local rows rather than entities, each found by
-//! the property this replica is tested with:
+//! Three things an adapter must do that are about local rows rather than entities:
 //! - Compare a row with its image in gid terms: the image through the row-to-gid mapping as it
 //!   was, the row through the mapping as it will be. When a natural key changes, the row stands
 //!   for a new entity, and rows that refer to it by local key now refer to that entity.
@@ -21,8 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::eval::{Evaluator, Target};
 use fongo_sync_core::model::{ALIAS, FieldKind, Identity, Row, Schema, view};
-use fongo_sync_core::plan::{Columns, Planned, RowAction, clashes, edits, order, record, write};
-use fongo_sync_core::source::Store;
+use fongo_sync_core::plan::{
+    Columns, NewEntity, Planned, RowAction, clashes, edits, order, record, write,
+};
+use fongo_sync_core::source::{Source, Store, admit};
 use fongo_sync_core::{Change, Clock, Gid, Value};
 
 pub type Key = i64;
@@ -491,7 +492,15 @@ impl<'s> Replica<'s> {
                         value,
                         clock,
                     }));
-                let recorded = record(self.schema, c, &found, old.as_ref(), new, clock);
+                let new_entity = new.map(|gid| NewEntity {
+                    gid,
+                    known: self
+                        .store
+                        .claims(gid)
+                        .iter()
+                        .any(|claim| claim.collection == *c),
+                });
+                let recorded = record(self.schema, c, &found, old.as_ref(), new_entity, clock);
                 if std::env::var_os("FONGO_SIM_TRACE").is_some() {
                     eprintln!(
                         "replica {} collects {c} row {k}: {before:?} -> {after:?}; old {old:?}; records {recorded:?}",
@@ -633,7 +642,9 @@ impl<'s> Replica<'s> {
     pub fn sync(&mut self, incoming: &[Change]) {
         let mut set = self.collect();
         for c in incoming {
-            self.clock.observe(&c.clock);
+            if admit(self.schema, c).is_some() {
+                self.clock.observe(&c.clock);
+            }
         }
         set.extend(self.ev.affected(&self.store, incoming).unwrap());
         self.absorb(incoming);
@@ -884,8 +895,18 @@ impl<'s> Replica<'s> {
                 };
                 for f in written {
                     let cell = (c.to_string(), k, f.clone());
+                    // A parked cell is one set NULL now that the final write will fill.
+                    let finally = planned
+                        .iter()
+                        .find(|p| p.collection == c && p.gid == step.gid)
+                        .and_then(|p| match &p.action {
+                            RowAction::Insert(r) | RowAction::Update(r) => r.get(&f).cloned(),
+                            _ => None,
+                        });
                     let nulled = match &step.action {
-                        RowAction::Insert(r) | RowAction::Update(r) => r[&f] == Value::Null,
+                        RowAction::Insert(r) | RowAction::Update(r) => {
+                            r[&f] == Value::Null && finally.is_some_and(|v| v != Value::Null)
+                        }
                         _ => false,
                     };
                     if step.parked && nulled {

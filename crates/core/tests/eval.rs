@@ -346,3 +346,25 @@ fn rewrites_older_than_the_creation_can_hide_an_entity_in_the_model_and_the_eval
     assert!(view(&schema, &changes).row("tags", tag).is_none());
     agrees(&schema, &changes).unwrap();
 }
+
+#[test]
+fn a_together_set_written_by_two_members_at_one_clock_comes_from_the_smaller() {
+    let schema = Schema::new(vec![
+        Collection::minted("sites")
+            .plain("x", Merge::Lww)
+            .plain("y", Merge::Lww)
+            .together(&["x", "y"]),
+    ]);
+    let changes = vec![
+        change("sites", gid(1), "x", Value::Int(1), 5),
+        change("sites", gid(1), "y", Value::Int(1), 5),
+        change("sites", gid(2), "x", Value::Int(2), 5),
+        change("sites", gid(2), "y", Value::Int(2), 5),
+        change("sites", gid(2), ALIAS, Value::Ref(gid(1)), 6),
+    ];
+    assert_eq!(
+        view(&schema, &changes).row("sites", gid(1)).unwrap()["x"],
+        Value::Int(1)
+    );
+    agrees(&schema, &changes).unwrap();
+}

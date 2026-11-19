@@ -8,7 +8,7 @@ use fongo_sync_core::model::{
     Collection, FieldKind, Identity, Row, Schema, unmerged_identities, view,
 };
 use fongo_sync_core::plan::{
-    Columns, FieldEdit, Planned, RowAction, Step, clashes, edits, order, record, write,
+    Columns, FieldEdit, NewEntity, Planned, RowAction, Step, clashes, edits, order, record, write,
 };
 use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value};
@@ -205,10 +205,11 @@ proptest! {
                     made.insert(f.name.clone(), v);
                 }
                 let found = edits(&schema, &coll.name, None, Some(&made));
+                let new = NewEntity { gid: new, known: false };
                 for c in record(&schema, &coll.name, &found, None, Some(new), clock) {
                     store.merge(&schema, &c);
                 }
-                let t = ev.target(&store, &coll.name, new).unwrap();
+                let t = ev.target(&store, &coll.name, new.gid).unwrap();
                 prop_assert_eq!(t.row.as_ref(), Some(&made));
                 prop_assert_eq!(write(t.row.as_ref(), Some(&made)), RowAction::Nothing);
                 return Ok(());
@@ -806,4 +807,135 @@ fn moving_a_merged_entity_moves_every_member_even_one_dead_for_now() {
         ..ch("sites", u, fongo_sync_core::DELETED, Value::Int(1), 0)
     });
     assert_eq!(view(&schema, &known).rows("items").count(), 0);
+}
+
+#[test]
+fn an_entity_created_again_under_its_natural_key_does_not_bring_back_old_values() {
+    let schema = Schema::new(vec![
+        Collection::natural("tags", &["label"])
+            .plain("label", Merge::Lww)
+            .plain("note", Merge::Lww)
+            .plain("hits", Merge::Max),
+    ]);
+    let tag = Gid::derive("tags", &[text("x")]);
+    let clock = |n| Hlc {
+        wall_ms: n,
+        counter: 0,
+        node: gid(1),
+    };
+    let first = row(&[
+        ("label", text("x")),
+        ("note", text("old")),
+        ("hits", Value::Int(5)),
+    ]);
+    let fresh = NewEntity {
+        gid: tag,
+        known: false,
+    };
+    let mut log = record(
+        &schema,
+        "tags",
+        &edits(&schema, "tags", None, Some(&first)),
+        None,
+        Some(fresh),
+        clock(1),
+    );
+    let shown = Evaluator::new(&schema)
+        .unwrap()
+        .target(&store(&schema, &log), "tags", tag)
+        .unwrap();
+    log.extend(record(
+        &schema,
+        "tags",
+        &edits(&schema, "tags", Some(&first), None),
+        Some(&shown),
+        None,
+        clock(2),
+    ));
+    let again = row(&[
+        ("label", text("x")),
+        ("note", Value::Null),
+        ("hits", Value::Int(0)),
+    ]);
+    let known = NewEntity {
+        gid: tag,
+        known: true,
+    };
+    log.extend(record(
+        &schema,
+        "tags",
+        &edits(&schema, "tags", None, Some(&again)),
+        None,
+        Some(known),
+        clock(3),
+    ));
+    // The note is reset; a Max field cannot be, and keeps the greatest value written.
+    let expected = row(&[
+        ("label", text("x")),
+        ("note", Value::Null),
+        ("hits", Value::Int(5)),
+    ]);
+    assert_eq!(view(&schema, &log).row("tags", tag), Some(&expected));
+}
+
+#[test]
+fn clashes_on_a_key_led_by_a_reference_look_through_the_referenced_group() {
+    let schema = Schema::new(vec![
+        Collection::minted("sites").plain("name", Merge::Lww),
+        Collection::minted("items")
+            .reference("link", "sites")
+            .plain("text", Merge::Lww)
+            .identity_key(&["link", "text"]),
+    ]);
+    let at = |n: u64| Hlc {
+        wall_ms: n,
+        counter: 0,
+        node: gid(1),
+    };
+    let ch = |c: &str, g: Gid, f: &str, v: Value, n: u64| Change {
+        collection: c.into(),
+        gid: g,
+        field: f.into(),
+        value: v,
+        clock: at(n),
+    };
+    let (s1, s2, a, b) = (gid(1), gid(2), gid(10), gid(11));
+    let changes = vec![
+        ch("sites", s1, "name", Value::Int(1), 1),
+        ch("sites", s2, "name", Value::Int(2), 1),
+        ch(
+            "sites",
+            s2,
+            fongo_sync_core::model::ALIAS,
+            Value::Ref(s1),
+            2,
+        ),
+        ch("items", a, "link", Value::Ref(s1), 3),
+        ch("items", a, "text", Value::Int(0), 3),
+        ch("items", b, "link", Value::Ref(s2), 4),
+        ch("items", b, "text", Value::Int(0), 4),
+    ];
+    assert_eq!(
+        unmerged_identities(&schema, &view(&schema, &changes)).len(),
+        1
+    );
+    let store = store(&schema, &changes);
+    let ev = Evaluator::new(&schema).unwrap();
+    let mut session = ev.session(&store);
+    let t = session.target("items", a).unwrap();
+    assert_eq!(clashes(&mut session, &t).unwrap(), [b].into());
+}
+
+#[test]
+fn independent_writes_come_in_ascending_order() {
+    let schema = Schema::new(vec![Collection::minted("sites").plain("name", Merge::Lww)]);
+    let insert = |n: u8| Planned {
+        collection: "sites".into(),
+        gid: gid(n),
+        image: None,
+        action: RowAction::Insert(row(&[("name", Value::Int(n.into()))])),
+    };
+    let plan = order(&schema, &Columns::new(), &[insert(3), insert(1), insert(2)]);
+    let order_of: Vec<Gid> = plan.steps.iter().map(|s| s.gid).collect();
+    assert_eq!(order_of, vec![gid(1), gid(2), gid(3)]);
 }

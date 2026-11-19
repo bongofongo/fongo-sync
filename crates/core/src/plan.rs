@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::change::{Change, DELETED};
+use crate::change::{Change, DELETED, Strategy};
 use crate::clock::Hlc;
 use crate::eval::{Session, Target, Undetermined};
 use crate::model::{Collection, FieldKind, Identity, Row, Schema};
@@ -107,13 +107,25 @@ fn expand(coll: &Collection, pick: impl Fn(&str) -> bool) -> Vec<&String> {
         .collect()
 }
 
+/// The entity a row stands for once `edits` say it was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewEntity {
+    pub gid: Gid,
+    /// Whether the source already has a fact about this gid in the collection: the entity is
+    /// created again.
+    pub known: bool,
+}
+
 /// The changes that record `edits` to a row of `collection`, all at `clock`, which must be a fresh
 /// reading of the replica's clock. Values must be as changes carry them: references as gids.
 ///
 /// - `Deleted` writes `$deleted = 1` to every member of `old`, the target of the entity the row
-///   named, except `new`.
-/// - `Created` writes `$deleted = 0` to `new`, the gid of the entity the row now names (a fresh
-///   gid, or for a natural collection the gid its key derives), and every `Set` to it.
+///   named, except the new entity's gid.
+/// - `Created` writes `$deleted = 0` to the new entity (`new`: a fresh gid, or for a natural
+///   collection the gid its key derives), and every `Set` to it. If that gid already has facts
+///   (an entity created again under the same natural key), every declared field the edits do not
+///   set is written NULL too, so that old values do not come back; a `Max` field cannot be
+///   reset this way and keeps the greatest value ever written.
 /// - Otherwise each `Set` goes to the smallest live member of `old` (its canonical gid if none is
 ///   live), so the write is one the group shows. A `Set` of an owner field goes to every member,
 ///   live or not: a member that is dead only because its owner has not arrived here would
@@ -121,13 +133,14 @@ fn expand(coll: &Collection, pick: impl Fn(&str) -> bool) -> Vec<&String> {
 ///   only through its owner comes back with the move, and its fields compete as a live
 ///   member's do.
 ///
-/// Returns nothing for `Created` without `new`, or for a `Set` or `Deleted` without `old`.
+/// For `Created` without `new` only the tombstones of a `Deleted` are returned; a `Set` or
+/// `Deleted` without `old` records nothing.
 pub fn record(
     schema: &Schema,
     collection: &str,
     edits: &[FieldEdit],
     old: Option<&Target>,
-    new: Option<Gid>,
+    new: Option<NewEntity>,
     clock: Hlc,
 ) -> Vec<Change> {
     let Some(coll) = schema.collection(collection) else {
@@ -146,7 +159,7 @@ pub fn record(
         && let Some(old) = old
     {
         for &m in &old.members {
-            if Some(m) != new {
+            if Some(m) != new.map(|n| n.gid) {
                 out.push(change(m, DELETED, Value::Int(1)));
             }
         }
@@ -155,10 +168,20 @@ pub fn record(
         let Some(new) = new else {
             return out;
         };
-        out.push(change(new, DELETED, Value::Int(0)));
+        out.push(change(new.gid, DELETED, Value::Int(0)));
         for e in edits {
             if let FieldEdit::Set(f, v) = e {
-                out.push(change(new, f, v.clone()));
+                out.push(change(new.gid, f, v.clone()));
+            }
+        }
+        if new.known {
+            for f in &coll.fields {
+                let set = edits
+                    .iter()
+                    .any(|e| matches!(e, FieldEdit::Set(g, _) if *g == f.name));
+                if !set && f.strategy != Strategy::Max {
+                    out.push(change(new.gid, &f.name, Value::Null));
+                }
             }
         }
         return out;
