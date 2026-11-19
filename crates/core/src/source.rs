@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, DELETED, Strategy, wins};
 use crate::clock::Hlc;
-use crate::model::{ALIAS, Identity, Schema};
+use crate::model::{ALIAS, Identity, KEY_ENTRIES, Schema};
 use crate::total::{Total, same};
 use crate::value::{Gid, Value};
 
@@ -39,10 +39,10 @@ pub struct Alias {
 pub enum Slot {
     /// One entry: the winner by this strategy (`crate::wins`).
     One(Strategy),
-    /// One entry per distinct value under `Value::total_cmp`, each with the largest clock that
-    /// wrote it. Used for the key fields of a natural collection, whose every written value
-    /// matters to whether the entity's key holds.
-    PerValue,
+    /// The [`KEY_ENTRIES`](crate::model::KEY_ENTRIES) entries with the smallest clocks, ties to
+    /// the smaller value under `Value::total_cmp`. Used for the key fields of a natural
+    /// collection: those entries decide whether the entity's key holds.
+    Earliest,
 }
 
 /// What storing a change means.
@@ -110,7 +110,7 @@ pub fn slot(schema: &Schema, collection: &str, field: &str) -> Slot {
     if let Identity::Natural(key) = &c.identity
         && key.iter().any(|k| k == field)
     {
-        return Slot::PerValue;
+        return Slot::Earliest;
     }
     match c.fields.iter().find(|f| f.name == field) {
         Some(f) if field != DELETED => Slot::One(f.strategy),
@@ -118,8 +118,8 @@ pub fn slot(schema: &Schema, collection: &str, field: &str) -> Slot {
     }
 }
 
-/// Keeps `value` at `clock` in `entries` as `slot` says. Returns the value it displaced, if any,
-/// and whether anything changed.
+/// Keeps `value` at `clock` in `entries` as `slot` says. Returns whether anything changed, and a
+/// value no entry holds any more, if one went.
 fn keep(
     slot: Slot,
     entries: &mut Vec<(Value, Hlc)>,
@@ -136,17 +136,22 @@ fn keep(
                 (true, old)
             }
         },
-        Slot::PerValue => match entries.iter_mut().find(|(v, _)| same(v, value)) {
-            Some((_, k)) if *k >= clock => (false, None),
-            Some((_, k)) => {
-                *k = clock;
-                (true, None)
+        Slot::Earliest => {
+            if entries.iter().any(|(v, k)| *k == clock && same(v, value)) {
+                return (false, None);
             }
-            None => {
-                entries.push((value.clone(), clock));
-                (true, None)
+            entries.push((value.clone(), clock));
+            entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0)));
+            if entries.len() <= KEY_ENTRIES {
+                return (true, None);
             }
-        },
+            let (evicted, at) = entries.pop().expect("more than KEY_ENTRIES");
+            if at == clock && same(&evicted, value) {
+                return (false, None);
+            }
+            let still_held = entries.iter().any(|(v, _)| same(v, &evicted));
+            (true, (!still_held).then_some(evicted))
+        }
     }
 }
 

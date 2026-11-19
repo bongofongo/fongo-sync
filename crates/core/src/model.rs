@@ -16,6 +16,11 @@ use crate::value::{Gid, Value};
 /// two are one entity. Every such change ever made counts, not only the latest.
 pub const ALIAS: &str = "$alias";
 
+/// How many changes to each key field of a natural entity count: those with the smallest
+/// clocks, ties going to the smaller value. An honest creation writes the key first, so later
+/// rewrites, however many, neither count nor need keeping.
+pub const KEY_ENTRIES: usize = 4;
+
 /// How a collection's entities get their gids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
@@ -297,11 +302,13 @@ impl PartialEq for View {
 ///    `$deleted` whose value is neither `Int(0)` nor `Int(1)`, or its gid belongs to another
 ///    collection. A gid belongs to the collection of its change with the
 ///    smallest clock, ties going to the smaller collection name. Changes to undeclared fields
-///    are kept: they claim the gid, but are not shown. In a natural collection, a change to a
-///    key field is ignored unless its value is part of a key that derives the entity's gid: one
-///    value per key field, each written to that field, such that `Gid::derive` of them is the gid.
-///    Short of a hash collision only one key derives a gid, so a rewrite of a key field is
-///    always ignored.
+///    are kept: they claim the gid, but are not shown. In a natural collection, of the changes to
+///    each key field of an entity only the [`KEY_ENTRIES`] with the smallest clocks count (ties
+///    to the smaller value; a change counted once however often it arrives), and a change to a
+///    key field is ignored unless it counts and its value is part of a key that derives the
+///    entity's gid: one value per key field, each written to that field by a change that counts,
+///    such that `Gid::derive` of them is the gid. Short of a hash collision only one key derives a
+///    gid, so a rewrite of a key field is always ignored.
 /// 2. Each (gid, field) holds the winner among its changes by the field's strategy; `$deleted`
 ///    and undeclared fields merge `Lww`.
 /// 3. An alias whose target belongs to the same collection joins the two gids. Groups are the
@@ -458,6 +465,35 @@ impl<'a> Merged<'a> {
             .filter(|(c, coll)| home[&c.gid].name == coll.name)
             .collect();
 
+        let mut earliest: BTreeMap<(Gid, &str), Vec<(Hlc, &Value)>> = BTreeMap::new();
+        for (c, coll) in &claimed {
+            let Identity::Natural(key) = &coll.identity else {
+                continue;
+            };
+            if !key.contains(&c.field) {
+                continue;
+            }
+            let list = earliest.entry((c.gid, c.field.as_str())).or_default();
+            if !list
+                .iter()
+                .any(|(k, v)| *k == c.clock && v.total_cmp(&c.value) == Ordering::Equal)
+            {
+                list.push((c.clock, &c.value));
+            }
+        }
+        for list in earliest.values_mut() {
+            list.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(b.1)));
+            list.truncate(KEY_ENTRIES);
+        }
+        let counts = |c: &Change| {
+            earliest
+                .get(&(c.gid, c.field.as_str()))
+                .is_some_and(|list| {
+                    list.iter()
+                        .any(|(k, v)| *k == c.clock && v.total_cmp(&c.value) == Ordering::Equal)
+                })
+        };
+
         let mut keys: BTreeMap<Gid, Vec<Value>> = BTreeMap::new();
         let mut unverified = BTreeSet::new();
         for (&gid, coll) in &home {
@@ -468,14 +504,9 @@ impl<'a> Merged<'a> {
                 .iter()
                 .map(|f| {
                     let mut seen: Vec<&Value> = Vec::new();
-                    for (c, _) in &claimed {
-                        if c.gid == gid
-                            && &c.field == f
-                            && !seen
-                                .iter()
-                                .any(|v| v.total_cmp(&c.value) == Ordering::Equal)
-                        {
-                            seen.push(&c.value);
+                    for (_, value) in earliest.get(&(gid, f.as_str())).into_iter().flatten() {
+                        if !seen.iter().any(|v| v.total_cmp(value) == Ordering::Equal) {
+                            seen.push(value);
                         }
                     }
                     seen.sort_by(|a, b| a.total_cmp(b));
@@ -499,9 +530,12 @@ impl<'a> Merged<'a> {
                 };
                 match key.iter().position(|f| *f == c.field) {
                     None => true,
-                    Some(i) => keys
-                        .get(&c.gid)
-                        .is_some_and(|k| k[i].total_cmp(&c.value) == Ordering::Equal),
+                    Some(i) => {
+                        counts(c)
+                            && keys
+                                .get(&c.gid)
+                                .is_some_and(|k| k[i].total_cmp(&c.value) == Ordering::Equal)
+                    }
                 }
             })
             .collect();

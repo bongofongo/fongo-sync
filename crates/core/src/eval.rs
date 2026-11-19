@@ -410,7 +410,7 @@ impl<S: Source> Session<'_, S> {
         let mut options: BTreeMap<String, BTreeMap<Total, Hlc>> = BTreeMap::new();
         for e in self.source.entries(&coll.name, gid) {
             match slot(schema, &coll.name, &e.field) {
-                Slot::PerValue => {
+                Slot::Earliest => {
                     let latest = options
                         .entry(e.field)
                         .or_default()

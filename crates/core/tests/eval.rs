@@ -3,7 +3,7 @@ mod common;
 use common::{arb_case, arb_random_case, gid, mentioned};
 use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
 use fongo_sync_core::model::{ALIAS, Collection, Schema, View, view};
-use fongo_sync_core::source::Store;
+use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value};
 use proptest::prelude::*;
 
@@ -192,13 +192,14 @@ fn a_natural_entity_with_too_many_candidate_keys_is_undetermined_and_so_is_what_
             key_combinations: n,
         })
     };
-    assert_eq!(limited(35).target(&store, "tags", tag), Err(Undetermined));
+    // Each key field keeps its KEY_ENTRIES earliest writes: four values each, sixteen keys.
+    assert_eq!(limited(15).target(&store, "tags", tag), Err(Undetermined));
     assert_eq!(
-        limited(35).target(&store, "notes", gid(7)),
+        limited(15).target(&store, "notes", gid(7)),
         Err(Undetermined)
     );
     assert!(
-        limited(36)
+        limited(16)
             .target(&store, "notes", gid(7))
             .unwrap()
             .row
@@ -281,4 +282,67 @@ fn a_deep_owner_chain_is_followed_to_the_top() {
             .row
             .is_none()
     );
+}
+
+fn tags() -> Schema {
+    Schema::new(vec![
+        Collection::natural("tags", &["label"])
+            .plain("label", Merge::Lww)
+            .plain("note", Merge::Lww),
+        Collection::minted("notes").owner("tag", "tags"),
+    ])
+}
+
+fn rewrites(tag: Gid, from: u64, n: i64) -> Vec<Change> {
+    (0..n)
+        .map(|i| Change {
+            clock: Hlc {
+                wall_ms: from,
+                counter: i as u32,
+                node: gid(66),
+            },
+            ..change("tags", tag, "label", Value::Int(i), 0)
+        })
+        .collect()
+}
+
+#[test]
+fn hostile_rewrites_of_a_natural_key_neither_hide_the_entity_nor_grow_the_store() {
+    let schema = tags();
+    let key = [Value::Text("x".into())];
+    let tag = Gid::derive("tags", &key);
+    let mut changes = vec![
+        change("tags", tag, "label", key[0].clone(), 1),
+        change("notes", gid(7), "tag", Value::Ref(tag), 2),
+    ];
+    changes.extend(rewrites(tag, 5, 1_100));
+    assert!(view(&schema, &changes).row("notes", gid(7)).is_some());
+    agrees(&schema, &changes).unwrap();
+    let mut reversed = changes.clone();
+    reversed.reverse();
+    let (forward, backward) = (store(&schema, &changes), store(&schema, &reversed));
+    let kept = |s: &Store| -> Vec<(Value, Hlc)> {
+        s.entries("tags", tag)
+            .into_iter()
+            .filter(|e| e.field == "label")
+            .map(|e| (e.value, e.clock))
+            .collect()
+    };
+    assert_eq!(kept(&forward).len(), fongo_sync_core::model::KEY_ENTRIES);
+    assert_eq!(kept(&forward), kept(&backward));
+    let ev = Evaluator::new(&schema).unwrap();
+    assert!(ev.target(&forward, "notes", gid(7)).unwrap().row.is_some());
+    let before = store(&schema, &changes[..2]);
+    assert!(ev.affected(&before, &changes[2..]).is_ok());
+}
+
+#[test]
+fn rewrites_older_than_the_creation_can_hide_an_entity_in_the_model_and_the_evaluator_alike() {
+    let schema = tags();
+    let key = [Value::Text("x".into())];
+    let tag = Gid::derive("tags", &key);
+    let mut changes = rewrites(tag, 0, fongo_sync_core::model::KEY_ENTRIES as i64);
+    changes.push(change("tags", tag, "label", key[0].clone(), 1));
+    assert!(view(&schema, &changes).row("tags", tag).is_none());
+    agrees(&schema, &changes).unwrap();
 }
