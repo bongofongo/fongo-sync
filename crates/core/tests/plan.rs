@@ -1000,3 +1000,115 @@ fn independent_writes_come_in_ascending_order() {
     let order_of: Vec<Gid> = plan.steps.iter().map(|s| s.gid).collect();
     assert_eq!(order_of, vec![gid(1), gid(2), gid(3)]);
 }
+
+fn one_change_per_register(changes: &[Change]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for c in changes {
+        if !seen.insert((c.gid, c.field.clone())) {
+            return Err(format!(
+                "two changes to {:?}.{} in {changes:?}",
+                c.gid, c.field
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_key_change_back_to_a_member_of_the_group_tombstones_only_the_others() {
+    let schema = small();
+    let (s, room) = (
+        gid(1),
+        Gid::derive("rooms", &[Value::Ref(gid(1)), text("a")]),
+    );
+    let old = Target {
+        collection: "rooms".into(),
+        canonical: gid(5).min(room),
+        members: {
+            let mut m = vec![gid(5), room];
+            m.sort();
+            m
+        },
+        live: vec![gid(5)],
+        row: Some(row(&[
+            ("site", Value::Ref(s)),
+            ("label", text("b")),
+            ("size", Value::Null),
+        ])),
+    };
+    let found = vec![
+        FieldEdit::Deleted,
+        FieldEdit::Created,
+        set("site", Value::Ref(s)),
+        set("label", text("a")),
+    ];
+    let new = NewEntity {
+        gid: room,
+        known: true,
+    };
+    let recorded = record(&schema, "rooms", &found, Some(&old), Some(new), fresh(0));
+    one_change_per_register(&recorded).unwrap();
+    let tombstones: Vec<(Gid, Value)> = recorded
+        .iter()
+        .filter(|c| c.field == fongo_sync_core::DELETED)
+        .map(|c| (c.gid, c.value.clone()))
+        .collect();
+    assert!(tombstones.contains(&(gid(5), Value::Int(1))));
+    assert!(tombstones.contains(&(room, Value::Int(0))));
+    assert_eq!(tombstones.len(), 2);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1500))]
+
+    /// Whatever the edits and whichever entity a row stood for and now stands for, `record`
+    /// writes each field of each gid at most once.
+    #[test]
+    fn record_writes_each_register_at_most_once(
+        (schema, changes) in arb_case(0..50),
+        pick in any::<usize>(),
+        shape in 0u8..4,
+        fields in proptest::collection::vec(any::<usize>(), 0..6),
+        known in any::<bool>(),
+    ) {
+        let store = store(&schema, &changes);
+        let ev = Evaluator::new(&schema).unwrap();
+        let mut session = ev.session(&store);
+        let mut targets = Vec::new();
+        for c in &schema.collections {
+            for g in common::mentioned(&schema, &changes) {
+                let t = session.target(&c.name, g).unwrap();
+                if !t.members.is_empty() {
+                    targets.push(t);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let old = &targets[pick % targets.len()];
+        let coll = schema.collection(&old.collection).unwrap();
+        let mut found = Vec::new();
+        if shape >= 1 {
+            found.push(FieldEdit::Deleted);
+        }
+        if shape >= 2 {
+            found.push(FieldEdit::Created);
+        }
+        if shape != 1 {
+            let mut named = BTreeSet::new();
+            for f in &fields {
+                let field = &coll.fields[f % coll.fields.len()].name;
+                if named.insert(field.clone()) {
+                    found.push(set(field, Value::Int(*f as i64 % 3)));
+                }
+            }
+        }
+        let new_gid = if shape == 3 { old.members[pick % old.members.len()] } else { Gid([202; 16]) };
+        let new = (shape >= 2).then_some(NewEntity { gid: new_gid, known });
+        let recorded = record(&schema, &old.collection, &found, Some(old), new, fresh(0));
+        if let Err(e) = one_change_per_register(&recorded) {
+            prop_assert!(false, "{e}");
+        }
+    }
+}
