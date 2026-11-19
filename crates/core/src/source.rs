@@ -460,6 +460,7 @@ impl<S: Source> Source for Overlay<'_, S> {
                 self.after.get(&key).unwrap_or(&empty)
             })
             .collect();
+        crate::work::add(sets.iter().map(|s| s.len()).min().unwrap_or(touched.len()));
         match sets.iter().min_by_key(|s| s.len()) {
             None => found.extend(touched),
             Some(fewest) => found.extend(

@@ -623,3 +623,46 @@ pub fn arb_random_case(len: usize) -> impl Strategy<Value = (Schema, Vec<Change>
         (schema, changes)
     })
 }
+
+/// A source that counts what is asked of it: one for each question and one for each item an
+/// answer holds.
+pub struct Counting<'a> {
+    pub inner: &'a fongo_sync_core::source::Store,
+    pub work: std::cell::Cell<usize>,
+}
+
+impl<'a> Counting<'a> {
+    pub fn new(inner: &'a fongo_sync_core::source::Store) -> Counting<'a> {
+        Counting {
+            inner,
+            work: std::cell::Cell::new(0),
+        }
+    }
+
+    fn count<T>(&self, answer: Vec<T>) -> Vec<T> {
+        self.work.set(self.work.get() + 1 + answer.len());
+        answer
+    }
+}
+
+impl fongo_sync_core::source::Source for Counting<'_> {
+    fn claims(&self, gid: Gid) -> Vec<fongo_sync_core::source::Claim> {
+        self.count(self.inner.claims(gid))
+    }
+
+    fn entries(&self, collection: &str, gid: Gid) -> Vec<fongo_sync_core::source::Entry> {
+        self.count(self.inner.entries(collection, gid))
+    }
+
+    fn aliases(&self, gid: Gid) -> Vec<fongo_sync_core::source::Alias> {
+        self.count(self.inner.aliases(gid))
+    }
+
+    fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
+        self.count(self.inner.holding(collection, fields))
+    }
+
+    fn gids(&self) -> Vec<Gid> {
+        self.count(self.inner.gids())
+    }
+}

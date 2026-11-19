@@ -4,55 +4,13 @@
 //! for the evaluator, the questions it asks of the source and the items they return, and with the
 //! `work-counters` feature what `work` counts as well; for `plan::order`, what `work` counts.
 
-use std::cell::Cell;
+mod common;
 
+use common::Counting;
 use fongo_sync_core::eval::Evaluator;
 use fongo_sync_core::model::{ALIAS, Collection, Schema};
-use fongo_sync_core::source::{Alias, Claim, Entry, Source, Store};
+use fongo_sync_core::source::Store;
 use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value};
-
-/// A source that counts what is asked of it: one for each question and one for each item an
-/// answer holds.
-struct Counting<'a> {
-    inner: &'a Store,
-    work: Cell<usize>,
-}
-
-impl<'a> Counting<'a> {
-    fn new(inner: &'a Store) -> Counting<'a> {
-        Counting {
-            inner,
-            work: Cell::new(0),
-        }
-    }
-
-    fn count<T>(&self, answer: Vec<T>) -> Vec<T> {
-        self.work.set(self.work.get() + 1 + answer.len());
-        answer
-    }
-}
-
-impl Source for Counting<'_> {
-    fn claims(&self, gid: Gid) -> Vec<Claim> {
-        self.count(self.inner.claims(gid))
-    }
-
-    fn entries(&self, collection: &str, gid: Gid) -> Vec<Entry> {
-        self.count(self.inner.entries(collection, gid))
-    }
-
-    fn aliases(&self, gid: Gid) -> Vec<Alias> {
-        self.count(self.inner.aliases(gid))
-    }
-
-    fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
-        self.count(self.inner.holding(collection, fields))
-    }
-
-    fn gids(&self) -> Vec<Gid> {
-        self.count(self.inner.gids())
-    }
-}
 
 fn wide(n: u32) -> Gid {
     let mut bytes = [0u8; 16];

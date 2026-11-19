@@ -224,6 +224,7 @@ impl<S: Source> Session<'_, S> {
     }
 
     fn compute_target(&mut self, home: usize, group: &Group) -> Answer<Target> {
+        crate::work::add(group.members.len());
         let mut live = Vec::new();
         for &m in &group.members {
             if self.member_live(m)? {
@@ -246,6 +247,7 @@ impl<S: Source> Session<'_, S> {
 
     fn present(&mut self, home: usize, live: &[Gid]) -> Answer<Row> {
         let coll = &self.schema.collections[home];
+        crate::work::add(live.len() * (coll.fields.len() + 1));
         let infos: Vec<Rc<Info>> = live.iter().map(|&m| self.info(m)).collect::<Answer<_>>()?;
         let mut row = Row::new();
         let in_together = |name: &str| coll.together.iter().any(|s| s.iter().any(|f| f == name));
@@ -325,6 +327,7 @@ impl<S: Source> Session<'_, S> {
         }
         let mut answer = Ok(false);
         for &m in &group.members {
+            crate::work::add(1);
             match self.member_live(m) {
                 Ok(true) => {
                     answer = Ok(true);
