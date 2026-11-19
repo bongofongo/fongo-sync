@@ -8,7 +8,8 @@ use fongo_sync_core::model::{
     Collection, FieldKind, Identity, Row, Schema, unmerged_identities, view,
 };
 use fongo_sync_core::plan::{
-    Columns, FieldEdit, NewEntity, Planned, RowAction, Step, clashes, edits, order, record, write,
+    Columns, FieldEdit, NewEntity, Plan, Planned, RowAction, Step, clashes, edits, order, record,
+    write,
 };
 use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value};
@@ -1243,4 +1244,195 @@ fn a_row_a_parking_leaves_off_every_cycle_is_not_parked() {
         .collect();
     assert_eq!(parked, vec![a, b]);
     assert!(plan.stuck.is_empty());
+}
+
+/// Rows of one collection inserted together, each naming rows by `x`, which refuses NULL, and by
+/// `y` and `z`, which accept it.
+fn linked() -> (Schema, Columns) {
+    let schema = Schema::new(vec![
+        Collection::minted("a")
+            .reference("x", "a")
+            .reference("y", "a")
+            .reference("z", "a"),
+    ]);
+    (schema, Columns::new().not_null("a", "x"))
+}
+
+fn inserted(n: u8, refs: &[(&str, u8)]) -> Planned {
+    Planned {
+        collection: "a".into(),
+        gid: gid(n),
+        image: None,
+        action: RowAction::Insert(
+            refs.iter()
+                .map(|(f, t)| (f.to_string(), Value::Ref(gid(*t))))
+                .collect(),
+        ),
+    }
+}
+
+fn parked_rows(plan: &Plan) -> Vec<Gid> {
+    plan.steps
+        .iter()
+        .filter(|s| s.parked)
+        .map(|s| s.gid)
+        .collect()
+}
+
+#[test]
+fn a_cycle_that_waits_on_another_is_broken_once_the_other_is() {
+    let (schema, columns) = linked();
+    // 1 and 2 wait on each other, and only 1 can be inserted early, once 5 exists; 5 waits on 3,
+    // which with 4 forms a cycle that inserting 3 early breaks.
+    let planned = [
+        inserted(1, &[("x", 5), ("y", 2)]),
+        inserted(2, &[("x", 1)]),
+        inserted(3, &[("x", 3), ("y", 4)]),
+        inserted(4, &[("x", 4), ("y", 3)]),
+        inserted(5, &[("x", 3)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(3), gid(1)]);
+    // 1 also waits on 3, which with 4 forms a cycle that inserting 3 early breaks.
+    let planned = [
+        inserted(1, &[("x", 3), ("y", 2)]),
+        inserted(2, &[("x", 1)]),
+        inserted(3, &[("x", 3), ("y", 4)]),
+        inserted(4, &[("x", 3)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(3), gid(1)]);
+}
+
+#[test]
+fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_written() {
+    let (schema, columns) = linked();
+    // One set: 2 → 3 → 1 → 4 → 6 → 2, and 4 with 5. Parking 1 splits it into 2 with 3 and 4
+    // with 5. Neither 2 nor 3 can be inserted early while 6 does not exist; parking 4 lets 6 be
+    // written, and then 2 can be parked.
+    let planned = [
+        inserted(1, &[("y", 3)]),
+        inserted(2, &[("x", 6), ("y", 3)]),
+        inserted(3, &[("x", 2)]),
+        inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
+        inserted(5, &[("x", 5), ("z", 4)]),
+        inserted(6, &[("x", 4)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(1), gid(4), gid(2)]);
+}
+
+#[test]
+fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_parked() {
+    let (schema, columns) = linked();
+    // As above, but 2 waits on 4 itself, which parking 4 inserts.
+    let planned = [
+        inserted(1, &[("y", 3)]),
+        inserted(2, &[("x", 4), ("y", 3)]),
+        inserted(3, &[("x", 2)]),
+        inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
+        inserted(5, &[("x", 5), ("z", 4)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(1), gid(4), gid(2)]);
+}
+
+/// From one table of `n` rows referring to each other at random to another, with `x` refusing
+/// NULL or not: every step keeps the constraints, every row not stuck ends as it should, and
+/// where every field accepts NULL nothing is stuck. This holds for sets of rows too large for the
+/// search for the fewest parkings, which are planned by parking whatever can be.
+fn large_plan_law(seed: u64, n: u8, x_not_null: bool) -> Result<(), String> {
+    let mut rng = common::Rng(seed | 1);
+    let schema = linked().0;
+    let columns = if x_not_null {
+        Columns::new().not_null("a", "x")
+    } else {
+        Columns::new()
+    };
+    let tables = Tables {
+        schema: &schema,
+        columns: &columns,
+    };
+    let random = |rng: &mut common::Rng| -> Table {
+        let mut table = Table::new();
+        for i in 0..n {
+            if rng.one_in(4) {
+                continue;
+            }
+            let mut r = Row::new();
+            for f in ["x", "y", "z"] {
+                let to = Value::Ref(gid(rng.below(n as usize) as u8));
+                r.insert(f.into(), if rng.one_in(5) { Value::Null } else { to });
+            }
+            table.insert(("a".into(), gid(i)), r);
+        }
+        tables.repair(table)
+    };
+    let before = random(&mut rng);
+    let after = random(&mut rng);
+    let planned = plan_between(&before, &after);
+    let plan = order(&schema, &columns, &planned);
+    if !x_not_null && !plan.stuck.is_empty() {
+        return Err(format!("stuck though every field accepts NULL: {:?}", plan.stuck));
+    }
+    let mut table = before.clone();
+    for step in &plan.steps {
+        if plan.stuck.contains(&(step.collection.clone(), step.gid)) {
+            return Err(format!("a step for stuck {step:?}"));
+        }
+        tables.apply(&mut table, step)?;
+    }
+    for p in &planned {
+        let at = (p.collection.clone(), p.gid);
+        let wanted = if plan.stuck.contains(&at) {
+            before.get(&at)
+        } else {
+            after.get(&at)
+        };
+        if table.get(&at) != wanted {
+            return Err(format!("{at:?} ends as {:?}", table.get(&at)));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn large_sets_of_rows_waiting_on_each_other_are_written_within_the_constraints() {
+    for seed in 0..48 {
+        large_plan_law(seed, 250, seed % 2 == 0).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+#[test]
+fn a_long_doubly_linked_list_inserted_at_once_is_written() {
+    let (schema, _) = linked();
+    let n: u8 = 250;
+    let planned: Vec<Planned> = (0..n)
+        .map(|i| {
+            let mut refs = Vec::new();
+            if i > 0 {
+                refs.push(("y", i - 1));
+            }
+            if i + 1 < n {
+                refs.push(("z", i + 1));
+            }
+            inserted(i, &refs)
+        })
+        .collect();
+    let columns = Columns::new();
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty());
+    let tables = Tables {
+        schema: &schema,
+        columns: &columns,
+    };
+    let mut table = Table::new();
+    for step in &plan.steps {
+        tables.apply(&mut table, step).unwrap();
+    }
+    assert_eq!(table.len(), n as usize);
 }
