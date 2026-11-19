@@ -42,8 +42,41 @@ def render (cs : List (Change Value)) : List String :=
     (runView schema cs r).map fun row =>
       s!"{r} " ++ " ".intercalate (row.map fun (f, v) => s!"{f}={showValue v}")
 
+def reading (wall counter node : Nat) : Hlc := ⟨wall, counter, node⟩
+
+/-- A clock's start and what it is asked to do. -/
+def clockCases : List (String × Hlc × List Event) := [
+  ("ticks and observes", (reading 0 0 1, [.tick 1000, .tick 900, .observe (reading 5000 3 2),
+    .tick 10, .observe (reading 4000 0 2), .tick 5001])),
+  ("full counter carries", (reading 5 COUNTER_MAX 1, [.tick 5, .tick 0])),
+  ("carries into the last millisecond", (reading (WALL_MAX - 1) COUNTER_MAX 1, [.tick 0, .tick 0])),
+  ("the last millisecond is not observed", (reading 0 0 1, [.tick 1000,
+    .observe (reading WALL_MAX 5 7), .tick 1000, .observe (reading WALL_MAX COUNTER_MAX 7),
+    .tick 1000])),
+  ("beyond the text form is not observed", (reading WALL_MAX 5 1,
+    [.observe (reading (WALL_MAX + 1) 0 2), .tick 0, .observe (reading (2 ^ 64 - 1) 0 2), .tick 0])),
+  ("a clock that issued every reading repeats the last", (reading WALL_MAX COUNTER_MAX 1,
+    [.tick 0, .tick WALL_MAX, .tick (2 ^ 64 - 1)]))
+]
+
+def showReading (h : Hlc) : String := s!"{h.wall} {h.counter} {h.node}"
+
+/-- After each event, the reading a tick issued or the clock after an observation. -/
+def runClock (c : Clock) : List Event → List String
+  | [] => []
+  | .tick wall :: rest =>
+    let (r, c') := c.tick wall
+    s!"tick {wall}: {showReading r}" :: runClock c' rest
+  | .observe remote :: rest =>
+    let c' := c.observe remote
+    s!"observe {showReading remote}: {showReading c'.last}" :: runClock c' rest
+
 def main : IO Unit := do
   for (name, cs) in cases do
     IO.println s!"case {name}"
     for line in render cs do
+      IO.println line
+  for (name, start, events) in clockCases do
+    IO.println s!"clock {name}"
+    for line in runClock ⟨start⟩ events do
       IO.println line

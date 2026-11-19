@@ -5,7 +5,9 @@ import FongoSync
 `propext`, `Classical.choice` and `Quot.sound`. -/
 
 #print axioms FongoSync.Laws.tick_later
+#print axioms FongoSync.Laws.tick_encodable
 #print axioms FongoSync.Laws.observe_ignores_unencodable
+#print axioms FongoSync.Laws.observe_keeps_room
 #print axioms FongoSync.Laws.tick_after_observe
 #print axioms FongoSync.Laws.tick_after_any_history
 #print axioms FongoSync.Laws.merge_comm

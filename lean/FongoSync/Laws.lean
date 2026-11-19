@@ -18,26 +18,39 @@ open FongoSync
 
 /-! ## Clock -/
 
-/-- A tick's reading is later than the clock's last reading, whatever the wall says. -/
-theorem tick_later (c : Clock) (wall : Nat) : c.last < (c.tick wall).1 :=
-  c.tick_lt wall
+/-- A tick's reading is later than the clock's last reading, whatever the wall says, unless the
+clock has issued the last reading the text form holds. -/
+theorem tick_later (c : Clock) (wall : Nat) (room : c.HasRoom) : c.last < (c.tick wall).1 :=
+  c.tick_lt wall room
+
+/-- A clock whose last reading the text form holds issues only readings it holds. -/
+theorem tick_encodable (c : Clock) (wall : Nat) (h : c.last.encodable) :
+    (c.tick wall).1.encodable :=
+  c.tick_encodable wall h
 
 /-- Observing a reading the text form cannot hold changes nothing. -/
 theorem observe_ignores_unencodable (c : Clock) (remote : Hlc) (h : ¬ remote.encodable) :
     c.observe remote = c :=
   c.observe_ignores remote h
 
-/-- The next tick after observing an encodable reading is later than it. -/
-theorem tick_after_observe (c : Clock) (remote : Hlc) (wall : Nat) (h : remote.encodable) :
+/-- Observing never takes away a clock's room to tick. -/
+theorem observe_keeps_room (c : Clock) (remote : Hlc) (room : c.HasRoom) :
+    (c.observe remote).HasRoom :=
+  c.observe_hasRoom remote room
+
+/-- The next tick after observing a reading before the last millisecond the text form holds is
+later than it. -/
+theorem tick_after_observe (c : Clock) (remote : Hlc) (wall : Nat) (h : remote.wall < WALL_MAX) :
     remote < ((c.observe remote).tick wall).1 :=
   c.observe_then_tick remote wall h
 
-/-- After any history, the next tick is later than the start, than every reading issued, and
-than every encodable reading observed. -/
-theorem tick_after_any_history (c : Clock) (events : List Event) (wall : Nat) :
+/-- After any history that leaves the clock room to tick, the next tick is later than the start,
+than every reading issued, and than every reading observed before the last millisecond. -/
+theorem tick_after_any_history (c : Clock) (events : List Event) (wall : Nat)
+    (room : (c.run events).1.HasRoom) :
     c.last < ((c.run events).1.tick wall).1 ∧
       ∀ r ∈ (c.run events).2, r < ((c.run events).1.tick wall).1 :=
-  c.tick_after_any_history events wall
+  c.tick_after_any_history events wall room
 
 /-! ## One register, for any value type with a total order -/
 

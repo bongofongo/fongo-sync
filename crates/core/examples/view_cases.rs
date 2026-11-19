@@ -2,7 +2,9 @@
 //! Lean model's view of the same cases in the same form, and `make lean-diff` compares the two.
 
 use fongo_sync_core::model::{ALIAS, Collection, FieldKind, Schema, view};
-use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy, Value};
+use fongo_sync_core::{Change, Clock, DELETED, Gid, Hlc, Strategy, Value};
+
+const WALL_MAX: u64 = 0xFFFF_FFFF_FFFF;
 
 fn gid(n: u128) -> Gid {
     Gid(n.to_be_bytes())
@@ -34,6 +36,82 @@ fn show(value: &Value) -> String {
         Value::Ref(g) => format!("ref:{}", u128::from_be_bytes(g.0)),
         other => panic!("no Lean counterpart for {other:?}"),
     }
+}
+
+fn reading(wall_ms: u64, counter: u32, node: u128) -> Hlc {
+    Hlc {
+        wall_ms,
+        counter,
+        node: gid(node),
+    }
+}
+
+fn show_reading(h: &Hlc) -> String {
+    format!(
+        "{} {} {}",
+        h.wall_ms,
+        h.counter,
+        u128::from_be_bytes(h.node.0)
+    )
+}
+
+enum Event {
+    Tick(u64),
+    Observe(Hlc),
+}
+
+fn clock_cases() -> Vec<(&'static str, Hlc, Vec<Event>)> {
+    use Event::{Observe, Tick};
+    vec![
+        (
+            "ticks and observes",
+            reading(0, 0, 1),
+            vec![
+                Tick(1000),
+                Tick(900),
+                Observe(reading(5000, 3, 2)),
+                Tick(10),
+                Observe(reading(4000, 0, 2)),
+                Tick(5001),
+            ],
+        ),
+        (
+            "full counter carries",
+            reading(5, u32::MAX, 1),
+            vec![Tick(5), Tick(0)],
+        ),
+        (
+            "carries into the last millisecond",
+            reading(WALL_MAX - 1, u32::MAX, 1),
+            vec![Tick(0), Tick(0)],
+        ),
+        (
+            "the last millisecond is not observed",
+            reading(0, 0, 1),
+            vec![
+                Tick(1000),
+                Observe(reading(WALL_MAX, 5, 7)),
+                Tick(1000),
+                Observe(reading(WALL_MAX, u32::MAX, 7)),
+                Tick(1000),
+            ],
+        ),
+        (
+            "beyond the text form is not observed",
+            reading(WALL_MAX, 5, 1),
+            vec![
+                Observe(reading(WALL_MAX + 1, 0, 2)),
+                Tick(0),
+                Observe(reading(u64::MAX, 0, 2)),
+                Tick(0),
+            ],
+        ),
+        (
+            "a clock that issued every reading repeats the last",
+            reading(WALL_MAX, u32::MAX, 1),
+            vec![Tick(0), Tick(WALL_MAX), Tick(u64::MAX)],
+        ),
+    ]
 }
 
 fn main() {
@@ -133,6 +211,26 @@ fn main() {
                 .map(|(f, v)| format!("{f}={}", show(v)))
                 .collect();
             println!("{} {}", u128::from_be_bytes(g.0), fields.join(" "));
+        }
+    }
+    for (name, start, events) in clock_cases() {
+        println!("clock {name}");
+        let mut clock = Clock::resume(start);
+        for event in events {
+            match event {
+                Event::Tick(wall_ms) => {
+                    let r = clock.tick(wall_ms);
+                    println!("tick {wall_ms}: {}", show_reading(&r));
+                }
+                Event::Observe(remote) => {
+                    clock.observe(&remote);
+                    println!(
+                        "observe {}: {}",
+                        show_reading(&remote),
+                        show_reading(&clock.last())
+                    );
+                }
+            }
         }
     }
 }
