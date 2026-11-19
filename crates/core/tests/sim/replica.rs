@@ -70,10 +70,27 @@ pub struct Replica<'s> {
     minted: u32,
     pub parked_steps: usize,
     pub refused: usize,
+    not_null: BTreeSet<(String, String)>,
+    /// Cells the application wrote since the adapter last wrote or recorded them.
+    app_cells: BTreeSet<(String, Key, String)>,
+    /// What each collect must have recorded, worked out from the rows alone.
+    pub expected: Vec<Expected>,
+}
+
+/// A write the application made, as the collect that found it saw it: entity, field, value and
+/// the clock the collect gave the row.
+#[derive(Debug, Clone)]
+pub struct Expected {
+    pub collection: String,
+    pub gid: Gid,
+    pub field: String,
+    pub value: Value,
+    pub clock: fongo_sync_core::Hlc,
 }
 
 impl<'s> Replica<'s> {
-    pub fn new(schema: &'s Schema, id: u8) -> Replica<'s> {
+    /// A replica whose tables refuse NULL in the `(collection, field)` columns of `not_null`.
+    pub fn new(schema: &'s Schema, id: u8, not_null: &[(&str, &str)]) -> Replica<'s> {
         Replica {
             schema,
             ev: Evaluator::new(schema).unwrap(),
@@ -97,6 +114,12 @@ impl<'s> Replica<'s> {
             minted: 0,
             parked_steps: 0,
             refused: 0,
+            not_null: not_null
+                .iter()
+                .map(|(c, f)| (c.to_string(), f.to_string()))
+                .collect(),
+            app_cells: BTreeSet::new(),
+            expected: Vec::new(),
         }
     }
 
@@ -129,9 +152,17 @@ impl<'s> Replica<'s> {
 
     // --- The application's tables and their constraints ---------------------------------------
 
-    /// Whether `row` may stand at `key` in `collection`: every reference names an existing row
-    /// and no other row shares a unique set with it.
+    /// Whether `row` may stand at `key` in `collection`: no NULL where the column refuses one,
+    /// every reference names an existing row, and no other row shares a unique set with it.
     fn allowed(&self, collection: &str, key: Key, row: &Row) -> bool {
+        let null = |f: &String| row.get(f).is_none_or(|v| *v == Value::Null);
+        if self
+            .not_null
+            .iter()
+            .any(|(c, f)| c == collection && null(f))
+        {
+            return false;
+        }
         for (f, t, _) in self.refs(collection) {
             match row.get(&f) {
                 None | Some(Value::Null) => {}
@@ -176,13 +207,21 @@ impl<'s> Replica<'s> {
         self.tables[collection].keys().copied().collect()
     }
 
-    /// The application inserts a row; refused if a constraint refuses it.
-    pub fn insert(&mut self, collection: &str, row: Row) -> Option<Key> {
+    /// The application inserts a row, NULL in every column it does not give; refused if a
+    /// constraint refuses it.
+    pub fn insert(&mut self, collection: &str, mut row: Row) -> Option<Key> {
+        for f in &self.schema.collection(collection).unwrap().fields {
+            row.entry(f.name.clone()).or_insert(Value::Null);
+        }
         let key = self.next_key;
         if !self.allowed(collection, key, &row) {
             return None;
         }
         self.next_key += 1;
+        for f in row.keys() {
+            self.app_cells
+                .insert((collection.to_string(), key, f.clone()));
+        }
         self.tables.get_mut(collection).unwrap().insert(key, row);
         self.dirty.insert((collection.to_string(), key));
         Some(key)
@@ -199,6 +238,8 @@ impl<'s> Replica<'s> {
         }
         self.tables.get_mut(collection).unwrap().insert(key, row);
         self.dirty.insert((collection.to_string(), key));
+        self.app_cells
+            .insert((collection.to_string(), key, field.to_string()));
         for (c, k, f) in self.parked.clone() {
             if c == collection && k == key && f == field {
                 self.parked.remove(&(c, k, f));
@@ -236,6 +277,17 @@ impl<'s> Replica<'s> {
             }
             doomed.extend(more);
         }
+        for c in &self.schema.collections {
+            for (f, t, _) in self.refs(&c.name) {
+                let nulled = self.tables[&c.name].iter().any(|(k, r)| {
+                    !doomed.contains(&(c.name.clone(), *k))
+                        && matches!(r.get(&f), Some(Value::Int(to)) if doomed.contains(&(t.clone(), *to)))
+                });
+                if nulled && self.not_null.contains(&(c.name.clone(), f.clone())) {
+                    return false;
+                }
+            }
+        }
         for c in self
             .schema
             .collections
@@ -251,6 +303,7 @@ impl<'s> Replica<'s> {
                     {
                         r.insert(f.clone(), Value::Null);
                         self.dirty.insert((c.clone(), *k));
+                        self.app_cells.insert((c.clone(), *k, f.clone()));
                     }
                 }
             }
@@ -416,17 +469,30 @@ impl<'s> Replica<'s> {
                 let before = image.as_ref().map(|i| self.to_gids_in(c, i, &was));
                 let after = row.as_ref().map(|r| self.to_gids_in(c, r, &will));
                 let found = edits(self.schema, c, before.as_ref(), after.as_ref());
-                if found.is_empty() {
+                let old_gid = image.as_ref().and_then(|_| was.get(&at).copied());
+                let new = fresh.get(&at).copied();
+                let writes = self.writes(c, before.as_ref(), after.as_ref(), old_gid, new);
+                if found.is_empty() && writes.is_empty() {
                     if let Some(r) = row {
                         self.images.insert(at, r);
                     }
                     continue;
                 }
-                let old_gid = image.as_ref().and_then(|_| was.get(&at).copied());
                 let old: Option<Target> = old_gid.map(|g| session.target(c, g).unwrap());
-                let new = fresh.get(&at).copied();
                 let clock = self.clock.tick(self.wall);
+                self.expected
+                    .extend(writes.into_iter().map(|(gid, field, value)| Expected {
+                        collection: c.clone(),
+                        gid,
+                        field,
+                        value,
+                        clock,
+                    }));
                 let recorded = record(self.schema, c, &found, old.as_ref(), new, clock);
+                let created = found.contains(&fongo_sync_core::plan::FieldEdit::Created);
+                let coll = self.schema.collection(c).unwrap();
+                let written_by_app =
+                    |f: &String| self.app_cells.contains(&(c.clone(), *k, f.clone()));
                 for ch in &recorded {
                     if ch.field == fongo_sync_core::DELETED {
                         continue;
@@ -442,7 +508,26 @@ impl<'s> Replica<'s> {
                         "replica {} recorded a parked value: {ch:?}",
                         self.id
                     );
+                    // A value the application did not write since the adapter last wrote the
+                    // cell may be sent only as part of a new entity, beside a field of its
+                    // `together` set that the application did write, or as a reference whose
+                    // local row now stands for another entity.
+                    let sibling = coll
+                        .together
+                        .iter()
+                        .any(|set| set.contains(&ch.field) && set.iter().any(written_by_app));
+                    let follows = self.refs(c).iter().any(|(f, _, _)| *f == ch.field)
+                        && image.as_ref().zip(row.as_ref()).is_some_and(|(i, r)| {
+                            i.get(&ch.field)
+                                .is_some_and(|a| r.get(&ch.field).is_some_and(|b| same(a, b)))
+                        });
+                    assert!(
+                        created || sibling || follows || written_by_app(&ch.field),
+                        "replica {} recorded {ch:?}, which its application did not write",
+                        self.id
+                    );
                 }
+                self.app_cells.retain(|(cc, kk, _)| !(cc == c && kk == k));
                 changes.extend(recorded);
                 if let Some(o) = old_gid {
                     touched.insert((c.clone(), o));
@@ -467,6 +552,70 @@ impl<'s> Replica<'s> {
         self.absorb(&changes);
         self.outbox.extend(changes);
         affected
+    }
+
+    /// What the application wrote to one row since the last collect, worked out without the
+    /// planner: a deleted row deletes its entity; a new row, or a natural row whose key changed,
+    /// creates an entity with its key and every non-NULL field (deleting the old one); otherwise
+    /// each changed field is written. A `together` set any of whose fields is written is written
+    /// whole, as the row holds it.
+    fn writes(
+        &self,
+        collection: &str,
+        before: Option<&Row>,
+        after: Option<&Row>,
+        old: Option<Gid>,
+        new: Option<Gid>,
+    ) -> Vec<(Gid, String, Value)> {
+        let coll = self.schema.collection(collection).unwrap();
+        let key: Vec<String> = match &coll.identity {
+            Identity::Natural(k) => k.clone(),
+            Identity::Minted => Vec::new(),
+        };
+        let get = |r: &Row, f: &str| r.get(f).cloned().unwrap_or(Value::Null);
+        let whole = |chosen: BTreeSet<String>| -> BTreeSet<String> {
+            let mut all = chosen.clone();
+            for set in &coll.together {
+                if set.iter().any(|f| chosen.contains(f)) {
+                    all.extend(set.iter().cloned());
+                }
+            }
+            all
+        };
+        let deleted = |g: Gid, v: i64| (g, fongo_sync_core::DELETED.to_string(), Value::Int(v));
+        let mut out = Vec::new();
+        match (before, after, new) {
+            (Some(_), None, _) => out.extend(old.map(|o| deleted(o, 1))),
+            (_, Some(a), Some(n)) => {
+                if before.is_some() {
+                    out.extend(old.map(|o| deleted(o, 1)));
+                }
+                out.push(deleted(n, 0));
+                let chosen = coll
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .filter(|f| key.contains(f) || get(a, f) != Value::Null)
+                    .collect();
+                for f in whole(chosen) {
+                    out.push((n, f.clone(), get(a, &f)));
+                }
+            }
+            (Some(b), Some(a), None) => {
+                let Some(o) = old else { return out };
+                let chosen = coll
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .filter(|f| !same(&get(b, f), &get(a, f)))
+                    .collect();
+                for f in whole(chosen) {
+                    out.push((o, f.clone(), get(a, &f)));
+                }
+            }
+            _ => {}
+        }
+        out
     }
 
     // --- Apply --------------------------------------------------------------------------------
@@ -546,7 +695,8 @@ impl<'s> Replica<'s> {
             for ((c, canon), (row, keys)) in &wanted {
                 if row.is_none() {
                     for k in keys {
-                        doomed.insert((c.clone(), *k), (c.clone(), *canon));
+                        let was = self.gid_of[&(c.clone(), *k)];
+                        doomed.insert((c.clone(), *k), (c.clone(), was));
                     }
                     continue;
                 }
@@ -694,6 +844,14 @@ impl<'s> Replica<'s> {
             if !ok {
                 self.refused += 1;
             }
+            if std::env::var_os("FONGO_SIM_TRACE").is_some() {
+                let table = &self.tables[&step.collection];
+                eprintln!(
+                    "replica {} {} {step:?}; table {table:?}",
+                    self.id,
+                    if ok { "wrote" } else { "refused" }
+                );
+            }
             if ok {
                 let written: Vec<String> = match &step.action {
                     RowAction::Insert(r) | RowAction::Update(r) => r.keys().cloned().collect(),
@@ -737,6 +895,75 @@ impl<'s> Replica<'s> {
             }
         }
         out
+    }
+
+    /// Whether every entity still held is one these tables cannot hold: its row has NULL where a
+    /// column refuses it, refers to an entity with no row here, or takes a unique value a row of
+    /// a held entity keeps; or a row that stood for it, and must go, is still referred to by the
+    /// row of an entity that is held.
+    pub fn waits_for_a_reason(&self) -> Result<(), String> {
+        let mut session = self.ev.session(&self.store);
+        let has_row = |c: &str, g: Gid| {
+            self.gid_of
+                .iter()
+                .any(|((cc, k), gg)| cc == c && *gg == g && self.tables[c].contains_key(k))
+        };
+        for (c, g) in &self.held {
+            let t = session.target(c, *g).unwrap();
+            let unwritable = match &t.row {
+                Some(row) => {
+                    let null = self
+                        .not_null
+                        .iter()
+                        .any(|(cc, f)| cc == c && row.get(f).is_none_or(|v| *v == Value::Null));
+                    let missing = self.refs(c).iter().any(
+                        |(f, t, _)| matches!(row.get(f), Some(Value::Ref(h)) if !has_row(t, *h)),
+                    );
+                    let blocked = self.uniques(c).iter().any(|set| {
+                        let tuple: Vec<&Value> = set
+                            .iter()
+                            .map(|f| row.get(f).unwrap_or(&Value::Null))
+                            .collect();
+                        !tuple.contains(&&Value::Null)
+                            && self.tables[c].iter().any(|(k, other)| {
+                                let other = self.to_gids_in(c, other, &self.gid_of);
+                                let mine = self.gid_of.get(&(c.clone(), *k));
+                                mine.is_some_and(|h| {
+                                    *h != t.canonical && self.held.contains(&(c.clone(), *h))
+                                }) && set
+                                    .iter()
+                                    .zip(&tuple)
+                                    .all(|(f, v)| other.get(f).is_some_and(|w| same(w, v)))
+                            })
+                    });
+                    null || missing || blocked
+                }
+                None => false,
+            };
+            let pinned = self.gid_of.iter().any(|((cc, k), gg)| {
+                cc == c
+                    && gg == g
+                    && self.schema.collections.iter().any(|other| {
+                        self.refs(&other.name).iter().any(|(f, t, _)| {
+                            t == c
+                                && self.tables[&other.name].iter().any(|(j, r)| {
+                                    r.get(f).is_some_and(|v| same(v, &Value::Int(*k)))
+                                        && self.gid_of.get(&(other.name.clone(), *j)).is_some_and(
+                                            |h| self.held.contains(&(other.name.clone(), *h)),
+                                        )
+                                })
+                        })
+                    })
+            });
+            let why = unwritable || pinned;
+            if !why {
+                return Err(format!(
+                    "replica {} holds {c} {g:?} for no reason its tables give: target {:?}",
+                    self.id, t.row
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Every row the replica holds equals what `model::view` of the changes it merged shows,
