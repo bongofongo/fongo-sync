@@ -34,8 +34,9 @@
 //!   - joining two copies of paths through natural keys d collections deep costs about d^1.8 per
 //!     path (each entity's group is found from the keys above it), d being fixed by the schema.
 //!
-//!   Ordering row writes stays O((n + e) log n) for n rows and e requirements among them, though
-//!   images that break unique constraints can make e grow as n².
+//!   Ordering row writes stays O((n + e) log n) for n rows and e requirements among them. Rows
+//!   whose targets keep a unique constraint give at most n requirements per unique set; e grows
+//!   as n² only when many rows hold a tuple and many targets take that same tuple.
 //!
 //! None of these is prevented here.
 

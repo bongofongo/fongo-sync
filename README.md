@@ -75,6 +75,7 @@ What is tested against what (`crates/core/tests`):
 | `affected.rs` | the incremental law: re-evaluating only what `affected` names after each batch, delivered in random order with repeats, keeps the rows equal to `model::view`, over both kinds of schema |
 | `plan.rs` | recorded edits round-trip; `edits` never reports what an adapter wrote; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps NOT NULL, unique and foreign-key constraints, and nothing is parked or stuck where no cycle forces it |
 | `scaling.rs` | the work of `affected` and `target` grows with what changed, not with what is stored, checked as a ratio between two sizes |
+| `work.rs` | counted work of `affected`, `target` and `order` stays within a stated bound over random schemas, batches and plans and a set of named hard shapes (needs the `work-counters` feature) |
 | `sim` | several replicas over tables with real constraints, random edits and partial, reordered, per-device, repeated delivery: rows equal `model::view` of what each replica merged after every step and once everything is delivered; no replica sends a value its application did not write, and every write an application made is in the merged state; also every short script over a small alphabet |
 
 `FONGO_SIM_CASES` and `FONGO_EXHAUSTIVE_LENGTH` raise the volume of the last two.
