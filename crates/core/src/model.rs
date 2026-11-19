@@ -4,6 +4,25 @@
 //!
 //! The answer depends only on the set of changes: their order and any duplicates do not matter,
 //! provided no two changes to one field share a clock with different values.
+//!
+//! # What a member device can do
+//!
+//! Every device that holds a library's key is trusted to write any change. The rules converge
+//! whatever it writes, but a device that writes against the application's intent can:
+//!
+//! - delete an entity for good, by writing `$deleted = 1` at the largest clock the text form
+//!   holds: no later clock exists to restore it;
+//! - move a gid to another collection, by writing to it under that collection at a clock older
+//!   than any it has, so that its own collection's changes to it are ignored;
+//! - grow every replica's store without limit, by writing undeclared fields, which are kept;
+//! - merge unrelated entities of one collection, by aliasing them: an alias cannot be undone;
+//! - hide a natural entity, by writing [`KEY_ENTRIES`] values to one of its key fields at clocks
+//!   older than its creation;
+//! - set a `Max` field to a value no later write can lower;
+//! - make entities undecidable for an evaluator, by building alias chains or key candidates
+//!   beyond its limits (`eval::Limits`), which then answers `Undetermined` for them.
+//!
+//! None of these is prevented here.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
