@@ -15,6 +15,10 @@ pub mod plan;
 pub mod source;
 mod total;
 mod value;
+#[cfg(feature = "work-counters")]
+pub mod work;
+#[cfg(not(feature = "work-counters"))]
+mod work;
 
 pub use change::{ALIAS, Change, DELETED, State, Strategy, wins};
 pub use clock::{Clock, Hlc};

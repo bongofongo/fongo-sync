@@ -6,6 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Counts the work `plan::order` and `affected` do, for tests that check how it grows.
+work-counters = []
+
 [dependencies]
 sha2.workspace = true
 

@@ -637,6 +637,7 @@ fn order_once(
     let mut candidates: BTreeSet<((String, Gid), usize)> = BTreeSet::new();
     loop {
         while let Some((_, i)) = ready.pop_first() {
+            crate::work::add(1);
             done[i] = true;
             finished += 1;
             candidates.remove(&(ids[i].clone(), i));
@@ -736,6 +737,7 @@ fn order_once(
                 break;
             };
             cursor = Some(next.clone());
+            crate::work::add(1);
             let r = next.1;
             let p = &planned[r];
             let same_cycle = |m: usize| component_of.get(&m) == component_of.get(&r);
@@ -862,6 +864,7 @@ fn order_once(
 
 /// The strongly connected components of more than one row among `left`, by `out`'s edges.
 fn cycles(left: &[usize], out: &[BTreeSet<(usize, Need)>]) -> Vec<Vec<usize>> {
+    crate::work::add(left.len());
     let inside: BTreeSet<usize> = left.iter().copied().collect();
     let mut index = BTreeMap::new();
     let mut low = BTreeMap::new();

@@ -98,6 +98,7 @@ impl Evaluator<'_> {
                     }
                     if queued.insert((collection.clone(), t.canonical, was_before)) {
                         found.insert((collection.clone(), t.canonical));
+                        crate::work::add(t.members.len());
                         queue.extend(t.members.iter());
                     }
                 }
