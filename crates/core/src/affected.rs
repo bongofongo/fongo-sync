@@ -69,6 +69,7 @@ impl Evaluator<'_> {
         let mut seen = BTreeSet::new();
         let mut expanded = BTreeSet::new();
         let mut compared = BTreeMap::new();
+        let mut queued = BTreeSet::new();
         let mut found = BTreeSet::new();
         while let Some(x) = queue.pop() {
             if !seen.insert(x) {
@@ -80,25 +81,25 @@ impl Evaluator<'_> {
             for collection in homes {
                 let old = was.shared(&collection, x)?;
                 let new = will.shared(&collection, x)?;
-                // Every member of a group shares its target, so a pair of groups is compared,
-                // and its members queued, once.
+                // Every member of a group shares its target, so a pair of groups is compared once,
+                // and each group's members are queued once.
                 let pair = (
                     collection.clone(),
                     (old.canonical, old.members.is_empty()),
                     (new.canonical, new.members.is_empty()),
                 );
-                let first = !compared.contains_key(&pair);
                 let differs = *compared.entry(pair).or_insert_with(|| old != new);
                 if !differs {
                     continue;
                 }
-                if first {
-                    for t in [&old, &new] {
-                        if !t.members.is_empty() {
-                            found.insert((collection.clone(), t.canonical));
-                        }
+                for (t, was_before) in [(&old, true), (&new, false)] {
+                    if t.members.is_empty() {
+                        continue;
                     }
-                    queue.extend(old.members.iter().chain(&new.members));
+                    if queued.insert((collection.clone(), t.canonical, was_before)) {
+                        found.insert((collection.clone(), t.canonical));
+                        queue.extend(t.members.iter());
+                    }
                 }
                 // A reference to x reads x's canonical gid while its group is live, and a natural
                 // key naming x reads its canonical gid: nothing else about x reaches them.
