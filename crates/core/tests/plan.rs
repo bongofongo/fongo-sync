@@ -460,6 +460,87 @@ impl Tables<'_> {
         }
     }
 
+    /// Whether row `at`'s final write waits, through rows whose final writes are still pending, on
+    /// itself, judged from `table` as it stands: a row waits on a row its write would refer to
+    /// that is not there yet, on a row holding a unique value its write takes, and, to be
+    /// deleted, on a row still referring to it that will stop.
+    fn on_a_cycle(
+        &self,
+        table: &Table,
+        planned: &[Planned],
+        pending: &BTreeSet<(String, Gid)>,
+        at: &(String, Gid),
+    ) -> bool {
+        let finals: BTreeMap<(String, Gid), Option<Row>> = planned
+            .iter()
+            .map(|p| {
+                let row = match &p.action {
+                    RowAction::Insert(r) => Some(r.clone()),
+                    RowAction::Update(f) => {
+                        let mut r = p.image.clone().unwrap_or_default();
+                        r.extend(f.clone());
+                        Some(r)
+                    }
+                    RowAction::Delete => None,
+                    RowAction::Nothing => p.image.clone(),
+                };
+                ((p.collection.clone(), p.gid), row)
+            })
+            .collect();
+        let waits_on = |x: &(String, Gid)| -> Vec<(String, Gid)> {
+            let mut out = Vec::new();
+            let coll = self.schema.collection(&x.0).unwrap();
+            match &finals[x] {
+                Some(row) => {
+                    for f in &coll.fields {
+                        if let (
+                            FieldKind::Reference(t) | FieldKind::Owner(t),
+                            Some(Value::Ref(g)),
+                        ) = (&f.kind, row.get(&f.name))
+                        {
+                            let y = (t.clone(), *g);
+                            if !table.contains_key(&y) && pending.contains(&y) {
+                                out.push(y);
+                            }
+                        }
+                    }
+                    for set in uniques(coll) {
+                        if let Some(other) = self.clash(table, &x.0, x.1, row, &set) {
+                            let y = (x.0.clone(), other);
+                            if pending.contains(&y) {
+                                out.push(y);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for ((c, g), r) in table {
+                        let y = (c.clone(), *g);
+                        let refers = self.schema.collection(c).unwrap().fields.iter().any(|f| {
+                            matches!(&f.kind, FieldKind::Reference(t) | FieldKind::Owner(t) if *t == x.0)
+                                && r.get(&f.name) == Some(&Value::Ref(x.1))
+                        });
+                        if refers && y != *x && pending.contains(&y) {
+                            out.push(y);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let mut seen = BTreeSet::new();
+        let mut stack = waits_on(at);
+        while let Some(y) = stack.pop() {
+            if y == *at {
+                return true;
+            }
+            if seen.insert(y.clone()) {
+                stack.extend(waits_on(&y));
+            }
+        }
+        false
+    }
+
     /// Whether the actions can all be done one at a time, each whole, in some order: tries any
     /// action that keeps the constraints until none is left or none can go.
     fn greedy(&self, before: &Table, planned: &[Planned]) -> bool {
@@ -622,12 +703,25 @@ fn plan_law(
     }
     let plan = order(schema, columns, &planned);
     let mut table = before.clone();
+    let mut pending: BTreeSet<(String, Gid)> = planned
+        .iter()
+        .filter(|p| p.action != RowAction::Nothing)
+        .map(|p| (p.collection.clone(), p.gid))
+        .collect();
     for step in &plan.steps {
         let at = (step.collection.clone(), step.gid);
         prop_assert!(
             !plan.stuck.contains(&at),
             "a step for stuck {at:?}: {plan:#?}"
         );
+        if step.parked {
+            prop_assert!(
+                tables.on_a_cycle(&table, &planned, &pending, &at),
+                "{at:?} parked though on no cycle of what waits: {plan:#?}"
+            );
+        } else {
+            pending.remove(&at);
+        }
         if let Err(e) = tables.apply(&mut table, step) {
             prop_assert!(false, "{e}\nplan: {plan:#?}");
         }
@@ -1111,4 +1205,42 @@ proptest! {
             prop_assert!(false, "{e}");
         }
     }
+}
+
+#[test]
+fn a_row_a_parking_leaves_off_every_cycle_is_not_parked() {
+    // Four rows deleted together, each referring to the next: a to b, z to a, b to c, and c to
+    // both b and z. Parking a breaks the long cycle; z then waits on nothing that waits on it,
+    // and only b and c still form a cycle.
+    let schema = Schema::new(vec![
+        Collection::minted("n")
+            .reference("r1", "n")
+            .reference("r2", "n"),
+    ]);
+    let (a, z, b, c) = (gid(1), gid(2), gid(3), gid(4));
+    let deleted = |g: Gid, refs: &[(&str, Gid)]| Planned {
+        collection: "n".into(),
+        gid: g,
+        image: Some(
+            refs.iter()
+                .map(|(f, t)| (f.to_string(), Value::Ref(*t)))
+                .collect(),
+        ),
+        action: RowAction::Delete,
+    };
+    let planned = [
+        deleted(a, &[("r1", b)]),
+        deleted(z, &[("r1", a)]),
+        deleted(b, &[("r1", c)]),
+        deleted(c, &[("r1", b), ("r2", z)]),
+    ];
+    let plan = order(&schema, &Columns::new(), &planned);
+    let parked: Vec<Gid> = plan
+        .steps
+        .iter()
+        .filter(|s| s.parked)
+        .map(|s| s.gid)
+        .collect();
+    assert_eq!(parked, vec![a, b]);
+    assert!(plan.stuck.is_empty());
 }
