@@ -348,6 +348,10 @@ pub(crate) struct Overlay<'a, S> {
     schema: &'a Schema,
     base: &'a S,
     batch: Store,
+    /// The gids the batch touches, by collection, and the entries they keep after the merge,
+    /// indexed by (collection, field, value): the base is never asked about them by value.
+    touched: BTreeMap<String, BTreeSet<Gid>>,
+    after: BTreeMap<(String, String, Total), BTreeSet<Gid>>,
 }
 
 impl<'a, S: Source> Overlay<'a, S> {
@@ -356,11 +360,35 @@ impl<'a, S: Source> Overlay<'a, S> {
         for change in batch {
             store.merge(schema, change);
         }
-        Overlay {
+        let mut overlay = Overlay {
             schema,
             base,
             batch: store,
+            touched: BTreeMap::new(),
+            after: BTreeMap::new(),
+        };
+        for (gid, claims) in &overlay.batch.claims {
+            for collection in claims.keys() {
+                overlay
+                    .touched
+                    .entry(collection.clone())
+                    .or_default()
+                    .insert(*gid);
+            }
         }
+        let mut after = BTreeMap::new();
+        for (collection, gids) in &overlay.touched {
+            for &gid in gids {
+                for e in overlay.entries(collection, gid) {
+                    after
+                        .entry((collection.clone(), e.field, Total(e.value)))
+                        .or_insert_with(BTreeSet::new)
+                        .insert(gid);
+                }
+            }
+        }
+        overlay.after = after;
+        overlay
     }
 }
 
@@ -413,29 +441,34 @@ impl<S: Source> Source for Overlay<'_, S> {
     }
 
     fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
-        let mut found: BTreeSet<Gid> = self.base.holding(collection, fields).into_iter().collect();
-        // A gid that qualifies only once the batch is merged holds at least one of the pairs
-        // through an entry of the batch.
-        let mut candidates = BTreeSet::new();
-        if fields.is_empty() {
-            candidates.extend(self.batch.touched(collection));
-        }
-        for pair in fields {
-            candidates.extend(self.batch.holding(collection, std::slice::from_ref(pair)));
-        }
-        for gid in candidates {
-            if found.contains(&gid) {
-                continue;
-            }
-            let entries = self.entries(collection, gid);
-            let holds = fields.iter().all(|(field, value)| {
-                entries
+        let empty = BTreeSet::new();
+        let touched = self.touched.get(collection).unwrap_or(&empty);
+        let mut found: BTreeSet<Gid> = self
+            .base
+            .holding(collection, fields)
+            .into_iter()
+            .filter(|g| !touched.contains(g))
+            .collect();
+        let sets: Vec<&BTreeSet<Gid>> = fields
+            .iter()
+            .map(|(field, value)| {
+                let key = (
+                    collection.to_string(),
+                    field.to_string(),
+                    Total((*value).clone()),
+                );
+                self.after.get(&key).unwrap_or(&empty)
+            })
+            .collect();
+        crate::work::add(sets.iter().map(|s| s.len()).min().unwrap_or(touched.len()));
+        match sets.iter().min_by_key(|s| s.len()) {
+            None => found.extend(touched),
+            Some(fewest) => found.extend(
+                fewest
                     .iter()
-                    .any(|e| e.field == *field && same(&e.value, value))
-            });
-            if holds {
-                found.insert(gid);
-            }
+                    .filter(|g| sets.iter().all(|s| s.contains(g)))
+                    .copied(),
+            ),
         }
         found.into_iter().collect()
     }

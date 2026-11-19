@@ -117,6 +117,26 @@ pub enum Op {
         code: u8,
         label: u8,
     },
+    /// An item under the first site, linked to the first site or room: two replicas doing this
+    /// with the same text make items one identity merges.
+    TwinItem {
+        at: u8,
+        text: u8,
+        site: u8,
+    },
+    /// The application moves an item that stands for a merged entity to another site.
+    MoveMerged {
+        at: u8,
+        row: u8,
+        site: u8,
+    },
+    /// The application swaps two sites' identity codes through a temporary value, so that a
+    /// replica receiving the result must write a swap.
+    Swap {
+        at: u8,
+        first: u8,
+        second: u8,
+    },
 }
 
 /// A value the application might write: small domains, so that identity codes clash and natural
@@ -230,6 +250,94 @@ pub fn step(world: &World, rs: &mut [Replica], log: &mut Vec<(u8, Change)>, op: 
                 r.insert("rooms", room);
             }
         }
+        Op::TwinItem { at: a, text, site } => {
+            let r = &mut rs[at(*a)];
+            let sites = r.keys("sites");
+            if sites.is_empty() {
+                return;
+            }
+            let link_target = match &schema.collection("items").unwrap().fields[2].kind {
+                FieldKind::Reference(t) => t.clone(),
+                _ => unreachable!("items.link is a reference"),
+            };
+            // Link to the site with the same code as the text, or a room of it with that label,
+            // making them if missing: replicas share them once sites merge.
+            let word = Value::Text(["a", "b"][usize::from(text % 2)].into());
+            let find = |r: &Replica, c: &str, f: &str, also: &dyn Fn(&Row) -> bool| {
+                r.keys(c)
+                    .into_iter()
+                    .find(|k| r.tables[c][k].get(f) == Some(&word) && also(&r.tables[c][k]))
+            };
+            let coded = find(r, "sites", "code", &|_| true).or_else(|| {
+                r.insert(
+                    "sites",
+                    Row::from([("name".into(), word.clone()), ("code".into(), word.clone())]),
+                )
+            });
+            let link = match (link_target.as_str(), coded) {
+                ("sites", Some(s)) => Some(s),
+                (_, Some(s)) => find(r, "rooms", "label", &|row| {
+                    row.get("site") == Some(&Value::Int(s))
+                })
+                .or_else(|| {
+                    r.insert(
+                        "rooms",
+                        Row::from([
+                            ("site".into(), Value::Int(s)),
+                            ("label".into(), word.clone()),
+                        ]),
+                    )
+                }),
+                _ => None,
+            };
+            let link = link.map_or(Value::Null, Value::Int);
+            let item = Row::from([
+                ("text".to_string(), word.clone()),
+                (
+                    "site".to_string(),
+                    Value::Int(sites[usize::from(*site) % sites.len()]),
+                ),
+                ("link".to_string(), link),
+            ]);
+            r.insert("items", item);
+        }
+        Op::MoveMerged { at: a, row, site } => {
+            let r = &mut rs[at(*a)];
+            let (items, sites) = (r.merged("items"), r.keys("sites"));
+            if items.is_empty() || sites.is_empty() {
+                return;
+            }
+            let item = items[usize::from(*row) % items.len()];
+            let to = Value::Int(sites[usize::from(*site) % sites.len()]);
+            r.edit("items", item, "site", to);
+        }
+        Op::Swap {
+            at: a,
+            first,
+            second,
+        } => {
+            let r = &mut rs[at(*a)];
+            let coded: Vec<(Key, Value)> = r
+                .keys("sites")
+                .into_iter()
+                .filter_map(|k| {
+                    let code = r.tables["sites"][&k].get("code").cloned()?;
+                    (code != Value::Null).then_some((k, code))
+                })
+                .collect();
+            if coded.len() < 2 {
+                return;
+            }
+            let (x, cx) = coded[usize::from(*first) % coded.len()].clone();
+            let (y, cy) = coded[usize::from(*second) % coded.len()].clone();
+            if x == y {
+                return;
+            }
+            let spare = Value::Text(format!("~{}", r.id));
+            if r.edit("sites", x, "code", spare) && r.edit("sites", y, "code", cx) {
+                r.edit("sites", x, "code", cy);
+            }
+        }
         Op::Sync { at: a, from, picks } => {
             let candidates: Vec<&Change> = log
                 .iter()
@@ -292,6 +400,19 @@ fn writes_kept(schema: &Schema, rs: &[Replica], everything: &[Change]) -> Result
                 .map_or(Merge::Lww, |f| f.strategy);
             let key = matches!(&coll.identity, Identity::Natural(k) if k.contains(&w.field));
             let same = |v: &Value| v.total_cmp(&w.value) == std::cmp::Ordering::Equal;
+            let holds = |m: &Gid| {
+                merged.entities.get(m).is_some_and(|e| {
+                    e.registers
+                        .get(&w.field)
+                        .is_some_and(|(v, at)| *at > w.clock || (*at == w.clock && same(v)))
+                })
+            };
+            if let Some(m) = w.members.iter().find(|m| !holds(m)) {
+                return Err(format!(
+                    "replica {} moved {w:?}; member {m:?} of the group kept its old owner",
+                    r.id
+                ));
+            }
             let kept = groups[&entity.canonical].iter().any(|m| {
                 merged.entities[m]
                     .registers
@@ -352,6 +473,7 @@ pub struct Exercised {
     pub held_at_the_end: usize,
     pub natural_groups: usize,
     pub minted_groups: usize,
+    pub merged_moves: usize,
 }
 
 pub fn run(world: &World, replicas: usize, ops: &[Op]) -> Result<Exercised, String> {
@@ -368,7 +490,10 @@ pub fn run(world: &World, replicas: usize, ops: &[Op]) -> Result<Exercised, Stri
             | Op::Edit { at, .. }
             | Op::Delete { at, .. }
             | Op::Sync { at, .. }
-            | Op::Twin { at, .. } => usize::from(*at) % rs.len(),
+            | Op::Twin { at, .. }
+            | Op::TwinItem { at, .. }
+            | Op::MoveMerged { at, .. }
+            | Op::Swap { at, .. } => usize::from(*at) % rs.len(),
         };
         if rs[touched].is_clean() {
             rs[touched]
@@ -384,6 +509,11 @@ pub fn run(world: &World, replicas: usize, ops: &[Op]) -> Result<Exercised, Stri
     seen.refused = rs.iter().map(|r| r.refused).sum();
     seen.parked = rs.iter().map(|r| r.parked_steps).sum();
     seen.held_at_the_end = rs.iter().map(|r| r.held.len()).sum();
+    seen.merged_moves = rs
+        .iter()
+        .flat_map(|r| &r.expected)
+        .filter(|w| w.members.len() > 1)
+        .count();
     let everything: Vec<Change> = log.iter().map(|(_, c)| c.clone()).collect();
     let merged = merge(&world.schema, &everything);
     let mut sizes: BTreeMap<(String, Gid), usize> = BTreeMap::new();
@@ -417,7 +547,23 @@ fn arb_op() -> impl Strategy<Value = Op> {
             .prop_map(|(at, from, picks)| Op::Sync { at, from, picks }),
         2 => (any::<u8>(), any::<u8>(), any::<u8>())
             .prop_map(|(at, code, label)| Op::Twin { at, code, label }),
+        4 => (any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(at, text, site)| Op::TwinItem { at, text, site }),
+        2 => (any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(at, first, second)| Op::Swap { at, first, second }),
+        4 => (any::<u8>(), any::<u8>(), any::<u8>())
+            .prop_map(|(at, row, site)| Op::MoveMerged { at, row, site }),
     ]
+}
+
+/// Families from the whole range, half of them with identity keys on both sites and items, so
+/// that items on different replicas become one entity and are then moved.
+fn arb_sim_family() -> impl Strategy<Value = Family> {
+    (arb_family(), any::<bool>()).prop_map(|(family, merging)| Family {
+        identity: family.identity || merging,
+        item_identity: family.item_identity || merging,
+        ..family
+    })
 }
 
 fn cases() -> u32 {
@@ -432,7 +578,7 @@ proptest! {
 
     #[test]
     fn replicas_converge_to_the_model_and_keep_every_write(
-        family in arb_family(),
+        family in arb_sim_family(),
         replicas in 2usize..4,
         ops in proptest::collection::vec(arb_op(), 0..80),
     ) {
@@ -452,7 +598,7 @@ fn what_the_random_runs_cover() {
     use proptest::test_runner::TestRunner;
     let mut runner = TestRunner::default();
     let cases = (
-        arb_family(),
+        arb_sim_family(),
         2usize..4,
         proptest::collection::vec(arb_op(), 0..80),
     );
@@ -484,6 +630,11 @@ fn what_the_random_runs_cover() {
                 "minted groups",
                 seen.minted_groups,
                 &mut total.minted_groups,
+            ),
+            (
+                "moves of merged groups",
+                seen.merged_moves,
+                &mut total.merged_moves,
             ),
         ] {
             *sum += count;

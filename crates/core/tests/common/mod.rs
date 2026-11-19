@@ -474,12 +474,53 @@ pub fn random_schema(rng: &mut Rng) -> Schema {
     }
 }
 
-/// Gids to write to: four plain ones and the gids natural keys over small domains derive.
+/// Natural keys three deep over one minted collection, each choice random: `r`; `k1` keyed by an
+/// owner or a reference in `r` and a plain field; `k2` by an owner in `k1` and a plain field;
+/// `k3` by a plain field and an owner in `k2`, or by a reference in `k1`, an owner in `r` and a
+/// plain field in either order; and a minted `m` referring to `k3`.
+pub fn nested_schema(rng: &mut Rng) -> Schema {
+    let r = Collection::minted("r").plain("p0", Merge::Lww);
+    let k1 = Collection::natural("k1", &["up", "p0"]);
+    let k1 = if rng.one_in(2) {
+        k1.owner("up", "r")
+    } else {
+        k1.reference("up", "r")
+    }
+    .plain("p0", Merge::Lww)
+    .plain("p1", Merge::Lww);
+    let k2 = Collection::natural("k2", &["up", "p0"])
+        .owner("up", "k1")
+        .plain("p0", Merge::Lww)
+        .plain("p1", Merge::Max);
+    let k3 = if rng.one_in(2) {
+        Collection::natural("k3", &["p0", "up"])
+            .plain("p0", Merge::Lww)
+            .owner("up", "k2")
+    } else {
+        let key: &[&str] = if rng.one_in(2) {
+            &["a", "b", "p0"]
+        } else {
+            &["b", "a", "p0"]
+        };
+        Collection::natural("k3", key)
+            .reference("a", "k1")
+            .owner("b", "r")
+            .plain("p0", Merge::Lww)
+    };
+    let m = Collection::minted("m")
+        .reference("r0", "k3")
+        .plain("p0", Merge::Lww);
+    let schema = Schema::new(vec![r, k1, k2, k3, m]);
+    schema.check().expect("a valid schema");
+    schema
+}
+
 /// A natural entity the pool holds: its collection, gid and key.
 pub type Keyed = (String, Gid, Vec<Value>);
 
-pub fn random_pool(rng: &mut Rng, schema: &Schema) -> (Vec<Gid>, Vec<Keyed>) {
-    let mut pool: Vec<Gid> = (1..=4).map(gid).collect();
+/// Gids to write to: `roots` plain ones and the gids natural keys over small domains derive.
+pub fn random_pool(rng: &mut Rng, schema: &Schema, roots: u8) -> (Vec<Gid>, Vec<Keyed>) {
+    let mut pool: Vec<Gid> = (1..=roots).map(gid).collect();
     let mut keyed = Vec::new();
     for _ in 0..3 {
         for c in &schema.collections {
@@ -489,13 +530,28 @@ pub fn random_pool(rng: &mut Rng, schema: &Schema) -> (Vec<Gid>, Vec<Keyed>) {
             for _ in 0..3 {
                 let values: Vec<Value> = key
                     .iter()
-                    .map(
-                        |f| match &c.fields.iter().find(|d| &d.name == f).unwrap().kind {
+                    .map(|f| {
+                        let kind = &c.fields.iter().find(|d| &d.name == f).unwrap().kind;
+                        let kin: Vec<Gid> = match kind {
+                            FieldKind::Reference(t) | FieldKind::Owner(t) => {
+                                match &schema.collection(t).unwrap().identity {
+                                    Identity::Minted => (1..=roots).map(gid).collect(),
+                                    Identity::Natural(_) => keyed
+                                        .iter()
+                                        .filter(|(k, _, _): &&Keyed| k == t)
+                                        .map(|(_, g, _)| *g)
+                                        .collect(),
+                                }
+                            }
+                            FieldKind::Plain => keyed.iter().map(|(_, g, _)| *g).collect(),
+                        };
+                        match kind {
                             FieldKind::Plain if !rng.one_in(3) => Value::Int(rng.below(2) as i64),
                             _ if rng.one_in(12) => Value::Null,
+                            _ if !kin.is_empty() && !rng.one_in(4) => Value::Ref(*rng.pick(&kin)),
                             _ => Value::Ref(*rng.pick(&pool)),
-                        },
-                    )
+                        }
+                    })
                     .collect();
                 let g = Gid::derive(&c.name, &values);
                 if !pool.contains(&g) {
@@ -512,7 +568,12 @@ pub fn random_pool(rng: &mut Rng, schema: &Schema) -> (Vec<Gid>, Vec<Keyed>) {
 /// and hostile ones: tombstones that are not 0 or 1, aliases to themselves or to non-gids,
 /// undeclared fields and collections, unencodable clocks, repeats.
 pub fn random_changes(rng: &mut Rng, schema: &Schema, n: usize) -> Vec<Change> {
-    let (pool, keyed) = random_pool(rng, schema);
+    dense_changes(rng, schema, 4, n)
+}
+
+/// [`random_changes`] over a pool with `roots` plain gids: with few, keys collide often.
+pub fn dense_changes(rng: &mut Rng, schema: &Schema, roots: u8, n: usize) -> Vec<Change> {
+    let (pool, keyed) = random_pool(rng, schema, roots);
     let mut out: Vec<Change> = Vec::new();
     let value = |rng: &mut Rng| match rng.below(10) {
         0 => Value::Null,
@@ -581,9 +642,16 @@ pub fn random_changes(rng: &mut Rng, schema: &Schema, n: usize) -> Vec<Change> {
             };
             (DELETED.to_string(), v)
         } else if roll < 27 {
+            let kin: Vec<Gid> = keyed
+                .iter()
+                .filter(|(k, _, _)| *k == c.name)
+                .map(|(_, g, _)| *g)
+                .chain((1..=roots).map(gid))
+                .collect();
             let v = match rng.below(10) {
                 0 => Value::Int(1),
                 1 => Value::Ref(g),
+                2..=5 => Value::Ref(*rng.pick(&kin)),
                 _ => Value::Ref(*rng.pick(&pool)),
             };
             (ALIAS.to_string(), v)
@@ -622,4 +690,47 @@ pub fn arb_random_case(len: usize) -> impl Strategy<Value = (Schema, Vec<Change>
         let changes = random_changes(&mut rng, &schema, n);
         (schema, changes)
     })
+}
+
+/// A source that counts what is asked of it: one for each question and one for each item an
+/// answer holds.
+pub struct Counting<'a> {
+    pub inner: &'a fongo_sync_core::source::Store,
+    pub work: std::cell::Cell<usize>,
+}
+
+impl<'a> Counting<'a> {
+    pub fn new(inner: &'a fongo_sync_core::source::Store) -> Counting<'a> {
+        Counting {
+            inner,
+            work: std::cell::Cell::new(0),
+        }
+    }
+
+    fn count<T>(&self, answer: Vec<T>) -> Vec<T> {
+        self.work.set(self.work.get() + 1 + answer.len());
+        answer
+    }
+}
+
+impl fongo_sync_core::source::Source for Counting<'_> {
+    fn claims(&self, gid: Gid) -> Vec<fongo_sync_core::source::Claim> {
+        self.count(self.inner.claims(gid))
+    }
+
+    fn entries(&self, collection: &str, gid: Gid) -> Vec<fongo_sync_core::source::Entry> {
+        self.count(self.inner.entries(collection, gid))
+    }
+
+    fn aliases(&self, gid: Gid) -> Vec<fongo_sync_core::source::Alias> {
+        self.count(self.inner.aliases(gid))
+    }
+
+    fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
+        self.count(self.inner.holding(collection, fields))
+    }
+
+    fn gids(&self) -> Vec<Gid> {
+        self.count(self.inner.gids())
+    }
 }

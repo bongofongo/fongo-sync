@@ -33,8 +33,9 @@
 //!   entity is shown again.
 //! - Alias the groups [`clashes`] reports before writing rows.
 //! - Write in the order [`order`] gives, with [`Columns`] from its table definitions. Hold the
-//!   rows [`Plan::stuck`] names and every entity whose write the database refuses, under the gid
-//!   the row stands for, leave row and image as they were, and retry them on every later apply.
+//!   rows [`Plan::stuck`] names (they get no step) and every entity whose write the database
+//!   refuses, under the gid the row stands for; leave row and image as they were, and retry them
+//!   on every later apply.
 //! - Observe the clock of a change from elsewhere only if [`crate::source::admit`] accepts it.
 //!
 //! [`Evaluator::affected`]: crate::eval::Evaluator::affected
@@ -386,9 +387,11 @@ impl Columns {
     }
 }
 
-/// The writes [`order`] puts in order, and the rows it cannot write, ascending: those on a cycle
-/// no permitted parking breaks, and those that wait on them. An adapter holds the stuck rows, leaves
-/// them as they are, and tries again later.
+/// The writes [`order`] puts in order, and the rows it cannot write, ascending: the rows of each
+/// set waiting on each other that no parkings within `Columns` let be written whole, and those
+/// that wait on them. A stuck row gets no step at all, not
+/// even a parking, so an adapter holds it, leaves its row and image as they are, and tries again
+/// later.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -398,8 +401,8 @@ pub struct Plan {
 /// What a requirement waits for, and so which fields parking its source sets to NULL.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Need {
-    /// The source row, being inserted, exists. Parking inserts it with every field that makes it
-    /// wait set to NULL.
+    /// The source row, being inserted, exists. Parking inserts it with every field that still
+    /// waits set to NULL.
     Exists,
     /// The source row stops referring, through this field, to a row being deleted.
     Unrefer(String),
@@ -416,30 +419,228 @@ enum Need {
 ///
 /// A row is written after the rows it will refer to are inserted, after any row now holding the
 /// unique values it takes has let go of them, and it is deleted after the rows that refer to it
-/// stop doing so. Where these requirements form a cycle (two rows swapping a unique value, rows
-/// inserted referring to each other, a deleted owner and a deleted owned row that refers back),
-/// one row on the cycle is parked: only the fields that keep the cycle from proceeding are set to
-/// NULL, choosing, for a unique set, a field the row's own write changes where one accepts NULL.
-/// The smallest (collection, gid) that can be parked is. A row on no cycle is never parked; a
-/// cycle no row of which can be parked within `columns` is reported as stuck.
+/// stop doing so. Rows that wait on each other, directly or through others, form a set that is
+/// written together once every row it waits on outside it is written. Within a set, when
+/// nothing can proceed, one row on a cycle of what remains is parked: only the fields that keep
+/// the cycle from proceeding are set to NULL, choosing, for a unique set, a field the row's own
+/// write changes where one accepts NULL. A row being inserted is parked by inserting it early,
+/// with NULL in every field that still waits on a row not yet written. The smallest
+/// (collection, gid) that can be parked is.
 ///
-/// Cost: O((n + e) log n) for n rows and e requirements (at most the number of reference and
-/// unique fields across the rows), plus O(n + e) for each cycle broken.
+/// Where that search finds nothing to park before the set is written, or takes more than
+/// 8 · (r + e) + 4,096 steps for a set of r rows with e requirements among them, the set is
+/// planned again from its start, parking at each stall every row of it that can be parked;
+/// only then may a row be parked that earlier parkings have already taken off every cycle.
+///
+/// A set is stuck, all of it, when it waits on a stuck row or when no parkings of its own rows
+/// let every one of them be written. A stuck row gets no step, not even a parking.
+///
+/// Cost: O((n + e) log n) for n rows and e requirements: the references in their writes and
+/// images, and the pairs of rows one of which takes unique values the other holds, at most one
+/// such pair per row and unique set where the images keep the constraints.
 pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
+    let rows = Rows::new(schema, columns, planned);
     let n = planned.len();
-    let ids: Vec<(String, Gid)> = planned
+    let mut spent = 0;
+    let sets = strongly_connected(&(0..n).collect::<Vec<_>>(), &rows.out, &mut spent);
+    let mut set_of = vec![0; n];
+    for (c, set) in sets.iter().enumerate() {
+        for &r in set {
+            set_of[r] = c;
+        }
+    }
+    let mut waiting = vec![0usize; sets.len()];
+    for v in 0..n {
+        for (u, _) in &rows.into[v] {
+            if set_of[*u] != set_of[v] {
+                waiting[set_of[v]] += 1;
+            }
+        }
+    }
+    let first: Vec<&(String, Gid)> = sets
         .iter()
-        .map(|p| (p.collection.clone(), p.gid))
+        .map(|set| {
+            set.iter()
+                .map(|&r| &rows.ids[r])
+                .min()
+                .expect("a set has a row")
+        })
         .collect();
-    let at: BTreeMap<(String, Gid), usize> = ids
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, k)| (k, i))
+    let mut ready: BTreeSet<(&(String, Gid), usize)> = (0..sets.len())
+        .filter(|&c| waiting[c] == 0)
+        .map(|c| (first[c], c))
         .collect();
-    let refs = |coll: &str| -> Vec<(String, String)> {
-        schema
-            .collection(coll)
+    let mut stuck = vec![false; n];
+    let mut steps = Vec::new();
+    while let Some((_, c)) = ready.pop_first() {
+        let set = &sets[c];
+        spent += set.len();
+        let blocked = set.iter().any(|&v| {
+            spent += rows.into[v].len();
+            rows.into[v].iter().any(|(u, _)| stuck[*u])
+        });
+        let written = if blocked {
+            None
+        } else if let [r] = set[..] {
+            Some(rows.finish(r, None).into_iter().collect())
+        } else {
+            rows.solve(set)
+        };
+        match written {
+            Some(written) => steps.extend(written),
+            None => {
+                for &v in set {
+                    stuck[v] = true;
+                }
+            }
+        }
+        for &v in set {
+            spent += rows.out[v].len();
+            for (w, _) in &rows.out[v] {
+                let d = set_of[*w];
+                if d != c {
+                    waiting[d] -= 1;
+                    if waiting[d] == 0 {
+                        ready.insert((first[d], d));
+                    }
+                }
+            }
+        }
+    }
+    crate::work::add(spent);
+    let mut stuck: Vec<(String, Gid)> = (0..n)
+        .filter(|&i| stuck[i])
+        .map(|i| rows.ids[i].clone())
+        .collect();
+    stuck.sort();
+    Plan { steps, stuck }
+}
+
+/// The rows of one set, by their place in it and in `planned`.
+struct Local {
+    members: Vec<usize>,
+    pos: BTreeMap<usize, usize>,
+}
+
+/// The rows to be ordered, what each will be, and what each waits on.
+struct Rows<'a> {
+    schema: &'a Schema,
+    columns: &'a Columns,
+    planned: &'a [Planned],
+    ids: Vec<(String, Gid)>,
+    at: BTreeMap<(String, Gid), usize>,
+    finals: Vec<Option<Row>>,
+    /// Requirements by source and by target: the source must act before the target can.
+    out: Vec<BTreeSet<(usize, Need)>>,
+    into: Vec<BTreeSet<(usize, Need)>>,
+}
+
+impl<'a> Rows<'a> {
+    fn new(schema: &'a Schema, columns: &'a Columns, planned: &'a [Planned]) -> Rows<'a> {
+        let n = planned.len();
+        let ids: Vec<(String, Gid)> = planned
+            .iter()
+            .map(|p| (p.collection.clone(), p.gid))
+            .collect();
+        let at: BTreeMap<(String, Gid), usize> = ids
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, k)| (k, i))
+            .collect();
+        let finals: Vec<Option<Row>> = planned
+            .iter()
+            .map(|p| match &p.action {
+                RowAction::Insert(row) => Some(row.clone()),
+                RowAction::Update(fields) => {
+                    let mut row = p.image.clone().unwrap_or_default();
+                    row.extend(fields.iter().map(|(f, v)| (f.clone(), v.clone())));
+                    Some(row)
+                }
+                RowAction::Delete => None,
+                RowAction::Nothing => p.image.clone(),
+            })
+            .collect();
+        let mut rows = Rows {
+            schema,
+            columns,
+            planned,
+            ids,
+            at,
+            finals,
+            out: vec![BTreeSet::new(); n],
+            into: vec![BTreeSet::new(); n],
+        };
+        let mut holders: BTreeMap<(String, usize, Vec<Total>), Vec<usize>> = BTreeMap::new();
+        for (i, p) in planned.iter().enumerate() {
+            if let Some(image) = &p.image {
+                for (u, set) in rows.uniques(&p.collection).iter().enumerate() {
+                    if let Some(t) = tuple(image, set) {
+                        holders
+                            .entry((p.collection.clone(), u, t))
+                            .or_default()
+                            .push(i);
+                    }
+                }
+            }
+        }
+        let mut edges: BTreeSet<(usize, usize, Need)> = BTreeSet::new();
+        for (v, p) in planned.iter().enumerate() {
+            let written: Option<&Row> = match &p.action {
+                RowAction::Insert(row) | RowAction::Update(row) => Some(row),
+                _ => None,
+            };
+            for (field, target) in rows.refs(&p.collection) {
+                if let Some(Value::Ref(g)) = written.and_then(|w| w.get(&field))
+                    && let Some(&u) = rows.at.get(&(target.clone(), *g))
+                    && matches!(planned[u].action, RowAction::Insert(_))
+                    && u != v
+                {
+                    edges.insert((u, v, Need::Exists));
+                }
+                if let Some(Value::Ref(g)) = p.image.as_ref().and_then(|i| i.get(&field))
+                    && let Some(&u) = rows.at.get(&(target.clone(), *g))
+                    && planned[u].action == RowAction::Delete
+                    && u != v
+                {
+                    let lets_go = rows.finals[v].as_ref().is_none_or(|f| {
+                        f.get(&field).is_none_or(|now| !same(now, &Value::Ref(*g)))
+                    });
+                    if lets_go {
+                        edges.insert((v, u, Need::Unrefer(field.clone())));
+                    }
+                }
+            }
+            let (Some(finished), Some(_)) = (&rows.finals[v], written) else {
+                continue;
+            };
+            for (u, set) in rows.uniques(&p.collection).iter().enumerate() {
+                let Some(t) = tuple(finished, set) else {
+                    continue;
+                };
+                for &h in holders
+                    .get(&(p.collection.clone(), u, t))
+                    .into_iter()
+                    .flatten()
+                {
+                    let was = planned[h].image.as_ref().and_then(|i| tuple(i, set));
+                    let now = rows.finals[h].as_ref().and_then(|r| tuple(r, set));
+                    if h != v && was != now {
+                        edges.insert((h, v, Need::Release(u)));
+                    }
+                }
+            }
+        }
+        for (from, to, need) in edges {
+            rows.out[from].insert((to, need.clone()));
+            rows.into[to].insert((from, need));
+        }
+        rows
+    }
+
+    fn refs(&self, collection: &str) -> Vec<(String, String)> {
+        self.schema
+            .collection(collection)
             .map(|c| {
                 c.fields
                     .iter()
@@ -452,10 +653,11 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
                     .collect()
             })
             .unwrap_or_default()
-    };
-    let uniques = |coll: &str| -> Vec<Vec<String>> {
-        schema
-            .collection(coll)
+    }
+
+    fn uniques(&self, collection: &str) -> Vec<Vec<String>> {
+        self.schema
+            .collection(collection)
             .map(|c| {
                 let mut sets = c.identity_keys.clone();
                 if let Identity::Natural(key) = &c.identity {
@@ -464,100 +666,21 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
                 sets
             })
             .unwrap_or_default()
-    };
-    let after = |p: &Planned| -> Option<Row> {
-        match &p.action {
-            RowAction::Insert(row) => Some(row.clone()),
-            RowAction::Update(fields) => {
-                let mut row = p.image.clone().unwrap_or_default();
-                row.extend(fields.iter().map(|(f, v)| (f.clone(), v.clone())));
-                Some(row)
-            }
-            RowAction::Delete => None,
-            RowAction::Nothing => p.image.clone(),
-        }
-    };
-    let tuple = |row: &Row, set: &[String]| -> Option<Vec<Total>> {
-        let values: Vec<Value> = set
-            .iter()
-            .map(|f| row.get(f).cloned().unwrap_or(Value::Null))
-            .collect();
-        (!values.contains(&Value::Null)).then(|| values.into_iter().map(Total).collect())
-    };
-    let finals: Vec<Option<Row>> = planned.iter().map(after).collect();
-
-    let mut holders: BTreeMap<(String, usize, Vec<Total>), Vec<usize>> = BTreeMap::new();
-    for (i, p) in planned.iter().enumerate() {
-        if let Some(image) = &p.image {
-            for (u, set) in uniques(&p.collection).iter().enumerate() {
-                if let Some(t) = tuple(image, set) {
-                    holders
-                        .entry((p.collection.clone(), u, t))
-                        .or_default()
-                        .push(i);
-                }
-            }
-        }
     }
 
-    // Requirements: (source, target, what the source must do first).
-    let mut edges: BTreeSet<(usize, usize, Need)> = BTreeSet::new();
-    for (v, p) in planned.iter().enumerate() {
-        let written: Option<&Row> = match &p.action {
-            RowAction::Insert(row) | RowAction::Update(row) => Some(row),
-            _ => None,
-        };
-        for (field, target) in refs(&p.collection) {
-            if let Some(Value::Ref(g)) = written.and_then(|w| w.get(&field))
-                && let Some(&u) = at.get(&(target.clone(), *g))
-                && matches!(planned[u].action, RowAction::Insert(_))
-                && u != v
-            {
-                edges.insert((u, v, Need::Exists));
-            }
-            if let Some(Value::Ref(g)) = p.image.as_ref().and_then(|i| i.get(&field))
-                && let Some(&u) = at.get(&(target.clone(), *g))
-                && planned[u].action == RowAction::Delete
-                && u != v
-            {
-                let lets_go = finals[v]
-                    .as_ref()
-                    .is_none_or(|f| f.get(&field).is_none_or(|now| !same(now, &Value::Ref(*g))));
-                if lets_go {
-                    edges.insert((v, u, Need::Unrefer(field.clone())));
-                }
-            }
-        }
-        let (Some(finished), Some(_)) = (&finals[v], written) else {
-            continue;
-        };
-        for (u, set) in uniques(&p.collection).iter().enumerate() {
-            let Some(t) = tuple(finished, set) else {
-                continue;
-            };
-            for &h in holders
-                .get(&(p.collection.clone(), u, t))
-                .into_iter()
-                .flatten()
-            {
-                let was = planned[h].image.as_ref().and_then(|i| tuple(i, set));
-                let now = finals[h].as_ref().and_then(|r| tuple(r, set));
-                if h != v && was != now {
-                    edges.insert((h, v, Need::Release(u)));
-                }
-            }
-        }
+    fn inserts(&self, r: usize) -> bool {
+        matches!(self.planned[r].action, RowAction::Insert(_))
     }
 
-    // Which field of unique set `u` parking row `r` sets to NULL: one its write changes if any
-    // accepts NULL, else any that does.
-    let release_field = |r: usize, u: usize| -> Option<String> {
-        let p = &planned[r];
-        let set = &uniques(&p.collection)[u];
-        let open = |f: &&String| columns.accepts_null(&p.collection, f);
+    /// Which field of unique set `u` parking row `r` sets to NULL: one its write changes if any
+    /// accepts NULL, else any that does.
+    fn release_field(&self, r: usize, u: usize) -> Option<String> {
+        let p = &self.planned[r];
+        let set = &self.uniques(&p.collection)[u];
+        let open = |f: &&String| self.columns.accepts_null(&p.collection, f);
         let changes = |f: &&String| {
             let was = p.image.as_ref().and_then(|i| i.get(*f));
-            let now = finals[r].as_ref().and_then(|row| row.get(*f));
+            let now = self.finals[r].as_ref().and_then(|row| row.get(*f));
             match (was, now) {
                 (Some(a), Some(b)) => !same(a, b),
                 _ => true,
@@ -568,194 +691,404 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
             .find(changes)
             .or_else(|| set.iter().find(open))
             .cloned()
-    };
+    }
 
-    let mut out: Vec<BTreeSet<(usize, Need)>> = vec![BTreeSet::new(); n];
-    let mut into: Vec<BTreeSet<(usize, Need)>> = vec![BTreeSet::new(); n];
-    for (from, to, need) in edges {
-        out[from].insert((to, need.clone()));
-        into[to].insert((from, need));
+    /// The fields of inserted row `r` that refer to row `u`.
+    fn referring(&self, r: usize, u: usize) -> Vec<String> {
+        let (target, g) = &self.ids[u];
+        self.refs(&self.planned[r].collection)
+            .into_iter()
+            .filter(|(field, t)| {
+                t == target
+                    && matches!(
+                        self.finals[r].as_ref().and_then(|row| row.get(field)),
+                        Some(Value::Ref(x)) if x == g
+                    )
+            })
+            .map(|(field, _)| field)
+            .collect()
     }
-    let mut done = vec![false; n];
-    let mut stuck = vec![false; n];
-    let mut parked: Vec<Option<Row>> = vec![None; n];
-    let mut ready: BTreeSet<((String, Gid), usize)> = (0..n)
-        .filter(|&i| into[i].is_empty())
-        .map(|i| (ids[i].clone(), i))
-        .collect();
-    let mut steps = Vec::new();
-    let drop_edge = |from: usize,
-                     to: usize,
-                     need: &Need,
-                     out: &mut Vec<BTreeSet<(usize, Need)>>,
-                     into: &mut Vec<BTreeSet<(usize, Need)>>,
-                     ready: &mut BTreeSet<((String, Gid), usize)>,
-                     done: &[bool],
-                     stuck: &[bool]| {
-        out[from].remove(&(to, need.clone()));
-        into[to].remove(&(from, need.clone()));
-        if into[to].is_empty() && !done[to] && !stuck[to] {
-            ready.insert((ids[to].clone(), to));
-        }
-    };
-    loop {
-        while let Some((_, i)) = ready.pop_first() {
-            done[i] = true;
-            let p = &planned[i];
-            let action = match (&parked[i], &p.action) {
-                (_, RowAction::Delete) => RowAction::Delete,
-                (Some(image), _) => write(finals[i].as_ref(), Some(image)),
-                (None, action) => action.clone(),
-            };
-            if action != RowAction::Nothing {
-                steps.push(Step {
-                    collection: p.collection.clone(),
-                    gid: p.gid,
-                    action,
-                    parked: false,
-                });
-            }
-            for (to, need) in out[i].clone() {
-                drop_edge(i, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
-            }
-        }
-        let left: Vec<usize> = (0..n).filter(|&i| !done[i] && !stuck[i]).collect();
-        if left.is_empty() {
-            break;
-        }
-        let components = cycles(&left, &out);
-        if components.is_empty() {
-            // What is left waits on stuck rows.
-            for i in left {
-                stuck[i] = true;
-            }
-            break;
-        }
-        let on_cycle: BTreeMap<usize, usize> = components
-            .iter()
-            .enumerate()
-            .flat_map(|(c, members)| members.iter().map(move |&m| (m, c)))
-            .collect();
-        let mut candidates: Vec<usize> = on_cycle
-            .keys()
-            .copied()
-            .filter(|&r| parked[r].is_none())
-            .collect();
-        candidates.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
-        let mut broke = false;
-        for r in candidates {
-            let p = &planned[r];
-            let same_cycle = |m: usize| on_cycle.get(&m) == Some(&on_cycle[&r]);
-            // Fields to set NULL, and the requirements that parking satisfies.
-            let mut nulls: BTreeSet<String> = BTreeSet::new();
-            let mut satisfied: Vec<(usize, Need)> = Vec::new();
-            let mut possible = true;
-            if let RowAction::Insert(_) = p.action {
-                // Inserted early, the row must wait for nothing: every field that makes it wait
-                // goes in NULL, and it then exists for every row waiting on that.
-                for (field, target) in refs(&p.collection) {
-                    let waits = matches!(
-                        finals[r].as_ref().and_then(|row| row.get(&field)),
-                        Some(Value::Ref(g)) if at.get(&(target.clone(), *g)).is_some_and(|u| {
-                            into[r].contains(&(*u, Need::Exists))
-                        })
-                    );
-                    if waits {
-                        if columns.accepts_null(&p.collection, &field) {
-                            nulls.insert(field);
-                        } else {
-                            possible = false;
-                        }
-                    }
-                }
-                for (_, need) in &into[r] {
-                    if let Need::Release(u) = need {
-                        match release_field(r, *u) {
-                            Some(f) => {
-                                nulls.insert(f);
-                            }
-                            None => possible = false,
-                        }
-                    }
-                }
-                satisfied.extend(
-                    out[r]
-                        .iter()
-                        .filter(|(_, need)| *need == Need::Exists)
-                        .cloned(),
-                );
-            } else {
-                for (to, need) in &out[r] {
-                    if !same_cycle(*to) {
-                        continue;
-                    }
-                    let field = match need {
-                        Need::Unrefer(f) => Some(f.clone()),
-                        Need::Release(u) => release_field(r, *u),
-                        Need::Exists => None,
-                    };
-                    if let Some(f) = field.filter(|f| columns.accepts_null(&p.collection, f)) {
-                        nulls.insert(f);
-                        satisfied.push((*to, need.clone()));
-                    }
-                }
-            }
-            if !possible || satisfied.is_empty() {
-                continue;
-            }
-            let (action, image) = match (&p.action, &p.image) {
-                (RowAction::Insert(row), _) => {
-                    let mut first = row.clone();
-                    for f in &nulls {
-                        first.insert(f.clone(), Value::Null);
-                    }
-                    (RowAction::Insert(first.clone()), first)
-                }
-                (_, Some(image)) => {
-                    let set: Row = nulls
-                        .iter()
-                        .filter(|f| image.get(*f).is_some_and(|v| *v != Value::Null))
-                        .map(|f| (f.clone(), Value::Null))
-                        .collect();
-                    let mut now = image.clone();
-                    now.extend(set.clone());
-                    (RowAction::Update(set), now)
-                }
-                (_, None) => continue,
-            };
-            steps.push(Step {
-                collection: p.collection.clone(),
-                gid: p.gid,
-                action,
-                parked: true,
-            });
-            parked[r] = Some(image);
-            for (to, need) in satisfied {
-                drop_edge(r, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
-            }
-            broke = true;
-            break;
-        }
-        if !broke {
-            let first = components
+
+    /// Whether inserted row `r`, waiting on `u` for `need`, cannot be inserted early because of it.
+    fn hard(&self, r: usize, u: usize, need: &Need) -> bool {
+        match need {
+            Need::Exists => self
+                .referring(r, u)
                 .iter()
-                .min_by_key(|members| members.iter().map(|&m| ids[m].clone()).min())
-                .expect("a cycle");
-            for &m in first {
-                stuck[m] = true;
-            }
+                .any(|f| !self.columns.accepts_null(&self.planned[r].collection, f)),
+            Need::Release(set) => self.release_field(r, *set).is_none(),
+            Need::Unrefer(_) => false,
         }
     }
-    let mut stuck: Vec<(String, Gid)> = (0..n)
-        .filter(|&i| stuck[i])
-        .map(|i| ids[i].clone())
+
+    /// Row `r`'s final write, after a parking that left it as `parked` if there was one.
+    fn finish(&self, r: usize, parked: Option<&Row>) -> Option<Step> {
+        let p = &self.planned[r];
+        let action = match (parked, &p.action) {
+            (_, RowAction::Delete) => RowAction::Delete,
+            (Some(image), _) => write(self.finals[r].as_ref(), Some(image)),
+            (None, action) => action.clone(),
+        };
+        (action != RowAction::Nothing).then(|| Step {
+            collection: p.collection.clone(),
+            gid: p.gid,
+            action,
+            parked: false,
+        })
+    }
+
+    /// Parking row `r` of a set: the step, the row it leaves, and the requirements it meets,
+    /// given what `r` still waits on (`into`) and what waits on it (`out`, of which only those
+    /// to rows `meets` accepts count), by place in the set. `None` if `r` cannot be parked or
+    /// parking it meets nothing.
+    #[allow(clippy::type_complexity)]
+    fn parking(
+        &self,
+        r: usize,
+        out: &BTreeSet<(usize, Need)>,
+        into: &BTreeSet<(usize, Need)>,
+        local: &Local,
+        meets: impl Fn(usize) -> bool,
+    ) -> Option<(Step, Row, Vec<(usize, Need)>)> {
+        let p = &self.planned[r];
+        let mut nulls: BTreeSet<String> = BTreeSet::new();
+        let mut satisfied: Vec<(usize, Need)> = Vec::new();
+        if self.inserts(r) {
+            // Inserted early, the row must wait for nothing: every field that makes it wait goes
+            // in NULL, and it then exists for every row waiting on that.
+            for (u, need) in into {
+                match need {
+                    Need::Exists => {
+                        for f in self.referring(r, local.members[*u]) {
+                            if !self.columns.accepts_null(&p.collection, &f) {
+                                return None;
+                            }
+                            nulls.insert(f);
+                        }
+                    }
+                    Need::Release(set) => {
+                        nulls.insert(self.release_field(r, *set)?);
+                    }
+                    Need::Unrefer(_) => {}
+                }
+            }
+            satisfied.extend(
+                out.iter()
+                    .filter(|(_, need)| *need == Need::Exists)
+                    .cloned(),
+            );
+        } else {
+            for (to, need) in out {
+                if !meets(*to) {
+                    continue;
+                }
+                let field = match need {
+                    Need::Unrefer(f) => Some(f.clone()),
+                    Need::Release(u) => self.release_field(r, *u),
+                    Need::Exists => None,
+                };
+                if let Some(f) = field.filter(|f| self.columns.accepts_null(&p.collection, f)) {
+                    nulls.insert(f);
+                    satisfied.push((*to, need.clone()));
+                }
+            }
+        }
+        if satisfied.is_empty() {
+            return None;
+        }
+        let (action, image) = match (&p.action, &p.image) {
+            (RowAction::Insert(row), _) => {
+                let mut first = row.clone();
+                for f in &nulls {
+                    first.insert(f.clone(), Value::Null);
+                }
+                (RowAction::Insert(first.clone()), first)
+            }
+            (_, Some(image)) => {
+                let set: Row = nulls
+                    .iter()
+                    .filter(|f| image.get(*f).is_some_and(|v| *v != Value::Null))
+                    .map(|f| (f.clone(), Value::Null))
+                    .collect();
+                let mut now = image.clone();
+                now.extend(set.clone());
+                (RowAction::Update(set), now)
+            }
+            (_, None) => return None,
+        };
+        let step = Step {
+            collection: p.collection.clone(),
+            gid: p.gid,
+            action,
+            parked: true,
+        };
+        Some((step, image, satisfied))
+    }
+
+    /// The steps that write every row of `set`, a strongly connected set whose requirements on
+    /// rows outside it are all met, or `None` if no parkings of its rows let all be written.
+    fn solve(&self, set: &[usize]) -> Option<Vec<Step>> {
+        let m = set.len();
+        let local = Local {
+            members: set.to_vec(),
+            pos: set.iter().enumerate().map(|(i, &r)| (r, i)).collect(),
+        };
+        let mut out = vec![BTreeSet::new(); m];
+        let mut into = vec![BTreeSet::new(); m];
+        let mut edges = 0;
+        for (i, &r) in set.iter().enumerate() {
+            for (w, need) in &self.out[r] {
+                if let Some(&j) = local.pos.get(w) {
+                    out[i].insert((j, need.clone()));
+                    into[j].insert((i, need.clone()));
+                    edges += 1;
+                }
+            }
+        }
+        crate::work::add(m + edges);
+        let budget = 8 * (m + edges) + 4096;
+        self.fewest(&local, out.clone(), into.clone(), budget)
+            .or_else(|| self.every(&local, out, into))
+    }
+
+    /// Writes a set parking one row at a time, the smallest that can be parked on a cycle of what
+    /// remains. `None` if no such row is left before the set is written, or after `budget` steps.
+    fn fewest(
+        &self,
+        local: &Local,
+        mut out: Vec<BTreeSet<(usize, Need)>>,
+        mut into: Vec<BTreeSet<(usize, Need)>>,
+        budget: usize,
+    ) -> Option<Vec<Step>> {
+        let m = local.members.len();
+        let id = |i: usize| &self.ids[local.members[i]];
+        let mut spent = 0usize;
+        let mut done = vec![false; m];
+        let mut parked: Vec<Option<Row>> = vec![None; m];
+        let mut ready: BTreeSet<(&(String, Gid), usize)> = (0..m)
+            .filter(|&i| into[i].is_empty())
+            .map(|i| (id(i), i))
+            .collect();
+        let mut steps = Vec::new();
+        let mut finished = 0usize;
+        // The cycles among what is left, found at the first stall and afterwards refreshed only
+        // for the component a parking changed; the rows on them that may still be parked.
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        let mut component_of: Vec<Option<usize>> = vec![None; m];
+        let mut changed: BTreeSet<usize> = BTreeSet::new();
+        let mut found_cycles = false;
+        let mut live = 0usize;
+        let mut candidates: BTreeSet<(&(String, Gid), usize)> = BTreeSet::new();
+        // Rows tried and found unparkable. Only a refreshed component or a requirement on the row
+        // being met can change that, and either puts the row back among the candidates.
+        let mut failed: BTreeSet<usize> = BTreeSet::new();
+        let outcome = loop {
+            while let Some((_, i)) = ready.pop_first() {
+                spent += 1 + out[i].len();
+                done[i] = true;
+                finished += 1;
+                candidates.remove(&(id(i), i));
+                steps.extend(self.finish(local.members[i], parked[i].as_ref()));
+                for (to, need) in std::mem::take(&mut out[i]) {
+                    into[to].remove(&(i, need));
+                    if into[to].is_empty() && !done[to] {
+                        ready.insert((id(to), to));
+                    }
+                    if failed.remove(&to) && component_of[to].is_some() {
+                        candidates.insert((id(to), to));
+                    }
+                }
+            }
+            if finished == m {
+                break Some(steps);
+            }
+            if spent > budget {
+                break None;
+            }
+            let mut found: Vec<Vec<usize>> = Vec::new();
+            if !found_cycles {
+                found_cycles = true;
+                let left: Vec<usize> = (0..m).filter(|&i| !done[i]).collect();
+                found.extend(cycles(&left, &out, &mut spent));
+            }
+            for c in std::mem::take(&mut changed) {
+                let members = std::mem::take(&mut components[c]);
+                live -= 1;
+                for &x in &members {
+                    component_of[x] = None;
+                    candidates.remove(&(id(x), x));
+                }
+                let left: Vec<usize> = members.into_iter().filter(|&i| !done[i]).collect();
+                found.extend(cycles(&left, &out, &mut spent));
+            }
+            for members in found {
+                let c = components.len();
+                for &x in &members {
+                    component_of[x] = Some(c);
+                    if parked[x].is_none() {
+                        candidates.insert((id(x), x));
+                    }
+                }
+                components.push(members);
+                live += 1;
+            }
+            if live == 0 {
+                break None;
+            }
+            let mut broke = false;
+            while let Some(&(_, r)) = candidates.first() {
+                spent += 1 + out[r].len() + into[r].len();
+                let mine = component_of[r];
+                let parking = self.parking(local.members[r], &out[r], &into[r], local, |x| {
+                    component_of[x] == mine
+                });
+                candidates.remove(&(id(r), r));
+                let Some((step, image, satisfied)) = parking else {
+                    failed.insert(r);
+                    continue;
+                };
+                steps.push(step);
+                parked[r] = Some(image);
+                changed.insert(mine.expect("a candidate is on a cycle"));
+                for (to, need) in satisfied {
+                    out[r].remove(&(to, need.clone()));
+                    into[to].remove(&(r, need));
+                    if into[to].is_empty() && !done[to] {
+                        ready.insert((id(to), to));
+                    }
+                    if failed.remove(&to) && component_of[to].is_some() && parked[to].is_none() {
+                        candidates.insert((id(to), to));
+                    }
+                }
+                broke = true;
+                break;
+            }
+            if !broke || spent > budget {
+                break None;
+            }
+        };
+        crate::work::add(spent);
+        outcome
+    }
+
+    /// Writes a set parking, whenever nothing can proceed, every row of it that can be parked.
+    /// `None` if a stall comes with none left: then no parkings let the whole set be written.
+    fn every(
+        &self,
+        local: &Local,
+        mut out: Vec<BTreeSet<(usize, Need)>>,
+        mut into: Vec<BTreeSet<(usize, Need)>>,
+    ) -> Option<Vec<Step>> {
+        let m = local.members.len();
+        let id = |i: usize| &self.ids[local.members[i]];
+        let global = |i: usize| local.members[i];
+        let mut spent = 0usize;
+        // For each row being inserted, how many of its waits it cannot be inserted early around.
+        let mut hard = vec![0usize; m];
+        for (i, waits) in into.iter().enumerate() {
+            spent += 1 + waits.len();
+            if self.inserts(global(i)) {
+                hard[i] = waits
+                    .iter()
+                    .filter(|(u, need)| self.hard(global(i), global(*u), need))
+                    .count();
+            }
+        }
+        let mut eligible: BTreeSet<(&(String, Gid), usize)> = (0..m)
+            .filter(|&i| hard[i] == 0)
+            .map(|i| (id(i), i))
+            .collect();
+        let mut done = vec![false; m];
+        let mut parked: Vec<Option<Row>> = vec![None; m];
+        let mut ready: BTreeSet<(&(String, Gid), usize)> = (0..m)
+            .filter(|&i| into[i].is_empty())
+            .map(|i| (id(i), i))
+            .collect();
+        let mut steps = Vec::new();
+        let mut finished = 0usize;
+        let outcome = loop {
+            while let Some((_, i)) = ready.pop_first() {
+                spent += 1 + out[i].len();
+                done[i] = true;
+                finished += 1;
+                steps.extend(self.finish(global(i), parked[i].as_ref()));
+                for (to, need) in std::mem::take(&mut out[i]) {
+                    if self.inserts(global(to)) && self.hard(global(to), global(i), &need) {
+                        hard[to] -= 1;
+                        if hard[to] == 0 {
+                            eligible.insert((id(to), to));
+                        }
+                    }
+                    into[to].remove(&(i, need));
+                    if into[to].is_empty() && !done[to] {
+                        ready.insert((id(to), to));
+                    }
+                }
+            }
+            if finished == m {
+                break Some(steps);
+            }
+            let mut any = false;
+            for (_, r) in std::mem::take(&mut eligible) {
+                spent += 1 + out[r].len() + into[r].len();
+                if done[r] || parked[r].is_some() || into[r].is_empty() {
+                    continue;
+                }
+                let Some((step, image, satisfied)) =
+                    self.parking(global(r), &out[r], &into[r], local, |_| true)
+                else {
+                    continue;
+                };
+                steps.push(step);
+                parked[r] = Some(image);
+                any = true;
+                for (to, need) in satisfied {
+                    if self.inserts(global(to)) && self.hard(global(to), global(r), &need) {
+                        hard[to] -= 1;
+                        if hard[to] == 0 {
+                            eligible.insert((id(to), to));
+                        }
+                    }
+                    out[r].remove(&(to, need.clone()));
+                    into[to].remove(&(r, need));
+                    if into[to].is_empty() && !done[to] {
+                        ready.insert((id(to), to));
+                    }
+                }
+            }
+            if !any {
+                break None;
+            }
+        };
+        crate::work::add(spent);
+        outcome
+    }
+}
+
+/// The values of unique set `set` in `row`, unless one is NULL.
+fn tuple(row: &Row, set: &[String]) -> Option<Vec<Total>> {
+    let values: Vec<Value> = set
+        .iter()
+        .map(|f| row.get(f).cloned().unwrap_or(Value::Null))
         .collect();
-    stuck.sort();
-    Plan { steps, stuck }
+    (!values.contains(&Value::Null)).then(|| values.into_iter().map(Total).collect())
 }
 
 /// The strongly connected components of more than one row among `left`, by `out`'s edges.
-fn cycles(left: &[usize], out: &[BTreeSet<(usize, Need)>]) -> Vec<Vec<usize>> {
+fn cycles(left: &[usize], out: &[BTreeSet<(usize, Need)>], spent: &mut usize) -> Vec<Vec<usize>> {
+    let mut found = strongly_connected(left, out, spent);
+    found.retain(|c| c.len() > 1);
+    found
+}
+
+/// The strongly connected components among `left`, by `out`'s edges, counting in `spent` each
+/// row and edge looked at.
+fn strongly_connected(
+    left: &[usize],
+    out: &[BTreeSet<(usize, Need)>],
+    spent: &mut usize,
+) -> Vec<Vec<usize>> {
+    *spent += left.len();
     let inside: BTreeSet<usize> = left.iter().copied().collect();
     let mut index = BTreeMap::new();
     let mut low = BTreeMap::new();
@@ -763,22 +1096,23 @@ fn cycles(left: &[usize], out: &[BTreeSet<(usize, Need)>]) -> Vec<Vec<usize>> {
     let mut stack = Vec::new();
     let mut found = Vec::new();
     let mut counter = 0;
+    let mut next = |v: usize| -> Vec<usize> {
+        *spent += out[v].len();
+        let mut t: Vec<usize> = out[v]
+            .iter()
+            .map(|(to, _)| *to)
+            .filter(|to| inside.contains(to))
+            .collect();
+        t.dedup();
+        t.reverse();
+        t
+    };
     for &start in left {
         if index.contains_key(&start) {
             continue;
         }
         // Iterative Tarjan: (node, the targets still to visit).
         let mut work: Vec<(usize, Vec<usize>)> = Vec::new();
-        let next = |v: usize| -> Vec<usize> {
-            let mut t: Vec<usize> = out[v]
-                .iter()
-                .map(|(to, _)| *to)
-                .filter(|to| inside.contains(to))
-                .collect();
-            t.dedup();
-            t.reverse();
-            t
-        };
         index.insert(start, counter);
         low.insert(start, counter);
         counter += 1;
@@ -813,9 +1147,7 @@ fn cycles(left: &[usize], out: &[BTreeSet<(usize, Need)>]) -> Vec<Vec<usize>> {
                         break;
                     }
                 }
-                if component.len() > 1 {
-                    found.push(component);
-                }
+                found.push(component);
             }
             if let Some((parent, _)) = work.last() {
                 let l = low[parent].min(low[&v]);

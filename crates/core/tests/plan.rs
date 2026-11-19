@@ -8,7 +8,8 @@ use fongo_sync_core::model::{
     Collection, FieldKind, Identity, Row, Schema, unmerged_identities, view,
 };
 use fongo_sync_core::plan::{
-    Columns, FieldEdit, NewEntity, Planned, RowAction, Step, clashes, edits, order, record, write,
+    Columns, FieldEdit, NewEntity, Plan, Planned, RowAction, Step, clashes, edits, order, record,
+    write,
 };
 use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value};
@@ -460,6 +461,87 @@ impl Tables<'_> {
         }
     }
 
+    /// Whether row `at`'s final write waits, through rows whose final writes are still pending, on
+    /// itself, judged from `table` as it stands: a row waits on a row its write would refer to
+    /// that is not there yet, on a row holding a unique value its write takes, and, to be
+    /// deleted, on a row still referring to it that will stop.
+    fn on_a_cycle(
+        &self,
+        table: &Table,
+        planned: &[Planned],
+        pending: &BTreeSet<(String, Gid)>,
+        at: &(String, Gid),
+    ) -> bool {
+        let finals: BTreeMap<(String, Gid), Option<Row>> = planned
+            .iter()
+            .map(|p| {
+                let row = match &p.action {
+                    RowAction::Insert(r) => Some(r.clone()),
+                    RowAction::Update(f) => {
+                        let mut r = p.image.clone().unwrap_or_default();
+                        r.extend(f.clone());
+                        Some(r)
+                    }
+                    RowAction::Delete => None,
+                    RowAction::Nothing => p.image.clone(),
+                };
+                ((p.collection.clone(), p.gid), row)
+            })
+            .collect();
+        let waits_on = |x: &(String, Gid)| -> Vec<(String, Gid)> {
+            let mut out = Vec::new();
+            let coll = self.schema.collection(&x.0).unwrap();
+            match &finals[x] {
+                Some(row) => {
+                    for f in &coll.fields {
+                        if let (
+                            FieldKind::Reference(t) | FieldKind::Owner(t),
+                            Some(Value::Ref(g)),
+                        ) = (&f.kind, row.get(&f.name))
+                        {
+                            let y = (t.clone(), *g);
+                            if !table.contains_key(&y) && pending.contains(&y) {
+                                out.push(y);
+                            }
+                        }
+                    }
+                    for set in uniques(coll) {
+                        if let Some(other) = self.clash(table, &x.0, x.1, row, &set) {
+                            let y = (x.0.clone(), other);
+                            if pending.contains(&y) {
+                                out.push(y);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for ((c, g), r) in table {
+                        let y = (c.clone(), *g);
+                        let refers = self.schema.collection(c).unwrap().fields.iter().any(|f| {
+                            matches!(&f.kind, FieldKind::Reference(t) | FieldKind::Owner(t) if *t == x.0)
+                                && r.get(&f.name) == Some(&Value::Ref(x.1))
+                        });
+                        if refers && y != *x && pending.contains(&y) {
+                            out.push(y);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let mut seen = BTreeSet::new();
+        let mut stack = waits_on(at);
+        while let Some(y) = stack.pop() {
+            if y == *at {
+                return true;
+            }
+            if seen.insert(y.clone()) {
+                stack.extend(waits_on(&y));
+            }
+        }
+        false
+    }
+
     /// Whether the actions can all be done one at a time, each whole, in some order: tries any
     /// action that keeps the constraints until none is left or none can go.
     fn greedy(&self, before: &Table, planned: &[Planned]) -> bool {
@@ -569,13 +651,107 @@ fn plan_between(before: &Table, after: &Table) -> Vec<Planned> {
         .collect()
 }
 
+/// Rows referring to their own collection, two identity keys (one of two fields), an owner, and a
+/// natural collection under that owner that refers back into itself outside its key.
+fn tangled() -> Schema {
+    Schema::new(vec![
+        Collection::minted("pages")
+            .plain("slug", Merge::Lww)
+            .plain("rank", Merge::Lww)
+            .plain("lang", Merge::Lww)
+            .reference("next", "pages")
+            .reference("cover", "media")
+            .identity_key(&["slug"])
+            .identity_key(&["rank", "lang"]),
+        Collection::minted("media")
+            .plain("hash", Merge::Lww)
+            .owner("page", "pages")
+            .identity_key(&["hash"]),
+        Collection::natural("notes", &["medium", "n"])
+            .owner("medium", "media")
+            .plain("n", Merge::Lww)
+            .reference("see", "notes"),
+    ])
+}
+
+/// From any table that keeps its constraints to any other: every step of the plan keeps them;
+/// every row the plan does not report stuck ends as it should; a stuck row gets no step at all,
+/// so it is left as it was. Where the actions can be done whole in some order, nothing is parked
+/// and nothing is stuck. The plan does not depend on the order the actions arrive in.
+fn plan_law(
+    schema: &Schema,
+    columns: &Columns,
+    before: Table,
+    after: Table,
+    shuffle: u64,
+) -> Result<(), TestCaseError> {
+    let tables = Tables { schema, columns };
+    let (before, after) = (tables.repair(before), tables.repair(after));
+    let mut planned = plan_between(&before, &after);
+    for (k, row) in &before {
+        if shuffle.rotate_left(k.1.0[15] as u32).is_multiple_of(3) && after.get(k) == Some(row) {
+            planned.push(Planned {
+                collection: k.0.clone(),
+                gid: k.1,
+                image: Some(row.clone()),
+                action: RowAction::Nothing,
+            });
+        }
+    }
+    let n = planned.len();
+    for i in 0..n {
+        planned.swap(i, (shuffle.wrapping_mul(i as u64 + 7) % n as u64) as usize);
+    }
+    let plan = order(schema, columns, &planned);
+    let mut table = before.clone();
+    let mut pending: BTreeSet<(String, Gid)> = planned
+        .iter()
+        .filter(|p| p.action != RowAction::Nothing)
+        .map(|p| (p.collection.clone(), p.gid))
+        .collect();
+    for step in &plan.steps {
+        let at = (step.collection.clone(), step.gid);
+        prop_assert!(
+            !plan.stuck.contains(&at),
+            "a step for stuck {at:?}: {plan:#?}"
+        );
+        if step.parked {
+            prop_assert!(
+                tables.on_a_cycle(&table, &planned, &pending, &at),
+                "{at:?} parked though on no cycle of what waits: {plan:#?}"
+            );
+        } else {
+            pending.remove(&at);
+        }
+        if let Err(e) = tables.apply(&mut table, step) {
+            prop_assert!(false, "{e}\nplan: {plan:#?}");
+        }
+    }
+    for p in &planned {
+        let at = (p.collection.clone(), p.gid);
+        let wanted = if plan.stuck.contains(&at) {
+            before.get(&at)
+        } else {
+            after.get(&at)
+        };
+        prop_assert_eq!(table.get(&at), wanted, "{:?}", at);
+    }
+    if tables.greedy(&before, &planned) {
+        prop_assert!(plan.stuck.is_empty(), "stuck where no cycle is: {plan:#?}");
+        prop_assert!(
+            plan.steps.iter().all(|s| !s.parked),
+            "parked where no cycle is: {plan:#?}"
+        );
+    }
+    let mut reordered = planned.clone();
+    reordered.reverse();
+    prop_assert_eq!(order(schema, columns, &reordered), plan);
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
-    /// From any table that keeps its constraints to any other, every step of the plan keeps
-    /// them, every row the plan does not report stuck ends as it should, and a stuck row is left
-    /// as it was or parked. Where the actions can be done whole in some order, nothing is parked
-    /// and nothing is stuck. The plan does not depend on the order the actions arrive in.
     #[test]
     fn an_ordered_plan_keeps_every_constraint_at_every_step(
         (schema, columns, before, after, shuffle) in arb_family().prop_flat_map(|f| {
@@ -583,36 +759,16 @@ proptest! {
             (Just(schema.clone()), arb_columns(&schema), arb_table(&schema), arb_table(&schema), any::<u64>())
         })
     ) {
-        let tables = Tables { schema: &schema, columns: &columns };
-        let (before, after) = (tables.repair(before), tables.repair(after));
-        let mut planned = plan_between(&before, &after);
-        let n = planned.len();
-        for i in 0..n {
-            planned.swap(i, (shuffle.wrapping_mul(i as u64 + 7) % n as u64) as usize);
-        }
-        let plan = order(&schema, &columns, &planned);
-        let mut table = before.clone();
-        for step in &plan.steps {
-            if let Err(e) = tables.apply(&mut table, step) {
-                prop_assert!(false, "{e}\nplan: {plan:#?}");
-            }
-        }
-        for p in &planned {
-            let at = (p.collection.clone(), p.gid);
-            if plan.stuck.contains(&at) {
-                let parked = plan.steps.iter().any(|s| s.parked && (s.collection.clone(), s.gid) == at);
-                prop_assert!(parked || table.get(&at) == before.get(&at), "{at:?} was touched");
-            } else {
-                prop_assert_eq!(table.get(&at), after.get(&at), "{:?}", at);
-            }
-        }
-        if tables.greedy(&before, &planned) {
-            prop_assert!(plan.stuck.is_empty(), "stuck where no cycle is: {plan:#?}");
-            prop_assert!(plan.steps.iter().all(|s| !s.parked), "parked where no cycle is: {plan:#?}");
-        }
-        let mut reordered = planned.clone();
-        reordered.reverse();
-        prop_assert_eq!(order(&schema, &columns, &reordered), plan);
+        plan_law(&schema, &columns, before, after, shuffle)?;
+    }
+
+    #[test]
+    fn an_ordered_plan_keeps_every_constraint_over_tangled_tables(
+        (columns, before, after, shuffle) in (
+            arb_columns(&tangled()), arb_table(&tangled()), arb_table(&tangled()), any::<u64>()
+        )
+    ) {
+        plan_law(&tangled(), &columns, before, after, shuffle)?;
     }
 }
 
@@ -938,4 +1094,350 @@ fn independent_writes_come_in_ascending_order() {
     let plan = order(&schema, &Columns::new(), &[insert(3), insert(1), insert(2)]);
     let order_of: Vec<Gid> = plan.steps.iter().map(|s| s.gid).collect();
     assert_eq!(order_of, vec![gid(1), gid(2), gid(3)]);
+}
+
+fn one_change_per_register(changes: &[Change]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for c in changes {
+        if !seen.insert((c.gid, c.field.clone())) {
+            return Err(format!(
+                "two changes to {:?}.{} in {changes:?}",
+                c.gid, c.field
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_key_change_back_to_a_member_of_the_group_tombstones_only_the_others() {
+    let schema = small();
+    let (s, room) = (
+        gid(1),
+        Gid::derive("rooms", &[Value::Ref(gid(1)), text("a")]),
+    );
+    let old = Target {
+        collection: "rooms".into(),
+        canonical: gid(5).min(room),
+        members: {
+            let mut m = vec![gid(5), room];
+            m.sort();
+            m
+        },
+        live: vec![gid(5)],
+        row: Some(row(&[
+            ("site", Value::Ref(s)),
+            ("label", text("b")),
+            ("size", Value::Null),
+        ])),
+    };
+    let found = vec![
+        FieldEdit::Deleted,
+        FieldEdit::Created,
+        set("site", Value::Ref(s)),
+        set("label", text("a")),
+    ];
+    let new = NewEntity {
+        gid: room,
+        known: true,
+    };
+    let recorded = record(&schema, "rooms", &found, Some(&old), Some(new), fresh(0));
+    one_change_per_register(&recorded).unwrap();
+    let tombstones: Vec<(Gid, Value)> = recorded
+        .iter()
+        .filter(|c| c.field == fongo_sync_core::DELETED)
+        .map(|c| (c.gid, c.value.clone()))
+        .collect();
+    assert!(tombstones.contains(&(gid(5), Value::Int(1))));
+    assert!(tombstones.contains(&(room, Value::Int(0))));
+    assert_eq!(tombstones.len(), 2);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1500))]
+
+    /// Whatever the edits and whichever entity a row stood for and now stands for, `record`
+    /// writes each field of each gid at most once.
+    #[test]
+    fn record_writes_each_register_at_most_once(
+        (schema, changes) in arb_case(0..50),
+        pick in any::<usize>(),
+        shape in 0u8..4,
+        fields in proptest::collection::vec(any::<usize>(), 0..6),
+        known in any::<bool>(),
+    ) {
+        let store = store(&schema, &changes);
+        let ev = Evaluator::new(&schema).unwrap();
+        let mut session = ev.session(&store);
+        let mut targets = Vec::new();
+        for c in &schema.collections {
+            for g in common::mentioned(&schema, &changes) {
+                let t = session.target(&c.name, g).unwrap();
+                if !t.members.is_empty() {
+                    targets.push(t);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let old = &targets[pick % targets.len()];
+        let coll = schema.collection(&old.collection).unwrap();
+        let mut found = Vec::new();
+        if shape >= 1 {
+            found.push(FieldEdit::Deleted);
+        }
+        if shape >= 2 {
+            found.push(FieldEdit::Created);
+        }
+        if shape != 1 {
+            let mut named = BTreeSet::new();
+            for f in &fields {
+                let field = &coll.fields[f % coll.fields.len()].name;
+                if named.insert(field.clone()) {
+                    found.push(set(field, Value::Int(*f as i64 % 3)));
+                }
+            }
+        }
+        let new_gid = if shape == 3 { old.members[pick % old.members.len()] } else { Gid([202; 16]) };
+        let new = (shape >= 2).then_some(NewEntity { gid: new_gid, known });
+        let recorded = record(&schema, &old.collection, &found, Some(old), new, fresh(0));
+        if let Err(e) = one_change_per_register(&recorded) {
+            prop_assert!(false, "{e}");
+        }
+    }
+}
+
+#[test]
+fn a_row_a_parking_leaves_off_every_cycle_is_not_parked() {
+    // Four rows deleted together, each referring to the next: a to b, z to a, b to c, and c to
+    // both b and z. Parking a breaks the long cycle; z then waits on nothing that waits on it,
+    // and only b and c still form a cycle.
+    let schema = Schema::new(vec![
+        Collection::minted("n")
+            .reference("r1", "n")
+            .reference("r2", "n"),
+    ]);
+    let (a, z, b, c) = (gid(1), gid(2), gid(3), gid(4));
+    let deleted = |g: Gid, refs: &[(&str, Gid)]| Planned {
+        collection: "n".into(),
+        gid: g,
+        image: Some(
+            refs.iter()
+                .map(|(f, t)| (f.to_string(), Value::Ref(*t)))
+                .collect(),
+        ),
+        action: RowAction::Delete,
+    };
+    let planned = [
+        deleted(a, &[("r1", b)]),
+        deleted(z, &[("r1", a)]),
+        deleted(b, &[("r1", c)]),
+        deleted(c, &[("r1", b), ("r2", z)]),
+    ];
+    let plan = order(&schema, &Columns::new(), &planned);
+    let parked: Vec<Gid> = plan
+        .steps
+        .iter()
+        .filter(|s| s.parked)
+        .map(|s| s.gid)
+        .collect();
+    assert_eq!(parked, vec![a, b]);
+    assert!(plan.stuck.is_empty());
+}
+
+/// Rows of one collection inserted together, each naming rows by `x`, which refuses NULL, and by
+/// `y` and `z`, which accept it.
+fn linked() -> (Schema, Columns) {
+    let schema = Schema::new(vec![
+        Collection::minted("a")
+            .reference("x", "a")
+            .reference("y", "a")
+            .reference("z", "a"),
+    ]);
+    (schema, Columns::new().not_null("a", "x"))
+}
+
+fn inserted(n: u8, refs: &[(&str, u8)]) -> Planned {
+    Planned {
+        collection: "a".into(),
+        gid: gid(n),
+        image: None,
+        action: RowAction::Insert(
+            refs.iter()
+                .map(|(f, t)| (f.to_string(), Value::Ref(gid(*t))))
+                .collect(),
+        ),
+    }
+}
+
+fn parked_rows(plan: &Plan) -> Vec<Gid> {
+    plan.steps
+        .iter()
+        .filter(|s| s.parked)
+        .map(|s| s.gid)
+        .collect()
+}
+
+#[test]
+fn a_cycle_that_waits_on_another_is_broken_once_the_other_is() {
+    let (schema, columns) = linked();
+    // 1 and 2 wait on each other, and only 1 can be inserted early, once 5 exists; 5 waits on 3,
+    // which with 4 forms a cycle that inserting 3 early breaks.
+    let planned = [
+        inserted(1, &[("x", 5), ("y", 2)]),
+        inserted(2, &[("x", 1)]),
+        inserted(3, &[("x", 3), ("y", 4)]),
+        inserted(4, &[("x", 4), ("y", 3)]),
+        inserted(5, &[("x", 3)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(3), gid(1)]);
+    // 1 also waits on 3, which with 4 forms a cycle that inserting 3 early breaks.
+    let planned = [
+        inserted(1, &[("x", 3), ("y", 2)]),
+        inserted(2, &[("x", 1)]),
+        inserted(3, &[("x", 3), ("y", 4)]),
+        inserted(4, &[("x", 3)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(3), gid(1)]);
+}
+
+#[test]
+fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_written() {
+    let (schema, columns) = linked();
+    // One set: 2 → 3 → 1 → 4 → 6 → 2, and 4, 5 and 6 in a cycle of their own. Parking 1 splits
+    // it into 2 with 3 and 4 with 5 and 6. Neither 2 nor 3 can be inserted early while 6 does not
+    // exist; parking 4 lets 6 be written, and then 2 can be parked. Parking every row that can
+    // be would also park 5.
+    let planned = [
+        inserted(1, &[("y", 3)]),
+        inserted(2, &[("x", 6), ("y", 3)]),
+        inserted(3, &[("x", 2)]),
+        inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
+        inserted(5, &[("x", 5), ("y", 6), ("z", 4)]),
+        inserted(6, &[("x", 4)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(1), gid(4), gid(2)]);
+}
+
+#[test]
+fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_parked() {
+    let (schema, columns) = linked();
+    // As above, but 2 waits on 4 itself, which parking 4 inserts.
+    let planned = [
+        inserted(1, &[("y", 3)]),
+        inserted(2, &[("x", 4), ("y", 3)]),
+        inserted(3, &[("x", 2)]),
+        inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
+        inserted(5, &[("x", 5), ("y", 6), ("z", 4)]),
+        inserted(6, &[("x", 4)]),
+    ];
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty(), "{plan:#?}");
+    assert_eq!(parked_rows(&plan), vec![gid(1), gid(4), gid(2)]);
+}
+
+/// From one table of `n` rows referring to each other at random to another, with `x` refusing
+/// NULL or not: every step keeps the constraints, every row not stuck ends as it should, and
+/// where every field accepts NULL nothing is stuck. This holds for sets of rows too large for the
+/// search for the fewest parkings, which are planned by parking whatever can be.
+fn large_plan_law(seed: u64, n: u8, x_not_null: bool) -> Result<(), String> {
+    let mut rng = common::Rng(seed | 1);
+    let schema = linked().0;
+    let columns = if x_not_null {
+        Columns::new().not_null("a", "x")
+    } else {
+        Columns::new()
+    };
+    let tables = Tables {
+        schema: &schema,
+        columns: &columns,
+    };
+    let random = |rng: &mut common::Rng| -> Table {
+        let mut table = Table::new();
+        for i in 0..n {
+            if rng.one_in(4) {
+                continue;
+            }
+            let mut r = Row::new();
+            for f in ["x", "y", "z"] {
+                let to = Value::Ref(gid(rng.below(n as usize) as u8));
+                r.insert(f.into(), if rng.one_in(5) { Value::Null } else { to });
+            }
+            table.insert(("a".into(), gid(i)), r);
+        }
+        tables.repair(table)
+    };
+    let before = random(&mut rng);
+    let after = random(&mut rng);
+    let planned = plan_between(&before, &after);
+    let plan = order(&schema, &columns, &planned);
+    if !x_not_null && !plan.stuck.is_empty() {
+        return Err(format!(
+            "stuck though every field accepts NULL: {:?}",
+            plan.stuck
+        ));
+    }
+    let mut table = before.clone();
+    for step in &plan.steps {
+        if plan.stuck.contains(&(step.collection.clone(), step.gid)) {
+            return Err(format!("a step for stuck {step:?}"));
+        }
+        tables.apply(&mut table, step)?;
+    }
+    for p in &planned {
+        let at = (p.collection.clone(), p.gid);
+        let wanted = if plan.stuck.contains(&at) {
+            before.get(&at)
+        } else {
+            after.get(&at)
+        };
+        if table.get(&at) != wanted {
+            return Err(format!("{at:?} ends as {:?}", table.get(&at)));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn large_sets_of_rows_waiting_on_each_other_are_written_within_the_constraints() {
+    for seed in 0..48 {
+        large_plan_law(seed, 250, seed % 2 == 0).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+#[test]
+fn a_long_doubly_linked_list_inserted_at_once_is_written() {
+    let (schema, _) = linked();
+    let n: u8 = 250;
+    let planned: Vec<Planned> = (0..n)
+        .map(|i| {
+            let mut refs = Vec::new();
+            if i > 0 {
+                refs.push(("y", i - 1));
+            }
+            if i + 1 < n {
+                refs.push(("z", i + 1));
+            }
+            inserted(i, &refs)
+        })
+        .collect();
+    let columns = Columns::new();
+    let plan = order(&schema, &columns, &planned);
+    assert!(plan.stuck.is_empty());
+    let tables = Tables {
+        schema: &schema,
+        columns: &columns,
+    };
+    let mut table = Table::new();
+    for step in &plan.steps {
+        tables.apply(&mut table, step).unwrap();
+    }
+    assert_eq!(table.len(), n as usize);
 }

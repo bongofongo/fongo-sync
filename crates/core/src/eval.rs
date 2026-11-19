@@ -26,6 +26,11 @@ pub struct Limits {
     /// The most candidate keys tried for one natural entity: the product, over its key fields, of
     /// the number of distinct values ever written to that field.
     pub key_combinations: usize,
+    /// The most keys the evaluator looks natural entities up by to decide one alias group: for
+    /// each distinct natural key in the region, read through the groups, the product of the
+    /// sizes of the groups its references fall in, summed. Where every group a key names holds
+    /// one gid, that is one per key, so at most the region's size.
+    pub lookups: usize,
 }
 
 impl Default for Limits {
@@ -33,6 +38,7 @@ impl Default for Limits {
         Limits {
             region: 1 << 16,
             key_combinations: 1 << 10,
+            lookups: 1 << 18,
         }
     }
 }
@@ -187,11 +193,16 @@ impl<S: Source> Session<'_, S> {
     /// The target of the group `gid` belongs to in `collection`, as `model::view` of the changes
     /// behind the source would show it.
     ///
-    /// Cost, for a group of `m` members whose region (see [`Limits::region`]) holds `r` gids:
-    /// O(r log r) source questions and work to find the group, times the number of rounds in
-    /// which new natural entities are found to share a key (one per level of natural keys naming
-    /// natural keys, in data that does not contrive otherwise); then O(m) to decide liveness,
-    /// each member asking once about each of its owners' groups, which are found the same way.
+    /// Cost, for a group of `m` members whose region (see [`Limits::region`]) holds `r` gids: each
+    /// gid in the region is fetched once, and each distinct natural key in it, read through the
+    /// groups, asks the source once for each choice of one member from every group its
+    /// references fall in. Where those groups hold one member each, that is O(r log r) in all.
+    /// Where they are large it is their product for each distinct key, up to
+    /// [`Limits::lookups`] in all: `n` items merged into one group, each with a tag keyed by the
+    /// item and its own label, ask n² questions, and with the default limits are undetermined
+    /// beyond 512 items. Then O(m)
+    /// to decide liveness, each member asking once about each of its owners' groups, which are
+    /// found the same way.
     pub fn target(&mut self, collection: &str, gid: Gid) -> Answer<Target> {
         self.shared(collection, gid).map(|t| (*t).clone())
     }
@@ -224,6 +235,7 @@ impl<S: Source> Session<'_, S> {
     }
 
     fn compute_target(&mut self, home: usize, group: &Group) -> Answer<Target> {
+        crate::work::add(group.members.len());
         let mut live = Vec::new();
         for &m in &group.members {
             if self.member_live(m)? {
@@ -246,6 +258,7 @@ impl<S: Source> Session<'_, S> {
 
     fn present(&mut self, home: usize, live: &[Gid]) -> Answer<Row> {
         let coll = &self.schema.collections[home];
+        crate::work::add(live.len() * (coll.fields.len() + 1));
         let infos: Vec<Rc<Info>> = live.iter().map(|&m| self.info(m)).collect::<Answer<_>>()?;
         let mut row = Row::new();
         let in_together = |name: &str| coll.together.iter().any(|s| s.iter().any(|f| f == name));
@@ -325,6 +338,7 @@ impl<S: Source> Session<'_, S> {
         }
         let mut answer = Ok(false);
         for &m in &group.members {
+            crate::work::add(1);
             match self.member_live(m) {
                 Ok(true) => {
                     answer = Ok(true);
@@ -485,146 +499,105 @@ impl<S: Source> Session<'_, S> {
     /// neighbours, the gids a natural key names, and natural entities that may share a key with
     /// one in the set. Alias groups computed over that set alone are the groups over every fact,
     /// so the group of every gid in it is cached.
+    ///
+    /// Groups are kept as they are found: each gid is fetched once, each alias joins once, a join
+    /// re-reads only the keys that name the smaller of the two groups (congruence closure), and a
+    /// natural key is looked up by all its parts at once, so the work is near-linear in the set
+    /// and the questions it asks.
     fn region(&mut self, start: Gid) -> Answer<()> {
         let schema = self.schema;
-        let mut region = Region::default();
-        region.add(start);
-        let mut asked: BTreeSet<(usize, Vec<(String, Total)>)> = BTreeSet::new();
+        let mut r = Closure {
+            limit: self.limits.lookups,
+            ..Closure::default()
+        };
+        r.add(start);
+        let mut asked: BTreeSet<(usize, Vec<Total>)> = BTreeSet::new();
+        let mut infos: BTreeMap<usize, Rc<Info>> = BTreeMap::new();
+        let mut edges: Vec<(usize, usize, String)> = Vec::new();
         loop {
-            while let Some(i) = region.pending.pop() {
-                let x = region.gids[i];
+            while let Some(i) = r.pending.pop() {
+                crate::work::add(1);
+                let x = r.gids[i];
                 let info = self.info(x)?;
                 let home = info.home.map(|h| schema.collections[h].name.as_str());
                 for a in &info.aliases {
                     if Some(a.collection.as_str()) == home {
-                        region.add(if a.from == x { a.to } else { a.from });
+                        let j = r.add(if a.from == x { a.to } else { a.from });
+                        edges.push((i, j, a.collection.clone()));
                     }
                 }
-                if let Key::Verified(key) = &info.key {
-                    for v in key {
-                        if let Value::Ref(y) = v {
-                            region.add(*y);
-                        }
+                if let (Key::Verified(key), Some(h)) = (&info.key, info.home) {
+                    let refs: Vec<Option<usize>> = key
+                        .iter()
+                        .map(|v| match v {
+                            Value::Ref(y) => Some(r.add(*y)),
+                            _ => None,
+                        })
+                        .collect();
+                    r.natural(i, h, key, &refs);
+                    if r.over() {
+                        return Err(Undetermined);
                     }
                 }
-                if region.gids.len() > self.limits.region {
+                infos.insert(i, info);
+                if r.gids.len() > self.limits.region {
                     return Err(Undetermined);
                 }
             }
-
-            let infos: Vec<Rc<Info>> = region
-                .gids
-                .iter()
-                .map(|&g| self.info(g))
-                .collect::<Answer<_>>()?;
-            let mut uf = UnionFind::new(&region.gids);
-            for (i, info) in infos.iter().enumerate() {
-                for a in &info.aliases {
-                    if a.from != region.gids[i] {
-                        continue;
-                    }
-                    let Some(&j) = region.pos.get(&a.to) else {
-                        continue;
-                    };
-                    let joins = |info: &Info| {
-                        info.home
-                            .is_some_and(|h| schema.collections[h].name == a.collection)
-                            && !matches!(info.key, Key::Unverified)
-                    };
-                    if joins(info) && joins(&infos[j]) {
-                        uf.union(i, j);
-                    }
+            for (i, j, collection) in std::mem::take(&mut edges) {
+                let joins = |info: &Info| {
+                    info.home
+                        .is_some_and(|h| schema.collections[h].name == collection)
+                        && !matches!(info.key, Key::Unverified)
+                };
+                if joins(&infos[&i]) && joins(&infos[&j]) {
+                    r.joins.push((i, j));
                 }
             }
-            let naturals: Vec<(usize, usize, &Vec<Value>)> = infos
-                .iter()
-                .enumerate()
-                .filter_map(|(i, info)| match (&info.key, info.home) {
-                    (Key::Verified(k), Some(h)) => Some((i, h, k)),
-                    _ => None,
-                })
-                .collect();
-            loop {
-                let mut joined = false;
-                let mut seen: BTreeMap<(usize, Vec<Total>), usize> = BTreeMap::new();
-                for &(i, h, key) in &naturals {
-                    let canonical: Vec<Total> = key
-                        .iter()
-                        .map(|v| match v {
-                            Value::Ref(y) => Total(Value::Ref(uf.least(region.pos[y]))),
-                            other => Total(other.clone()),
-                        })
-                        .collect();
-                    match seen.get(&(h, canonical.clone())) {
-                        Some(&j) => joined |= uf.union(i, j),
-                        None => {
-                            seen.insert((h, canonical), i);
-                        }
-                    }
-                }
-                if !joined {
-                    break;
-                }
+            r.settle();
+            if r.over() {
+                return Err(Undetermined);
             }
-
-            let classes = uf.classes();
-            // Natural entities that share a collection, a reference position, the values at the
-            // other positions and the class that reference falls in ask the same questions, so
-            // each such shape asks once per member of the class.
-            let mut shapes: BTreeSet<Shape> = BTreeSet::new();
-            for &(_, h, key) in &naturals {
-                let Some(p) = key.iter().position(|v| matches!(v, Value::Ref(_))) else {
-                    continue;
-                };
-                let Value::Ref(y) = key[p] else {
-                    continue;
-                };
+            if r.questions.is_empty() {
+                break;
+            }
+            for (h, key) in std::mem::take(&mut r.questions) {
+                crate::work::add(1);
                 let Identity::Natural(fields) = &schema.collections[h].identity else {
                     continue;
                 };
-                let fixed: Vec<(String, Total)> = fields
+                let question: Vec<Total> = key.into_iter().map(Total).collect();
+                if !asked.insert((h, question.clone())) {
+                    continue;
+                }
+                let pairs: Vec<(&str, &Value)> = fields
                     .iter()
-                    .zip(key)
-                    .filter(|(_, v)| !matches!(v, Value::Ref(_)))
-                    .map(|(f, v)| (f.clone(), Total(v.clone())))
+                    .zip(&question)
+                    .map(|(f, v)| (f.as_str(), &v.0))
                     .collect();
-                shapes.insert((h, p, fixed, uf.find(region.pos[&y])));
-            }
-            for (h, p, fixed, root) in shapes {
-                let Identity::Natural(fields) = &schema.collections[h].identity else {
-                    continue;
-                };
-                for &m in &classes[&root] {
-                    let mut question = vec![(fields[p].clone(), Total(Value::Ref(region.gids[m])))];
-                    question.extend(fixed.iter().cloned());
-                    if !asked.insert((h, question.clone())) {
-                        continue;
-                    }
-                    let pairs: Vec<(&str, &Value)> =
-                        question.iter().map(|(f, v)| (f.as_str(), &v.0)).collect();
-                    for z in self.source.holding(&schema.collections[h].name, &pairs) {
-                        region.add(z);
-                    }
+                for z in self.source.holding(&schema.collections[h].name, &pairs) {
+                    r.add(z);
                 }
             }
-            if region.pending.is_empty() {
-                for members in classes.values() {
-                    let mut gids: Vec<Gid> = members.iter().map(|&i| region.gids[i]).collect();
-                    gids.sort();
-                    let group = Rc::new(Group {
-                        canonical: gids[0],
-                        members: gids,
-                    });
-                    for &g in &group.members {
-                        self.groups.insert(g, Ok(group.clone()));
-                    }
-                }
-                return Ok(());
-            }
-            if region.gids.len() > self.limits.region {
+            if r.gids.len() > self.limits.region {
                 return Err(Undetermined);
             }
         }
+        for i in 0..r.gids.len() {
+            if r.parent[i] != i {
+                continue;
+            }
+            let mut gids: Vec<Gid> = r.members[i].iter().map(|&m| r.gids[m]).collect();
+            gids.sort();
+            let group = Rc::new(Group {
+                canonical: gids[0],
+                members: gids,
+            });
+            for &g in &group.members {
+                self.groups.insert(g, Ok(group.clone()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -651,42 +624,64 @@ fn deriving<'v>(
     None
 }
 
-/// A natural collection, the position of the reference its key asks by, the values at the key's
-/// other positions, and the class that reference falls in.
-type Shape = (usize, usize, Vec<(String, Total)>, usize);
+/// A natural entity's collection, the region positions of the gids its key names, and its key.
+type NaturalKey = (usize, Vec<Option<usize>>, Vec<Value>);
 
+/// One position of a natural key read through the groups: the group a reference falls in, or a
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Part {
+    Group(usize),
+    Value(Total),
+}
+
+/// A natural key read through the groups, with its collection. Natural entities with one sign
+/// share a key.
+type Sign = (usize, Vec<Part>);
+
+/// The groups of a region as they grow: union-find by size over the region's gids, each root
+/// holding its members, the natural entities whose keys name a member, and the signs that ask
+/// about its members.
+///
+/// Each sign with a reference asks the source, once, for every key that reads as that sign: one
+/// question per choice of a member from each of its groups. When groups join, only the keys the
+/// join adds are asked, and of two signs the join makes equal only the one that asked more goes on.
 #[derive(Default)]
-struct Region {
+struct Closure {
     gids: Vec<Gid>,
     pos: BTreeMap<Gid, usize>,
     pending: Vec<usize>,
-}
-
-impl Region {
-    fn add(&mut self, gid: Gid) -> bool {
-        if self.pos.contains_key(&gid) {
-            return false;
-        }
-        self.pos.insert(gid, self.gids.len());
-        self.pending.push(self.gids.len());
-        self.gids.push(gid);
-        true
-    }
-}
-
-struct UnionFind {
     parent: Vec<usize>,
-    size: Vec<usize>,
-    least: Vec<Gid>,
+    members: Vec<Vec<usize>>,
+    uses: Vec<Vec<usize>>,
+    keys: BTreeMap<usize, NaturalKey>,
+    signs: BTreeMap<Sign, usize>,
+    sign_of: BTreeMap<usize, Sign>,
+    joins: Vec<(usize, usize)>,
+    asks: Vec<Option<Sign>>,
+    ask_of: BTreeMap<Sign, usize>,
+    asks_at: Vec<BTreeSet<usize>>,
+    questions: Vec<(usize, Vec<Value>)>,
+    /// The lookups the live signs stand for, and the most allowed. A join never lowers the sum:
+    /// two signs it makes equal named disjoint groups at some position.
+    lookups: usize,
+    limit: usize,
 }
 
-impl UnionFind {
-    fn new(gids: &[Gid]) -> UnionFind {
-        UnionFind {
-            parent: (0..gids.len()).collect(),
-            size: vec![1; gids.len()],
-            least: gids.to_vec(),
+impl Closure {
+    fn add(&mut self, gid: Gid) -> usize {
+        if let Some(&i) = self.pos.get(&gid) {
+            return i;
         }
+        let i = self.gids.len();
+        self.pos.insert(gid, i);
+        self.pending.push(i);
+        self.gids.push(gid);
+        self.parent.push(i);
+        self.members.push(vec![i]);
+        self.uses.push(Vec::new());
+        self.asks_at.push(BTreeSet::new());
+        i
     }
 
     fn find(&mut self, i: usize) -> usize {
@@ -703,31 +698,264 @@ impl UnionFind {
         root
     }
 
-    fn least(&mut self, i: usize) -> Gid {
-        let root = self.find(i);
-        self.least[root]
+    /// Records natural entity `i` of collection `h`, whose key is `key`, its references at the
+    /// region positions `refs`.
+    fn natural(&mut self, i: usize, h: usize, key: &[Value], refs: &[Option<usize>]) {
+        for j in refs.iter().flatten() {
+            let root = self.find(*j);
+            self.uses[root].push(i);
+        }
+        self.keys.insert(i, (h, refs.to_vec(), key.to_vec()));
+        let sign = self.sign(i);
+        if refs.iter().all(Option::is_none) || self.ask_of.contains_key(&sign) {
+            return;
+        }
+        let size = lookups(&sign.1, |g| self.members[g].len());
+        self.lookups = self.lookups.saturating_add(size);
+        if self.over() {
+            return;
+        }
+        let id = self.asks.len();
+        let lists: Vec<&[usize]> = sign
+            .1
+            .iter()
+            .filter_map(|p| match p {
+                Part::Group(g) => Some(self.members[*g].as_slice()),
+                Part::Value(_) => None,
+            })
+            .collect();
+        let mut found = Vec::new();
+        product(&sign.1, &lists, &self.gids, &mut found);
+        self.questions.extend(found.into_iter().map(|k| (h, k)));
+        for p in &sign.1 {
+            if let Part::Group(g) = p {
+                self.asks_at[*g].insert(id);
+            }
+        }
+        self.ask_of.insert(sign.clone(), id);
+        self.asks.push(Some(sign));
     }
 
-    fn union(&mut self, a: usize, b: usize) -> bool {
-        let (mut ra, mut rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return false;
+    /// Files natural entity `i` under its key read through the current groups, and joins it with
+    /// any entity already filed there.
+    fn sign(&mut self, i: usize) -> Sign {
+        crate::work::add(1);
+        let (h, refs, key) = self.keys[&i].clone();
+        let parts: Vec<Part> = refs
+            .iter()
+            .zip(&key)
+            .map(|(r, v)| match r {
+                Some(j) => Part::Group(self.find(*j)),
+                None => Part::Value(Total(v.clone())),
+            })
+            .collect();
+        let sign = (h, parts);
+        if let Some(old) = self.sign_of.insert(i, sign.clone())
+            && self.signs.get(&old) == Some(&i)
+        {
+            self.signs.remove(&old);
         }
-        if self.size[ra] < self.size[rb] {
-            std::mem::swap(&mut ra, &mut rb);
+        match self.signs.get(&sign) {
+            Some(&j) if j != i => self.joins.push((i, j)),
+            Some(_) => {}
+            None => {
+                self.signs.insert(sign.clone(), i);
+            }
         }
-        self.parent[rb] = ra;
-        self.size[ra] += self.size[rb];
-        self.least[ra] = self.least[ra].min(self.least[rb]);
-        true
+        sign
     }
 
-    fn classes(&mut self) -> BTreeMap<usize, Vec<usize>> {
-        let mut classes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for i in 0..self.parent.len() {
-            let root = self.find(i);
-            classes.entry(root).or_default().push(i);
+    /// Whether the live signs stand for more lookups than allowed.
+    fn over(&self) -> bool {
+        self.lookups > self.limit
+    }
+
+    /// Joins every pair waiting to be joined, and every pair those joins make congruent, unless
+    /// the lookups grow past the limit.
+    fn settle(&mut self) {
+        while let Some((a, b)) = self.joins.pop() {
+            if self.over() {
+                return;
+            }
+            let (mut big, mut small) = (self.find(a), self.find(b));
+            if big == small {
+                continue;
+            }
+            if self.members[big].len() < self.members[small].len() {
+                std::mem::swap(&mut big, &mut small);
+            }
+            crate::work::add(self.members[small].len());
+            let kept = self.members[big].len();
+            self.parent[small] = big;
+            let moved = std::mem::take(&mut self.members[small]);
+            self.members[big].extend(moved);
+            self.regroup_asks(small, big, kept);
+            let users = std::mem::take(&mut self.uses[small]);
+            for &n in &users {
+                self.sign(n);
+            }
+            self.uses[big].extend(users);
         }
-        classes
+    }
+
+    /// After `small` joined `big`, whose first `kept` members were its own, moves the signs that
+    /// asked about either group onto the joined group and asks the keys the join adds.
+    fn regroup_asks(&mut self, small: usize, big: usize, kept: usize) {
+        let mut sets = [
+            std::mem::take(&mut self.asks_at[small]),
+            std::mem::take(&mut self.asks_at[big]),
+        ];
+        if sets[0].len() > sets[1].len() {
+            sets.swap(0, 1);
+        }
+        let [few, mut all] = sets;
+        all.extend(few);
+        crate::work::add(all.len());
+        let mut by_sign: BTreeMap<Sign, Vec<(usize, Sign)>> = BTreeMap::new();
+        for &id in &all {
+            let old = self.asks[id].clone().expect("only live asks are filed");
+            if self.ask_of.get(&old) == Some(&id) {
+                self.ask_of.remove(&old);
+            }
+            let new: Vec<Part> = old
+                .1
+                .iter()
+                .map(|p| match p {
+                    Part::Group(g) if *g == small => Part::Group(big),
+                    p => p.clone(),
+                })
+                .collect();
+            by_sign.entry((old.0, new)).or_default().push((id, old));
+        }
+        let members = &self.members;
+        let old_list = |g: usize| -> &[usize] {
+            if g == big {
+                &members[big][..kept]
+            } else if g == small {
+                &members[big][kept..]
+            } else {
+                &members[g]
+            }
+        };
+        let asked = |old: &Sign| lookups(&old.1, |g| old_list(g).len());
+        let mut total = self.lookups;
+        for (new, olds) in &by_sign {
+            let before: usize = olds.iter().map(|(_, old)| asked(old)).sum();
+            total = total
+                .saturating_sub(before)
+                .saturating_add(lookups(&new.1, |g| members[g].len()));
+        }
+        self.lookups = total;
+        if self.over() {
+            return;
+        }
+        let mut found: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut dropped: Vec<(usize, Sign)> = Vec::new();
+        let mut kept_asks: Vec<(usize, Sign)> = Vec::new();
+        for (new, olds) in by_sign {
+            let (survivor, old) = olds
+                .iter()
+                .max_by_key(|(id, old)| (asked(old), std::cmp::Reverse(*id)))
+                .cloned()
+                .expect("a sign has an ask");
+            for (id, _) in olds {
+                if id != survivor {
+                    dropped.push((id, new.clone()));
+                }
+            }
+            let groups: Vec<usize> = old
+                .1
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Group(g) => Some(*g),
+                    Part::Value(_) => None,
+                })
+                .collect();
+            for t in 0..groups.len() {
+                let added: &[usize] = if groups[t] == big {
+                    &members[big][kept..]
+                } else if groups[t] == small {
+                    &members[big][..kept]
+                } else {
+                    &[]
+                };
+                if added.is_empty() {
+                    continue;
+                }
+                let lists: Vec<&[usize]> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(u, &g)| match u.cmp(&t) {
+                        std::cmp::Ordering::Less => old_list(g),
+                        std::cmp::Ordering::Equal => added,
+                        std::cmp::Ordering::Greater if g == small || g == big => &members[big][..],
+                        std::cmp::Ordering::Greater => &members[g][..],
+                    })
+                    .collect();
+                let mut keys = Vec::new();
+                product(&new.1, &lists, &self.gids, &mut keys);
+                found.extend(keys.into_iter().map(|k| (new.0, k)));
+            }
+            kept_asks.push((survivor, new));
+        }
+        self.asks_at[big] = all;
+        for (id, sign) in dropped {
+            self.asks[id] = None;
+            for p in &sign.1 {
+                if let Part::Group(g) = p {
+                    self.asks_at[*g].remove(&id);
+                }
+            }
+        }
+        for (id, sign) in kept_asks {
+            self.ask_of.insert(sign.clone(), id);
+            self.asks[id] = Some(sign);
+        }
+        self.questions.extend(found);
+    }
+}
+
+/// How many keys read as `parts`, the group at a position holding `size` of its gids.
+fn lookups(parts: &[Part], size: impl Fn(usize) -> usize) -> usize {
+    parts.iter().fold(1usize, |n, p| match p {
+        Part::Group(g) => n.saturating_mul(size(*g)),
+        Part::Value(_) => n,
+    })
+}
+
+/// Every key that reads as `parts` with a reference from each of `lists` in order, one list per
+/// group in `parts`.
+fn product(parts: &[Part], lists: &[&[usize]], gids: &[Gid], out: &mut Vec<Vec<Value>>) {
+    if lists.iter().any(|l| l.is_empty()) {
+        return;
+    }
+    let mut at = vec![0; lists.len()];
+    loop {
+        let mut k = 0;
+        out.push(
+            parts
+                .iter()
+                .map(|p| match p {
+                    Part::Value(v) => v.0.clone(),
+                    Part::Group(_) => {
+                        let m = lists[k][at[k]];
+                        k += 1;
+                        Value::Ref(gids[m])
+                    }
+                })
+                .collect(),
+        );
+        let mut d = lists.len();
+        loop {
+            if d == 0 {
+                return;
+            }
+            d -= 1;
+            at[d] += 1;
+            if at[d] < lists[d].len() {
+                break;
+            }
+            at[d] = 0;
+        }
     }
 }

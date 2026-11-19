@@ -4,6 +4,41 @@
 //!
 //! The answer depends only on the set of changes: their order and any duplicates do not matter,
 //! provided no two changes to one field share a clock with different values.
+//!
+//! # What a member device can do
+//!
+//! Every device that holds a library's key is trusted to write any change. The rules converge
+//! whatever it writes, but a device that writes against the application's intent can:
+//!
+//! - delete a gid for good, by writing `$deleted = 1` at the largest clock the text form holds:
+//!   no later clock exists to restore it. Its group still shows while another member is live,
+//!   and then under this gid if it is the group's smallest;
+//! - move a gid to another collection, by writing to it under that collection at a clock older
+//!   than any it has, so that its own collection's changes to it are ignored;
+//! - grow every replica's store without limit, by writing undeclared fields, which are kept;
+//! - merge unrelated entities of one collection, by aliasing them: an alias cannot be undone;
+//! - hide a natural entity, by writing [`KEY_ENTRIES`] values to one of its key fields at clocks
+//!   older than its creation;
+//! - set a `Max` field to a value no later write can lower;
+//! - make entities undecidable for an evaluator, which then answers `Undetermined` for them
+//!   (`eval::Limits`): by building alias chains, or groups that natural keys join, larger than
+//!   its region limit; or by merging the groups a natural key's references fall in until looking
+//!   it up takes more keys than its lookup limit, the product of those groups' sizes. Key
+//!   candidates cannot exceed the default limit of 1,024: each key field counts at most
+//!   [`KEY_ENTRIES`] values, and 4^5 is 1,024, so only a key of six or more fields could;
+//! - make an evaluator's work grow faster than the data it touches, within those limits:
+//!   - a natural key whose references fall in groups of g1, g2, … gids is looked up g1 · g2 · …
+//!     times: n items merged into one group, each with a tag keyed by the item and its own
+//!     label, the tags merged too, cost n² lookups (0.2 s at 500 items) and are undetermined
+//!     beyond 512 items under the default limits;
+//!   - joining two copies of paths through natural keys d collections deep costs about d^1.8 per
+//!     path (each entity's group is found from the keys above it), d being fixed by the schema.
+//!
+//!   Ordering row writes stays O((n + e) log n) for n rows and e requirements among them. Rows
+//!   whose targets keep a unique constraint give at most n requirements per unique set; e grows
+//!   as n² only when many rows hold a tuple and many targets take that same tuple.
+//!
+//! None of these is prevented here.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +63,11 @@ pub enum Identity {
     Minted,
     /// An entity's gid is `Gid::derive(collection, key)`, the key being these fields' values in
     /// order. Two entities whose keys are equal, once every reference in them is read as its
-    /// group's canonical gid, are one entity.
+    /// group's canonical gid, are one entity. Key fields declared references may not lead, from
+    /// natural collection to natural collection, back round to where they started: then whether
+    /// two entities are one depends on whether their parents are, down a path as long as the data
+    /// makes it, and joining two copies of a deep path costs work in proportion to its depth for
+    /// every entity on it.
     Natural(Vec<String>),
 }
 
@@ -152,7 +191,8 @@ impl Schema {
 
     /// Whether [`view`] can be asked about this schema. It refuses: duplicate names; field names
     /// starting with `$`; references to undeclared collections; undeclared fields in a key, an
-    /// identity key or a `together` set; identity keys on natural collections; a `together`
+    /// identity key or a `together` set; natural key fields declared references that lead round
+    /// to the collection they start from; identity keys on natural collections; a `together`
     /// field that does not merge `Lww`, is a reference of either kind, or is in two sets; a collection
     /// owning its own rows; and owner references that form a cycle across collections.
     pub fn check(&self) -> Result<(), String> {
@@ -222,24 +262,55 @@ impl Schema {
                 }
             }
         }
+        let owners = |c: &'_ Collection| -> Vec<String> {
+            c.fields
+                .iter()
+                .filter_map(|f| match &f.kind {
+                    FieldKind::Owner(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let keyed_on = |c: &'_ Collection| -> Vec<String> {
+            let Identity::Natural(key) = &c.identity else {
+                return Vec::new();
+            };
+            key.iter()
+                .filter_map(|f| match c.declared(f).map(|d| &d.kind) {
+                    Some(FieldKind::Reference(t) | FieldKind::Owner(t)) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if let Some(c) = self.cycle(owners) {
+            return Err(format!("ownership cycles through {c}"));
+        }
+        if let Some(c) = self.cycle(keyed_on) {
+            return Err(format!("natural keys refer round through {c}"));
+        }
+        Ok(())
+    }
+
+    /// A collection from which `edges` lead back to itself, if any.
+    fn cycle(&self, edges: impl Fn(&Collection) -> Vec<String>) -> Option<&str> {
         for start in &self.collections {
-            let mut at = vec![start.name.as_str()];
+            let mut at = vec![start.name.clone()];
             let mut visited = BTreeSet::new();
             while let Some(name) = at.pop() {
-                let fields = self.collection(name).map_or(&[][..], |c| &c.fields);
-                for f in fields {
-                    if let FieldKind::Owner(t) = &f.kind {
-                        if t == &start.name {
-                            return Err(format!("ownership cycles through {}", start.name));
-                        }
-                        if visited.insert(t.as_str()) {
-                            at.push(t);
-                        }
+                let Some(c) = self.collection(&name) else {
+                    continue;
+                };
+                for t in edges(c) {
+                    if t == start.name {
+                        return Some(&start.name);
+                    }
+                    if visited.insert(t.clone()) {
+                        at.push(t);
                     }
                 }
             }
         }
-        Ok(())
+        None
     }
 }
 

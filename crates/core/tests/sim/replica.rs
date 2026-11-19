@@ -87,6 +87,9 @@ pub struct Expected {
     pub field: String,
     pub value: Value,
     pub clock: fongo_sync_core::Hlc,
+    /// For an owner edit, every member of the entity's group when the edit was collected: each
+    /// must hold it.
+    pub members: Vec<Gid>,
 }
 
 impl<'s> Replica<'s> {
@@ -202,6 +205,20 @@ impl<'s> Replica<'s> {
                         .any(|r| r.get(f).is_some_and(|v| same(v, &Value::Int(key))))
             })
         })
+    }
+
+    /// The rows of `collection` that stand for an entity with more than one member.
+    pub fn merged(&self, collection: &str) -> Vec<Key> {
+        let mut session = self.ev.session(&self.store);
+        self.tables[collection]
+            .keys()
+            .copied()
+            .filter(|k| {
+                self.gid_of
+                    .get(&(collection.to_string(), *k))
+                    .is_some_and(|g| session.target(collection, *g).unwrap().members.len() > 1)
+            })
+            .collect()
     }
 
     pub fn keys(&self, collection: &str) -> Vec<Key> {
@@ -484,14 +501,31 @@ impl<'s> Replica<'s> {
                 }
                 let old: Option<Target> = old_gid.map(|g| session.target(c, g).unwrap());
                 let clock = self.clock.tick(self.wall);
-                self.expected
-                    .extend(writes.into_iter().map(|(gid, field, value)| Expected {
+                // An owner edit moves the whole entity: every member the replica knows of.
+                let owners: Vec<String> = self
+                    .refs(c)
+                    .into_iter()
+                    .filter(|(_, _, owner)| *owner)
+                    .map(|(f, _, _)| f)
+                    .collect();
+                for (gid, field, value) in writes {
+                    let members = match &old {
+                        Some(t)
+                            if new.is_none() && owners.contains(&field) && Some(gid) == old_gid =>
+                        {
+                            t.members.clone()
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.expected.push(Expected {
                         collection: c.clone(),
                         gid,
                         field,
                         value,
                         clock,
-                    }));
+                        members,
+                    });
+                }
                 let new_entity = new.map(|gid| NewEntity {
                     gid,
                     known: self
@@ -820,15 +854,10 @@ impl<'s> Replica<'s> {
             .fold(Columns::new(), |cols, (c, f)| cols.not_null(c, f));
         let plan = order(self.schema, &columns, &planned);
         let mut failed: BTreeSet<(String, Key)> = BTreeSet::new();
-        // A stuck row gets no final write; its parking step, if any, others rely on.
         for (c, g) in &plan.stuck {
             let at = (c.clone(), key_of(*g).unwrap());
             self.held.insert(owner_of[&at].clone());
-            let parked = plan
-                .steps
-                .iter()
-                .any(|s| s.parked && s.collection == *c && s.gid == *g);
-            if inserting.contains(&at) && !parked {
+            if inserting.contains(&at) {
                 self.gid_of.remove(&at);
             }
         }
