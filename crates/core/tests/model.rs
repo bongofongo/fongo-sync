@@ -850,6 +850,20 @@ fn the_schema_check_refuses_what_the_model_cannot_answer() {
 }
 
 #[test]
+fn a_natural_key_may_not_refer_to_its_own_collection() {
+    let dirs = Collection::natural("dirs", &["parent", "name"])
+        .reference("parent", "dirs")
+        .plain("name", Merge::Lww);
+    assert!(Schema::new(vec![dirs]).check().is_err());
+    let elsewhere = Collection::natural("dirs", &["root", "name"])
+        .reference("root", "roots")
+        .reference("parent", "dirs")
+        .plain("name", Merge::Lww);
+    let schema = Schema::new(vec![Collection::minted("roots"), elsewhere]);
+    assert!(schema.check().is_ok());
+}
+
+#[test]
 fn a_collection_may_not_own_its_own_rows_because_concurrent_moves_could_form_a_cycle() {
     let schema = Schema::new(vec![Collection::minted("a").owner("parent", "a")]);
     assert!(schema.check().is_err());
