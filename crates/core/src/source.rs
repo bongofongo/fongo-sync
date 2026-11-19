@@ -267,15 +267,6 @@ impl Store {
         changed
     }
 
-    /// The gids keeping, in `collection`, an entry of `field` equal to `value`.
-    fn holders(&self, collection: &str, field: &str, value: &Value) -> Option<&BTreeSet<Gid>> {
-        self.index.get(&(
-            collection.to_string(),
-            field.to_string(),
-            Total(value.clone()),
-        ))
-    }
-
     fn touched(&self, collection: &str) -> Vec<Gid> {
         self.claims
             .iter()
@@ -357,6 +348,10 @@ pub(crate) struct Overlay<'a, S> {
     schema: &'a Schema,
     base: &'a S,
     batch: Store,
+    /// The gids the batch touches, by collection, and the entries they keep after the merge,
+    /// indexed by (collection, field, value): the base is never asked about them by value.
+    touched: BTreeMap<String, BTreeSet<Gid>>,
+    after: BTreeMap<(String, String, Total), BTreeSet<Gid>>,
 }
 
 impl<'a, S: Source> Overlay<'a, S> {
@@ -365,11 +360,35 @@ impl<'a, S: Source> Overlay<'a, S> {
         for change in batch {
             store.merge(schema, change);
         }
-        Overlay {
+        let mut overlay = Overlay {
             schema,
             base,
             batch: store,
+            touched: BTreeMap::new(),
+            after: BTreeMap::new(),
+        };
+        for (gid, claims) in &overlay.batch.claims {
+            for collection in claims.keys() {
+                overlay
+                    .touched
+                    .entry(collection.clone())
+                    .or_default()
+                    .insert(*gid);
+            }
         }
+        let mut after = BTreeMap::new();
+        for (collection, gids) in &overlay.touched {
+            for &gid in gids {
+                for e in overlay.entries(collection, gid) {
+                    after
+                        .entry((collection.clone(), e.field, Total(e.value)))
+                        .or_insert_with(BTreeSet::new)
+                        .insert(gid);
+                }
+            }
+        }
+        overlay.after = after;
+        overlay
     }
 }
 
@@ -422,50 +441,33 @@ impl<S: Source> Source for Overlay<'_, S> {
     }
 
     fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
-        let mut found: BTreeSet<Gid> = self.base.holding(collection, fields).into_iter().collect();
-        // A gid that qualifies only once the batch is merged holds some pair through an entry of
-        // the batch, and holds the pair whose batch entries are fewest either through the batch
-        // or through the base.
         let empty = BTreeSet::new();
-        let in_batch: Vec<&BTreeSet<Gid>> = fields
+        let touched = self.touched.get(collection).unwrap_or(&empty);
+        let mut found: BTreeSet<Gid> = self
+            .base
+            .holding(collection, fields)
+            .into_iter()
+            .filter(|g| !touched.contains(g))
+            .collect();
+        let sets: Vec<&BTreeSet<Gid>> = fields
             .iter()
             .map(|(field, value)| {
-                self.batch
-                    .holders(collection, field, value)
-                    .unwrap_or(&empty)
+                let key = (
+                    collection.to_string(),
+                    field.to_string(),
+                    Total((*value).clone()),
+                );
+                self.after.get(&key).unwrap_or(&empty)
             })
             .collect();
-        let candidates: BTreeSet<Gid> =
-            match (0..fields.len()).min_by_key(|&i| in_batch[i].len()) {
-                None => self.batch.touched(collection).into_iter().collect(),
-                Some(j) => {
-                    let mut candidates = in_batch[j].clone();
-                    let others = (0..fields.len()).filter(|&i| i != j);
-                    let others_size: usize = others.clone().map(|i| in_batch[i].len()).sum();
-                    if others_size <= in_batch[j].len() + 1 {
-                        candidates.extend(others.flat_map(|i| in_batch[i].iter().copied()));
-                    } else {
-                        let through_base = self.base.holding(collection, &fields[j..=j]);
-                        candidates.extend(through_base.into_iter().filter(|g| {
-                            (0..fields.len()).any(|i| i != j && in_batch[i].contains(g))
-                        }));
-                    }
-                    candidates
-                }
-            };
-        for gid in candidates {
-            if found.contains(&gid) {
-                continue;
-            }
-            let entries = self.entries(collection, gid);
-            let holds = fields.iter().all(|(field, value)| {
-                entries
+        match sets.iter().min_by_key(|s| s.len()) {
+            None => found.extend(touched),
+            Some(fewest) => found.extend(
+                fewest
                     .iter()
-                    .any(|e| e.field == *field && same(&e.value, value))
-            });
-            if holds {
-                found.insert(gid);
-            }
+                    .filter(|g| sets.iter().all(|s| s.contains(g)))
+                    .copied(),
+            ),
         }
         found.into_iter().collect()
     }
