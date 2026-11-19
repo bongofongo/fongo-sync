@@ -1,5 +1,6 @@
-//! Prints `model::view` for a fixed set of cases, one line per row. `lean/Cases.lean` prints the
-//! Lean model's view of the same cases in the same form, and `make lean-diff` compares the two.
+//! Prints `model::view` for a fixed set of cases, one line per row, which schemas
+//! `Schema::check` refuses, and what clocks issue. `lean/Cases.lean` prints the same from the Lean
+//! model in the same form, and `make lean-diff` compares the two.
 
 use fongo_sync_core::model::{ALIAS, Collection, FieldKind, Schema, view};
 use fongo_sync_core::{Change, Clock, DELETED, Gid, Hlc, Strategy, Value};
@@ -21,6 +22,16 @@ fn ch(g: u128, field: &str, value: Value, wall_ms: u64) -> Change {
             counter: 0,
             node: gid(9),
         },
+    }
+}
+
+fn at(collection: &str, g: Gid, field: &str, value: Value, wall_ms: u64) -> Change {
+    Change {
+        collection: collection.into(),
+        gid: g,
+        field: field.into(),
+        value,
+        clock: reading(wall_ms, 0, 9),
     }
 }
 
@@ -111,6 +122,157 @@ fn schema_cases() -> Vec<(&'static str, Vec<Collection>)> {
             vec![Collection::minted("things").owner("parent", "things")],
         ),
     ]
+}
+
+fn author(name: &str) -> Gid {
+    Gid::derive("authors", &[text(name)])
+}
+
+fn book(a: Gid, title: &str) -> Gid {
+    Gid::derive("books", &[Value::Ref(a), text(title)])
+}
+
+fn library() -> Schema {
+    Schema::new(vec![
+        Collection::natural("authors", &["name"])
+            .plain("born", Strategy::Lww)
+            .plain("name", Strategy::Lww),
+        Collection::natural("books", &["author", "title"])
+            .reference("author", "authors")
+            .plain("pages", Strategy::Max)
+            .plain("title", Strategy::Lww),
+        Collection::minted("notes")
+            .owner("book", "books")
+            .plain("page", Strategy::Lww)
+            .plain("text", Strategy::Lww)
+            .together(&["text", "page"]),
+    ])
+}
+
+/// Writes `name` to an author's key field at clocks 1, 2, …, then the honest name.
+fn rewritten_first(name: &str, others: &[&str]) -> Vec<Change> {
+    let a = author(name);
+    let mut changes: Vec<Change> = others
+        .iter()
+        .enumerate()
+        .map(|(i, o)| at("authors", a, "name", text(o), i as u64 + 1))
+        .collect();
+    changes.push(at(
+        "authors",
+        a,
+        "name",
+        text(name),
+        others.len() as u64 + 1,
+    ));
+    changes.push(at("authors", a, "born", Value::Int(1900), 50));
+    changes
+}
+
+fn full_cases() -> Vec<(&'static str, Vec<Change>)> {
+    let ann = author("Ann");
+    let middlemarch = book(ann, "Middlemarch");
+    let bob = author("Bob");
+    let persuasion = book(bob, "Persuasion");
+    let eve = author("Eve");
+    let fay = author("Fay");
+    let a_ann = author("A. Ann");
+    let a_middlemarch = book(a_ann, "Middlemarch");
+    vec![
+        (
+            "natural keys and a together set",
+            vec![
+                at("authors", ann, "name", text("Ann"), 1),
+                at("authors", ann, "born", Value::Int(1819), 2),
+                at("books", middlemarch, "author", Value::Ref(ann), 3),
+                at("books", middlemarch, "title", text("Middlemarch"), 3),
+                at("books", middlemarch, "pages", Value::Int(880), 4),
+                at("notes", gid(100), "book", Value::Ref(middlemarch), 5),
+                at("notes", gid(100), "text", text("Dorothea"), 5),
+                at("notes", gid(100), "page", Value::Int(12), 5),
+                at("notes", gid(100), "text", text("Casaubon"), 6),
+                at("notes", gid(101), "book", Value::Ref(gid(7)), 7),
+                at("notes", gid(101), "text", text("orphan"), 7),
+            ],
+        ),
+        (
+            "key rewritten after it was written",
+            std::iter::once(at("authors", ann, "name", text("Ann"), 1))
+                .chain((0..6).map(|i| at("authors", ann, "name", text(&format!("X{i}")), i + 2)))
+                .collect(),
+        ),
+        (
+            "four rewrites before the key hide it",
+            rewritten_first("Bob", &["W1", "W2", "W3", "W4"])
+                .into_iter()
+                .chain([
+                    at("books", persuasion, "author", Value::Ref(bob), 60),
+                    at("books", persuasion, "title", text("Persuasion"), 60),
+                ])
+                .collect(),
+        ),
+        (
+            "three rewrites before the key do not",
+            rewritten_first("Cy", &["W1", "W2", "W3"]),
+        ),
+        (
+            "a write counts once however often it arrives",
+            std::iter::once(at("authors", author("Dee"), "name", text("W1"), 1))
+                .chain(rewritten_first("Dee", &["W1", "W2", "W3"]))
+                .collect(),
+        ),
+        (
+            "ties go to the smaller value",
+            vec![
+                at("authors", eve, "name", text("W1"), 1),
+                at("authors", eve, "name", text("W2"), 2),
+                at("authors", eve, "name", text("W3"), 3),
+                at("authors", eve, "name", text("Zed"), 4),
+                at("authors", eve, "name", text("Eve"), 4),
+                at("authors", fay, "name", text("W1"), 1),
+                at("authors", fay, "name", text("W2"), 2),
+                at("authors", fay, "name", text("W3"), 3),
+                at("authors", fay, "name", text("Fay"), 4),
+                at("authors", fay, "name", text("Abe"), 4),
+            ],
+        ),
+        (
+            "keys equal through an alias",
+            vec![
+                at("authors", ann, "name", text("Ann"), 1),
+                at("authors", a_ann, "name", text("A. Ann"), 2),
+                at("authors", a_ann, ALIAS, Value::Ref(ann), 3),
+                at("books", middlemarch, "author", Value::Ref(ann), 4),
+                at("books", middlemarch, "title", text("Middlemarch"), 4),
+                at("books", a_middlemarch, "author", Value::Ref(a_ann), 5),
+                at("books", a_middlemarch, "title", text("Middlemarch"), 5),
+                at("books", a_middlemarch, "pages", Value::Int(900), 6),
+            ],
+        ),
+        (
+            "clocks beyond the text form",
+            vec![
+                at("authors", author("Gus"), "name", text("Gus"), WALL_MAX + 1),
+                at("notes", gid(102), "text", text("late"), WALL_MAX + 1),
+                at("notes", gid(103), "text", text("edge"), WALL_MAX),
+            ],
+        ),
+    ]
+}
+
+fn print_full(schema: &Schema, changes: &[Change]) {
+    for (collection, rows) in &view(schema, changes).collections {
+        for (g, row) in rows {
+            let fields: Vec<String> = row
+                .iter()
+                .map(|(f, v)| format!("{f}={}", show(v)))
+                .collect();
+            println!(
+                "{collection} {} {}",
+                u128::from_be_bytes(g.0),
+                fields.join(" ")
+            );
+        }
+    }
 }
 
 enum Event {
@@ -282,6 +444,16 @@ fn main() {
                 .collect();
             println!("{} {}", u128::from_be_bytes(g.0), fields.join(" "));
         }
+    }
+    for (name, changes) in &cases {
+        println!("full case {name}");
+        print_full(&schema, changes);
+    }
+    let library = library();
+    library.check().expect("valid schema");
+    for (name, changes) in &full_cases() {
+        println!("full case {name}");
+        print_full(&library, changes);
     }
     for (name, collections) in schema_cases() {
         let verdict = match Schema::new(collections).check() {

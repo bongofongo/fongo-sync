@@ -9,3 +9,4 @@ import FongoSync.Examples
 import FongoSync.Laws
 import FongoSync.Model
 import FongoSync.Run
+import FongoSync.RunModel
