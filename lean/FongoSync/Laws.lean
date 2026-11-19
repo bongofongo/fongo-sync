@@ -199,6 +199,18 @@ theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
 
 /-! ## The view over several collections, with `together` sets and natural keys -/
 
+/-- Of the writes to a natural key field, the ones that count depend only on the set of writes,
+not on the order they arrive in. -/
+theorem key_writes_set {l₁ l₂ : List (Hlc × Value)} (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂) :
+    earliest l₁ = earliest l₂ :=
+  earliest_eq_of_mem_iff same
+
+/-- A write to a natural key field that arrives again does not change which writes count. -/
+theorem key_write_redelivered (l : List (Hlc × Value)) (x : Hlc × Value) (h : x ∈ l) :
+    earliest (x :: l) = earliest l :=
+  earliest_redelivered l x h
+
+
 /-- **The view over several collections depends only on the set of changes**, given unique
 clocks per register. -/
 theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}

@@ -1,4 +1,4 @@
-import FongoSync.View
+import FongoSync.OrdSet
 
 /-!
 # The view over several collections
@@ -11,9 +11,11 @@ collection, the rule for which collection a gid belongs to, the changes ignored 
    reference to another gid, it is a `$deleted` whose value is neither 0 nor 1, or its collection
    is unknown. Of the rest, a gid belongs to the
    collection of its change with the smallest clock, ties going to the smaller collection name,
-   and a change to that gid in another collection is ignored. In a natural collection a gid is
-   verified if some key derives it: one value per key field, each written to that field, whose
-   `derive` is the gid. A change to a key field is ignored unless its value is part of that key.
+   and a change to that gid in another collection is ignored. In a natural collection, of the
+   changes to each key field of a gid only those among the `KEY_ENTRIES` smallest
+   `(clock, value)` pairs count (`earliest`). A gid is verified if some key derives it: one value
+   per key field, each written to that field by a change that counts, whose `derive` is the gid.
+   A change to a key field is ignored unless it counts and its value is part of that key.
 2. Each (collection, gid, field) holds the winner among its changes; `$deleted` and undeclared
    fields merge `Lww`.
 3. An alias whose target belongs to the same collection joins the two gids, unless either is
@@ -127,11 +129,19 @@ def claimed : List (Change Value) :=
 /-- The collection a gid belongs to, as declared. -/
 def homeCollection (g : Gid) : Option Collection := (home sc cs g).bind sc.find
 
-/-- `k` derives `g`: one value per key field, each written to that field by a counted change to
-`g`, and `derive` of them is `g`. -/
+/-- The `(clock, value)` pairs that claimed changes wrote to field `f` of `g`. -/
+def keyWrites (g : Gid) (f : String) : List (Hlc × Value) :=
+  ((claimed sc cs).filter fun x => x.gid = g ∧ x.field = f).map fun x => (x.clock, x.value)
+
+/-- A change to a key field counts if it is among the `KEY_ENTRIES` earliest writes to it. -/
+def Counts (x : Change Value) : Prop :=
+  (x.clock, x.value) ∈ earliest (keyWrites sc cs x.gid x.field)
+
+/-- `k` derives `g`: one value per key field, each written to that field by a change to `g` that
+counts, and `derive` of them is `g`. -/
 def Derives (g : Gid) (c : Collection) (fields : List String) (k : List Value) : Prop :=
   k.length = fields.length ∧
-    (∀ p ∈ fields.zip k, ∃ x ∈ claimed sc cs, x.gid = g ∧ x.field = p.1 ∧ x.value = p.2) ∧
+    (∀ p ∈ fields.zip k, ∃ w ∈ earliest (keyWrites sc cs g p.1), w.2 = p.2) ∧
     sc.derive c.name k = g
 
 /-- The key that derives a natural gid, if any. The Rust takes the first in sorted order; the two
@@ -148,14 +158,14 @@ noncomputable def key (g : Gid) : Option (List Value) :=
 def Unverified (g : Gid) : Prop :=
   ∃ c fields, homeCollection sc cs g = some c ∧ c.natural = some fields ∧ key sc cs g = none
 
-/-- A change to a key field counts only if its value is part of the key. -/
+/-- A change to a key field is kept only if it counts and its value is part of the key. -/
 noncomputable def keyFieldOk (x : Change Value) : Prop :=
   match homeCollection sc cs x.gid with
   | some c =>
     match c.natural with
     | some fields =>
       match fields.findIdx? (· = x.field) with
-      | some i => ∃ k, key sc cs x.gid = some k ∧ k[i]? = some x.value
+      | some i => Counts sc cs x ∧ ∃ k, key sc cs x.gid = some k ∧ k[i]? = some x.value
       | none => True
     | none => True
   | none => True
@@ -260,22 +270,29 @@ def liveAt : Nat → Gid → Prop
 
 def Live (g : Gid) : Prop := ∃ k, liveAt sc inp k g
 
-noncomputable def liveMembers (r : Gid) : List Gid :=
-  inp.gids.filter fun m => decide (inp.canon m = r ∧ Live sc inp m)
+/-! The rows, given which members are live. `present` takes `Live`; a runnable view decides it. -/
 
-noncomputable def read (f : Field) (v : Value) : Value :=
+variable (live : Gid → Prop) [DecidablePred live]
+
+instance (target : String) (o : Gid) : Decidable (namesLive inp live target o) := by
+  unfold namesLive; infer_instance
+
+def liveMembers (r : Gid) : List Gid :=
+  inp.gids.filter fun m => decide (inp.canon m = r ∧ live m)
+
+def read (f : Field) (v : Value) : Value :=
   match f.kind with
   | .plain => v
   | .reference t | .owner t =>
     match v with
-    | .ref o => if namesLive inp (Live sc inp) t o then .ref (inp.canon o) else .null
+    | .ref o => if namesLive inp live t o then .ref (inp.canon o) else .null
     | _ => .null
 
 /-- A field outside any `together` set: the strategy winner among the live members. -/
-noncomputable def plainValue (f : Field) (r : Gid) : Value :=
-  match ((liveMembers sc inp r).filterMap fun m => register inp m f.name).foldl
+def plainValue (f : Field) (r : Gid) : Value :=
+  match ((liveMembers inp live r).filterMap fun m => register inp m f.name).foldl
       (apply f.strategy) none with
-  | some e => read sc inp f e.value
+  | some e => read inp live f e.value
   | none => .null
 
 /-- The latest clock a member has written to any field of a set. -/
@@ -287,8 +304,8 @@ def latest (set : List String) (m : Gid) : Option Hlc :=
 
 /-- The live member holding the latest clock across a set, and that clock. The first member in
 ascending order wins a tie. -/
-noncomputable def setHolder (set : List String) (r : Gid) : Option (Hlc × Gid) :=
-  (liveMembers sc inp r).foldl (fun best m =>
+def setHolder (set : List String) (r : Gid) : Option (Hlc × Gid) :=
+  (liveMembers inp live r).foldl (fun best m =>
     match latest inp set m with
     | none => best
     | some at_ =>
@@ -297,30 +314,34 @@ noncomputable def setHolder (set : List String) (r : Gid) : Option (Hlc × Gid) 
       | some (held, _) => if held < at_ then some (at_, m) else best) none
 
 /-- A field of a `together` set: the holder's value if written at the holder's clock. -/
-noncomputable def setValue (c : Collection) (set : List String) (name : String) (r : Gid) : Value :=
-  match setHolder sc inp set r, c.declared name with
+def setValue (c : Collection) (set : List String) (name : String) (r : Gid) : Value :=
+  match setHolder inp live set r, c.declared name with
   | some (at_, m), some f =>
     match register inp m name with
-    | some e => if e.clock = at_ then read sc inp f e.value else .null
+    | some e => if e.clock = at_ then read inp live f e.value else .null
     | none => .null
   | _, _ => .null
 
 abbrev Row := List (String × Value)
 
-noncomputable def row (c : Collection) (r : Gid) : Row :=
-  (c.fields.filter fun f => !c.inTogether f.name).map (fun f => (f.name, plainValue sc inp f r)) ++
-    c.together.flatMap fun set => set.map fun name => (name, setValue sc inp c set name r)
+def row (c : Collection) (r : Gid) : Row :=
+  (c.fields.filter fun f => !c.inTogether f.name).map (fun f => (f.name, plainValue inp live f r)) ++
+    c.together.flatMap fun set => set.map fun name => (name, setValue inp live c set name r)
 
-/-- The rows of one collection, by canonical gid. -/
-noncomputable def present (collection : String) (r : Gid) : Option Row :=
+/-- The rows of one collection, by canonical gid, given the live members. -/
+def presentWith (collection : String) (r : Gid) : Option Row :=
   match sc.find collection with
   | none => none
   | some c =>
-    if inp.home r = some collection ∧ ∃ m ∈ inp.gids, inp.canon m = r ∧ Live sc inp m then
-      some (row sc inp c r)
+    if inp.home r = some collection ∧ ∃ m ∈ inp.gids, inp.canon m = r ∧ live m then
+      some (row inp live c r)
     else none
 
 end Present
+
+/-- The rows of one collection, by canonical gid. -/
+noncomputable def present (sc : Schema) (inp : Inputs) : String → Gid → Option Row :=
+  presentWith sc inp (Live sc inp)
 
 /-- **The view** of the changes `cs`: for each collection, its live groups' rows. -/
 noncomputable def view (sc : Schema) (cs : List (Change Value)) : String → Gid → Option Row :=
@@ -366,9 +387,18 @@ theorem gids_eq : gids sc cs₁ = gids sc cs₂ :=
 theorem homeCollection_eq : homeCollection sc cs₁ = homeCollection sc cs₂ := by
   funext g; simp only [homeCollection, home_eq sc same]
 
+theorem earliest_keyWrites_eq (g : Gid) (f : String) :
+    earliest (keyWrites sc cs₁ g f) = earliest (keyWrites sc cs₂ g f) :=
+  earliest_eq_of_mem_iff fun w => by
+    simp only [keyWrites, List.mem_map, List.mem_filter, mem_claimed_iff sc same]
+
+theorem counts_eq : Counts sc cs₁ = Counts sc cs₂ := by
+  funext x
+  simp only [Counts, earliest_keyWrites_eq sc same]
+
 theorem derives_eq : Derives sc cs₁ = Derives sc cs₂ := by
   funext g c fields k
-  simp only [Derives, mem_claimed_iff sc same]
+  simp only [Derives, earliest_keyWrites_eq sc same]
 
 theorem key_eq : key sc cs₁ = key sc cs₂ := by
   funext g
@@ -381,7 +411,7 @@ theorem unverified_eq : Unverified sc cs₁ = Unverified sc cs₂ := by
 
 theorem mem_accepted_iff (c : Change Value) : c ∈ accepted sc cs₁ ↔ c ∈ accepted sc cs₂ := by
   have : keyFieldOk sc cs₁ = keyFieldOk sc cs₂ := by
-    funext x; unfold keyFieldOk; rw [homeCollection_eq sc same, key_eq sc same]
+    funext x; unfold keyFieldOk; rw [homeCollection_eq sc same, key_eq sc same, counts_eq sc same]
   simp only [accepted, List.mem_filter, mem_claimed_iff sc same, this]
 
 theorem mem_edges_iff (e : Edge) : e ∈ edges sc cs₁ ↔ e ∈ edges sc cs₂ := by

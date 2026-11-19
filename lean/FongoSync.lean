@@ -4,6 +4,7 @@ import FongoSync.Register
 import FongoSync.State
 import FongoSync.Alias
 import FongoSync.View
+import FongoSync.OrdSet
 import FongoSync.Examples
 import FongoSync.Laws
 import FongoSync.Model
