@@ -875,6 +875,35 @@ fn a_swap_no_field_of_which_accepts_null_is_reported_stuck_and_not_written() {
     );
 }
 
+/// What a storage adapter needs to write two rows that swap values of a unique set none of
+/// whose columns accepts NULL, such as an identity column declared NOT NULL UNIQUE: `order` parks
+/// only by writing NULL, so it reports such a swap stuck, and an adapter can only hold it.
+#[test]
+#[ignore = "order cannot write a swap of NOT NULL unique values"]
+fn a_swap_of_not_null_unique_values_can_be_written() {
+    let schema = Schema::new(vec![
+        Collection::minted("sites")
+            .plain("code", Merge::Lww)
+            .identity_key(&["code"]),
+    ]);
+    let planned = [
+        update(
+            "sites",
+            1,
+            row(&[("code", text("x"))]),
+            row(&[("code", text("y"))]),
+        ),
+        update(
+            "sites",
+            2,
+            row(&[("code", text("y"))]),
+            row(&[("code", text("x"))]),
+        ),
+    ];
+    let plan = order(&schema, &Columns::new().not_null("sites", "code"), &planned);
+    assert!(plan.stuck.is_empty(), "{plan:?}");
+}
+
 #[test]
 fn a_row_on_no_cycle_is_never_parked() {
     let schema = Schema::new(vec![

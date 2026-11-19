@@ -119,8 +119,9 @@ pub fn slot(schema: &Schema, collection: &str, field: &str) -> Slot {
 }
 
 /// Keeps `value` at `clock` in `entries` as `slot` says. Returns whether anything changed, and a
-/// value no entry holds any more, if one went.
-fn keep(
+/// value no entry holds any more, if one went. A store that keeps facts elsewhere than in
+/// [`Store`] keeps each field's entries with this.
+pub fn keep(
     slot: Slot,
     entries: &mut Vec<(Value, Hlc)>,
     value: &Value,
