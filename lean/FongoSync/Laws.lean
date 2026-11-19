@@ -1,6 +1,7 @@
 import FongoSync.Examples
 import FongoSync.Model
 import FongoSync.Run
+import FongoSync.RunModel
 
 /-!
 # The laws
@@ -18,26 +19,39 @@ open FongoSync
 
 /-! ## Clock -/
 
-/-- A tick's reading is later than the clock's last reading, whatever the wall says. -/
-theorem tick_later (c : Clock) (wall : Nat) : c.last < (c.tick wall).1 :=
-  c.tick_lt wall
+/-- A tick's reading is later than the clock's last reading, whatever the wall says, unless the
+clock has issued the last reading the text form holds. -/
+theorem tick_later (c : Clock) (wall : Nat) (room : c.HasRoom) : c.last < (c.tick wall).1 :=
+  c.tick_lt wall room
+
+/-- A clock whose last reading the text form holds issues only readings it holds. -/
+theorem tick_encodable (c : Clock) (wall : Nat) (h : c.last.encodable) :
+    (c.tick wall).1.encodable :=
+  c.tick_encodable wall h
 
 /-- Observing a reading the text form cannot hold changes nothing. -/
 theorem observe_ignores_unencodable (c : Clock) (remote : Hlc) (h : ¬ remote.encodable) :
     c.observe remote = c :=
   c.observe_ignores remote h
 
-/-- The next tick after observing an encodable reading is later than it. -/
-theorem tick_after_observe (c : Clock) (remote : Hlc) (wall : Nat) (h : remote.encodable) :
+/-- Observing never takes away a clock's room to tick. -/
+theorem observe_keeps_room (c : Clock) (remote : Hlc) (room : c.HasRoom) :
+    (c.observe remote).HasRoom :=
+  c.observe_hasRoom remote room
+
+/-- The next tick after observing a reading before the last millisecond the text form holds is
+later than it. -/
+theorem tick_after_observe (c : Clock) (remote : Hlc) (wall : Nat) (h : remote.wall < WALL_MAX) :
     remote < ((c.observe remote).tick wall).1 :=
   c.observe_then_tick remote wall h
 
-/-- After any history, the next tick is later than the start, than every reading issued, and
-than every encodable reading observed. -/
-theorem tick_after_any_history (c : Clock) (events : List Event) (wall : Nat) :
+/-- After any history that leaves the clock room to tick, the next tick is later than the start,
+than every reading issued, and than every reading observed before the last millisecond. -/
+theorem tick_after_any_history (c : Clock) (events : List Event) (wall : Nat)
+    (room : (c.run events).1.HasRoom) :
     c.last < ((c.run events).1.tick wall).1 ∧
       ∀ r ∈ (c.run events).2, r < ((c.run events).1.tick wall).1 :=
-  c.tick_after_any_history events wall
+  c.tick_after_any_history events wall room
 
 /-! ## One register, for any value type with a total order -/
 
@@ -186,6 +200,30 @@ theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
 
 /-! ## The view over several collections, with `together` sets and natural keys -/
 
+/-- Of the writes to a natural key field, the ones that count depend only on the set of writes,
+not on the order they arrive in. -/
+theorem key_writes_set {l₁ l₂ : List (Hlc × Value)} (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂) :
+    earliest l₁ = earliest l₂ :=
+  earliest_eq_of_mem_iff same
+
+/-- A write to a natural key field that arrives again does not change which writes count. -/
+theorem key_write_redelivered (l : List (Hlc × Value)) (x : Hlc × Value) (h : x ∈ l) :
+    earliest (x :: l) = earliest l :=
+  earliest_redelivered l x h
+
+/-- A write to a natural key field that does not count among the writes seen never counts once
+more writes arrive, so a store may drop it for good. -/
+theorem key_write_dropped_for_good {l₁ l₂ : List (Hlc × Value)} (sub : ∀ y ∈ l₁, y ∈ l₂)
+    {x : Hlc × Value} (hx : x ∈ l₁) (out : x ∉ earliest l₁) : x ∉ earliest l₂ :=
+  not_mem_earliest_of_subset sub hx out
+
+/-- The view over several collections can be computed from computed inputs: `Full.runView` gives
+the rows of those inputs as `Full.view` gives the rows of its own, liveness computed in as many
+rounds as there are gids. That the computed inputs are `Full.view`'s is not proven here. -/
+theorem full_view_runs_from_inputs (sc : Full.Schema) (cs : List (Change Value)) :
+    Full.runView sc cs = Full.present sc (Full.runInputs sc (Full.candidates sc cs)).toInputs :=
+  Full.runView_eq sc cs
+
 /-- **The view over several collections depends only on the set of changes**, given unique
 clocks per register. -/
 theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}
@@ -210,5 +248,11 @@ theorem full_view_ignores_bad_alias (sc : Full.Schema) (c : Change Value)
     (cs : List (Change Value)) (h : aliasOk c = false) :
     Full.view sc (c :: cs) = Full.view sc cs :=
   Full.view_ignores_bad_alias sc c cs h
+
+/-- A `$deleted` whose value is neither 0 nor 1 is ignored. -/
+theorem full_view_ignores_bad_tombstone (sc : Full.Schema) (c : Change Value)
+    (cs : List (Change Value)) (h : deletedOk c = false) :
+    Full.view sc (c :: cs) = Full.view sc cs :=
+  Full.view_ignores_bad_tombstone sc c cs h
 
 end FongoSync.Laws

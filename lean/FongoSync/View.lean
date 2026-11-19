@@ -9,8 +9,9 @@ What an application sees, given a schema and a set of changes: the live alias gr
 collection, each with its field values, references rewritten to canonical gids. It states what
 replicas must converge to, cut down to one collection and to what is listed below.
 
-Covered: registers (`Lww` and `Max`, `$deleted` merging `Lww`), alias edges and groups, liveness
-through owners, per-field group values from live members, and reading references.
+Covered: registers (`Lww` and `Max`, `$deleted` merging `Lww`), the changes ignored as invalid
+(an alias that does not name another gid, a `$deleted` that is neither 0 nor 1), alias edges and
+groups, liveness through owners, per-field group values from live members, and reading references.
 
 Not covered: several collections and which collection claims a gid; natural keys and the
 closure of groups under equal keys; `together` sets; the filter on clocks that do not survive
@@ -108,19 +109,30 @@ def aliasOk (c : Change Value) : Bool :=
     | _ => false
   else true
 
+/-- A `$deleted` change is valid only if its value is 0 or 1. -/
+def deletedOk (c : Change Value) : Bool :=
+  if c.field = DELETED then decide (c.value = .int 0 ∨ c.value = .int 1) else true
+
+/-- A change that writes a register: not an alias, and not an invalid `$deleted`. -/
+def Writes (c : Change Value) : Prop := c.field ≠ ALIAS ∧ deletedOk c = true
+
+instance (c : Change Value) : Decidable (Writes c) :=
+  inferInstanceAs (Decidable (c.field ≠ ALIAS ∧ deletedOk c = true))
+
 section Inputs
 
 variable (sc : Schema) (cs : List (Change Value))
 
 /-- One change applied to the registers. An alias change only joins groups, as in the Rust. -/
 def step (st : State Value) (c : Change Value) : State Value :=
-  if c.field = ALIAS then st else State.apply sc.strategyOf st c
+  if Writes c then State.apply sc.strategyOf st c else st
 
 def registers : State Value := cs.foldl (step sc) State.empty
 
-/-- The changes to this collection, without aliases that do not name another gid: those are
-ignored outright, so they do not make a gid known. -/
-def ours : List (Change Value) := cs.filter fun c => c.collection = sc.collection ∧ aliasOk c
+/-- The changes to this collection, without the invalid ones: those are ignored outright, so they
+do not make a gid known. -/
+def ours : List (Change Value) :=
+  cs.filter fun c => c.collection = sc.collection ∧ aliasOk c ∧ deletedOk c
 
 /-- Every gid a change to this collection has named, ascending. -/
 def known : List Gid := gidSet ((ours sc cs).map (·.gid))
@@ -281,25 +293,25 @@ theorem inputs_eq (sc : Schema) {cs₁ cs₂ : List (Change Value)} (same : ∀ 
 theorem step_swap (sc : Schema) (st : State Value) (a b : Change Value)
     (h : a.field = ALIAS ∨ b.field = ALIAS ∨ Compatible a b) :
     step sc (step sc st a) b = step sc (step sc st b) a := by
-  by_cases ha : a.field = ALIAS
-  · simp [step, ha]
-  · by_cases hb : b.field = ALIAS
-    · simp [step, hb]
+  by_cases ha : Writes a
+  · by_cases hb : Writes b
     · simp only [step, ha, hb, ↓reduceIte]
-      exact State.apply_swap _ _ _ _ (by simpa [ha, hb] using h)
+      exact State.apply_swap _ _ _ _ (by simpa [ha.1, hb.1] using h)
+    · simp [step, hb]
+  · simp [step, ha]
 
 theorem step_twice (sc : Schema) (st : State Value) (a : Change Value) :
     step sc (step sc st a) a = step sc st a := by
-  by_cases ha : a.field = ALIAS
-  · simp [step, ha]
+  by_cases ha : Writes a
   · simp only [step, ha, ↓reduceIte]; exact State.apply_twice _ _ _
+  · simp [step, ha]
 
 theorem registers_eq_merged (sc : Schema) (cs : List (Change Value)) :
-    registers sc cs = merged sc.strategyOf (cs.filter fun c => c.field ≠ ALIAS) := by
+    registers sc cs = merged sc.strategyOf (cs.filter fun c => decide (Writes c)) := by
   simp only [registers, merged, List.foldl_filter]
   congr
   funext st c
-  by_cases h : c.field = ALIAS <;> simp [h, step]
+  by_cases h : Writes c <;> simp [h, step]
 
 /-- Swapping two neighbouring changes leaves the view the same, if either is an alias or they do
 not write one register at one clock with different values. -/
