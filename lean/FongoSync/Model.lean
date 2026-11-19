@@ -8,7 +8,8 @@ collection, the rule for which collection a gid belongs to, the changes ignored 
 `together` field sets, and natural keys.
 
 1. A change is ignored if its clock is not encodable, it is an alias whose value is not a
-   reference to another gid, or its collection is unknown. Of the rest, a gid belongs to the
+   reference to another gid, it is a `$deleted` whose value is neither 0 nor 1, or its collection
+   is unknown. Of the rest, a gid belongs to the
    collection of its change with the smallest clock, ties going to the smaller collection name,
    and a change to that gid in another collection is ignored. In a natural collection a gid is
    verified if some key derives it: one value per key field, each written to that field, whose
@@ -81,7 +82,8 @@ def Schema.Restricted (sc : Schema) : Prop :=
 
 /-- The changes not ignored outright. -/
 def candidates (sc : Schema) (cs : List (Change Value)) : List (Change Value) :=
-  cs.filter fun c => decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome
+  cs.filter fun c =>
+    decide c.clock.encodable && aliasOk c && deletedOk c && (sc.find c.collection).isSome
 
 /-- Claims compare by clock, then collection name. -/
 def claimCmp (a b : Hlc × String) : Ordering :=
@@ -431,17 +433,21 @@ theorem view_dup (sc : Schema) (cs : List (Change Value)) (unique : ClockDetermi
 
 /-- A change that is not a candidate does not change the view. -/
 theorem view_ignores (sc : Schema) (c : Change Value) (cs : List (Change Value))
-    (h : ¬ (c.clock.encodable ∧ aliasOk c = true ∧ (sc.find c.collection).isSome)) :
+    (h : ¬ (c.clock.encodable ∧ aliasOk c = true ∧ deletedOk c = true ∧
+      (sc.find c.collection).isSome)) :
     view sc (c :: cs) = view sc cs := by
   have hc : candidates sc (c :: cs) = candidates sc cs := by
     simp only [candidates, List.filter_cons]
-    have : (decide c.clock.encodable && aliasOk c && (sc.find c.collection).isSome) = false := by
+    have : (decide c.clock.encodable && aliasOk c && deletedOk c &&
+        (sc.find c.collection).isSome) = false := by
       simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
       by_cases h₁ : c.clock.encodable
       · by_cases h₂ : aliasOk c = true
-        · exact .inr (by simpa [h₁, h₂] using h)
-        · exact .inl (.inr (by simpa using h₂))
-      · exact .inl (.inl h₁)
+        · by_cases h₃ : deletedOk c = true
+          · exact .inr (by simpa [h₁, h₂, h₃] using h)
+          · exact .inl (.inr (by simpa using h₃))
+        · exact .inl (.inl (.inr (by simpa using h₂)))
+      · exact .inl (.inl (.inl h₁))
     simp [this]
   simp only [view, hc]
 
@@ -458,6 +464,11 @@ theorem view_ignores_unknown_collection (sc : Schema) (c : Change Value) (cs : L
 /-- An alias that does not name another gid is ignored. -/
 theorem view_ignores_bad_alias (sc : Schema) (c : Change Value) (cs : List (Change Value))
     (h : aliasOk c = false) : view sc (c :: cs) = view sc cs :=
+  view_ignores sc c cs fun h' => by simp [h] at h'
+
+/-- A `$deleted` that is neither 0 nor 1 is ignored. -/
+theorem view_ignores_bad_tombstone (sc : Schema) (c : Change Value) (cs : List (Change Value))
+    (h : deletedOk c = false) : view sc (c :: cs) = view sc cs :=
   view_ignores sc c cs fun h' => by simp [h] at h'
 
 end FongoSync.Full

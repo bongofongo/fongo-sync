@@ -202,6 +202,18 @@ fn main() {
                 ch(4, "high", text("z"), 5),
             ],
         ),
+        (
+            "tombstones neither 0 nor 1",
+            vec![
+                ch(1, "title", text("a"), 1),
+                ch(1, DELETED, Value::Int(1), 2),
+                ch(1, DELETED, Value::Int(2), 3),
+                ch(2, "title", text("b"), 4),
+                ch(2, DELETED, text("1"), 5),
+                ch(3, DELETED, Value::Int(-1), 6),
+                ch(4, DELETED, Value::Null, 7),
+            ],
+        ),
     ];
     for (name, changes) in &cases {
         println!("case {name}");

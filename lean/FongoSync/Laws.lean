@@ -224,4 +224,10 @@ theorem full_view_ignores_bad_alias (sc : Full.Schema) (c : Change Value)
     Full.view sc (c :: cs) = Full.view sc cs :=
   Full.view_ignores_bad_alias sc c cs h
 
+/-- A `$deleted` whose value is neither 0 nor 1 is ignored. -/
+theorem full_view_ignores_bad_tombstone (sc : Full.Schema) (c : Change Value)
+    (cs : List (Change Value)) (h : deletedOk c = false) :
+    Full.view sc (c :: cs) = Full.view sc cs :=
+  Full.view_ignores_bad_tombstone sc c cs h
+
 end FongoSync.Laws

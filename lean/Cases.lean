@@ -27,7 +27,10 @@ def cases : List (String × List (Change Value)) := [
   ("ignored aliases", [ch 1 "title" (.text "a") 1, ch 1 ALIAS (.ref 1) 2, ch 2 ALIAS (.ref 8) 3,
     ch 3 ALIAS (.int 1) 4]),
   ("chain", [ch 5 "title" (.text "e") 1, ch 4 ALIAS (.ref 5) 2, ch 3 ALIAS (.ref 4) 3,
-    ch 3 "high" (.int 2) 4, ch 4 "high" (.text "z") 5])
+    ch 3 "high" (.int 2) 4, ch 4 "high" (.text "z") 5]),
+  ("tombstones neither 0 nor 1", [ch 1 "title" (.text "a") 1, ch 1 DELETED (.int 1) 2,
+    ch 1 DELETED (.int 2) 3, ch 2 "title" (.text "b") 4, ch 2 DELETED (.text "1") 5,
+    ch 3 DELETED (.int (-1)) 6, ch 4 DELETED .null 7])
 ]
 
 def showValue : Value → String

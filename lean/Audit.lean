@@ -37,3 +37,4 @@ import FongoSync
 #print axioms FongoSync.Laws.full_view_ignores_unencodable
 #print axioms FongoSync.Laws.full_view_ignores_unknown_collection
 #print axioms FongoSync.Laws.full_view_ignores_bad_alias
+#print axioms FongoSync.Laws.full_view_ignores_bad_tombstone
