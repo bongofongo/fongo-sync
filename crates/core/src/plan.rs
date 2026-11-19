@@ -33,8 +33,9 @@
 //!   entity is shown again.
 //! - Alias the groups [`clashes`] reports before writing rows.
 //! - Write in the order [`order`] gives, with [`Columns`] from its table definitions. Hold the
-//!   rows [`Plan::stuck`] names and every entity whose write the database refuses, under the gid
-//!   the row stands for, leave row and image as they were, and retry them on every later apply.
+//!   rows [`Plan::stuck`] names (they get no step) and every entity whose write the database
+//!   refuses, under the gid the row stands for; leave row and image as they were, and retry them
+//!   on every later apply.
 //! - Observe the clock of a change from elsewhere only if [`crate::source::admit`] accepts it.
 //!
 //! [`Evaluator::affected`]: crate::eval::Evaluator::affected
@@ -388,8 +389,9 @@ impl Columns {
 }
 
 /// The writes [`order`] puts in order, and the rows it cannot write, ascending: those on a cycle
-/// no permitted parking breaks, and those that wait on them. An adapter holds the stuck rows, leaves
-/// them as they are, and tries again later.
+/// no permitted parking breaks, and those that wait on them. A stuck row gets no step at all, not
+/// even a parking, so an adapter holds it, leaves its row and image as they are, and tries again
+/// later.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -399,8 +401,8 @@ pub struct Plan {
 /// What a requirement waits for, and so which fields parking its source sets to NULL.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Need {
-    /// The source row, being inserted, exists. Parking inserts it with every field that makes it
-    /// wait set to NULL.
+    /// The source row, being inserted, exists. Parking inserts it with every field that still
+    /// waits set to NULL.
     Exists,
     /// The source row stops referring, through this field, to a row being deleted.
     Unrefer(String),
@@ -421,12 +423,37 @@ enum Need {
 /// inserted referring to each other, a deleted owner and a deleted owned row that refers back),
 /// one row on the cycle is parked: only the fields that keep the cycle from proceeding are set to
 /// NULL, choosing, for a unique set, a field the row's own write changes where one accepts NULL.
-/// The smallest (collection, gid) that can be parked is. A row on no cycle is never parked; a
-/// cycle no row of which can be parked within `columns` is reported as stuck.
+/// A row being inserted is parked by inserting it early, with NULL in every field that still
+/// waits on a row not yet written: parking happens only when nothing else can proceed, so such a
+/// wait may come from outside its cycle. The smallest (collection, gid) that can be parked is. A
+/// row on no cycle is never parked; a cycle no row of which can be parked within `columns` is
+/// reported as stuck, and so is every row waiting on it. A row that would be parked and then
+/// found stuck is not parked: the plan is made again without parking it.
 ///
 /// Cost: O((n + e) log n) for n rows and e requirements (at most the number of reference and
-/// unique fields across the rows), plus O(n + e) for each cycle broken.
+/// unique fields across the rows), plus, for each row parked, the size of its cycle's component;
+/// repeated in the rare case a parked row turns out stuck.
 pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
+    // A row parked and then found stuck would keep NULLs its application never wrote, and later
+    // steps would rely on them: plan again without parking such rows until there are none.
+    let mut unparkable = BTreeSet::new();
+    loop {
+        let (plan, parked_and_stuck) = order_once(schema, columns, planned, &unparkable);
+        if parked_and_stuck.is_empty() {
+            return plan;
+        }
+        unparkable.extend(parked_and_stuck);
+    }
+}
+
+/// One attempt at [`order`], never parking the rows (by index) in `unparkable`. Returns the plan
+/// and the rows it parked and then reported stuck.
+fn order_once(
+    schema: &Schema,
+    columns: &Columns,
+    planned: &[Planned],
+    unparkable: &BTreeSet<usize>,
+) -> (Plan, BTreeSet<usize>) {
     let n = planned.len();
     let ids: Vec<(String, Gid)> = planned
         .iter()
@@ -643,7 +670,7 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
             let c = components.len();
             for &m in &members {
                 component_of.insert(m, c);
-                if parked[m].is_none() {
+                if parked[m].is_none() && !unparkable.contains(&m) {
                     candidates.insert((ids[m].clone(), m));
                 }
             }
@@ -822,12 +849,15 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
             }
         }
     }
+    let parked_and_stuck = (0..n)
+        .filter(|&i| stuck[i] && parked[i].is_some())
+        .collect();
     let mut stuck: Vec<(String, Gid)> = (0..n)
         .filter(|&i| stuck[i])
         .map(|i| ids[i].clone())
         .collect();
     stuck.sort();
-    Plan { steps, stuck }
+    (Plan { steps, stuck }, parked_and_stuck)
 }
 
 /// The strongly connected components of more than one row among `left`, by `out`'s edges.

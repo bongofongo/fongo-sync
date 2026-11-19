@@ -820,15 +820,10 @@ impl<'s> Replica<'s> {
             .fold(Columns::new(), |cols, (c, f)| cols.not_null(c, f));
         let plan = order(self.schema, &columns, &planned);
         let mut failed: BTreeSet<(String, Key)> = BTreeSet::new();
-        // A stuck row gets no final write; its parking step, if any, others rely on.
         for (c, g) in &plan.stuck {
             let at = (c.clone(), key_of(*g).unwrap());
             self.held.insert(owner_of[&at].clone());
-            let parked = plan
-                .steps
-                .iter()
-                .any(|s| s.parked && s.collection == *c && s.gid == *g);
-            if inserting.contains(&at) && !parked {
+            if inserting.contains(&at) {
                 self.gid_of.remove(&at);
             }
         }

@@ -569,13 +569,94 @@ fn plan_between(before: &Table, after: &Table) -> Vec<Planned> {
         .collect()
 }
 
+/// Rows referring to their own collection, two identity keys (one of two fields), an owner, and a
+/// natural collection under that owner that refers back into itself outside its key.
+fn tangled() -> Schema {
+    Schema::new(vec![
+        Collection::minted("pages")
+            .plain("slug", Merge::Lww)
+            .plain("rank", Merge::Lww)
+            .plain("lang", Merge::Lww)
+            .reference("next", "pages")
+            .reference("cover", "media")
+            .identity_key(&["slug"])
+            .identity_key(&["rank", "lang"]),
+        Collection::minted("media")
+            .plain("hash", Merge::Lww)
+            .owner("page", "pages")
+            .identity_key(&["hash"]),
+        Collection::natural("notes", &["medium", "n"])
+            .owner("medium", "media")
+            .plain("n", Merge::Lww)
+            .reference("see", "notes"),
+    ])
+}
+
+/// From any table that keeps its constraints to any other: every step of the plan keeps them;
+/// every row the plan does not report stuck ends as it should; a stuck row gets no step at all,
+/// so it is left as it was. Where the actions can be done whole in some order, nothing is parked
+/// and nothing is stuck. The plan does not depend on the order the actions arrive in.
+fn plan_law(
+    schema: &Schema,
+    columns: &Columns,
+    before: Table,
+    after: Table,
+    shuffle: u64,
+) -> Result<(), TestCaseError> {
+    let tables = Tables { schema, columns };
+    let (before, after) = (tables.repair(before), tables.repair(after));
+    let mut planned = plan_between(&before, &after);
+    for (k, row) in &before {
+        if shuffle.rotate_left(k.1.0[15] as u32).is_multiple_of(3) && after.get(k) == Some(row) {
+            planned.push(Planned {
+                collection: k.0.clone(),
+                gid: k.1,
+                image: Some(row.clone()),
+                action: RowAction::Nothing,
+            });
+        }
+    }
+    let n = planned.len();
+    for i in 0..n {
+        planned.swap(i, (shuffle.wrapping_mul(i as u64 + 7) % n as u64) as usize);
+    }
+    let plan = order(schema, columns, &planned);
+    let mut table = before.clone();
+    for step in &plan.steps {
+        let at = (step.collection.clone(), step.gid);
+        prop_assert!(
+            !plan.stuck.contains(&at),
+            "a step for stuck {at:?}: {plan:#?}"
+        );
+        if let Err(e) = tables.apply(&mut table, step) {
+            prop_assert!(false, "{e}\nplan: {plan:#?}");
+        }
+    }
+    for p in &planned {
+        let at = (p.collection.clone(), p.gid);
+        let wanted = if plan.stuck.contains(&at) {
+            before.get(&at)
+        } else {
+            after.get(&at)
+        };
+        prop_assert_eq!(table.get(&at), wanted, "{:?}", at);
+    }
+    if tables.greedy(&before, &planned) {
+        prop_assert!(plan.stuck.is_empty(), "stuck where no cycle is: {plan:#?}");
+        prop_assert!(
+            plan.steps.iter().all(|s| !s.parked),
+            "parked where no cycle is: {plan:#?}"
+        );
+    }
+    let mut reordered = planned.clone();
+    reordered.reverse();
+    prop_assert_eq!(order(schema, columns, &reordered), plan);
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
-    /// From any table that keeps its constraints to any other, every step of the plan keeps
-    /// them, every row the plan does not report stuck ends as it should, and a stuck row is left
-    /// as it was or parked. Where the actions can be done whole in some order, nothing is parked
-    /// and nothing is stuck. The plan does not depend on the order the actions arrive in.
     #[test]
     fn an_ordered_plan_keeps_every_constraint_at_every_step(
         (schema, columns, before, after, shuffle) in arb_family().prop_flat_map(|f| {
@@ -583,36 +664,16 @@ proptest! {
             (Just(schema.clone()), arb_columns(&schema), arb_table(&schema), arb_table(&schema), any::<u64>())
         })
     ) {
-        let tables = Tables { schema: &schema, columns: &columns };
-        let (before, after) = (tables.repair(before), tables.repair(after));
-        let mut planned = plan_between(&before, &after);
-        let n = planned.len();
-        for i in 0..n {
-            planned.swap(i, (shuffle.wrapping_mul(i as u64 + 7) % n as u64) as usize);
-        }
-        let plan = order(&schema, &columns, &planned);
-        let mut table = before.clone();
-        for step in &plan.steps {
-            if let Err(e) = tables.apply(&mut table, step) {
-                prop_assert!(false, "{e}\nplan: {plan:#?}");
-            }
-        }
-        for p in &planned {
-            let at = (p.collection.clone(), p.gid);
-            if plan.stuck.contains(&at) {
-                let parked = plan.steps.iter().any(|s| s.parked && (s.collection.clone(), s.gid) == at);
-                prop_assert!(parked || table.get(&at) == before.get(&at), "{at:?} was touched");
-            } else {
-                prop_assert_eq!(table.get(&at), after.get(&at), "{:?}", at);
-            }
-        }
-        if tables.greedy(&before, &planned) {
-            prop_assert!(plan.stuck.is_empty(), "stuck where no cycle is: {plan:#?}");
-            prop_assert!(plan.steps.iter().all(|s| !s.parked), "parked where no cycle is: {plan:#?}");
-        }
-        let mut reordered = planned.clone();
-        reordered.reverse();
-        prop_assert_eq!(order(&schema, &columns, &reordered), plan);
+        plan_law(&schema, &columns, before, after, shuffle)?;
+    }
+
+    #[test]
+    fn an_ordered_plan_keeps_every_constraint_over_tangled_tables(
+        (columns, before, after, shuffle) in (
+            arb_columns(&tangled()), arb_table(&tangled()), arb_table(&tangled()), any::<u64>()
+        )
+    ) {
+        plan_law(&tangled(), &columns, before, after, shuffle)?;
     }
 }
 
