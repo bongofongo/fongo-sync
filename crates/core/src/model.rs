@@ -28,10 +28,11 @@ pub enum Identity {
     Minted,
     /// An entity's gid is `Gid::derive(collection, key)`, the key being these fields' values in
     /// order. Two entities whose keys are equal, once every reference in them is read as its
-    /// group's canonical gid, are one entity. No key field may be declared a reference to the
-    /// collection itself: then whether two entities are one depends on whether their parents
-    /// are, down a path as long as the data makes it, and joining two copies of a deep path costs
-    /// work in proportion to its depth for every entity on it.
+    /// group's canonical gid, are one entity. Key fields declared references may not lead, from
+    /// natural collection to natural collection, back round to where they started: then whether
+    /// two entities are one depends on whether their parents are, down a path as long as the data
+    /// makes it, and joining two copies of a deep path costs work in proportion to its depth for
+    /// every entity on it.
     Natural(Vec<String>),
 }
 
@@ -155,8 +156,8 @@ impl Schema {
 
     /// Whether [`view`] can be asked about this schema. It refuses: duplicate names; field names
     /// starting with `$`; references to undeclared collections; undeclared fields in a key, an
-    /// identity key or a `together` set; a natural key field declared a reference to its own
-    /// collection; identity keys on natural collections; a `together`
+    /// identity key or a `together` set; natural key fields declared references that lead round
+    /// to the collection they start from; identity keys on natural collections; a `together`
     /// field that does not merge `Lww`, is a reference of either kind, or is in two sets; a collection
     /// owning its own rows; and owner references that form a cycle across collections.
     pub fn check(&self) -> Result<(), String> {
@@ -193,15 +194,6 @@ impl Schema {
                 if let Some(f) = undeclared(key) {
                     return Err(format!("{} keys on undeclared {f}", c.name));
                 }
-                if let Some(f) = key.iter().find(|f| {
-                    matches!(c.declared(f).map(|d| &d.kind),
-                        Some(FieldKind::Reference(t) | FieldKind::Owner(t)) if *t == c.name)
-                }) {
-                    return Err(format!(
-                        "{}.{f} is a key that refers to its own collection",
-                        c.name
-                    ));
-                }
                 if !c.identity_keys.is_empty() {
                     return Err(format!("{} is natural and has identity keys", c.name));
                 }
@@ -235,24 +227,55 @@ impl Schema {
                 }
             }
         }
+        let owners = |c: &'_ Collection| -> Vec<String> {
+            c.fields
+                .iter()
+                .filter_map(|f| match &f.kind {
+                    FieldKind::Owner(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let keyed_on = |c: &'_ Collection| -> Vec<String> {
+            let Identity::Natural(key) = &c.identity else {
+                return Vec::new();
+            };
+            key.iter()
+                .filter_map(|f| match c.declared(f).map(|d| &d.kind) {
+                    Some(FieldKind::Reference(t) | FieldKind::Owner(t)) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if let Some(c) = self.cycle(owners) {
+            return Err(format!("ownership cycles through {c}"));
+        }
+        if let Some(c) = self.cycle(keyed_on) {
+            return Err(format!("natural keys refer round through {c}"));
+        }
+        Ok(())
+    }
+
+    /// A collection from which `edges` lead back to itself, if any.
+    fn cycle(&self, edges: impl Fn(&Collection) -> Vec<String>) -> Option<&str> {
         for start in &self.collections {
-            let mut at = vec![start.name.as_str()];
+            let mut at = vec![start.name.clone()];
             let mut visited = BTreeSet::new();
             while let Some(name) = at.pop() {
-                let fields = self.collection(name).map_or(&[][..], |c| &c.fields);
-                for f in fields {
-                    if let FieldKind::Owner(t) = &f.kind {
-                        if t == &start.name {
-                            return Err(format!("ownership cycles through {}", start.name));
-                        }
-                        if visited.insert(t.as_str()) {
-                            at.push(t);
-                        }
+                let Some(c) = self.collection(&name) else {
+                    continue;
+                };
+                for t in edges(c) {
+                    if t == start.name {
+                        return Some(&start.name);
+                    }
+                    if visited.insert(t.clone()) {
+                        at.push(t);
                     }
                 }
             }
         }
-        Ok(())
+        None
     }
 }
 

@@ -850,17 +850,32 @@ fn the_schema_check_refuses_what_the_model_cannot_answer() {
 }
 
 #[test]
-fn a_natural_key_may_not_refer_to_its_own_collection() {
-    let dirs = Collection::natural("dirs", &["parent", "name"])
-        .reference("parent", "dirs")
-        .plain("name", Merge::Lww);
-    assert!(Schema::new(vec![dirs]).check().is_err());
-    let elsewhere = Collection::natural("dirs", &["root", "name"])
-        .reference("root", "roots")
-        .reference("parent", "dirs")
-        .plain("name", Merge::Lww);
-    let schema = Schema::new(vec![Collection::minted("roots"), elsewhere]);
-    assert!(schema.check().is_ok());
+fn natural_keys_may_not_refer_round_to_where_they_start() {
+    let keyed = |name: &str, on: &str| {
+        Collection::natural(name, &["up", "name"])
+            .reference("up", on)
+            .plain("name", Merge::Lww)
+    };
+    let owned = |name: &str, on: &str| {
+        Collection::natural(name, &["up", "name"])
+            .owner("up", on)
+            .plain("name", Merge::Lww)
+    };
+    for loops in [
+        vec![keyed("dirs", "dirs")],
+        vec![keyed("a", "b"), keyed("b", "a")],
+        vec![owned("a", "b"), keyed("b", "a")],
+        vec![keyed("a", "b"), keyed("b", "c"), keyed("c", "a")],
+    ] {
+        assert!(Schema::new(loops.clone()).check().is_err(), "{loops:?}");
+    }
+    let chain = Schema::new(vec![
+        Collection::minted("roots"),
+        keyed("a", "roots"),
+        owned("b", "a"),
+        keyed("c", "b").reference("see", "c"),
+    ]);
+    assert!(chain.check().is_ok());
 }
 
 #[test]
