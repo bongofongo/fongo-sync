@@ -41,7 +41,6 @@
 //! [`Evaluator::affected`]: crate::eval::Evaluator::affected
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 
 use crate::change::{Change, DELETED, Strategy};
 use crate::clock::Hlc;
@@ -435,25 +434,28 @@ enum Need {
 /// repeated in the rare case a parked row turns out stuck.
 pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
     // A row parked and then found stuck would keep NULLs its application never wrote, and later
-    // steps would rely on them: plan again without parking such rows until there are none.
+    // steps would rely on them: plan again, parking none of the rows found stuck, until no
+    // parked row is. A row found stuck is on a cycle nothing could break or waits on one, and
+    // forbidding more parkings frees nothing, so each round's stuck rows stay stuck.
     let mut unparkable = BTreeSet::new();
     loop {
-        let (plan, parked_and_stuck) = order_once(schema, columns, planned, &unparkable);
-        if parked_and_stuck.is_empty() {
+        crate::work::add(1);
+        let (plan, stuck, parked_and_stuck) = order_once(schema, columns, planned, &unparkable);
+        if !parked_and_stuck {
             return plan;
         }
-        unparkable.extend(parked_and_stuck);
+        unparkable.extend(stuck);
     }
 }
 
-/// One attempt at [`order`], never parking the rows (by index) in `unparkable`. Returns the plan
-/// and the rows it parked and then reported stuck.
+/// One attempt at [`order`], never parking the rows (by index) in `unparkable`. Returns the plan,
+/// the rows it reported stuck, and whether any of them it had parked.
 fn order_once(
     schema: &Schema,
     columns: &Columns,
     planned: &[Planned],
     unparkable: &BTreeSet<usize>,
-) -> (Plan, BTreeSet<usize>) {
+) -> (Plan, BTreeSet<usize>, bool) {
     let n = planned.len();
     let ids: Vec<(String, Gid)> = planned
         .iter()
@@ -635,6 +637,9 @@ fn order_once(
     let mut found_cycles = false;
     let mut live = 0usize;
     let mut candidates: BTreeSet<((String, Gid), usize)> = BTreeSet::new();
+    // Rows tried and found unparkable. Only a refreshed component or a requirement on the row
+    // being met can change that, and either puts the row back among the candidates.
+    let mut failed: BTreeSet<usize> = BTreeSet::new();
     loop {
         while let Some((_, i)) = ready.pop_first() {
             crate::work::add(1);
@@ -657,6 +662,9 @@ fn order_once(
             }
             for (to, need) in out[i].clone() {
                 drop_edge(i, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
+                if failed.remove(&to) && component_of.contains_key(&to) {
+                    candidates.insert((ids[to].clone(), to));
+                }
             }
         }
         if finished == n {
@@ -724,19 +732,7 @@ fn order_once(
             break;
         }
         let mut broke = false;
-        let mut cursor: Option<((String, Gid), usize)> = None;
-        loop {
-            let next = match &cursor {
-                None => candidates.first().cloned(),
-                Some(c) => candidates
-                    .range((Bound::Excluded(c.clone()), Bound::Unbounded))
-                    .next()
-                    .cloned(),
-            };
-            let Some(next) = next else {
-                break;
-            };
-            cursor = Some(next.clone());
+        while let Some(next) = candidates.first().cloned() {
             crate::work::add(1);
             let r = next.1;
             let p = &planned[r];
@@ -796,6 +792,8 @@ fn order_once(
                 }
             }
             if !possible || satisfied.is_empty() {
+                candidates.remove(&next);
+                failed.insert(r);
                 continue;
             }
             let (action, image) = match (&p.action, &p.image) {
@@ -816,7 +814,11 @@ fn order_once(
                     now.extend(set.clone());
                     (RowAction::Update(set), now)
                 }
-                (_, None) => continue,
+                (_, None) => {
+                    candidates.remove(&next);
+                    failed.insert(r);
+                    continue;
+                }
             };
             steps.push(Step {
                 collection: p.collection.clone(),
@@ -829,37 +831,28 @@ fn order_once(
             changed.insert(component_of[&r]);
             for (to, need) in satisfied {
                 drop_edge(r, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
+                if failed.remove(&to) && component_of.contains_key(&to) && parked[to].is_none() {
+                    candidates.insert((ids[to].clone(), to));
+                }
             }
             broke = true;
             break;
         }
         if !broke {
-            let Some(first) = (0..components.len())
-                .filter(|&c| !components[c].is_empty())
-                .min_by_key(|&c| components[c].iter().map(|&m| ids[m].clone()).min())
-            else {
-                break;
-            };
-            live -= 1;
-            for m in std::mem::take(&mut components[first]) {
-                component_of.remove(&m);
-                candidates.remove(&(ids[m].clone(), m));
-                if !done[m] && !stuck[m] {
-                    stuck[m] = true;
-                    finished += 1;
+            // Nothing can be parked, so nothing will change: what is left is stuck.
+            for i in 0..n {
+                if !done[i] && !stuck[i] {
+                    stuck[i] = true;
                 }
             }
+            break;
         }
     }
-    let parked_and_stuck = (0..n)
-        .filter(|&i| stuck[i] && parked[i].is_some())
-        .collect();
-    let mut stuck: Vec<(String, Gid)> = (0..n)
-        .filter(|&i| stuck[i])
-        .map(|i| ids[i].clone())
-        .collect();
+    let parked_and_stuck = (0..n).any(|i| stuck[i] && parked[i].is_some());
+    let stuck_rows: BTreeSet<usize> = (0..n).filter(|&i| stuck[i]).collect();
+    let mut stuck: Vec<(String, Gid)> = stuck_rows.iter().map(|&i| ids[i].clone()).collect();
     stuck.sort();
-    (Plan { steps, stuck }, parked_and_stuck)
+    (Plan { steps, stuck }, stuck_rows, parked_and_stuck)
 }
 
 /// The strongly connected components of more than one row among `left`, by `out`'s edges.
