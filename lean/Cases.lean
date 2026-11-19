@@ -171,7 +171,29 @@ def schemaCases : List (String × List Full.Collection) := [
     [["title"], ["title", "subtitle"]]]),
   ("an undeclared field in a set", [things [plainLww "title"] [["title", "subtitle"]]]),
   ("an empty set", [things [plainLww "title"] [[]]]),
-  ("a collection owning its own rows", [things [⟨"parent", .owner "things", .lww⟩] []])
+  ("a collection owning its own rows", [things [⟨"parent", .owner "things", .lww⟩] []]),
+  ("a key referring to its own collection",
+    [⟨"things", [⟨"parent", .reference "things", .lww⟩], [], some ["parent"]⟩]),
+  ("keys referring round two collections",
+    [⟨"a", [⟨"b", .reference "b", .lww⟩], [], some ["b"]⟩,
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩]),
+  ("keys referring round three collections",
+    [⟨"a", [⟨"b", .reference "b", .lww⟩], [], some ["b"]⟩,
+     ⟨"b", [⟨"c", .reference "c", .lww⟩], [], some ["c"]⟩,
+     ⟨"c", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩]),
+  ("an owner in a key leading round",
+    [⟨"a", [⟨"b", .owner "b", .lww⟩], [], some ["b"]⟩,
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩]),
+  ("a key chain going down",
+    [⟨"a", [⟨"b", .reference "b", .lww⟩], [], some ["b"]⟩,
+     ⟨"b", [⟨"c", .reference "c", .lww⟩], [], some ["c"]⟩,
+     ⟨"c", [plainLww "name"], [], some ["name"]⟩]),
+  ("a loop through a minted collection",
+    [⟨"a", [⟨"b", .reference "b", .lww⟩], [], some ["b"]⟩,
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], none⟩]),
+  ("a reference outside the key leading round",
+    [⟨"a", [plainLww "name", ⟨"b", .reference "b", .lww⟩], [], some ["name"]⟩,
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩])
 ]
 
 end Schemas

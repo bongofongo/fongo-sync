@@ -84,14 +84,34 @@ def Collection.groupable (c : Collection) (name : String) : Prop :=
 instance (c : Collection) (name : String) : Decidable (c.groupable name) := by
   unfold Collection.groupable; split <;> infer_instance
 
-/-- The rules `Schema::check` enforces on self-ownership and on `together` sets: no collection owns
-its own rows, and each set is non-empty, holds only fields it may hold, and shares none with
-another set. The convergence theorem does not need them. -/
+/-- The collections a natural collection's key fields refer to, as references or owners. -/
+def Collection.keyTargets (c : Collection) : List String :=
+  match c.natural with
+  | none => []
+  | some key => key.filterMap fun f =>
+      match (c.declared f).map Field.kind with
+      | some (Kind.reference t) | some (Kind.owner t) => some t
+      | _ => none
+
+def Schema.keyTargetsOf (sc : Schema) (name : String) : List String :=
+  ((sc.find name).map (·.keyTargets)).getD []
+
+/-- The collections natural keys lead to from `start`, in one step or more. A path back to `start`
+passes through distinct collections, so as many rounds as there are collections find it. -/
+def Schema.keyReachable (sc : Schema) (start : String) : List String :=
+  (List.range sc.collections.length).foldl
+    (fun acc _ => (acc ++ acc.flatMap sc.keyTargetsOf).eraseDups) (sc.keyTargetsOf start)
+
+/-- The rules `Schema::check` enforces on self-ownership, on `together` sets and on natural keys:
+no collection owns its own rows; each set is non-empty, holds only fields it may hold, and shares
+none with another set; and no natural key leads, through the key fields of the collections it
+refers to, back to its own collection. The convergence theorem does not need them. -/
 def Schema.Restricted (sc : Schema) : Prop :=
   ∀ c ∈ sc.collections,
     (∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
     (∀ set ∈ c.together, set ≠ [] ∧ ∀ name ∈ set, c.groupable name) ∧
-    c.together.flatten.Nodup
+    c.together.flatten.Nodup ∧
+    c.name ∉ sc.keyReachable c.name
 
 instance (sc : Schema) : Decidable sc.Restricted := by
   unfold Schema.Restricted; infer_instance

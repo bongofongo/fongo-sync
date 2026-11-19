@@ -121,6 +121,56 @@ fn schema_cases() -> Vec<(&'static str, Vec<Collection>)> {
             "a collection owning its own rows",
             vec![Collection::minted("things").owner("parent", "things")],
         ),
+        (
+            "a key referring to its own collection",
+            vec![Collection::natural("things", &["parent"]).reference("parent", "things")],
+        ),
+        (
+            "keys referring round two collections",
+            vec![
+                Collection::natural("a", &["b"]).reference("b", "b"),
+                Collection::natural("b", &["a"]).reference("a", "a"),
+            ],
+        ),
+        (
+            "keys referring round three collections",
+            vec![
+                Collection::natural("a", &["b"]).reference("b", "b"),
+                Collection::natural("b", &["c"]).reference("c", "c"),
+                Collection::natural("c", &["a"]).reference("a", "a"),
+            ],
+        ),
+        (
+            "an owner in a key leading round",
+            vec![
+                Collection::natural("a", &["b"]).owner("b", "b"),
+                Collection::natural("b", &["a"]).reference("a", "a"),
+            ],
+        ),
+        (
+            "a key chain going down",
+            vec![
+                Collection::natural("a", &["b"]).reference("b", "b"),
+                Collection::natural("b", &["c"]).reference("c", "c"),
+                Collection::natural("c", &["name"]).plain("name", Strategy::Lww),
+            ],
+        ),
+        (
+            "a loop through a minted collection",
+            vec![
+                Collection::natural("a", &["b"]).reference("b", "b"),
+                Collection::minted("b").reference("a", "a"),
+            ],
+        ),
+        (
+            "a reference outside the key leading round",
+            vec![
+                Collection::natural("a", &["name"])
+                    .plain("name", Strategy::Lww)
+                    .reference("b", "b"),
+                Collection::natural("b", &["a"]).reference("a", "a"),
+            ],
+        ),
     ]
 }
 
