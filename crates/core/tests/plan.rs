@@ -1377,7 +1377,10 @@ fn large_plan_law(seed: u64, n: u8, x_not_null: bool) -> Result<(), String> {
     let planned = plan_between(&before, &after);
     let plan = order(&schema, &columns, &planned);
     if !x_not_null && !plan.stuck.is_empty() {
-        return Err(format!("stuck though every field accepts NULL: {:?}", plan.stuck));
+        return Err(format!(
+            "stuck though every field accepts NULL: {:?}",
+            plan.stuck
+        ));
     }
     let mut table = before.clone();
     for step in &plan.steps {
