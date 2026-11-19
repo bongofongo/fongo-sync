@@ -1,6 +1,7 @@
-//! How much work the planner and `affected` have done on this thread: rows taken in order,
-//! searched for cycles and tried for parking, and gids queued for comparison. Counted only with
-//! the `work-counters` feature, for tests that check how work grows.
+//! How much work the evaluator, `affected` and the planner have done on this thread: gids
+//! fetched into regions, groups joined, keys filed and looked up, members read, gids queued for
+//! comparison, and rows, requirements and parkings looked at. Counted only with the
+//! `work-counters` feature, for tests that check how work grows.
 
 #[cfg(feature = "work-counters")]
 mod counter {

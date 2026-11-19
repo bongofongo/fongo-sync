@@ -435,8 +435,9 @@ enum Need {
 /// A set is stuck, all of it, when it waits on a stuck row or when no parkings of its own rows
 /// let every one of them be written. A stuck row gets no step, not even a parking.
 ///
-/// Cost: O((n + e) log n) for n rows and e requirements, at most the number of reference and
-/// unique fields across the rows.
+/// Cost: O((n + e) log n) for n rows and e requirements: the references in their writes and
+/// images, and the pairs of rows one of which takes unique values the other holds, at most one
+/// such pair per row and unique set where the images keep the constraints.
 pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
     let rows = Rows::new(schema, columns, planned);
     let n = planned.len();

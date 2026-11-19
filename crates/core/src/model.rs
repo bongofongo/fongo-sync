@@ -20,14 +20,22 @@
 //! - hide a natural entity, by writing [`KEY_ENTRIES`] values to one of its key fields at clocks
 //!   older than its creation;
 //! - set a `Max` field to a value no later write can lower;
-//! - make entities undecidable for an evaluator, by building alias chains, or groups that
-//!   natural keys join, larger than its region limit (`eval::Limits`), which then answers
-//!   `Undetermined` for them. Key candidates cannot exceed the default limit of 1,024: each key
-//!   field counts at most [`KEY_ENTRIES`] values, and 4^5 is 1,024, so only a key of six or more
-//!   fields could;
-//! - make work grow faster than the data it touches in one shape a schema can allow: joining
-//!   two copies of paths through natural keys d collections deep costs about d^1.8 per path
-//!   (each entity's group is found from the keys above it), d being fixed by the schema.
+//! - make entities undecidable for an evaluator, which then answers `Undetermined` for them
+//!   (`eval::Limits`): by building alias chains, or groups that natural keys join, larger than
+//!   its region limit; or by merging the groups a natural key's references fall in until looking
+//!   it up takes more keys than its lookup limit, the product of those groups' sizes. Key
+//!   candidates cannot exceed the default limit of 1,024: each key field counts at most
+//!   [`KEY_ENTRIES`] values, and 4^5 is 1,024, so only a key of six or more fields could;
+//! - make an evaluator's work grow faster than the data it touches, within those limits:
+//!   - a natural key whose references fall in groups of g1, g2, … gids is looked up g1 · g2 · …
+//!     times: n items merged into one group, each with a tag keyed by the item and its own
+//!     label, the tags merged too, cost n² lookups (0.2 s at 500 items) and are undetermined
+//!     beyond 512 items under the default limits;
+//!   - joining two copies of paths through natural keys d collections deep costs about d^1.8 per
+//!     path (each entity's group is found from the keys above it), d being fixed by the schema.
+//!
+//!   Ordering row writes stays O((n + e) log n) for n rows and e requirements among them, though
+//!   images that break unique constraints can make e grow as n².
 //!
 //! None of these is prevented here.
 
