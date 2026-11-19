@@ -267,6 +267,15 @@ impl Store {
         changed
     }
 
+    /// The gids keeping, in `collection`, an entry of `field` equal to `value`.
+    fn holders(&self, collection: &str, field: &str, value: &Value) -> Option<&BTreeSet<Gid>> {
+        self.index.get(&(
+            collection.to_string(),
+            field.to_string(),
+            Total(value.clone()),
+        ))
+    }
+
     fn touched(&self, collection: &str) -> Vec<Gid> {
         self.claims
             .iter()
@@ -414,15 +423,36 @@ impl<S: Source> Source for Overlay<'_, S> {
 
     fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
         let mut found: BTreeSet<Gid> = self.base.holding(collection, fields).into_iter().collect();
-        // A gid that qualifies only once the batch is merged holds at least one of the pairs
-        // through an entry of the batch.
-        let mut candidates = BTreeSet::new();
-        if fields.is_empty() {
-            candidates.extend(self.batch.touched(collection));
-        }
-        for pair in fields {
-            candidates.extend(self.batch.holding(collection, std::slice::from_ref(pair)));
-        }
+        // A gid that qualifies only once the batch is merged holds some pair through an entry of
+        // the batch, and holds the pair whose batch entries are fewest either through the batch
+        // or through the base.
+        let empty = BTreeSet::new();
+        let in_batch: Vec<&BTreeSet<Gid>> = fields
+            .iter()
+            .map(|(field, value)| {
+                self.batch
+                    .holders(collection, field, value)
+                    .unwrap_or(&empty)
+            })
+            .collect();
+        let candidates: BTreeSet<Gid> =
+            match (0..fields.len()).min_by_key(|&i| in_batch[i].len()) {
+                None => self.batch.touched(collection).into_iter().collect(),
+                Some(j) => {
+                    let mut candidates = in_batch[j].clone();
+                    let others = (0..fields.len()).filter(|&i| i != j);
+                    let others_size: usize = others.clone().map(|i| in_batch[i].len()).sum();
+                    if others_size <= in_batch[j].len() + 1 {
+                        candidates.extend(others.flat_map(|i| in_batch[i].iter().copied()));
+                    } else {
+                        let through_base = self.base.holding(collection, &fields[j..=j]);
+                        candidates.extend(through_base.into_iter().filter(|g| {
+                            (0..fields.len()).any(|i| i != j && in_batch[i].contains(g))
+                        }));
+                    }
+                    candidates
+                }
+            };
         for gid in candidates {
             if found.contains(&gid) {
                 continue;
