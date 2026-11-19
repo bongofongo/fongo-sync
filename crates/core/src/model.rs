@@ -4,6 +4,41 @@
 //!
 //! The answer depends only on the set of changes: their order and any duplicates do not matter,
 //! provided no two changes to one field share a clock with different values.
+//!
+//! # What a member device can do
+//!
+//! Every device that holds a library's key is trusted to write any change. The rules converge
+//! whatever it writes, but a device that writes against the application's intent can:
+//!
+//! - delete a gid for good, by writing `$deleted = 1` at the largest clock the text form holds:
+//!   no later clock exists to restore it. Its group still shows while another member is live,
+//!   and then under this gid if it is the group's smallest;
+//! - move a gid to another collection, by writing to it under that collection at a clock older
+//!   than any it has, so that its own collection's changes to it are ignored;
+//! - grow every replica's store without limit, by writing undeclared fields, which are kept;
+//! - merge unrelated entities of one collection, by aliasing them: an alias cannot be undone;
+//! - hide a natural entity, by writing [`KEY_ENTRIES`] values to one of its key fields at clocks
+//!   older than its creation;
+//! - set a `Max` field to a value no later write can lower;
+//! - make entities undecidable for an evaluator, which then answers `Undetermined` for them
+//!   (`eval::Limits`): by building alias chains, or groups that natural keys join, larger than
+//!   its region limit; or by merging the groups a natural key's references fall in until looking
+//!   it up takes more keys than its lookup limit, the product of those groups' sizes. Key
+//!   candidates cannot exceed the default limit of 1,024: each key field counts at most
+//!   [`KEY_ENTRIES`] values, and 4^5 is 1,024, so only a key of six or more fields could;
+//! - make an evaluator's work grow faster than the data it touches, within those limits:
+//!   - a natural key whose references fall in groups of g1, g2, … gids is looked up g1 · g2 · …
+//!     times: n items merged into one group, each with a tag keyed by the item and its own
+//!     label, the tags merged too, cost n² lookups (0.2 s at 500 items) and are undetermined
+//!     beyond 512 items under the default limits;
+//!   - joining two copies of paths through natural keys d collections deep costs about d^1.8 per
+//!     path (each entity's group is found from the keys above it), d being fixed by the schema.
+//!
+//!   Ordering row writes stays O((n + e) log n) for n rows and e requirements among them. Rows
+//!   whose targets keep a unique constraint give at most n requirements per unique set; e grows
+//!   as n² only when many rows hold a tuple and many targets take that same tuple.
+//!
+//! None of these is prevented here.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +51,11 @@ use crate::value::{Gid, Value};
 /// two are one entity. Every such change ever made counts, not only the latest.
 pub const ALIAS: &str = "$alias";
 
+/// How many changes to each key field of a natural entity count: those with the smallest
+/// clocks, ties going to the smaller value. An honest creation writes the key first, so later
+/// rewrites, however many, neither count nor need keeping.
+pub const KEY_ENTRIES: usize = 4;
+
 /// How a collection's entities get their gids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
@@ -23,7 +63,11 @@ pub enum Identity {
     Minted,
     /// An entity's gid is `Gid::derive(collection, key)`, the key being these fields' values in
     /// order. Two entities whose keys are equal, once every reference in them is read as its
-    /// group's canonical gid, are one entity.
+    /// group's canonical gid, are one entity. Key fields declared references may not lead, from
+    /// natural collection to natural collection, back round to where they started: then whether
+    /// two entities are one depends on whether their parents are, down a path as long as the data
+    /// makes it, and joining two copies of a deep path costs work in proportion to its depth for
+    /// every entity on it.
     Natural(Vec<String>),
 }
 
@@ -54,8 +98,10 @@ pub struct Collection {
     /// Sets of fields. Two live groups whose values agree, non-null, on every field of one set
     /// are one entity, and a replica that sees them must alias them.
     pub identity_keys: Vec<Vec<String>>,
-    /// Sets of fields whose values are taken as a unit from the latest clock written to any of
-    /// them; a field of the set not written at that clock reads as NULL.
+    /// Sets of plain fields whose values are taken as a unit from the latest clock written to
+    /// any of them; a field of the set not written at that clock reads as NULL. A replica writes
+    /// a set whole as it reads it, and a reference can read as NULL only because its target is not
+    /// live there yet, so a set may hold no reference.
     pub together: Vec<Vec<String>>,
 }
 
@@ -145,8 +191,9 @@ impl Schema {
 
     /// Whether [`view`] can be asked about this schema. It refuses: duplicate names; field names
     /// starting with `$`; references to undeclared collections; undeclared fields in a key, an
-    /// identity key or a `together` set; identity keys on natural collections; a `together`
-    /// field that does not merge `Lww`, is an owner reference, or is in two sets; a collection
+    /// identity key or a `together` set; natural key fields declared references that lead round
+    /// to the collection they start from; identity keys on natural collections; a `together`
+    /// field that does not merge `Lww`, is a reference of either kind, or is in two sets; a collection
     /// owning its own rows; and owner references that form a cycle across collections.
     pub fn check(&self) -> Result<(), String> {
         let mut names = BTreeSet::new();
@@ -209,30 +256,61 @@ impl Schema {
                     if c.strategy(f) != Strategy::Lww {
                         return Err(format!("{}.{f} is in a together set but not Lww", c.name));
                     }
-                    if matches!(c.declared(f).map(|d| &d.kind), Some(FieldKind::Owner(_))) {
-                        return Err(format!("{}.{f} is an owner in a together set", c.name));
+                    if !matches!(c.declared(f).map(|d| &d.kind), Some(FieldKind::Plain)) {
+                        return Err(format!("{}.{f} is a reference in a together set", c.name));
                     }
                 }
             }
         }
-        for start in &self.collections {
-            let mut at = vec![start.name.as_str()];
-            let mut visited = BTreeSet::new();
-            while let Some(name) = at.pop() {
-                let fields = self.collection(name).map_or(&[][..], |c| &c.fields);
-                for f in fields {
-                    if let FieldKind::Owner(t) = &f.kind {
-                        if t == &start.name {
-                            return Err(format!("ownership cycles through {}", start.name));
-                        }
-                        if visited.insert(t.as_str()) {
-                            at.push(t);
-                        }
-                    }
-                }
-            }
+        let owners = |c: &'_ Collection| -> Vec<String> {
+            c.fields
+                .iter()
+                .filter_map(|f| match &f.kind {
+                    FieldKind::Owner(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let keyed_on = |c: &'_ Collection| -> Vec<String> {
+            let Identity::Natural(key) = &c.identity else {
+                return Vec::new();
+            };
+            key.iter()
+                .filter_map(|f| match c.declared(f).map(|d| &d.kind) {
+                    Some(FieldKind::Reference(t) | FieldKind::Owner(t)) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if let Some(c) = self.cycle(owners) {
+            return Err(format!("ownership cycles through {c}"));
+        }
+        if let Some(c) = self.cycle(keyed_on) {
+            return Err(format!("natural keys refer round through {c}"));
         }
         Ok(())
+    }
+
+    /// A collection from which `edges` lead back to itself, if any.
+    fn cycle(&self, edges: impl Fn(&Collection) -> Vec<String>) -> Option<&str> {
+        for start in &self.collections {
+            let mut at = vec![start.name.clone()];
+            let mut visited = BTreeSet::new();
+            while let Some(name) = at.pop() {
+                let Some(c) = self.collection(&name) else {
+                    continue;
+                };
+                for t in edges(c) {
+                    if t == start.name {
+                        return Some(&start.name);
+                    }
+                    if visited.insert(t.clone()) {
+                        at.push(t);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -291,14 +369,17 @@ impl PartialEq for View {
 /// [`Schema::check`].
 ///
 /// 1. A change is ignored if its collection is unknown, its clock does not survive
-///    `Hlc::encode`, it is an [`ALIAS`] whose value is not a reference to another gid, or its gid
-///    belongs to another collection. A gid belongs to the collection of its change with the
+///    `Hlc::encode`, it is an [`ALIAS`] whose value is not a reference to another gid, it is a
+///    `$deleted` whose value is neither `Int(0)` nor `Int(1)`, or its gid belongs to another
+///    collection. A gid belongs to the collection of its change with the
 ///    smallest clock, ties going to the smaller collection name. Changes to undeclared fields
-///    are kept: they claim the gid, but are not shown. In a natural collection, a change to a
-///    key field is ignored unless its value is part of a key that derives the entity's gid: one
-///    value per key field, each written to that field, such that `Gid::derive` of them is the gid.
-///    Short of a hash collision only one key derives a gid, so a rewrite of a key field is
-///    always ignored.
+///    are kept: they claim the gid, but are not shown. In a natural collection, of the changes to
+///    each key field of an entity only the [`KEY_ENTRIES`] with the smallest clocks count (ties
+///    to the smaller value; a change counted once however often it arrives), and a change to a
+///    key field is ignored unless it counts and its value is part of a key that derives the
+///    entity's gid: one value per key field, each written to that field by a change that counts,
+///    such that `Gid::derive` of them is the gid. Short of a hash collision only one key derives a
+///    gid, so a rewrite of a key field is always ignored.
 /// 2. Each (gid, field) holds the winner among its changes by the field's strategy; `$deleted`
 ///    and undeclared fields merge `Lww`.
 /// 3. An alias whose target belongs to the same collection joins the two gids. Groups are the
@@ -316,6 +397,56 @@ impl PartialEq for View {
 ///    References read as described on [`FieldKind`].
 pub fn view(schema: &Schema, changes: &[Change]) -> View {
     Merged::new(schema, changes).present()
+}
+
+/// What [`view`] is computed from, for comparison with a store's own bookkeeping: every gid that
+/// survived step 1 of [`view`], with the collection it belongs to, the entry each of its fields
+/// holds after step 2, and the canonical gid of its group after step 3.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Merge {
+    pub entities: BTreeMap<Gid, Entity>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entity {
+    pub collection: String,
+    /// Every field written, `$deleted` and undeclared fields included; never [`ALIAS`].
+    pub registers: BTreeMap<String, (Value, Hlc)>,
+    pub canonical: Gid,
+    /// For a natural collection, whether a key deriving the gid has been seen; else true.
+    pub keyed: bool,
+    /// Whether this member is live, by step 4.
+    pub live: bool,
+}
+
+/// The registers and groups behind [`view`] of the same arguments.
+pub fn merge(schema: &Schema, changes: &[Change]) -> Merge {
+    let merged = Merged::new(schema, changes);
+    let entities = merged
+        .home
+        .iter()
+        .map(|(&gid, coll)| {
+            let registers = merged
+                .registers
+                .get(&gid)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(f, entry)| (f.to_string(), entry.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let entity = Entity {
+                collection: coll.name.clone(),
+                registers,
+                canonical: merged.find(gid),
+                keyed: !merged.unverified.contains(&gid),
+                live: merged.live.contains(&gid),
+            };
+            (gid, entity)
+        })
+        .collect();
+    Merge { entities }
 }
 
 /// Pairs of rows in `view` that an identity key says are one entity, as (collection, smaller
@@ -382,6 +513,7 @@ impl<'a> Merged<'a> {
             .iter()
             .filter(|c| encodable(&c.clock))
             .filter(|c| c.field != ALIAS || matches!(c.value, Value::Ref(t) if t != c.gid))
+            .filter(|c| c.field != DELETED || matches!(c.value, Value::Int(0 | 1)))
             .filter_map(|c| Some((c, schema.collection(&c.collection)?)))
             .collect();
 
@@ -404,6 +536,35 @@ impl<'a> Merged<'a> {
             .filter(|(c, coll)| home[&c.gid].name == coll.name)
             .collect();
 
+        let mut earliest: BTreeMap<(Gid, &str), Vec<(Hlc, &Value)>> = BTreeMap::new();
+        for (c, coll) in &claimed {
+            let Identity::Natural(key) = &coll.identity else {
+                continue;
+            };
+            if !key.contains(&c.field) {
+                continue;
+            }
+            let list = earliest.entry((c.gid, c.field.as_str())).or_default();
+            if !list
+                .iter()
+                .any(|(k, v)| *k == c.clock && v.total_cmp(&c.value) == Ordering::Equal)
+            {
+                list.push((c.clock, &c.value));
+            }
+        }
+        for list in earliest.values_mut() {
+            list.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(b.1)));
+            list.truncate(KEY_ENTRIES);
+        }
+        let counts = |c: &Change| {
+            earliest
+                .get(&(c.gid, c.field.as_str()))
+                .is_some_and(|list| {
+                    list.iter()
+                        .any(|(k, v)| *k == c.clock && v.total_cmp(&c.value) == Ordering::Equal)
+                })
+        };
+
         let mut keys: BTreeMap<Gid, Vec<Value>> = BTreeMap::new();
         let mut unverified = BTreeSet::new();
         for (&gid, coll) in &home {
@@ -414,14 +575,9 @@ impl<'a> Merged<'a> {
                 .iter()
                 .map(|f| {
                     let mut seen: Vec<&Value> = Vec::new();
-                    for (c, _) in &claimed {
-                        if c.gid == gid
-                            && &c.field == f
-                            && !seen
-                                .iter()
-                                .any(|v| v.total_cmp(&c.value) == Ordering::Equal)
-                        {
-                            seen.push(&c.value);
+                    for (_, value) in earliest.get(&(gid, f.as_str())).into_iter().flatten() {
+                        if !seen.iter().any(|v| v.total_cmp(value) == Ordering::Equal) {
+                            seen.push(value);
                         }
                     }
                     seen.sort_by(|a, b| a.total_cmp(b));
@@ -445,9 +601,12 @@ impl<'a> Merged<'a> {
                 };
                 match key.iter().position(|f| *f == c.field) {
                     None => true,
-                    Some(i) => keys
-                        .get(&c.gid)
-                        .is_some_and(|k| k[i].total_cmp(&c.value) == Ordering::Equal),
+                    Some(i) => {
+                        counts(c)
+                            && keys
+                                .get(&c.gid)
+                                .is_some_and(|k| k[i].total_cmp(&c.value) == Ordering::Equal)
+                    }
                 }
             })
             .collect();

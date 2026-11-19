@@ -411,6 +411,20 @@ fn a_malformed_alias_is_ignored_and_claims_nothing() {
 }
 
 #[test]
+fn a_tombstone_that_is_neither_zero_nor_one_is_ignored_and_claims_nothing() {
+    let v = view(
+        &schema(),
+        &[
+            change("parts", gid(1), DELETED, Value::Int(5), 1),
+            change("sites", gid(1), "name", text("north"), 2),
+            change("sites", gid(1), DELETED, Value::Int(1), 3),
+            change("sites", gid(1), DELETED, Value::Text("no".into()), 4),
+        ],
+    );
+    assert_eq!(v, View::default());
+}
+
+#[test]
 fn an_undeclared_field_is_kept_claims_its_gid_and_is_not_shown() {
     let v = view(
         &schema(),
@@ -836,13 +850,42 @@ fn the_schema_check_refuses_what_the_model_cannot_answer() {
 }
 
 #[test]
+fn natural_keys_may_not_refer_round_to_where_they_start() {
+    let keyed = |name: &str, on: &str| {
+        Collection::natural(name, &["up", "name"])
+            .reference("up", on)
+            .plain("name", Merge::Lww)
+    };
+    let owned = |name: &str, on: &str| {
+        Collection::natural(name, &["up", "name"])
+            .owner("up", on)
+            .plain("name", Merge::Lww)
+    };
+    for loops in [
+        vec![keyed("dirs", "dirs")],
+        vec![keyed("a", "b"), keyed("b", "a")],
+        vec![owned("a", "b"), keyed("b", "a")],
+        vec![keyed("a", "b"), keyed("b", "c"), keyed("c", "a")],
+    ] {
+        assert!(Schema::new(loops.clone()).check().is_err(), "{loops:?}");
+    }
+    let chain = Schema::new(vec![
+        Collection::minted("roots"),
+        keyed("a", "roots"),
+        owned("b", "a"),
+        keyed("c", "b").reference("see", "c"),
+    ]);
+    assert!(chain.check().is_ok());
+}
+
+#[test]
 fn a_collection_may_not_own_its_own_rows_because_concurrent_moves_could_form_a_cycle() {
     let schema = Schema::new(vec![Collection::minted("a").owner("parent", "a")]);
     assert!(schema.check().is_err());
 }
 
 #[test]
-fn an_owner_may_not_be_in_a_together_set_but_a_plain_reference_may() {
+fn a_together_set_may_hold_no_reference_of_either_kind() {
     let with = |field: Collection| {
         Schema::new(vec![
             Collection::minted("b"),
@@ -856,6 +899,11 @@ fn an_owner_may_not_be_in_a_together_set_but_a_plain_reference_may() {
     );
     assert!(
         with(Collection::minted("a").reference("o", "b"))
+            .check()
+            .is_err()
+    );
+    assert!(
+        with(Collection::minted("a").plain("o", Merge::Lww))
             .check()
             .is_ok()
     );
