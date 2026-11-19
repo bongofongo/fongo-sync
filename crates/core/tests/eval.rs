@@ -1,6 +1,8 @@
 mod common;
 
-use common::{arb_case, arb_random_case, gid, mentioned};
+use common::{
+    Rng, arb_case, arb_random_case, dense_changes, gid, mentioned, nested_schema, random_schema,
+};
 use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
 use fongo_sync_core::model::{ALIAS, Collection, Schema, View, view};
 use fongo_sync_core::source::{Source, Store};
@@ -60,6 +62,34 @@ proptest! {
         (schema, changes) in arb_random_case(80)
     ) {
         agrees(&schema, &changes)?;
+    }
+
+    #[test]
+    fn an_answer_does_not_depend_on_what_the_session_was_asked_before(seed in any::<u64>()) {
+        let mut rng = Rng(seed | 1);
+        let schema = if rng.one_in(2) { nested_schema(&mut rng) } else { random_schema(&mut rng) };
+        let n = 300 + rng.below(200);
+        let changes = dense_changes(&mut rng, &schema, 2, n);
+        let store = store(&schema, &changes);
+        let expected = view(&schema, &changes);
+        let ev = Evaluator::new(&schema).unwrap();
+        let mut questions: Vec<(String, Gid)> = Vec::new();
+        for c in &schema.collections {
+            for g in mentioned(&schema, &changes) {
+                questions.push((c.name.clone(), g));
+            }
+        }
+        for i in (1..questions.len()).rev() {
+            questions.swap(i, rng.below(i + 1));
+        }
+        let mut shared = ev.session(&store);
+        for (c, g) in &questions {
+            let alone = ev.target(&store, c, *g).expect("within limits");
+            prop_assert_eq!(&shared.target(c, *g).expect("within limits"), &alone);
+            if alone.canonical == *g {
+                prop_assert_eq!(alone.row.as_ref(), expected.row(c, *g));
+            }
+        }
     }
 
     #[test]
@@ -367,4 +397,78 @@ fn a_together_set_written_by_two_members_at_one_clock_comes_from_the_smaller() {
         Value::Int(1)
     );
     agrees(&schema, &changes).unwrap();
+}
+
+/// Natural keys over natural keys. `x` and `y` share a key once `d` joins `a` and `p` joins `q`,
+/// and `x` is also found through an older key entry it shares with `z`, after `d` has joined a
+/// group that later joins another.
+fn nested_groups() -> (Schema, Vec<Change>, Vec<Gid>) {
+    let schema = Schema::new(vec![
+        Collection::minted("r").plain("name", Merge::Lww),
+        Collection::natural("k1", &["up", "name"])
+            .owner("up", "r")
+            .plain("name", Merge::Lww),
+        Collection::natural("k2", &["up", "name"])
+            .owner("up", "k1")
+            .plain("name", Merge::Lww),
+        Collection::natural("k4", &["name", "q"])
+            .plain("name", Merge::Lww)
+            .owner("q", "k2"),
+    ]);
+    let mut changes = Vec::new();
+    let mut make = |collection: &str, key: [(&str, Value); 2], wall: u64| {
+        let values: Vec<Value> = key.iter().map(|(_, v)| v.clone()).collect();
+        let g = Gid::derive(collection, &values);
+        for (f, v) in key {
+            changes.push(change(collection, g, f, v, wall));
+        }
+        g
+    };
+    let (r1, r2) = (wide(1), wide(2));
+    let a = make("k1", [("up", Value::Ref(r1)), ("name", Value::Int(1))], 22);
+    let b = make("k1", [("up", Value::Ref(r1)), ("name", Value::Int(0))], 10);
+    let c = make("k1", [("up", Value::Ref(r2)), ("name", Value::Int(1))], 33);
+    let d = make("k1", [("up", Value::Ref(r2)), ("name", Value::Int(0))], 22);
+    let p = make("k2", [("up", Value::Ref(c)), ("name", Value::Int(0))], 35);
+    let q = make("k2", [("up", Value::Ref(a)), ("name", Value::Int(1))], 10);
+    let x = make("k4", [("name", Value::Ref(d)), ("q", Value::Ref(p))], 49);
+    let y = make("k4", [("name", Value::Ref(a)), ("q", Value::Ref(q))], 36);
+    let w = wide(3);
+    let z = make("k4", [("name", Value::Ref(d)), ("q", Value::Ref(w))], 47);
+    changes.push(change("k4", x, "q", Value::Ref(w), 2));
+    changes.push(change("r", r1, ALIAS, Value::Ref(r2), 26));
+    changes.push(change("r", r2, "name", Value::Int(2), 41));
+    changes.push(change("k1", b, ALIAS, Value::Ref(c), 43));
+    changes.push(change("k1", d, ALIAS, Value::Ref(a), 40));
+    changes.push(change("k2", p, ALIAS, Value::Ref(q), 25));
+    (schema, changes, vec![r1, r2, a, b, c, d, p, q, x, y, w, z])
+}
+
+#[test]
+fn a_group_that_forms_in_steps_is_the_same_whatever_was_asked_first() {
+    let (schema, changes, gids) = nested_groups();
+    let store = store(&schema, &changes);
+    let expected = view(&schema, &changes);
+    let ev = Evaluator::new(&schema).unwrap();
+    let mut questions: Vec<(String, Gid)> = Vec::new();
+    for c in &schema.collections {
+        for g in &gids {
+            questions.push((c.name.clone(), *g));
+        }
+    }
+    for first in 0..questions.len() {
+        for step in [1, 3, 7] {
+            let mut shared = ev.session(&store);
+            for k in 0..questions.len() {
+                let (c, g) = &questions[(first + k * step) % questions.len()];
+                let alone = ev.target(&store, c, *g).unwrap();
+                assert_eq!(shared.target(c, *g).unwrap(), alone, "{c} {g:?}");
+                if alone.canonical == *g {
+                    assert_eq!(alone.row.as_ref(), expected.row(c, *g));
+                }
+            }
+        }
+    }
+    let x = ev.target(&store, "k4", gids[8]).unwrap();
+    assert_eq!(x.members.len(), 2);
 }
