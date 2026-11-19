@@ -10,8 +10,9 @@
 //! Every device that holds a library's key is trusted to write any change. The rules converge
 //! whatever it writes, but a device that writes against the application's intent can:
 //!
-//! - delete an entity for good, by writing `$deleted = 1` at the largest clock the text form
-//!   holds: no later clock exists to restore it;
+//! - delete a gid for good, by writing `$deleted = 1` at the largest clock the text form holds:
+//!   no later clock exists to restore it. Its group still shows while another member is live,
+//!   and then under this gid if it is the group's smallest;
 //! - move a gid to another collection, by writing to it under that collection at a clock older
 //!   than any it has, so that its own collection's changes to it are ignored;
 //! - grow every replica's store without limit, by writing undeclared fields, which are kept;
@@ -19,8 +20,14 @@
 //! - hide a natural entity, by writing [`KEY_ENTRIES`] values to one of its key fields at clocks
 //!   older than its creation;
 //! - set a `Max` field to a value no later write can lower;
-//! - make entities undecidable for an evaluator, by building alias chains or key candidates
-//!   beyond its limits (`eval::Limits`), which then answers `Undetermined` for them.
+//! - make entities undecidable for an evaluator, by building alias chains, or groups that
+//!   natural keys join, larger than its region limit (`eval::Limits`), which then answers
+//!   `Undetermined` for them. Key candidates cannot exceed the default limit of 1,024: each key
+//!   field counts at most [`KEY_ENTRIES`] values, and 4^5 is 1,024, so only a key of six or more
+//!   fields could;
+//! - make work grow faster than the data it touches in one shape a schema can allow: joining
+//!   two copies of paths through natural keys d collections deep costs about d^1.8 per path
+//!   (each entity's group is found from the keys above it), d being fixed by the schema.
 //!
 //! None of these is prevented here.
 
