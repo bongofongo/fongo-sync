@@ -40,6 +40,7 @@
 //! [`Evaluator::affected`]: crate::eval::Evaluator::affected
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use crate::change::{Change, DELETED, Strategy};
 use crate::clock::Hlc;
@@ -598,9 +599,20 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
             ready.insert((ids[to].clone(), to));
         }
     };
+    let mut finished = 0usize;
+    // The cycles among what is left, found at the first stall and afterwards refreshed only for
+    // the component a parking changed; the rows on them that may still be parked.
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    let mut component_of: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut changed: BTreeSet<usize> = BTreeSet::new();
+    let mut found_cycles = false;
+    let mut live = 0usize;
+    let mut candidates: BTreeSet<((String, Gid), usize)> = BTreeSet::new();
     loop {
         while let Some((_, i)) = ready.pop_first() {
             done[i] = true;
+            finished += 1;
+            candidates.remove(&(ids[i].clone(), i));
             let p = &planned[i];
             let action = match (&parked[i], &p.action) {
                 (_, RowAction::Delete) => RowAction::Delete,
@@ -619,33 +631,87 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
                 drop_edge(i, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
             }
         }
-        let left: Vec<usize> = (0..n).filter(|&i| !done[i] && !stuck[i]).collect();
-        if left.is_empty() {
+        if finished == n {
             break;
         }
-        let components = cycles(&left, &out);
-        if components.is_empty() {
-            // What is left waits on stuck rows.
-            for i in left {
-                stuck[i] = true;
+        let add = |members: Vec<usize>,
+                   live: &mut usize,
+                   components: &mut Vec<Vec<usize>>,
+                   component_of: &mut BTreeMap<usize, usize>,
+                   candidates: &mut BTreeSet<((String, Gid), usize)>,
+                   parked: &[Option<Row>]| {
+            let c = components.len();
+            for &m in &members {
+                component_of.insert(m, c);
+                if parked[m].is_none() {
+                    candidates.insert((ids[m].clone(), m));
+                }
+            }
+            components.push(members);
+            *live += 1;
+        };
+        if !found_cycles {
+            found_cycles = true;
+            let left: Vec<usize> = (0..n).filter(|&i| !done[i] && !stuck[i]).collect();
+            for members in cycles(&left, &out) {
+                add(
+                    members,
+                    &mut live,
+                    &mut components,
+                    &mut component_of,
+                    &mut candidates,
+                    &parked,
+                );
+            }
+        }
+        for c in std::mem::take(&mut changed) {
+            let members = std::mem::take(&mut components[c]);
+            live -= 1;
+            for &m in &members {
+                component_of.remove(&m);
+                candidates.remove(&(ids[m].clone(), m));
+            }
+            let left: Vec<usize> = members
+                .into_iter()
+                .filter(|&i| !done[i] && !stuck[i])
+                .collect();
+            for sub in cycles(&left, &out) {
+                add(
+                    sub,
+                    &mut live,
+                    &mut components,
+                    &mut component_of,
+                    &mut candidates,
+                    &parked,
+                );
+            }
+        }
+        if live == 0 {
+            // What is left waits on rows that are stuck.
+            for i in 0..n {
+                if !done[i] && !stuck[i] {
+                    stuck[i] = true;
+                }
             }
             break;
         }
-        let on_cycle: BTreeMap<usize, usize> = components
-            .iter()
-            .enumerate()
-            .flat_map(|(c, members)| members.iter().map(move |&m| (m, c)))
-            .collect();
-        let mut candidates: Vec<usize> = on_cycle
-            .keys()
-            .copied()
-            .filter(|&r| parked[r].is_none())
-            .collect();
-        candidates.sort_by(|a, b| ids[*a].cmp(&ids[*b]));
         let mut broke = false;
-        for r in candidates {
+        let mut cursor: Option<((String, Gid), usize)> = None;
+        loop {
+            let next = match &cursor {
+                None => candidates.first().cloned(),
+                Some(c) => candidates
+                    .range((Bound::Excluded(c.clone()), Bound::Unbounded))
+                    .next()
+                    .cloned(),
+            };
+            let Some(next) = next else {
+                break;
+            };
+            cursor = Some(next.clone());
+            let r = next.1;
             let p = &planned[r];
-            let same_cycle = |m: usize| on_cycle.get(&m) == Some(&on_cycle[&r]);
+            let same_cycle = |m: usize| component_of.get(&m) == component_of.get(&r);
             // Fields to set NULL, and the requirements that parking satisfies.
             let mut nulls: BTreeSet<String> = BTreeSet::new();
             let mut satisfied: Vec<(usize, Need)> = Vec::new();
@@ -730,6 +796,8 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
                 parked: true,
             });
             parked[r] = Some(image);
+            candidates.remove(&(ids[r].clone(), r));
+            changed.insert(component_of[&r]);
             for (to, need) in satisfied {
                 drop_edge(r, to, &need, &mut out, &mut into, &mut ready, &done, &stuck);
             }
@@ -737,12 +805,20 @@ pub fn order(schema: &Schema, columns: &Columns, planned: &[Planned]) -> Plan {
             break;
         }
         if !broke {
-            let first = components
-                .iter()
-                .min_by_key(|members| members.iter().map(|&m| ids[m].clone()).min())
-                .expect("a cycle");
-            for &m in first {
-                stuck[m] = true;
+            let Some(first) = (0..components.len())
+                .filter(|&c| !components[c].is_empty())
+                .min_by_key(|&c| components[c].iter().map(|&m| ids[m].clone()).min())
+            else {
+                break;
+            };
+            live -= 1;
+            for m in std::mem::take(&mut components[first]) {
+                component_of.remove(&m);
+                candidates.remove(&(ids[m].clone(), m));
+                if !done[m] && !stuck[m] {
+                    stuck[m] = true;
+                    finished += 1;
+                }
             }
         }
     }
