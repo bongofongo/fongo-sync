@@ -506,7 +506,7 @@ mod tests {
             .reference("next", "notes")
             .field("body");
         let registry = |set: &[&str]| Registry::new(vec![books(), owned.clone().together(set)]);
-        assert!(registry(&["body", "next"]).is_ok());
+        assert!(registry(&["body", "next"]).is_err());
         assert!(registry(&["body", "book_id"]).is_err());
         let twice = books()
             .together(&["status", "finished"])
