@@ -1,10 +1,43 @@
 //! Decisions about rows, over plain values: which changes an application's edits to a row make,
 //! what to write to a row to bring it to its target, which groups an identity key says are one
-//! entity, and in what order a set of row writes can be made against tables with unique and
-//! foreign-key constraints.
+//! entity, and in what order a set of row writes can be made against tables with NOT NULL,
+//! unique and foreign-key constraints.
 //!
-//! An adapter keeps, for every row, an image: the values it last wrote to or read from that row.
-//! A row is only ever compared with its image, never with merged state.
+//! # What an adapter must do
+//!
+//! An adapter keeps the facts [`crate::source`] describes, a mapping from each local row to the
+//! gid it stands for, and for every row an image: the values it last wrote to or read from that
+//! row. `crates/core/tests/sim` is such an adapter over in-memory tables. It must:
+//!
+//! - Collect before it applies, in one transaction, so that at apply time every row equals its
+//!   image.
+//! - Compare a row only with its image, never with merged state, and record every value it
+//!   writes into a row (a reference that reads NULL because its target is not shown, a parked
+//!   value) in the image, so that [`edits`] never reports it.
+//! - Compare in gid terms: the image through the row-to-gid mapping as it was before this
+//!   collect, the row through the mapping as it will be after it. When a natural key changes,
+//!   the row stands for a new entity, and rows that refer to it by local key now refer to that
+//!   entity: mark them for collecting too.
+//! - Decide that a natural row's key changed by comparing key values, never by deriving a gid
+//!   from the row: what the adapter wrote need not derive the entity's gid.
+//! - Refuse, when an application registers a natural collection, key columns that accept NULL
+//!   (two rows with a NULL in the key are one entity, which no unique constraint enforces), and
+//!   key references that are not owners (a plain reference reads NULL once its target goes).
+//! - Merge its own changes as it collects them, ask [`Evaluator::affected`] before merging any
+//!   batch, and add the gids of rows it created while collecting, which `affected` names only if
+//!   they are canonical.
+//! - Keep one local row per live canonical gid. When two rows come to stand for one entity and
+//!   one is deleted, rewrite the rows that refer to the deleted one, though their targets did
+//!   not change.
+//! - Remove the row of an entity whose target is not shown; it cannot be edited until the
+//!   entity is shown again.
+//! - Alias the groups [`clashes`] reports before writing rows.
+//! - Write in the order [`order`] gives, with [`Columns`] from its table definitions. Hold the
+//!   rows [`Plan::stuck`] names and every entity whose write the database refuses, under the gid
+//!   the row stands for, leave row and image as they were, and retry them on every later apply.
+//! - Observe the clock of a change from elsewhere only if [`crate::source::admit`] accepts it.
+//!
+//! [`Evaluator::affected`]: crate::eval::Evaluator::affected
 
 use std::collections::{BTreeMap, BTreeSet};
 

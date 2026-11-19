@@ -39,7 +39,7 @@ pub struct Alias {
 pub enum Slot {
     /// One entry: the winner by this strategy (`crate::wins`).
     One(Strategy),
-    /// The [`KEY_ENTRIES`](crate::model::KEY_ENTRIES) entries with the smallest clocks, ties to
+    /// The [`KEY_ENTRIES`] entries with the smallest clocks, ties to
     /// the smaller value under `Value::total_cmp`. Used for the key fields of a natural
     /// collection: those entries decide whether the entity's key holds.
     Earliest,

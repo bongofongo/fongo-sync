@@ -60,8 +60,9 @@ Three layers, each tested against the one above it:
      whose rows may change when a batch is merged.
    - `plan`: `edits` and `record` turn an application's row edits (a row compared with its
      image) into changes; `write` turns a target into a row action; `clashes` finds groups an
-     identity key says are one; `order` orders row actions for tables with unique and
-     foreign-key constraints, parking a row where writes form a cycle.
+     identity key says are one; `order` orders row actions for tables with NOT NULL, unique and
+     foreign-key constraints, parking only the fields that break a cycle and reporting rows it
+     cannot write. Its module documentation lists what an adapter must do.
 3. **Mechanics.** A storage adapter keeps facts, rows, row images and a mapping from entities to
    local rows; it asks the core what to do and does it. `crates/core/tests/sim` is such an
    adapter over in-memory tables, with no SQL: the executable design of one.
@@ -70,10 +71,11 @@ What is tested against what (`crates/core/tests`):
 
 | test | checks |
 |---|---|
-| `eval.rs` | `target` for every gid equals `model::view`, over random schemas from a small family and hostile change sets; answers under tight limits do not depend on what was asked before |
-| `affected.rs` | the incremental law: re-evaluating only what `affected` names after each batch, delivered in random order with repeats, keeps the rows equal to `model::view` |
-| `plan.rs` | recorded edits round-trip; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps the tables' constraints |
-| `sim` | several replicas, random edits and partial, reordered, repeated delivery: rows equal `model::view` of what each replica merged after every step, and are identical once everything is delivered; also every short script over a small alphabet |
+| `eval.rs` | `target` for every gid equals `model::view`, over schemas from a small family and random schemas, with hostile change sets; answers under tight limits do not depend on what was asked before; hostile rewrites of a natural key neither hide the entity nor grow the store |
+| `affected.rs` | the incremental law: re-evaluating only what `affected` names after each batch, delivered in random order with repeats, keeps the rows equal to `model::view`, over both kinds of schema |
+| `plan.rs` | recorded edits round-trip; `edits` never reports what an adapter wrote; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps NOT NULL, unique and foreign-key constraints, and nothing is parked or stuck where no cycle forces it |
+| `scaling.rs` | the work of `affected` and `target` grows with what changed, not with what is stored, checked as a ratio between two sizes |
+| `sim` | several replicas over tables with real constraints, random edits and partial, reordered, per-device, repeated delivery: rows equal `model::view` of what each replica merged after every step and once everything is delivered; no replica sends a value its application did not write, and every write an application made is in the merged state; also every short script over a small alphabet |
 
 `FONGO_SIM_CASES` and `FONGO_EXHAUSTIVE_LENGTH` raise the volume of the last two.
 

@@ -1,6 +1,8 @@
 //! `model::view` computed on demand: the target of one entity, pulling from a [`Source`] only the
 //! facts it needs. For every input, [`Session::target`] agrees with what `model::view` shows.
 //!
+//! What a storage adapter must do around these questions is listed in [`crate::plan`].
+//!
 //! Work is bounded by [`Limits`]. Where a bound is reached the answer is [`Undetermined`], and
 //! whether it is reached depends only on the facts in the source: never on the order of
 //! evaluation or on what an earlier question in the same session happened to compute.
