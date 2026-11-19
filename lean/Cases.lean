@@ -1,3 +1,4 @@
+import FongoSync.Model
 import FongoSync.Run
 
 /-!
@@ -74,11 +75,42 @@ def runClock (c : Clock) : List Event → List String
     let c' := c.observe remote
     s!"observe {showReading remote}: {showReading c'.last}" :: runClock c' rest
 
+section Schemas
+
+open Full
+
+def plainLww (name : String) : Full.Field := ⟨name, .plain, .lww⟩
+
+def things (fields : List Full.Field) (together : List (List String)) : Full.Collection :=
+  ⟨"things", fields, together, none⟩
+
+def shelves : Full.Collection := ⟨"shelves", [plainLww "name"], [], none⟩
+
+/-- Schemas that differ only in the rules `Schema.Restricted` states. -/
+def schemaCases : List (String × List Full.Collection) := [
+  ("a set of plain fields", [things [plainLww "title", plainLww "subtitle"] [["title", "subtitle"]]]),
+  ("a reference in a set", [things [plainLww "title", ⟨"link", .reference "things", .lww⟩]
+    [["title", "link"]]]),
+  ("an owner in a set", [shelves, things [plainLww "title", ⟨"shelf", .owner "shelves", .lww⟩]
+    [["title", "shelf"]]]),
+  ("a Max field in a set", [things [plainLww "title", ⟨"high", .plain, .max⟩] [["title", "high"]]]),
+  ("a field in two sets", [things [plainLww "title", plainLww "subtitle"]
+    [["title"], ["title", "subtitle"]]]),
+  ("an undeclared field in a set", [things [plainLww "title"] [["title", "subtitle"]]]),
+  ("an empty set", [things [plainLww "title"] [[]]]),
+  ("a collection owning its own rows", [things [⟨"parent", .owner "things", .lww⟩] []])
+]
+
+end Schemas
+
 def main : IO Unit := do
   for (name, cs) in cases do
     IO.println s!"case {name}"
     for line in render cs do
       IO.println line
+  for (name, collections) in schemaCases do
+    let sc : Full.Schema := ⟨collections, fun _ _ => 0⟩
+    IO.println s!"schema {name}: {if decide sc.Restricted then "accepted" else "refused"}"
   for (name, start, events) in clockCases do
     IO.println s!"clock {name}"
     for line in runClock ⟨start⟩ events do

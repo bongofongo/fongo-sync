@@ -71,12 +71,28 @@ def Schema.strategyOf (sc : Schema) (collection field : String) : Strategy :=
   | some c => ((c.declared field).map (·.strategy)).getD .lww
   | none => .lww
 
-/-- Three of the rules `Schema::check` enforces. The convergence theorem does not need them;
-they keep liveness well-founded and `together` sets meaningful. -/
+/-- A field a `together` set may hold: declared, plain, and merging `Lww`. A replica writes a set
+whole as it reads it, and a reference reads as null while its target is not live there yet, so a
+reference in a set would be erased everywhere by a fresh null. -/
+def Collection.groupable (c : Collection) (name : String) : Prop :=
+  match c.declared name with
+  | some f => f.kind = .plain ∧ f.strategy = .lww
+  | none => False
+
+instance (c : Collection) (name : String) : Decidable (c.groupable name) := by
+  unfold Collection.groupable; split <;> infer_instance
+
+/-- The rules `Schema::check` enforces on self-ownership and on `together` sets: no collection owns
+its own rows, and each set is non-empty, holds only fields it may hold, and shares none with
+another set. The convergence theorem does not need them. -/
 def Schema.Restricted (sc : Schema) : Prop :=
-  (∀ c ∈ sc.collections, ∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
-  (∀ c ∈ sc.collections, ∀ set ∈ c.together, ∀ name ∈ set, ∀ f ∈ c.fields, f.name = name →
-    f.strategy = .lww ∧ ∀ t, f.kind ≠ .owner t)
+  ∀ c ∈ sc.collections,
+    (∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
+    (∀ set ∈ c.together, set ≠ [] ∧ ∀ name ∈ set, c.groupable name) ∧
+    c.together.flatten.Nodup
+
+instance (sc : Schema) : Decidable sc.Restricted := by
+  unfold Schema.Restricted; infer_instance
 
 /-! ## From changes to inputs -/
 

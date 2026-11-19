@@ -55,6 +55,64 @@ fn show_reading(h: &Hlc) -> String {
     )
 }
 
+fn schema_cases() -> Vec<(&'static str, Vec<Collection>)> {
+    let things = || Collection::minted("things").plain("title", Strategy::Lww);
+    let shelves = Collection::minted("shelves").plain("name", Strategy::Lww);
+    vec![
+        (
+            "a set of plain fields",
+            vec![
+                things()
+                    .plain("subtitle", Strategy::Lww)
+                    .together(&["title", "subtitle"]),
+            ],
+        ),
+        (
+            "a reference in a set",
+            vec![
+                things()
+                    .reference("link", "things")
+                    .together(&["title", "link"]),
+            ],
+        ),
+        (
+            "an owner in a set",
+            vec![
+                shelves,
+                things()
+                    .owner("shelf", "shelves")
+                    .together(&["title", "shelf"]),
+            ],
+        ),
+        (
+            "a Max field in a set",
+            vec![
+                things()
+                    .plain("high", Strategy::Max)
+                    .together(&["title", "high"]),
+            ],
+        ),
+        (
+            "a field in two sets",
+            vec![
+                things()
+                    .plain("subtitle", Strategy::Lww)
+                    .together(&["title"])
+                    .together(&["title", "subtitle"]),
+            ],
+        ),
+        (
+            "an undeclared field in a set",
+            vec![things().together(&["title", "subtitle"])],
+        ),
+        ("an empty set", vec![things().together(&[])]),
+        (
+            "a collection owning its own rows",
+            vec![Collection::minted("things").owner("parent", "things")],
+        ),
+    ]
+}
+
 enum Event {
     Tick(u64),
     Observe(Hlc),
@@ -224,6 +282,13 @@ fn main() {
                 .collect();
             println!("{} {}", u128::from_be_bytes(g.0), fields.join(" "));
         }
+    }
+    for (name, collections) in schema_cases() {
+        let verdict = match Schema::new(collections).check() {
+            Ok(()) => "accepted",
+            Err(_) => "refused",
+        };
+        println!("schema {name}: {verdict}");
     }
     for (name, start, events) in clock_cases() {
         println!("clock {name}");
