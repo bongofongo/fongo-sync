@@ -1309,15 +1309,16 @@ fn a_cycle_that_waits_on_another_is_broken_once_the_other_is() {
 #[test]
 fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_written() {
     let (schema, columns) = linked();
-    // One set: 2 → 3 → 1 → 4 → 6 → 2, and 4 with 5. Parking 1 splits it into 2 with 3 and 4
-    // with 5. Neither 2 nor 3 can be inserted early while 6 does not exist; parking 4 lets 6 be
-    // written, and then 2 can be parked.
+    // One set: 2 → 3 → 1 → 4 → 6 → 2, and 4, 5 and 6 in a cycle of their own. Parking 1 splits
+    // it into 2 with 3 and 4 with 5 and 6. Neither 2 nor 3 can be inserted early while 6 does not
+    // exist; parking 4 lets 6 be written, and then 2 can be parked. Parking every row that can
+    // be would also park 5.
     let planned = [
         inserted(1, &[("y", 3)]),
         inserted(2, &[("x", 6), ("y", 3)]),
         inserted(3, &[("x", 2)]),
         inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
-        inserted(5, &[("x", 5), ("z", 4)]),
+        inserted(5, &[("x", 5), ("y", 6), ("z", 4)]),
         inserted(6, &[("x", 4)]),
     ];
     let plan = order(&schema, &columns, &planned);
@@ -1334,7 +1335,8 @@ fn a_row_that_could_not_be_parked_is_tried_again_once_what_it_waited_on_is_parke
         inserted(2, &[("x", 4), ("y", 3)]),
         inserted(3, &[("x", 2)]),
         inserted(4, &[("x", 4), ("y", 5), ("z", 1)]),
-        inserted(5, &[("x", 5), ("z", 4)]),
+        inserted(5, &[("x", 5), ("y", 6), ("z", 4)]),
+        inserted(6, &[("x", 4)]),
     ];
     let plan = order(&schema, &columns, &planned);
     assert!(plan.stuck.is_empty(), "{plan:#?}");
