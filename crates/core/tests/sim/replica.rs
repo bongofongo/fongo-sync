@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::eval::{Evaluator, Target};
 use fongo_sync_core::model::{ALIAS, FieldKind, Identity, Row, Schema, view};
-use fongo_sync_core::plan::{Planned, RowAction, clashes, edits, order, record, write};
+use fongo_sync_core::plan::{Columns, Planned, RowAction, clashes, edits, order, record, write};
 use fongo_sync_core::source::Store;
 use fongo_sync_core::{Change, Clock, Gid, Value};
 
@@ -422,6 +422,9 @@ impl<'s> Replica<'s> {
                                 )
                             });
                             if same_key {
+                                // An earlier pass may have read a key through a row that has
+                                // since kept its entity.
+                                progress |= fresh.remove(&at).is_some();
                                 continue;
                             }
                         }
@@ -489,6 +492,12 @@ impl<'s> Replica<'s> {
                         clock,
                     }));
                 let recorded = record(self.schema, c, &found, old.as_ref(), new, clock);
+                if std::env::var_os("FONGO_SIM_TRACE").is_some() {
+                    eprintln!(
+                        "replica {} collects {c} row {k}: {before:?} -> {after:?}; old {old:?}; records {recorded:?}",
+                        self.id
+                    );
+                }
                 let created = found.contains(&fongo_sync_core::plan::FieldEdit::Created);
                 let coll = self.schema.collection(c).unwrap();
                 let written_by_app =
@@ -793,9 +802,25 @@ impl<'s> Replica<'s> {
             });
         }
 
-        let steps = order(self.schema, &planned);
+        let columns = self
+            .not_null
+            .iter()
+            .fold(Columns::new(), |cols, (c, f)| cols.not_null(c, f));
+        let plan = order(self.schema, &columns, &planned);
         let mut failed: BTreeSet<(String, Key)> = BTreeSet::new();
-        for step in steps {
+        // A stuck row gets no final write; its parking step, if any, others rely on.
+        for (c, g) in &plan.stuck {
+            let at = (c.clone(), key_of(*g).unwrap());
+            self.held.insert(owner_of[&at].clone());
+            let parked = plan
+                .steps
+                .iter()
+                .any(|s| s.parked && s.collection == *c && s.gid == *g);
+            if inserting.contains(&at) && !parked {
+                self.gid_of.remove(&at);
+            }
+        }
+        for step in plan.steps {
             let k = key_of(step.gid).unwrap();
             let at = (step.collection.clone(), k);
             if failed.contains(&at) {

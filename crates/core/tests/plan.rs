@@ -8,7 +8,7 @@ use fongo_sync_core::model::{
     Collection, FieldKind, Identity, Row, Schema, unmerged_identities, view,
 };
 use fongo_sync_core::plan::{
-    FieldEdit, Planned, RowAction, Step, clashes, edits, order, record, write,
+    Columns, FieldEdit, Planned, RowAction, Step, clashes, edits, order, record, write,
 };
 use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value};
@@ -352,95 +352,141 @@ fn uniques(c: &Collection) -> Vec<Vec<String>> {
     sets
 }
 
-/// The first constraint `table` breaks, if any.
-fn broken(schema: &Schema, table: &Table) -> Option<String> {
-    for ((c, g), r) in table {
-        let coll = schema.collection(c).unwrap();
-        for f in &coll.fields {
-            if let FieldKind::Reference(t) | FieldKind::Owner(t) = &f.kind {
-                match r.get(&f.name) {
-                    None | Some(Value::Null) => {}
-                    Some(Value::Ref(to)) if table.contains_key(&(t.clone(), *to)) => {}
-                    Some(v) => return Some(format!("{c} {g:?}.{} names missing {v:?}", f.name)),
-                }
-            }
-        }
-        for set in uniques(coll) {
-            let tuple: Vec<&Value> = set
-                .iter()
-                .map(|f| r.get(f).unwrap_or(&Value::Null))
-                .collect();
-            if tuple.contains(&&Value::Null) {
-                continue;
-            }
-            for ((c2, g2), r2) in table {
-                if c2 == c
-                    && g2 != g
-                    && set.iter().zip(&tuple).all(|(f, v)| {
-                        r2.get(f)
-                            .is_some_and(|w| w.total_cmp(v) == std::cmp::Ordering::Equal)
-                    })
-                {
-                    return Some(format!("{c} {g:?} and {g2:?} share {set:?}"));
-                }
-            }
-        }
-    }
-    None
+/// A small table store that enforces what a database would: NOT NULL, foreign keys and unique
+/// sets.
+struct Tables<'a> {
+    schema: &'a Schema,
+    columns: &'a Columns,
 }
 
-/// Drops and nulls until `table` breaks nothing: rows clashing on a unique set or owned by a
-/// missing row go, references to missing rows become NULL.
-fn repair(schema: &Schema, mut table: Table) -> Table {
-    loop {
-        let Some(problem) = (|| {
-            for ((c, g), r) in &table {
-                let coll = schema.collection(c).unwrap();
-                for f in &coll.fields {
-                    if let FieldKind::Reference(t) | FieldKind::Owner(t) = &f.kind
-                        && let Some(Value::Ref(to)) = r.get(&f.name)
-                        && !table.contains_key(&(t.clone(), *to))
-                    {
-                        let owned = matches!(f.kind, FieldKind::Owner(_));
-                        return Some((
-                            (c.clone(), *g),
-                            owned.then_some(()).map_or(Some(f.name.clone()), |_| None),
-                        ));
-                    }
+impl Tables<'_> {
+    /// The first constraint `table` breaks, if any.
+    fn broken(&self, table: &Table) -> Option<String> {
+        for ((c, g), r) in table {
+            let coll = self.schema.collection(c).unwrap();
+            for f in &coll.fields {
+                let v = r.get(&f.name).unwrap_or(&Value::Null);
+                if *v == Value::Null && !self.columns.accepts_null(c, &f.name) {
+                    return Some(format!("{c} {g:?}.{} is NULL", f.name));
                 }
-                for set in uniques(coll) {
-                    let tuple: Vec<&Value> = set
-                        .iter()
-                        .map(|f| r.get(f).unwrap_or(&Value::Null))
-                        .collect();
-                    if tuple.contains(&&Value::Null) {
-                        continue;
-                    }
-                    let clash = table.iter().any(|((c2, g2), r2)| {
-                        c2 == c
-                            && g2 < g
-                            && set.iter().zip(&tuple).all(|(f, v)| {
-                                r2.get(f)
-                                    .is_some_and(|w| w.total_cmp(v) == std::cmp::Ordering::Equal)
-                            })
-                    });
-                    if clash {
-                        return Some(((c.clone(), *g), None));
+                if let FieldKind::Reference(t) | FieldKind::Owner(t) = &f.kind {
+                    match v {
+                        Value::Null => {}
+                        Value::Ref(to) if table.contains_key(&(t.clone(), *to)) => {}
+                        v => return Some(format!("{c} {g:?}.{} names missing {v:?}", f.name)),
                     }
                 }
             }
-            None
-        })() else {
-            return table;
-        };
-        match problem {
-            (at, Some(field)) => {
-                table.get_mut(&at).unwrap().insert(field, Value::Null);
-            }
-            (at, None) => {
-                table.remove(&at);
+            for set in uniques(coll) {
+                if let Some(other) = self.clash(table, c, *g, r, &set) {
+                    return Some(format!("{c} {g:?} and {other:?} share {set:?}"));
+                }
             }
         }
+        None
+    }
+
+    fn clash(&self, table: &Table, c: &str, g: Gid, r: &Row, set: &[String]) -> Option<Gid> {
+        let tuple: Vec<&Value> = set
+            .iter()
+            .map(|f| r.get(f).unwrap_or(&Value::Null))
+            .collect();
+        if tuple.contains(&&Value::Null) {
+            return None;
+        }
+        table.iter().find_map(|((c2, g2), r2)| {
+            let same_tuple = set.iter().zip(&tuple).all(|(f, v)| {
+                r2.get(f)
+                    .is_some_and(|w| w.total_cmp(v) == std::cmp::Ordering::Equal)
+            });
+            (c2 == c && *g2 != g && same_tuple).then_some(*g2)
+        })
+    }
+
+    /// Drops rows and nulls references until `table` breaks nothing.
+    fn repair(&self, mut table: Table) -> Table {
+        while let Some(problem) = self.broken(&table) {
+            let at = table
+                .keys()
+                .find(|k| problem.starts_with(&format!("{} {:?}", k.0, k.1)))
+                .cloned()
+                .unwrap();
+            let coll = self.schema.collection(&at.0).unwrap();
+            let dangling = coll.fields.iter().find(|f| {
+                matches!(f.kind, FieldKind::Reference(_))
+                    && self.columns.accepts_null(&at.0, &f.name)
+                    && problem.contains(&format!(".{} names missing", f.name))
+            });
+            match dangling {
+                Some(f) => {
+                    table
+                        .get_mut(&at)
+                        .unwrap()
+                        .insert(f.name.clone(), Value::Null);
+                }
+                None => {
+                    table.remove(&at);
+                }
+            }
+        }
+        table
+    }
+
+    fn apply(&self, table: &mut Table, step: &Step) -> Result<(), String> {
+        let at = (step.collection.clone(), step.gid);
+        match &step.action {
+            RowAction::Nothing => {}
+            RowAction::Insert(r) => {
+                if table.insert(at, r.clone()).is_some() {
+                    return Err(format!("{step:?} inserts over a row"));
+                }
+            }
+            RowAction::Update(fields) => {
+                let Some(r) = table.get_mut(&at) else {
+                    return Err(format!("{step:?} updates a missing row"));
+                };
+                r.extend(fields.iter().map(|(f, v)| (f.clone(), v.clone())));
+            }
+            RowAction::Delete => {
+                if table.remove(&at).is_none() {
+                    return Err(format!("{step:?} deletes a missing row"));
+                }
+            }
+        }
+        match self.broken(table) {
+            Some(problem) => Err(format!("after {step:?}: {problem}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the actions can all be done one at a time, each whole, in some order: tries any
+    /// action that keeps the constraints until none is left or none can go.
+    fn greedy(&self, before: &Table, planned: &[Planned]) -> bool {
+        let mut table = before.clone();
+        let mut left: Vec<&Planned> = planned.iter().collect();
+        while !left.is_empty() {
+            let Some(i) = left.iter().position(|p| {
+                let mut t = table.clone();
+                let step = Step {
+                    collection: p.collection.clone(),
+                    gid: p.gid,
+                    action: p.action.clone(),
+                    parked: false,
+                };
+                self.apply(&mut t, &step).is_ok()
+            }) else {
+                return false;
+            };
+            let p = left.remove(i);
+            let step = Step {
+                collection: p.collection.clone(),
+                gid: p.gid,
+                action: p.action.clone(),
+                parked: false,
+            };
+            self.apply(&mut table, &step).unwrap();
+        }
+        true
     }
 }
 
@@ -451,7 +497,8 @@ fn arb_table(schema: &Schema) -> impl Strategy<Value = Table> + use<> {
     cells.prop_map(move |cells| {
         let mut table = Table::new();
         for (i, (present, picks)) in cells.into_iter().enumerate() {
-            let coll = &schema.collections[i / 4 % schema.collections.len()];
+            let c = i / 4 % schema.collections.len();
+            let coll = &schema.collections[c];
             if !present {
                 continue;
             }
@@ -478,50 +525,37 @@ fn arb_table(schema: &Schema) -> impl Strategy<Value = Table> + use<> {
                 };
                 r.insert(f.name.clone(), v);
             }
-            let c = schema
-                .collections
-                .iter()
-                .position(|c| c.name == coll.name)
-                .unwrap();
             table.insert(
                 (coll.name.clone(), Gid([c as u8 * 10 + (i % 4) as u8; 16])),
                 r,
             );
         }
-        repair(&schema, table)
+        table
     })
 }
 
-fn execute(schema: &Schema, table: &mut Table, steps: &[Step]) -> Result<(), String> {
-    for s in steps {
-        let at = (s.collection.clone(), s.gid);
-        match &s.action {
-            RowAction::Nothing => {}
-            RowAction::Insert(r) => {
-                if table.insert(at, r.clone()).is_some() {
-                    return Err(format!("{s:?} inserts over a row"));
-                }
-            }
-            RowAction::Update(fields) => {
-                let Some(r) = table.get_mut(&at) else {
-                    return Err(format!("{s:?} updates a missing row"));
-                };
-                r.extend(fields.iter().map(|(f, v)| (f.clone(), v.clone())));
-            }
-            RowAction::Delete => {
-                if table.remove(&at).is_none() {
-                    return Err(format!("{s:?} deletes a missing row"));
-                }
+fn arb_columns(schema: &Schema) -> impl Strategy<Value = Columns> + use<> {
+    let fields: Vec<(String, String)> = schema
+        .collections
+        .iter()
+        .flat_map(|c| {
+            c.fields
+                .iter()
+                .map(move |f| (c.name.clone(), f.name.clone()))
+        })
+        .collect();
+    proptest::collection::vec(0u8..4, fields.len()).prop_map(move |picks| {
+        let mut columns = Columns::new();
+        for ((c, f), pick) in fields.iter().zip(picks) {
+            if pick == 0 {
+                columns = columns.not_null(c, f);
             }
         }
-        if let Some(problem) = broken(schema, table) {
-            return Err(format!("after {s:?}: {problem}"));
-        }
-    }
-    Ok(())
+        columns
+    })
 }
 
-fn plan_between(schema: &Schema, before: &Table, after: &Table) -> Vec<Planned> {
+fn plan_between(before: &Table, after: &Table) -> Vec<Planned> {
     let keys: BTreeSet<&(String, Gid)> = before.keys().chain(after.keys()).collect();
     keys.into_iter()
         .map(|k| Planned {
@@ -530,83 +564,184 @@ fn plan_between(schema: &Schema, before: &Table, after: &Table) -> Vec<Planned> 
             image: before.get(k).cloned(),
             action: write(after.get(k), before.get(k)),
         })
-        .filter(|p| p.action != RowAction::Nothing || schema.collection(&p.collection).is_none())
+        .filter(|p| p.action != RowAction::Nothing)
         .collect()
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
-    /// From any table that keeps its constraints to any other, the ordered plan keeps them at
-    /// every step and ends at the other.
+    /// From any table that keeps its constraints to any other, every step of the plan keeps
+    /// them, every row the plan does not report stuck ends as it should, and a stuck row is left
+    /// as it was or parked. Where the actions can be done whole in some order, nothing is parked
+    /// and nothing is stuck. The plan does not depend on the order the actions arrive in.
     #[test]
     fn an_ordered_plan_keeps_every_constraint_at_every_step(
-        (schema, before, after, shuffle) in arb_family().prop_flat_map(|f| {
+        (schema, columns, before, after, shuffle) in arb_family().prop_flat_map(|f| {
             let schema = f.schema();
-            (Just(schema.clone()), arb_table(&schema), arb_table(&schema), any::<u64>())
+            (Just(schema.clone()), arb_columns(&schema), arb_table(&schema), arb_table(&schema), any::<u64>())
         })
     ) {
-        prop_assert_eq!(broken(&schema, &before), None);
-        prop_assert_eq!(broken(&schema, &after), None);
-        let mut planned = plan_between(&schema, &before, &after);
+        let tables = Tables { schema: &schema, columns: &columns };
+        let (before, after) = (tables.repair(before), tables.repair(after));
+        let mut planned = plan_between(&before, &after);
         let n = planned.len();
         for i in 0..n {
             planned.swap(i, (shuffle.wrapping_mul(i as u64 + 7) % n as u64) as usize);
         }
-        let steps = order(&schema, &planned);
+        let plan = order(&schema, &columns, &planned);
         let mut table = before.clone();
-        if let Err(e) = execute(&schema, &mut table, &steps) {
-            prop_assert!(false, "{e}\nplan: {steps:#?}");
+        for step in &plan.steps {
+            if let Err(e) = tables.apply(&mut table, step) {
+                prop_assert!(false, "{e}\nplan: {plan:#?}");
+            }
         }
-        prop_assert_eq!(table, after);
+        for p in &planned {
+            let at = (p.collection.clone(), p.gid);
+            if plan.stuck.contains(&at) {
+                let parked = plan.steps.iter().any(|s| s.parked && (s.collection.clone(), s.gid) == at);
+                prop_assert!(parked || table.get(&at) == before.get(&at), "{at:?} was touched");
+            } else {
+                prop_assert_eq!(table.get(&at), after.get(&at), "{:?}", at);
+            }
+        }
+        if tables.greedy(&before, &planned) {
+            prop_assert!(plan.stuck.is_empty(), "stuck where no cycle is: {plan:#?}");
+            prop_assert!(plan.steps.iter().all(|s| !s.parked), "parked where no cycle is: {plan:#?}");
+        }
         let mut reordered = planned.clone();
         reordered.reverse();
-        prop_assert_eq!(order(&schema, &reordered), steps);
+        prop_assert_eq!(order(&schema, &columns, &reordered), plan);
+    }
+}
+
+fn update(c: &str, n: u8, before: Row, after: Row) -> Planned {
+    Planned {
+        collection: c.into(),
+        gid: gid(n),
+        image: Some(before.clone()),
+        action: write(Some(&after), Some(&before)),
+    }
+}
+
+fn step(c: &str, n: u8, fields: &[(&str, Value)], parked: bool) -> Step {
+    Step {
+        collection: c.into(),
+        gid: gid(n),
+        action: RowAction::Update(row(fields)),
+        parked,
     }
 }
 
 #[test]
-fn a_swap_of_unique_values_is_written_in_two_steps() {
+fn a_swap_of_unique_values_parks_one_field_of_one_row() {
     let schema = Schema::new(vec![
         Collection::minted("sites")
             .plain("code", Merge::Lww)
             .identity_key(&["code"]),
     ]);
-    let (a, b) = (gid(1), gid(2));
-    let before: Table = [
-        (("sites".to_string(), a), row(&[("code", text("x"))])),
-        (("sites".to_string(), b), row(&[("code", text("y"))])),
-    ]
-    .into();
-    let after: Table = [
-        (("sites".to_string(), a), row(&[("code", text("y"))])),
-        (("sites".to_string(), b), row(&[("code", text("x"))])),
-    ]
-    .into();
-    let steps = order(&schema, &plan_between(&schema, &before, &after));
+    let planned = [
+        update(
+            "sites",
+            1,
+            row(&[("code", text("x"))]),
+            row(&[("code", text("y"))]),
+        ),
+        update(
+            "sites",
+            2,
+            row(&[("code", text("y"))]),
+            row(&[("code", text("x"))]),
+        ),
+    ];
+    let plan = order(&schema, &Columns::new(), &planned);
     assert_eq!(
-        steps,
+        plan.steps,
         vec![
-            Step {
-                collection: "sites".into(),
-                gid: a,
-                action: RowAction::Update(row(&[("code", Value::Null)])),
-                parked: true,
-            },
-            Step {
-                collection: "sites".into(),
-                gid: b,
-                action: RowAction::Update(row(&[("code", text("x"))])),
-                parked: false,
-            },
-            Step {
-                collection: "sites".into(),
-                gid: a,
-                action: RowAction::Update(row(&[("code", text("y"))])),
-                parked: false,
-            },
+            step("sites", 1, &[("code", Value::Null)], true),
+            step("sites", 2, &[("code", text("x"))], false),
+            step("sites", 1, &[("code", text("y"))], false),
         ]
     );
+    assert!(plan.stuck.is_empty());
+}
+
+fn chapters() -> Schema {
+    Schema::new(vec![
+        Collection::minted("books").plain("name", Merge::Lww),
+        Collection::minted("chapters")
+            .owner("book", "books")
+            .plain("n", Merge::Lww)
+            .identity_key(&["book", "n"]),
+    ])
+}
+
+fn swapped_chapters() -> [Planned; 2] {
+    let book = Value::Ref(gid(9));
+    let at = |n: i64| row(&[("book", book.clone()), ("n", Value::Int(n))]);
+    [
+        update("chapters", 1, at(1), at(2)),
+        update("chapters", 2, at(2), at(1)),
+    ]
+}
+
+#[test]
+fn a_swap_on_a_key_that_includes_an_owner_parks_only_the_field_that_moves() {
+    let plan = order(&chapters(), &Columns::new(), &swapped_chapters());
+    assert_eq!(
+        plan.steps[0],
+        step("chapters", 1, &[("n", Value::Null)], true)
+    );
+    assert_eq!(plan.steps.len(), 3);
+    let only_owner = Columns::new().not_null("chapters", "n");
+    let plan = order(&chapters(), &only_owner, &swapped_chapters());
+    assert_eq!(
+        plan.steps[0],
+        step("chapters", 1, &[("book", Value::Null)], true)
+    );
+    assert!(plan.stuck.is_empty());
+}
+
+#[test]
+fn a_swap_no_field_of_which_accepts_null_is_reported_stuck_and_not_written() {
+    let columns = Columns::new()
+        .not_null("chapters", "n")
+        .not_null("chapters", "book");
+    let plan = order(&chapters(), &columns, &swapped_chapters());
+    assert_eq!(plan.steps, vec![]);
+    assert_eq!(
+        plan.stuck,
+        vec![
+            ("chapters".to_string(), gid(1)),
+            ("chapters".to_string(), gid(2))
+        ]
+    );
+}
+
+#[test]
+fn a_row_on_no_cycle_is_never_parked() {
+    let schema = Schema::new(vec![
+        Collection::minted("sites")
+            .plain("code", Merge::Lww)
+            .plain("tag", Merge::Lww)
+            .identity_key(&["code"])
+            .identity_key(&["tag"]),
+    ]);
+    let site = |code: &str, tag: &str| row(&[("code", text(code)), ("tag", text(tag))]);
+    // Rows 2 and 3 swap codes; row 1 takes row 2's old tag, and row 4 takes row 1's.
+    let planned = [
+        update("sites", 2, site("x", "q"), site("y", "r")),
+        update("sites", 3, site("y", "m"), site("x", "m")),
+        update("sites", 1, site("w", "p"), site("w", "q")),
+        update("sites", 4, site("u", "s"), site("u", "p")),
+    ];
+    let plan = order(&schema, &Columns::new(), &planned);
+    let parked: Vec<&Step> = plan.steps.iter().filter(|s| s.parked).collect();
+    assert_eq!(
+        parked,
+        vec![&step("sites", 2, &[("code", Value::Null)], true)]
+    );
+    assert!(plan.stuck.is_empty());
 }
 
 #[test]
