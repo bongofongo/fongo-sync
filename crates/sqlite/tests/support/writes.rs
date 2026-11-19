@@ -5,6 +5,10 @@
 //! field changes with, or made or removed the row; besides that it sends aliases, and what an
 //! install adopts. Anything else it sends is a value the application did not write, such as a
 //! field the kernel held back in a row and later took for an edit.
+//!
+//! In the other direction, every value the application wrote must be sent, and once everything
+//! is exchanged, held in the merged state at the clock it was sent with or a later one
+//! ([`Writes::kept`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +19,8 @@ use sqlx::SqliteConnection;
 
 use super::{key_columns, quoted, rows, text};
 
-type Rows = BTreeMap<(String, String), Vec<Value>>;
+/// Rows by collection and key, each field by name, so rows read under two registries compare.
+type Rows = BTreeMap<(String, String), BTreeMap<String, Value>>;
 
 #[derive(Default)]
 pub struct Writes {
@@ -33,6 +38,13 @@ pub struct Writes {
     removed: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// Changes an install produced, which are not checked.
     adopted: Vec<Change>,
+    /// Cells the application changed, with the value it wrote, not yet seen in what was sent.
+    owed: BTreeMap<(String, String, String), Value>,
+    /// For a reference among them, the entity the row it names stood for when it was written.
+    named: BTreeMap<(String, String, String), Gid>,
+    /// Every write the application made, as the change that carried it: each must be in the
+    /// merged state once everything is exchanged.
+    pub expected: Vec<Change>,
 }
 
 async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
@@ -43,7 +55,14 @@ async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
         columns.extend(c.fields.iter().map(|f| quoted(&f.name)));
         let sql = format!("SELECT {} FROM {}", columns.join(", "), quoted(&c.table));
         for row in rows(conn, &sql, &[]).await {
-            out.insert((c.name.clone(), text(&row[0])), row[1..].to_vec());
+            out.insert(
+                (c.name.clone(), text(&row[0])),
+                c.fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .zip(row[1..].iter().cloned())
+                    .collect(),
+            );
         }
     }
     out
@@ -147,14 +166,46 @@ impl Writes {
                 .or_default()
                 .insert(text(&row[2]));
         }
+        // Rows made since the last step: the kernel has not yet given them an entity, so what
+        // it maps their keys to is not what a reference to them names.
+        let fresh: BTreeSet<&(String, String)> = current
+            .keys()
+            .filter(|at| !self.after.contains_key(*at) || remade.contains(*at))
+            .collect();
         for (at, values) in &current {
             let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
                 continue;
             };
             let old = self.after.get(at);
+            let new_row = old.is_none() || remade.contains(at);
+            for f in &c.fields {
+                let value = values.get(&f.name).cloned().unwrap_or(Value::Null);
+                let held = |row: &BTreeMap<String, Value>| {
+                    row.get(&f.name).cloned().unwrap_or(Value::Null)
+                };
+                let changed = match old {
+                    Some(old) if !new_row => held(old) != value,
+                    _ => value != Value::Null,
+                };
+                if changed {
+                    let cell = (at.0.clone(), at.1.clone(), f.name.clone());
+                    if let (Kind::Ref { collection: t, .. }, Value::Int(local)) = (&f.kind, &value)
+                        && !fresh.contains(&(t.clone(), format!("[{local}]")))
+                        && let Ok(Some(g)) = replica.gid_of(conn, t, *local).await
+                    {
+                        self.named.insert(cell.clone(), g);
+                    } else {
+                        self.named.remove(&cell);
+                    }
+                    self.owed.insert(cell, value);
+                }
+            }
             let mut touched = BTreeSet::new();
-            for (i, f) in c.fields.iter().enumerate() {
-                if old.is_none_or(|old| old.get(i) != values.get(i)) {
+            for f in &c.fields {
+                if old.is_none_or(|old| {
+                    old.get(&f.name).unwrap_or(&Value::Null)
+                        != values.get(&f.name).unwrap_or(&Value::Null)
+                }) {
                     touched.insert(f.name.clone());
                 }
             }
@@ -197,10 +248,10 @@ impl Writes {
             let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
                 continue;
             };
-            let with_owner = c.fields.iter().enumerate().any(|(i, f)| {
+            let with_owner = c.fields.iter().any(|f| {
                 let owning = matches!(f.kind, Kind::Ref { owned: true, .. })
                     || matches!(&c.key, Key::Natural { fields } if fields.contains(&f.name));
-                match (&f.kind, self.after[*at].get(i)) {
+                match (&f.kind, self.after[*at].get(&f.name)) {
                     (Kind::Ref { collection, .. }, Some(Value::Int(local))) if owning => {
                         gone.contains(&(collection.clone(), format!("[{local}]")))
                     }
@@ -455,12 +506,146 @@ impl Writes {
                 ));
             }
         }
+        // Every value the application wrote is carried by a change sent to its entity.
+        let uncollected: BTreeSet<(String, String)> =
+            inspection.uncollected.iter().cloned().collect();
+        let pinned: BTreeSet<(String, String, String)> =
+            inspection.pinned.iter().cloned().collect();
+        let registry = replica.registry();
+        let named = std::mem::take(&mut self.named);
+        for ((c, key, field), value) in std::mem::take(&mut self.owed) {
+            let at = (c.clone(), key.clone());
+            if uncollected.contains(&at) {
+                let cell = (c, key, field);
+                if let Some(g) = named.get(&cell) {
+                    self.named.insert(cell.clone(), *g);
+                }
+                self.owed.insert(cell, value);
+                continue;
+            }
+            if leftover.contains(&at)
+                || pinned.contains(&(c.clone(), key.clone(), field.clone()))
+                || !self.after.contains_key(&at)
+            {
+                continue;
+            }
+            let Some(collection) = registry.collections().iter().find(|x| x.name == c) else {
+                continue;
+            };
+            let kind = collection
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .map(|f| &f.kind);
+            // A reference names an entity the row at that local id has stood for: when written,
+            // now, or meanwhile, since a row that waited may be collected after the id was given
+            // to another. A row that has since gone with a merge, and was never seen with an
+            // entity, is known by none, and then any entity carried will do.
+            let mut names: BTreeSet<Gid> = BTreeSet::new();
+            if let (Some(Kind::Ref { collection: t, .. }), Value::Int(local)) = (kind, &value) {
+                names.extend(
+                    named
+                        .get(&(c.clone(), key.clone(), field.clone()))
+                        .map(|g| canonical(t, *g)),
+                );
+                let held = (t.clone(), format!("[{local}]"));
+                names.extend(
+                    self.gids
+                        .get(&held)
+                        .into_iter()
+                        .flatten()
+                        .map(|g| canonical(t, *g)),
+                );
+                if let Some(g) = replica.gid_of(conn, t, *local).await.unwrap() {
+                    names.insert(canonical(t, g));
+                }
+            }
+            let mut group: BTreeSet<Gid> = self
+                .gids
+                .get(&at)
+                .into_iter()
+                .flatten()
+                .map(|g| canonical(&c, *g))
+                .collect();
+            group.extend(self.latest.get(&at).map(|g| canonical(&c, *g)));
+            let carried = sent.iter().find(|ch| {
+                ch.collection == c
+                    && ch.field == field
+                    && group.contains(&canonical(&c, ch.gid))
+                    && match (&ch.value, &value, kind) {
+                        (Value::Ref(a), Value::Int(_), Some(Kind::Ref { collection: t, .. })) => {
+                            names.is_empty() || names.contains(&canonical(t, *a))
+                        }
+                        (a, b, _) => a.total_cmp(b) == std::cmp::Ordering::Equal,
+                    }
+            });
+            match carried {
+                Some(change) => self.expected.push(change.clone()),
+                None => wrong.push(format!(
+                    "the application wrote {c} row {key}.{field} = {value:?} and nothing sent it"
+                )),
+            }
+        }
         // What waits to be collected, such as a row whose owner is outside sync, is still owed.
-        let uncollected: BTreeSet<(String, String)> = inspection.uncollected.into_iter().collect();
         self.written
             .retain(|(c, k, _)| uncollected.contains(&(c.clone(), k.clone())));
         self.removed.retain(|at, _| uncollected.contains(at));
         self.adopted.clear();
         wrong
+    }
+}
+
+impl Writes {
+    /// Whether every write the application made is in the merged state of `everything`: some
+    /// member of its entity's group holds the field at the clock it was sent with, or a later
+    /// one; a `Max` field holds a value at least as great, and a natural key field that value.
+    pub fn kept(
+        &self,
+        registry: &fongo_sync_sqlite::Registry,
+        everything: &[Change],
+    ) -> Result<(), String> {
+        let schema = registry.model_schema();
+        let merged = model::merge(&schema, everything);
+        let mut groups: BTreeMap<Gid, Vec<Gid>> = BTreeMap::new();
+        for (g, e) in &merged.entities {
+            groups.entry(e.canonical).or_default().push(*g);
+        }
+        for w in &self.expected {
+            let Some(entity) = merged.entities.get(&w.gid) else {
+                return Err(format!(
+                    "the application wrote {w:?}; the entity never arrived"
+                ));
+            };
+            let c = schema
+                .collection(&w.collection)
+                .expect("a registered collection");
+            let strategy = c
+                .fields
+                .iter()
+                .find(|f| f.name == w.field)
+                .map_or(fongo_sync_sqlite::core::Strategy::Lww, |f| f.strategy);
+            let key = matches!(&c.identity, model::Identity::Natural(k) if k.contains(&w.field));
+            let same = |v: &Value| v.total_cmp(&w.value) == std::cmp::Ordering::Equal;
+            let kept = groups[&entity.canonical].iter().any(|m| {
+                merged.entities[m]
+                    .registers
+                    .get(&w.field)
+                    .is_some_and(|(v, at)| {
+                        if key {
+                            same(v)
+                        } else if strategy == fongo_sync_sqlite::core::Strategy::Max {
+                            v.total_cmp(&w.value) != std::cmp::Ordering::Less
+                        } else {
+                            *at > w.clock || (*at == w.clock && same(v))
+                        }
+                    })
+            });
+            if !kept {
+                return Err(format!(
+                    "the application wrote {w:?}; the merged state lost it"
+                ));
+            }
+        }
+        Ok(())
     }
 }

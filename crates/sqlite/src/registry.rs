@@ -11,8 +11,8 @@ pub enum Key {
     /// The table has an `INTEGER PRIMARY KEY` column that means nothing outside this database, so
     /// the replica mints a global id for each row.
     Minted { column: String },
-    /// These fields are the identity, so every replica derives the same global id from them. They
-    /// must be `NOT NULL`.
+    /// These fields are the identity, so every replica derives the same global id from them. Their
+    /// columns must be declared `NOT NULL`, which [`crate::Replica::install`] checks.
     Natural { fields: Vec<String> },
 }
 
@@ -142,9 +142,9 @@ impl Collection {
 
     /// Declares fields that only make sense together, such as a status and the dates that go
     /// with it. A write to any of them records all of them at one clock, and the newest such
-    /// write wins as a whole, so merging never yields a combination no replica wrote; until all
-    /// of a write has arrived the row keeps what it held. The fields must be plain fields or
-    /// references merged by clock, neither owners nor part of the key. When a field joins a set
+    /// write wins as a whole, so merging never yields a combination no replica wrote; a field of
+    /// it whose part of that write has not arrived yet reads NULL. The fields must be plain
+    /// fields merged by clock, not references nor part of the key. When a field joins a set
     /// that already holds writes, each replica whose rows hold a value for the set records the
     /// whole set again on install, and the newest of those wins.
     pub fn together(mut self, fields: &[&str]) -> Collection {
@@ -156,9 +156,10 @@ impl Collection {
     /// Declares an identity: two live entities equal on all of `fields`, none of them null, are
     /// the same entity, and become one on every replica, with one row. Only a minted collection
     /// can have one, and the table should hold the fields `UNIQUE` together. A row that holds an
-    /// identity only because it is out of date gives it up for the rest of an apply, taking null
-    /// or, where null is refused, a stand-in value; if a `CHECK` on the table refuses that too,
-    /// the rows wait for the application rather than swap.
+    /// identity only because it is out of date gives it up for the rest of an apply by taking
+    /// NULL in one of its fields. Where every field refuses NULL, rows that swap identities
+    /// cannot be written one at a time: they wait, reported in [`crate::Applied::held`], until
+    /// the application changes its rows.
     pub fn identity(mut self, fields: &[&str]) -> Collection {
         self.identity
             .push(fields.iter().map(|f| (*f).into()).collect());
@@ -207,10 +208,6 @@ impl Collection {
             .iter()
             .position(|set| set.iter().any(|f| f == field))
     }
-
-    pub(crate) fn field_index(&self, name: &str) -> Option<usize> {
-        self.fields.iter().position(|f| f.name == name)
-    }
 }
 
 /// The synced tables. A reference may name any minted collection; ownership may not go round in
@@ -218,8 +215,6 @@ impl Collection {
 #[derive(Debug, Clone)]
 pub struct Registry {
     collections: Vec<Collection>,
-    /// Each collection's place when rows are written owners first.
-    ranks: Vec<usize>,
 }
 
 fn is_identifier(text: &str) -> bool {
@@ -362,21 +357,20 @@ impl Registry {
                     .collect()
             })
             .collect();
-        let mut ranks = vec![usize::MAX; collections.len()];
-        for next in 0..collections.len() {
-            let ready = (0..collections.len()).find(|&i| {
-                ranks[i] == usize::MAX && owners[i].iter().all(|&o| ranks[o] != usize::MAX)
-            });
+        let mut placed = vec![false; collections.len()];
+        for _ in 0..collections.len() {
+            let ready = (0..collections.len())
+                .find(|&i| !placed[i] && owners[i].iter().all(|&o| placed[o]));
             let Some(ready) = ready else {
-                let stuck = (0..collections.len()).find(|&i| ranks[i] == usize::MAX);
+                let stuck = (0..collections.len()).find(|&i| !placed[i]);
                 return bad(format!(
                     "`{}` is owned, through others, by itself",
                     stuck.map_or("", |i| collections[i].name.as_str())
                 ));
             };
-            ranks[ready] = next;
+            placed[ready] = true;
         }
-        let registry = Registry { collections, ranks };
+        let registry = Registry { collections };
         registry.model_schema().check().map_err(Error::Registry)?;
         Ok(registry)
     }
@@ -422,25 +416,8 @@ impl Registry {
         &self.collections
     }
 
-    /// Where a collection comes when rows are written parents first.
-    pub(crate) fn rank(&self, idx: usize) -> usize {
-        self.ranks[idx]
-    }
-
     pub(crate) fn index(&self, name: &str) -> Option<usize> {
         self.collections.iter().position(|c| c.name == name)
-    }
-
-    pub(crate) fn strategy(&self, collection: &str, field: &str) -> Strategy {
-        if field == DELETED {
-            return Strategy::Lww;
-        }
-        self.index(collection)
-            .and_then(|i| {
-                let c = &self.collections[i];
-                c.field_index(field).map(|f| c.fields[f].strategy)
-            })
-            .unwrap_or(Strategy::Lww)
     }
 }
 
@@ -452,8 +429,7 @@ mod tests {
     fn a_reference_names_a_minted_collection_declared_anywhere() {
         let books = Collection::minted("books", "books", "id").reference("author_id", "authors");
         let authors = Collection::minted("authors", "authors", "id").reference("best", "books");
-        let registry = Registry::new(vec![books.clone(), authors.clone()]).unwrap();
-        assert_eq!(registry.rank(0), 0);
+        assert!(Registry::new(vec![books.clone(), authors.clone()]).is_ok());
         let tags = Collection::natural("tags", "tags", &["tag"]).field("tag");
         let wrong = Collection::minted("books", "books", "id").reference("tag", "tags");
         assert!(Registry::new(vec![tags, wrong]).is_err());
@@ -464,8 +440,7 @@ mod tests {
         let notes = Collection::minted("notes", "notes", "id").owner("book_id", "books");
         let books = Collection::minted("books", "books", "id").owner("shelf_id", "shelves");
         let shelves = Collection::minted("shelves", "shelves", "id").field("name");
-        let registry = Registry::new(vec![notes.clone(), books, shelves]).unwrap();
-        assert!(registry.rank(2) < registry.rank(1) && registry.rank(1) < registry.rank(0));
+        assert!(Registry::new(vec![notes.clone(), books, shelves]).is_ok());
         let circle = Collection::minted("books", "books", "id").owner("note_id", "notes");
         assert!(Registry::new(vec![notes, circle]).is_err());
         let own_kind = Collection::minted("books", "books", "id").owner("parent", "books");

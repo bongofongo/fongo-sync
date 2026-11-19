@@ -275,9 +275,13 @@ async fn run(seed: u64, replicas: usize, script: &[Op]) -> Result<(), String> {
         }
         let after = batches.iter().filter(|b| !b.is_empty()).count();
         if after == before {
+            let everything: Vec<Change> = batches.iter().flatten().cloned().collect();
             for (r, peer) in peers.iter_mut().enumerate() {
                 support::settled(&mut peer.conn, &peer.replica, &peer.taken)
                     .await
+                    .map_err(|e| format!("replica {r}: {e}"))?;
+                peer.writes
+                    .kept(peer.replica.registry(), &everything)
                     .map_err(|e| format!("replica {r}: {e}"))?;
             }
             return Ok(());

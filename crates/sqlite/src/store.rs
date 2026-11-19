@@ -1,0 +1,356 @@
+//! The facts `fongo_sync_core::source` describes, kept in the kernel's tables and read back
+//! through the indexed questions of [`Source`].
+
+use std::collections::BTreeSet;
+
+use fongo_sync_core::model::Schema;
+use fongo_sync_core::source::{Alias, Body, Claim, Entry, Fact, Slot, Source, keep};
+use fongo_sync_core::{Gid, Hlc, Value};
+
+use crate::db::{Db, as_gid, as_text, loaded, stored};
+use crate::error::{Error, Result};
+
+/// The kernel's own tables. Layout 3: facts as `source::admit` keeps them, a row image and the
+/// entity each local row stands for, and what waits.
+pub(crate) const TABLES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
+    // The smallest clock among a gid's facts in each collection.
+    "CREATE TABLE IF NOT EXISTS fongo_claims (
+        gid BLOB NOT NULL,
+        collection TEXT NOT NULL,
+        first TEXT NOT NULL,
+        PRIMARY KEY (gid, collection)) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS fongo_claims_collection ON fongo_claims (collection, gid)",
+    // Every kept entry of every field: one for most fields, a few for a natural key's.
+    "CREATE TABLE IF NOT EXISTS fongo_shadow (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        field TEXT NOT NULL,
+        value,
+        is_ref INTEGER NOT NULL DEFAULT 0,
+        clock TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS fongo_shadow_entity ON fongo_shadow (collection, gid, field)",
+    "CREATE INDEX IF NOT EXISTS fongo_shadow_value ON fongo_shadow (collection, field, value, is_ref, gid)",
+    "CREATE TABLE IF NOT EXISTS fongo_alias (
+        collection TEXT NOT NULL,
+        a BLOB NOT NULL,
+        b BLOB NOT NULL,
+        PRIMARY KEY (a, b, collection)) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS fongo_alias_b ON fongo_alias (b)",
+    // Changes to collections this registry does not have, kept for a registry that does.
+    "CREATE TABLE IF NOT EXISTS fongo_foreign (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        field TEXT NOT NULL,
+        value,
+        is_ref INTEGER NOT NULL DEFAULT 0,
+        clock TEXT NOT NULL,
+        PRIMARY KEY (collection, gid, field, clock))",
+    // Each local row: the entity it stands for, and its image. `local` is a minted row's id.
+    "CREATE TABLE IF NOT EXISTS fongo_ids (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        local INTEGER,
+        image BLOB NOT NULL,
+        doomed INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (collection, key))",
+    "CREATE INDEX IF NOT EXISTS fongo_ids_gid ON fongo_ids (collection, gid)",
+    "CREATE INDEX IF NOT EXISTS fongo_ids_local ON fongo_ids (collection, local)",
+    "CREATE TABLE IF NOT EXISTS fongo_dirty (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        gone INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (collection, key))",
+    "CREATE TABLE IF NOT EXISTS fongo_outbox (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        field TEXT NOT NULL,
+        value,
+        is_ref INTEGER NOT NULL DEFAULT 0,
+        clock TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS fongo_held (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        PRIMARY KEY (collection, gid)) WITHOUT ROWID",
+    // A field the application kept as this replica's own on resuming, and the merged value it
+    // stands against.
+    "CREATE TABLE IF NOT EXISTS fongo_pins (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        field TEXT NOT NULL,
+        against,
+        is_ref INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (collection, key, field))",
+    "CREATE TABLE IF NOT EXISTS fongo_bases (
+        collection TEXT NOT NULL,
+        gid BLOB NOT NULL,
+        field TEXT NOT NULL,
+        key TEXT,
+        base,
+        base_is_ref INTEGER NOT NULL DEFAULT 0,
+        base_clock TEXT,
+        local,
+        local_is_ref INTEGER NOT NULL DEFAULT 0,
+        local_clock TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        reported TEXT,
+        PRIMARY KEY (collection, gid, field))",
+];
+
+pub(crate) const LAYOUT: i64 = 3;
+
+pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {
+    Hlc::decode(as_text(value)?).ok_or_else(|| Error::Corrupt("a clock does not parse".into()))
+}
+
+fn clock_text(clock: &Hlc) -> Value {
+    Value::Text(clock.encode())
+}
+
+/// The facts, answering the evaluator.
+pub(crate) struct Facts<'a> {
+    pub db: &'a Db,
+}
+
+impl Facts<'_> {
+    fn entries_of(&self, collection: &str, gid: Gid, field: &str) -> Result<Vec<(Value, Hlc)>> {
+        let rows = self.db.query(
+            "SELECT value, is_ref, clock FROM fongo_shadow
+              WHERE collection = ?1 AND gid = ?2 AND field = ?3",
+            &[
+                Value::Text(collection.into()),
+                Value::Ref(gid),
+                Value::Text(field.into()),
+            ],
+        )?;
+        rows.iter()
+            .map(|r| Ok((loaded(&r[0], &r[1])?, as_clock(&r[2])?)))
+            .collect()
+    }
+
+    /// Keeps a fact as [`fongo_sync_core::source::Store::keep`] does. Returns whether anything
+    /// kept changed.
+    pub(crate) fn keep(&self, fact: &Fact) -> Result<bool> {
+        let collection = Value::Text(fact.collection.clone());
+        let mut changed = self.db.exec(
+            "INSERT INTO fongo_claims (gid, collection, first) VALUES (?1, ?2, ?3)
+             ON CONFLICT (gid, collection) DO UPDATE SET first = excluded.first
+              WHERE excluded.first < fongo_claims.first",
+            &[
+                Value::Ref(fact.gid),
+                collection.clone(),
+                clock_text(&fact.clock),
+            ],
+        )? > 0;
+        match &fact.body {
+            Body::Alias { target } => {
+                changed |= self.db.exec(
+                    "INSERT OR IGNORE INTO fongo_alias (collection, a, b) VALUES (?1, ?2, ?3)",
+                    &[collection, Value::Ref(fact.gid), Value::Ref(*target)],
+                )? > 0;
+            }
+            Body::Field { field, value, slot } => {
+                let mut entries = self.entries_of(&fact.collection, fact.gid, field)?;
+                let (kept, _) = keep(*slot, &mut entries, value, fact.clock);
+                if kept {
+                    changed = true;
+                    let at = [
+                        collection.clone(),
+                        Value::Ref(fact.gid),
+                        Value::Text(field.clone()),
+                    ];
+                    self.db.exec(
+                        "DELETE FROM fongo_shadow WHERE collection = ?1 AND gid = ?2 AND field = ?3",
+                        &at,
+                    )?;
+                    for (value, clock) in entries {
+                        let (value, kind) = stored(&value);
+                        self.db.exec(
+                            "INSERT INTO fongo_shadow (collection, gid, field, value, is_ref, clock)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            &[at[0].clone(), at[1].clone(), at[2].clone(), value, kind, clock_text(&clock)],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Every collection with a fact about `gid`, with the clock of the first.
+    pub(crate) fn claims_of(&self, gid: Gid) -> Result<Vec<Claim>> {
+        let rows = self.db.query(
+            "SELECT collection, first FROM fongo_claims WHERE gid = ?1",
+            &[Value::Ref(gid)],
+        )?;
+        rows.iter()
+            .map(|r| {
+                Ok(Claim {
+                    collection: as_text(&r[0])?.to_string(),
+                    first: as_clock(&r[1])?,
+                })
+            })
+            .collect()
+    }
+
+    /// The winning entry of a field among `members`, as a group shows it.
+    pub(crate) fn register(
+        &self,
+        schema: &Schema,
+        collection: &str,
+        members: &[Gid],
+        field: &str,
+    ) -> Result<Option<(Value, Hlc)>> {
+        let strategy = schema
+            .collection(collection)
+            .and_then(|c| c.fields.iter().find(|f| f.name == field))
+            .map_or(fongo_sync_core::Strategy::Lww, |f| f.strategy);
+        let slot = fongo_sync_core::source::slot(schema, collection, field);
+        let mut best: Option<(Value, Hlc)> = None;
+        for &m in members {
+            let mut entries = self.entries_of(collection, m, field)?;
+            if slot == Slot::Earliest {
+                entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+                entries.truncate(1);
+            }
+            for (v, k) in entries {
+                let strategy = if field == fongo_sync_core::DELETED {
+                    fongo_sync_core::Strategy::Lww
+                } else {
+                    strategy
+                };
+                if fongo_sync_core::wins(strategy, best.as_ref().map(|(v, k)| (v, k)), &v, &k) {
+                    best = Some((v, k));
+                }
+            }
+        }
+        Ok(best)
+    }
+}
+
+impl Source for Facts<'_> {
+    fn claims(&self, gid: Gid) -> Vec<Claim> {
+        match self.claims_of(gid) {
+            Ok(c) => c,
+            Err(e) => {
+                self.db.fail(e);
+                Vec::new()
+            }
+        }
+    }
+
+    fn entries(&self, collection: &str, gid: Gid) -> Vec<Entry> {
+        let rows = self.db.answer(
+            "SELECT field, value, is_ref, clock FROM fongo_shadow
+              WHERE collection = ?1 AND gid = ?2",
+            &[Value::Text(collection.into()), Value::Ref(gid)],
+        );
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            match (as_text(&r[0]), loaded(&r[1], &r[2]), as_clock(&r[3])) {
+                (Ok(field), Ok(value), Ok(clock)) => out.push(Entry {
+                    field: field.to_string(),
+                    value,
+                    clock,
+                }),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => self.db.fail(e),
+            }
+        }
+        out
+    }
+
+    fn aliases(&self, gid: Gid) -> Vec<Alias> {
+        let rows = self.db.answer(
+            "SELECT collection, a, b FROM fongo_alias WHERE a = ?1
+             UNION SELECT collection, a, b FROM fongo_alias WHERE b = ?1",
+            &[Value::Ref(gid)],
+        );
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            match (as_text(&r[0]), as_gid(&r[1]), as_gid(&r[2])) {
+                (Ok(collection), Ok(from), Ok(to)) => out.push(Alias {
+                    collection: collection.to_string(),
+                    from,
+                    to,
+                }),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => self.db.fail(e),
+            }
+        }
+        out
+    }
+
+    fn holding(&self, collection: &str, fields: &[(&str, &Value)]) -> Vec<Gid> {
+        let mut params = vec![Value::Text(collection.into())];
+        let mut sql = String::new();
+        if fields.is_empty() {
+            sql.push_str("SELECT gid FROM fongo_claims WHERE collection = ?1");
+        }
+        // The rest are tested against each gid the first holds, so the first is the pair the
+        // fewest entries hold, as far as a bounded count tells.
+        let mut fields = fields.to_vec();
+        if fields.len() > 1 {
+            let mut counted: Vec<(i64, (&str, &Value))> = fields
+                .iter()
+                .map(|&(field, value)| {
+                    let (value_, kind) = stored(value);
+                    let n = self
+                        .db
+                        .answer(
+                            "SELECT count(*) FROM (SELECT 1 FROM fongo_shadow INDEXED BY fongo_shadow_value
+                              WHERE collection = ?1 AND field = ?2 AND value IS ?3 AND is_ref = ?4
+                              LIMIT 256)",
+                            &[Value::Text(collection.into()), Value::Text(field.into()), value_, kind],
+                        )
+                        .first()
+                        .and_then(|r| match r[0] {
+                            Value::Int(n) => Some(n),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    (n, (field, value))
+                })
+                .collect();
+            counted.sort_by_key(|(n, _)| *n);
+            fields = counted.into_iter().map(|(_, pair)| pair).collect();
+        }
+        for (i, (field, value)) in fields.iter().enumerate() {
+            let (value, kind) = stored(value);
+            let n = params.len();
+            params.extend([Value::Text(field.to_string()), value, kind]);
+            let test = format!(
+                "s{i}.collection = ?1 AND s{i}.field = ?{} AND s{i}.value IS ?{} AND s{i}.is_ref = ?{}",
+                n + 1,
+                n + 2,
+                n + 3
+            );
+            if i == 0 {
+                sql.push_str(&format!(
+                    "SELECT DISTINCT s0.gid FROM fongo_shadow s0 INDEXED BY fongo_shadow_value WHERE {test}"
+                ));
+            } else {
+                sql.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM fongo_shadow s{i} INDEXED BY fongo_shadow_value
+                       WHERE s{i}.gid = s0.gid AND {test})"
+                ));
+            }
+        }
+        let found: BTreeSet<Gid> = self
+            .db
+            .answer(&sql, &params)
+            .iter()
+            .filter_map(|r| as_gid(&r[0]).ok())
+            .collect();
+        found.into_iter().collect()
+    }
+
+    fn gids(&self) -> Vec<Gid> {
+        self.db
+            .answer("SELECT DISTINCT gid FROM fongo_claims ORDER BY gid", &[])
+            .iter()
+            .filter_map(|r| as_gid(&r[0]).ok())
+            .collect()
+    }
+}

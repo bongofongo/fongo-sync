@@ -10,22 +10,21 @@
 //! from its tables, so these checks hold any implementation to the same account. A row is held
 //! back when its entity waits, when it is a row a merge gave up and another table holds, or when
 //! it holds local writes not yet collected, which holds back its entity too. The model has no
-//! notion of waiting, so those rows are compared only once they are settled. Fields of a
-//! set that changes together are also left out midway while the set's newest write has not all
-//! arrived, since the kernel keeps what the row held until then; so are groups with a live member
-//! whose tombstone has not arrived (see [`unconfirmed`]). A field the application pinned
-//! as its own baseline on resuming is never compared: it is outside what the model describes.
+//! notion of waiting, so those rows are compared only once they are settled. A field the
+//! application pinned as its own baseline on resuming is never compared: it is outside what the
+//! model describes.
 
 #![allow(dead_code)]
 
 pub mod peer;
+pub mod statements;
 pub mod world;
 pub mod writes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_sqlite::core::model::{self, Merge, Row, View};
-use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Strategy, Value, wins};
+use fongo_sync_sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_sqlite::{Collection, Key, Kind, Registry, Replica};
 use sqlx::SqliteConnection;
 
@@ -239,17 +238,8 @@ fn bookkeeping(
     merge: &Merge,
     kernel: &Kernel,
     seen: &[Change],
-    settled: bool,
 ) -> Vec<String> {
     let mut wrong = kernel.broken.clone();
-    // The model joins by an alias to a gid it knows only from aliases; the kernel waits for that
-    // gid's own changes. Until then its groups may be finer than the model's, never coarser.
-    let bare: BTreeSet<(&str, Gid)> = merge
-        .entities
-        .values()
-        .filter(|e| e.registers.is_empty())
-        .map(|e| (e.collection.as_str(), e.canonical))
-        .collect();
     let empty = BTreeMap::new();
     for ((collection, gid), registers) in &kernel.registers {
         match merge.entities.get(gid) {
@@ -266,7 +256,13 @@ fn bookkeeping(
                 {
                     registers.retain(|f, _| !fields.contains(f));
                 }
-                if e.registers != registers {
+                let same = e.registers.len() == registers.len()
+                    && e.registers.iter().zip(&registers).all(
+                        |((fa, (va, ka)), (fb, (vb, kb)))| {
+                            fa == fb && ka == kb && va.total_cmp(vb) == std::cmp::Ordering::Equal
+                        },
+                    );
+                if !same {
                     wrong.push(format!(
                         "{collection} {gid:?} registers differ:\n kernel {registers:?}\n model  {:?}",
                         e.registers
@@ -301,13 +297,7 @@ fn bookkeeping(
             ));
         }
         let canon = kernel.canonical(&e.collection, *gid);
-        let finer = !settled
-            && bare.contains(&(e.collection.as_str(), e.canonical))
-            && merge
-                .entities
-                .get(&canon)
-                .is_some_and(|k| k.collection == e.collection && k.canonical == e.canonical);
-        if canon != e.canonical && !finer {
+        if canon != e.canonical {
             wrong.push(format!(
                 "{} {gid:?} is in the group of {canon:?}, the model says {:?}",
                 e.collection, e.canonical
@@ -392,100 +382,13 @@ async fn tables(conn: &mut SqliteConnection, replica: &Replica, kernel: &Kernel)
         {
             wrong.push(format!("{collection} id {key} names no row"));
         }
-        if kernel.canonical(collection, *gid) != *gid {
+        // A row a merge gave up stands for the member it held until it goes.
+        let leftover = kernel.leftover.contains(&(collection.clone(), key.clone()));
+        if !leftover && kernel.canonical(collection, *gid) != *gid {
             wrong.push(format!("{collection} id {key} maps to a non-canonical gid"));
         }
     }
     wrong
-}
-
-/// The fields of each live group's sets that change together whose newest write has not all
-/// arrived, by the model's registers.
-fn incomplete_sets(registry: &Registry, merge: &Merge) -> BTreeSet<(String, Gid, String)> {
-    let mut out = BTreeSet::new();
-    let mut live: BTreeMap<(String, Gid), Vec<Gid>> = BTreeMap::new();
-    for (gid, e) in &merge.entities {
-        if e.live {
-            live.entry((e.collection.clone(), e.canonical))
-                .or_default()
-                .push(*gid);
-        }
-    }
-    for ((collection, canon), members) in live {
-        let Some(c) = registry.collections().iter().find(|c| c.name == collection) else {
-            continue;
-        };
-        for set in &c.together {
-            let clocks: Vec<Option<Hlc>> = set
-                .iter()
-                .map(|f| {
-                    let mut best: Option<&(Value, Hlc)> = None;
-                    for m in &members {
-                        if let Some(entry) = merge.entities[m].registers.get(f)
-                            && wins(Strategy::Lww, best.map(|(v, k)| (v, k)), &entry.0, &entry.1)
-                        {
-                            best = Some(entry);
-                        }
-                    }
-                    best.map(|(_, k)| *k)
-                })
-                .collect();
-            if clocks.iter().any(|k| *k != clocks[0]) {
-                for f in set {
-                    out.insert((collection.clone(), canon, f.clone()));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Groups with a live member the kernel cannot yet count live: its tombstone has not arrived, or
-/// an owner it names has no member that can be. The model counts a member with no tombstone live,
-/// having no notion of waiting; the kernel waits for the tombstone, which every replica writes
-/// when it makes an entity, before it shows the member or lends its fields to the group.
-fn unconfirmed(schema: &model::Schema, merge: &Merge) -> BTreeSet<(String, Gid)> {
-    let mut confirmed: BTreeSet<Gid> = BTreeSet::new();
-    loop {
-        let groups: BTreeSet<(&str, Gid)> = confirmed
-            .iter()
-            .map(|g| {
-                let e = &merge.entities[g];
-                (e.collection.as_str(), e.canonical)
-            })
-            .collect();
-        let more: Vec<Gid> = merge
-            .entities
-            .iter()
-            .filter(|(gid, e)| !confirmed.contains(gid) && e.live)
-            .filter(|(_, e)| matches!(e.registers.get(DELETED), Some((Value::Int(0), _))))
-            .filter(|(_, e)| {
-                let Some(c) = schema.collection(&e.collection) else {
-                    return false;
-                };
-                c.fields
-                    .iter()
-                    .all(|f| match (&f.kind, e.registers.get(&f.name)) {
-                        (model::FieldKind::Owner(t), Some((Value::Ref(owner), _))) => merge
-                            .entities
-                            .get(owner)
-                            .is_some_and(|o| groups.contains(&(t.as_str(), o.canonical))),
-                        _ => true,
-                    })
-            })
-            .map(|(gid, _)| *gid)
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        confirmed.extend(more);
-    }
-    merge
-        .entities
-        .iter()
-        .filter(|(gid, e)| e.live && !confirmed.contains(gid))
-        .map(|(_, e)| (e.collection.clone(), e.canonical))
-        .collect()
 }
 
 fn pinned(kernel: &Kernel) -> BTreeSet<(String, Gid, String)> {
@@ -573,47 +476,17 @@ pub async fn midway(
     let merge = model::merge(&schema, &seen);
     let expected = model::view(&schema, &seen);
     let kernel = read(conn, replica).await;
-    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen, false);
+    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen);
     wrong.extend(tables(conn, replica, &kernel).await);
-    let incomplete = incomplete_sets(registry, &merge);
     let pinned = pinned(&kernel);
-    let unconfirmed = unconfirmed(&schema, &merge);
-    // Where the kernel's groups may be finer than the model's (see `bookkeeping`), a reference
-    // reads as the model's name for the group it names.
-    let mut shown = kernel.view.clone();
-    for rows in shown.collections.values_mut() {
-        for row in rows.values_mut() {
-            for value in row.values_mut() {
-                if let Value::Ref(g) = value
-                    && let Some(e) = merge.entities.get(g)
-                    && merge
-                        .entities
-                        .values()
-                        .any(|m| m.registers.is_empty() && m.canonical == e.canonical)
-                {
-                    *g = e.canonical;
-                }
-            }
-        }
-    }
     wrong.extend(rows_differ(
         &expected,
-        &shown,
+        &kernel.view,
         |c, g| {
             let at = (c.to_string(), g);
-            let modelled = merge
-                .entities
-                .get(&g)
-                .map_or((c.to_string(), g), |e| (c.to_string(), e.canonical));
-            kernel.pending.contains(&at)
-                || kernel.uncollected.contains(&at)
-                || unconfirmed.contains(&at)
-                || unconfirmed.contains(&modelled)
+            kernel.pending.contains(&at) || kernel.uncollected.contains(&at)
         },
-        |c, g, f| {
-            let at = (c.to_string(), g, f.to_string());
-            incomplete.contains(&at) || pinned.contains(&at)
-        },
+        |c, g, f| pinned.contains(&(c.to_string(), g, f.to_string())),
     ));
     if !wrong.is_empty() {
         wrong.push(context(&merge, &kernel));
@@ -650,7 +523,7 @@ pub async fn settled(
     let merge = model::merge(&schema, &seen);
     let expected = model::view(&schema, &seen);
     let kernel = read(conn, replica).await;
-    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen, true);
+    let mut wrong = bookkeeping(registry, &merge, &kernel, &seen);
     wrong.extend(tables(conn, replica, &kernel).await);
     for (what, left) in [
         ("waiting", format!("{:?}", kernel.pending)),

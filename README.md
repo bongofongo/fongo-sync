@@ -7,7 +7,7 @@ The kernel knows nothing about any particular application.
 | crate | holds |
 |---|---|
 | `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules; `model`, the reference model of what replicas converge to; the evaluator and row planner that make every merge decision. No I/O. |
-| `fongo-sync-sqlite` | change capture by trigger, and applying remote changes to an application's own tables. |
+| `fongo-sync-sqlite` | the storage adapter: change capture by trigger, the core's facts kept in SQLite, and every row written as the core plans it. |
 | `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
 
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
@@ -65,7 +65,9 @@ Three layers, each tested against the one above it:
      cannot write. Its module documentation lists what an adapter must do.
 3. **Mechanics.** A storage adapter keeps facts, rows, row images and a mapping from entities to
    local rows; it asks the core what to do and does it. `crates/core/tests/sim` is such an
-   adapter over in-memory tables, with no SQL: the executable design of one.
+   adapter over in-memory tables, with no SQL: the executable design of one. `fongo-sync-sqlite`
+   is the same design over SQLite, answering the core's questions with indexed queries inside
+   one transaction per operation.
 
 What is tested against what (`crates/core/tests`):
 
@@ -104,13 +106,20 @@ One chain, each link checked against the one above it:
    model's row; once nothing waits, its rows must be exactly `model::view`, with no two sharing
    an identity. What a replica sends is checked against what its application wrote, told apart
    from what the kernel wrote by comparing tables between kernel steps, since a replica that
-   sends a value it only held back makes every replica agree on a wrong answer. The tests read
+   sends a value it only held back makes every replica agree on a wrong answer; and every value
+   the application wrote must be sent and, once everything is exchanged, be in the merged
+   state. The tests read
    the kernel only through `Replica::inspect` and the public lookups, so they hold any
    implementation to the same account, and `Registry::model_schema` gives the model's schema; a
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,
    every script up to a small length in `tests/exhaustive.rs`, both repeatable from a seed;
-   `make deep` runs them longer. `tests/departures.rs` lists, as ignored tests, the ways the
-   kernel is known to depart from the model.
+   `make deep` runs them longer. `tests/departures.rs` holds the ways an earlier adapter was
+   seen to depart from the model; `tests/crash.rs` stops an apply and a collect at every
+   statement and requires the database unchanged and a second run complete; `tests/bench.rs`
+   requires a small batch to run the same statements in a large library as in a small one.
+   Where the core plans no write (rows that wait on each other through columns none of which
+   accepts NULL), rows wait for the application: ignored tests in `crates/core/tests/plan.rs`,
+   `tests/converge.rs` and `tests/property.rs` show it.
 
 Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
 `clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
