@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    Rng, arb_case, arb_random_case, dense_changes, gid, mentioned, nested_schema, random_schema,
+    Counting, Rng, arb_case, arb_random_case, dense_changes, gid, mentioned, nested_schema,
+    random_schema,
 };
 use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
 use fongo_sync_core::model::{ALIAS, Collection, Schema, View, view};
@@ -97,10 +98,11 @@ proptest! {
         (schema, changes) in arb_case(0..40),
         region in 1usize..12,
         key_combinations in 0usize..3,
+        lookups in 0usize..12,
         order in any::<u64>(),
     ) {
         let store = store(&schema, &changes);
-        let ev = Evaluator::new(&schema).unwrap().with_limits(Limits { region, key_combinations });
+        let ev = Evaluator::new(&schema).unwrap().with_limits(Limits { region, key_combinations, lookups });
         let mut questions: Vec<(String, Gid)> = Vec::new();
         for c in &schema.collections {
             for g in mentioned(&schema, &changes) {
@@ -172,6 +174,7 @@ fn an_alias_chain_longer_than_the_region_limit_is_undetermined_from_every_end() 
     let tight = Evaluator::new(&schema).unwrap().with_limits(Limits {
         region: 49,
         key_combinations: 1,
+        ..Limits::default()
     });
     let mut session = tight.session(&store);
     for i in [0, 25, 49] {
@@ -182,6 +185,7 @@ fn an_alias_chain_longer_than_the_region_limit_is_undetermined_from_every_end() 
     let roomy = Evaluator::new(&schema).unwrap().with_limits(Limits {
         region: 50,
         key_combinations: 1,
+        ..Limits::default()
     });
     let t = roomy.target(&store, "things", wide(25)).unwrap();
     assert_eq!(t.members.len(), 50);
@@ -220,6 +224,7 @@ fn a_natural_entity_with_too_many_candidate_keys_is_undetermined_and_so_is_what_
         Evaluator::new(&schema).unwrap().with_limits(Limits {
             region: 100,
             key_combinations: n,
+            ..Limits::default()
         })
     };
     // Each key field keeps its KEY_ENTRIES earliest writes: four values each, sixteen keys.
@@ -471,4 +476,69 @@ fn a_group_that_forms_in_steps_is_the_same_whatever_was_asked_first() {
     }
     let x = ev.target(&store, "k4", gids[8]).unwrap();
     assert_eq!(x.members.len(), 2);
+}
+
+/// Memberships keyed by team and user, with `n` teams merged into one group and `n` users into
+/// another, and one membership: its key could be looked up as n² keys.
+fn merged_teams_and_users(n: u32) -> (Schema, Store, Gid) {
+    let schema = Schema::new(vec![
+        Collection::minted("teams").plain("name", Merge::Lww),
+        Collection::minted("users").plain("name", Merge::Lww),
+        Collection::natural("members", &["team", "user"])
+            .owner("team", "teams")
+            .owner("user", "users")
+            .plain("role", Merge::Lww),
+    ]);
+    let (team, user) = (|i: u32| wide(i), |i: u32| wide(1_000_000 + i));
+    let mut changes = Vec::new();
+    for i in 0..n {
+        changes.push(change("teams", team(i), "name", Value::Int(0), 1));
+        changes.push(change("users", user(i), "name", Value::Int(0), 1));
+        if i > 0 {
+            changes.push(change("teams", team(i), ALIAS, Value::Ref(team(i - 1)), 2));
+            changes.push(change("users", user(i), ALIAS, Value::Ref(user(i - 1)), 2));
+        }
+    }
+    let key = [Value::Ref(team(n / 2)), Value::Ref(user(n / 2))];
+    let member = Gid::derive("members", &key);
+    changes.push(change("members", member, "team", key[0].clone(), 3));
+    changes.push(change("members", member, "user", key[1].clone(), 3));
+    (schema.clone(), store(&schema, &changes), member)
+}
+
+#[test]
+fn a_key_whose_references_fall_in_large_groups_is_undetermined_before_its_lookups_are_made() {
+    let (schema, store, member) = merged_teams_and_users(200);
+    let limits = Limits {
+        lookups: 1_000,
+        ..Limits::default()
+    };
+    let counting = Counting::new(&store);
+    let ev = Evaluator::new(&schema).unwrap().with_limits(limits);
+    assert_eq!(ev.target(&counting, "members", member), Err(Undetermined));
+    assert!(
+        counting.work.get() < 20 * 400 + 2 * limits.lookups,
+        "{} units of work",
+        counting.work.get()
+    );
+    let wide_enough = Limits {
+        lookups: 200 * 200,
+        ..Limits::default()
+    };
+    let ev = Evaluator::new(&schema).unwrap().with_limits(wide_enough);
+    assert_eq!(
+        ev.target(&store, "members", member).unwrap().members,
+        vec![member]
+    );
+
+    let (schema, store, member) = merged_teams_and_users(1_000);
+    let counting = Counting::new(&store);
+    let ev = Evaluator::new(&schema).unwrap();
+    assert_eq!(ev.target(&counting, "members", member), Err(Undetermined));
+    let most = Limits::default().lookups;
+    assert!(
+        counting.work.get() < 20 * 2_000 + 2 * most,
+        "{} units of work",
+        counting.work.get()
+    );
 }

@@ -26,6 +26,11 @@ pub struct Limits {
     /// The most candidate keys tried for one natural entity: the product, over its key fields, of
     /// the number of distinct values ever written to that field.
     pub key_combinations: usize,
+    /// The most keys the evaluator looks natural entities up by to decide one alias group: for
+    /// each distinct natural key in the region, read through the groups, the product of the
+    /// sizes of the groups its references fall in, summed. Where every group a key names holds
+    /// one gid, that is one per key, so at most the region's size.
+    pub lookups: usize,
 }
 
 impl Default for Limits {
@@ -33,6 +38,7 @@ impl Default for Limits {
         Limits {
             region: 1 << 16,
             key_combinations: 1 << 10,
+            lookups: 1 << 18,
         }
     }
 }
@@ -191,8 +197,10 @@ impl<S: Source> Session<'_, S> {
     /// gid in the region is fetched once, and each distinct natural key in it, read through the
     /// groups, asks the source once for each choice of one member from every group its
     /// references fall in. Where those groups hold one member each, that is O(r log r) in all.
-    /// Where they are large it is their product for each distinct key: `n` items merged into one
-    /// group, each with a tag keyed by the item and its own label, ask n² questions. Then O(m)
+    /// Where they are large it is their product for each distinct key, up to
+    /// [`Limits::lookups`] in all: `n` items merged into one group, each with a tag keyed by the
+    /// item and its own label, ask n² questions, and with the default limits are undetermined
+    /// beyond 512 items. Then O(m)
     /// to decide liveness, each member asking once about each of its owners' groups, which are
     /// found the same way.
     pub fn target(&mut self, collection: &str, gid: Gid) -> Answer<Target> {
@@ -498,7 +506,10 @@ impl<S: Source> Session<'_, S> {
     /// and the questions it asks.
     fn region(&mut self, start: Gid) -> Answer<()> {
         let schema = self.schema;
-        let mut r = Closure::default();
+        let mut r = Closure {
+            limit: self.limits.lookups,
+            ..Closure::default()
+        };
         r.add(start);
         let mut asked: BTreeSet<(usize, Vec<Total>)> = BTreeSet::new();
         let mut infos: BTreeMap<usize, Rc<Info>> = BTreeMap::new();
@@ -524,6 +535,9 @@ impl<S: Source> Session<'_, S> {
                         })
                         .collect();
                     r.natural(i, h, key, &refs);
+                    if r.over() {
+                        return Err(Undetermined);
+                    }
                 }
                 infos.insert(i, info);
                 if r.gids.len() > self.limits.region {
@@ -541,6 +555,9 @@ impl<S: Source> Session<'_, S> {
                 }
             }
             r.settle();
+            if r.over() {
+                return Err(Undetermined);
+            }
             if r.questions.is_empty() {
                 break;
             }
@@ -645,6 +662,10 @@ struct Closure {
     ask_of: BTreeMap<Sign, usize>,
     asks_at: Vec<BTreeSet<usize>>,
     questions: Vec<(usize, Vec<Value>)>,
+    /// The lookups the live signs stand for, and the most allowed. A join never lowers the sum:
+    /// two signs it makes equal named disjoint groups at some position.
+    lookups: usize,
+    limit: usize,
 }
 
 impl Closure {
@@ -687,6 +708,11 @@ impl Closure {
         self.keys.insert(i, (h, refs.to_vec(), key.to_vec()));
         let sign = self.sign(i);
         if refs.iter().all(Option::is_none) || self.ask_of.contains_key(&sign) {
+            return;
+        }
+        let size = lookups(&sign.1, |g| self.members[g].len());
+        self.lookups = self.lookups.saturating_add(size);
+        if self.over() {
             return;
         }
         let id = self.asks.len();
@@ -739,9 +765,18 @@ impl Closure {
         sign
     }
 
-    /// Joins every pair waiting to be joined, and every pair those joins make congruent.
+    /// Whether the live signs stand for more lookups than allowed.
+    fn over(&self) -> bool {
+        self.lookups > self.limit
+    }
+
+    /// Joins every pair waiting to be joined, and every pair those joins make congruent, unless
+    /// the lookups grow past the limit.
     fn settle(&mut self) {
         while let Some((a, b)) = self.joins.pop() {
+            if self.over() {
+                return;
+            }
             let (mut big, mut small) = (self.find(a), self.find(b));
             if big == small {
                 continue;
@@ -802,16 +837,22 @@ impl Closure {
                 &members[g]
             }
         };
+        let asked = |old: &Sign| lookups(&old.1, |g| old_list(g).len());
+        let mut total = self.lookups;
+        for (new, olds) in &by_sign {
+            let before: usize = olds.iter().map(|(_, old)| asked(old)).sum();
+            total = total
+                .saturating_sub(before)
+                .saturating_add(lookups(&new.1, |g| members[g].len()));
+        }
+        self.lookups = total;
+        if self.over() {
+            return;
+        }
         let mut found: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut dropped: Vec<(usize, Sign)> = Vec::new();
         let mut kept_asks: Vec<(usize, Sign)> = Vec::new();
         for (new, olds) in by_sign {
-            let asked = |old: &Sign| {
-                old.1.iter().fold(1usize, |n, p| match p {
-                    Part::Group(g) => n.saturating_mul(old_list(*g).len()),
-                    Part::Value(_) => n,
-                })
-            };
             let (survivor, old) = olds
                 .iter()
                 .max_by_key(|(id, old)| (asked(old), std::cmp::Reverse(*id)))
@@ -872,6 +913,14 @@ impl Closure {
         }
         self.questions.extend(found);
     }
+}
+
+/// How many keys read as `parts`, the group at a position holding `size` of its gids.
+fn lookups(parts: &[Part], size: impl Fn(usize) -> usize) -> usize {
+    parts.iter().fold(1usize, |n, p| match p {
+        Part::Group(g) => n.saturating_mul(size(*g)),
+        Part::Value(_) => n,
+    })
 }
 
 /// Every key that reads as `parts` with a reference from each of `lists` in order, one list per
