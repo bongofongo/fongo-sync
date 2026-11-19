@@ -35,6 +35,7 @@ import FongoSync
 #print axioms FongoSync.Laws.view_set
 #print axioms FongoSync.Laws.key_writes_set
 #print axioms FongoSync.Laws.key_write_redelivered
+#print axioms FongoSync.Laws.key_write_dropped_for_good
 #print axioms FongoSync.Laws.full_view_set
 #print axioms FongoSync.Laws.full_view_ignores_unencodable
 #print axioms FongoSync.Laws.full_view_ignores_unknown_collection

@@ -124,6 +124,38 @@ theorem ordSet_eq_of_mem_iff {l₁ l₂ : List α} (same : ∀ x, x ∈ l₁ ↔
   eq_of_ascending cmp (ascending_ordSet cmp l₁) (ascending_ordSet cmp l₂)
     fun x => by simp [mem_ordSet, same]
 
+/-- In a strictly increasing list, a member is among the first `n` exactly when fewer than `n`
+members come before it. -/
+theorem mem_take_iff_below {s : List α} (asc : s.Pairwise (fun a b => cmp a b = .lt)) {x : α}
+    (hx : x ∈ s) (n : Nat) :
+    x ∈ s.take n ↔ (s.filter fun y => cmp y x == .lt).length < n := by
+  induction s generalizing n with
+  | nil => cases hx
+  | cons h t ih =>
+    rw [List.pairwise_cons] at asc
+    by_cases hxh : x = h
+    · subst hxh
+      have hnone : (t.filter fun y => cmp y x == .lt) = [] := by
+        apply List.filter_eq_nil_iff.mpr
+        intro y hy
+        have := OrientedCmp.gt_of_lt (asc.1 y hy)
+        simp [this]
+      have hself : (cmp x x == .lt) = false := by simp [ReflCmp.compare_self]
+      cases n with
+      | zero => simp
+      | succ m => simp [hself, hnone]
+    · have hxt : x ∈ t := by
+        rcases List.mem_cons.mp hx with h' | h'
+        · exact absurd h' hxh
+        · exact h'
+      have hlt : (cmp h x == .lt) = true := by simp [asc.1 x hxt]
+      cases n with
+      | zero => simp [hlt]
+      | succ m =>
+        simp only [List.take_succ_cons, List.mem_cons, hxh, false_or, List.filter_cons, hlt,
+          ↓reduceIte, List.length_cons, Nat.add_lt_add_iff_right]
+        exact ih asc.2 hxt m
+
 end OrdSet
 
 /-! ## The earliest writes to a key field -/
@@ -167,6 +199,27 @@ theorem earliest_redelivered (l : List (Hlc × Value)) (x : Hlc × Value) (h : x
       · exact h
       · exact hy
     · exact .inr
+
+theorem mem_earliest_iff {l : List (Hlc × Value)} {x : Hlc × Value} (hx : x ∈ l) :
+    x ∈ earliest l ↔
+      ((ordSet writeCmp l).filter fun y => writeCmp y x == .lt).length < KEY_ENTRIES :=
+  mem_take_iff_below writeCmp (ascending_ordSet writeCmp l) ((mem_ordSet writeCmp).mpr hx) _
+
+/-- A write that does not count among the writes seen never counts once more arrive, so a store
+may drop it for good. -/
+theorem not_mem_earliest_of_subset {l₁ l₂ : List (Hlc × Value)} (sub : ∀ y ∈ l₁, y ∈ l₂)
+    {x : Hlc × Value} (hx : x ∈ l₁) (out : x ∉ earliest l₁) : x ∉ earliest l₂ := by
+  intro h
+  apply out
+  rw [mem_earliest_iff hx]
+  rw [mem_earliest_iff (sub x hx)] at h
+  refine Nat.lt_of_le_of_lt (List.Nodup.length_le_of_subset ?_ ?_) h
+  · apply List.Pairwise.sublist List.filter_sublist
+    exact (ascending_ordSet writeCmp l₁).imp fun hab heq => by
+      subst heq; exact lt_irrefl_cmp writeCmp _ hab
+  · intro y hy
+    simp only [List.mem_filter] at hy ⊢
+    exact ⟨(mem_ordSet writeCmp).mpr (sub y ((mem_ordSet writeCmp).mp hy.1)), hy.2⟩
 
 theorem mem_of_mem_earliest {l : List (Hlc × Value)} {x : Hlc × Value} (h : x ∈ earliest l) :
     x ∈ l :=

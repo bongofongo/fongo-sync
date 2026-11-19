@@ -210,6 +210,12 @@ theorem key_write_redelivered (l : List (Hlc × Value)) (x : Hlc × Value) (h : 
     earliest (x :: l) = earliest l :=
   earliest_redelivered l x h
 
+/-- A write to a natural key field that does not count among the writes seen never counts once
+more writes arrive, so a store may drop it for good. -/
+theorem key_write_dropped_for_good {l₁ l₂ : List (Hlc × Value)} (sub : ∀ y ∈ l₁, y ∈ l₂)
+    {x : Hlc × Value} (hx : x ∈ l₁) (out : x ∉ earliest l₁) : x ∉ earliest l₂ :=
+  not_mem_earliest_of_subset sub hx out
+
 
 /-- **The view over several collections depends only on the set of changes**, given unique
 clocks per register. -/
