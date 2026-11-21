@@ -1925,3 +1925,159 @@ async fn a_tag_moved_to_the_book_a_merge_keeps_is_reported_removed_at_its_old_ke
         );
     }
 }
+
+#[tokio::test]
+async fn a_natural_key_may_be_the_rowid_and_nothing_else_that_takes_null() {
+    let shapes = [
+        (
+            "(book_id INTEGER PRIMARY KEY REFERENCES books(id), body TEXT)",
+            true,
+        ),
+        ("(book_id integer primary key, body TEXT)", true),
+        (
+            "(book_id INTEGER, body TEXT, PRIMARY KEY (book_id DESC))",
+            true,
+        ),
+        ("(book_id INTEGER NOT NULL, body TEXT)", true),
+        (
+            "(book_id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID",
+            true,
+        ),
+        ("(book_id INTEGER PRIMARY KEY DESC, body TEXT)", false),
+        ("(book_id INT PRIMARY KEY, body TEXT)", false),
+        ("(book_id TEXT PRIMARY KEY, body TEXT)", false),
+        (
+            "(book_id INTEGER, body TEXT, PRIMARY KEY (book_id, body))",
+            false,
+        ),
+        ("(book_id INTEGER UNIQUE, body TEXT)", false),
+        (
+            "(id INTEGER PRIMARY KEY, book_id INTEGER, body TEXT)",
+            false,
+        ),
+    ];
+    for (shape, accepted) in shapes {
+        let registry = Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+            Collection::natural("blurbs", "blurbs", &["book_id"])
+                .owner("book_id", "books")
+                .field("body"),
+        ])
+        .unwrap();
+        let blurbs = format!("CREATE TABLE blurbs {shape}");
+        let schema = [
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
+            &blurbs,
+        ];
+        let mut peer = Peer::bare_with(&schema, registry).await;
+        match peer.replica.install(&mut peer.conn).await {
+            Ok(()) => assert!(accepted, "{shape} was accepted"),
+            Err(e) => {
+                assert!(!accepted, "{shape} was refused: {e}");
+                assert!(e.to_string().contains("blurbs.book_id"), "{e}");
+            }
+        }
+    }
+}
+
+/// Checks every settled peer against the model, and returns what `state` shows, which must be
+/// the same on every peer, as must the shadow.
+async fn same_on_every_peer(peers: &mut [Peer], registry: &Registry, state: &str) -> Vec<String> {
+    let everything: Vec<Change> = peers.iter().flat_map(|p| p.taken.iter().cloned()).collect();
+    let mut first: Option<(Vec<String>, Vec<String>)> = None;
+    for peer in peers.iter_mut() {
+        peer.settled().await;
+        if let Err(e) = peer.writes.kept(registry, &everything) {
+            panic!("{e}");
+        }
+        let lines = (peer.lines(state).await, peer.lines(SHADOW).await);
+        match &first {
+            None => first = Some(lines),
+            Some(f) => assert_eq!(&lines, f),
+        }
+    }
+    first.unwrap().0
+}
+
+#[tokio::test]
+async fn a_child_keyed_by_its_parents_rowid_follows_the_parent_through_a_merge() {
+    let schema = [
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE)",
+        "CREATE TABLE blurbs (
+            book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+            body TEXT)",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("isbn")
+                .identity(&["isbn"]),
+            Collection::natural("blurbs", "blurbs", &["book_id"])
+                .owner("book_id", "books")
+                .field("body"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    // The third peer makes no blurb, so it meets them only as remote inserts.
+    let mut peers = [
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+        Peer::with(&schema, registry()).await,
+    ];
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('Middlemarch', 'v')")
+        .await;
+    peers[0]
+        .run("INSERT INTO blurbs (book_id, body) VALUES (1, 'from a')")
+        .await;
+    // Local ids differ between the replicas, so the key has to be translated.
+    peers[1]
+        .run("INSERT INTO books (title) VALUES ('Romola'), ('Middlemarch: A Study')")
+        .await;
+    peers[1]
+        .run("UPDATE books SET isbn = 'v' WHERE id = 2")
+        .await;
+    peers[1]
+        .run("INSERT INTO blurbs (book_id, body) VALUES (1, 'romola'), (2, 'from b')")
+        .await;
+    peers[2]
+        .run("INSERT INTO books (title) VALUES ('Felix Holt'), ('Silas Marner')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+
+    let state = "SELECT COALESCE(b.isbn, '-') || ' ' || COALESCE(
+                     (SELECT body FROM blurbs WHERE book_id = b.id), '-')
+                   FROM books b ORDER BY 1";
+    let books = same_on_every_peer(&mut peers, &registry(), state).await;
+    assert_eq!(books.len(), 4, "{books:#?}");
+    assert_eq!(
+        books.iter().filter(|l| *l == "- -").count(),
+        2,
+        "{books:#?}"
+    );
+    assert!(books.contains(&"- romola".to_string()), "{books:#?}");
+    assert!(
+        books.contains(&"v from a".to_string()) || books.contains(&"v from b".to_string()),
+        "{books:#?}"
+    );
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM blurbs").await, 2);
+    }
+
+    peers[2]
+        .run("UPDATE blurbs SET body = 'edited' WHERE book_id = (SELECT id FROM books WHERE isbn = 'v')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let books = same_on_every_peer(&mut peers, &registry(), state).await;
+    assert!(books.contains(&"v edited".to_string()), "{books:#?}");
+
+    peers[1].run("DELETE FROM books WHERE isbn = 'v'").await;
+    settle(&mut peers, &mut hub).await;
+    let books = same_on_every_peer(&mut peers, &registry(), state).await;
+    assert_eq!(books.len(), 3, "{books:#?}");
+    for peer in peers.iter_mut() {
+        assert_eq!(count(peer, "SELECT count(*) FROM blurbs").await, 1);
+    }
+}
