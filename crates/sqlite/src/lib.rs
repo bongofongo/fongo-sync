@@ -4,6 +4,10 @@
 //!
 //! Every decision is the core's (`fongo_sync_core::eval` and `plan`); this crate keeps the facts,
 //! the rows' images and the mapping from local rows to entities, and does what the core says.
+//!
+//! A value a column's type affinity converts, such as the text `"1872"` written to an `INTEGER`
+//! column, is shown as SQLite stores it (the integer 1872) while the merged state keeps the value
+//! as it arrived. The conversion is not an edit: it is not sent back.
 
 mod collect;
 mod db;

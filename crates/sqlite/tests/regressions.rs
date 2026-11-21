@@ -914,3 +914,98 @@ async fn a_value_a_table_or_its_triggers_refuse_is_held_and_everything_else_appl
     let sent = peers[1].push(&mut hub).await;
     assert_eq!(sent.len(), 1, "{sent:#?}");
 }
+
+// What a column's affinity converts.
+
+#[tokio::test]
+async fn a_value_the_column_converts_is_not_sent_back() {
+    let schema = ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, year INTEGER)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("year"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = make(2, &schema, registry).await;
+    peers[0]
+        .run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    // The row shows the integer SQLite stores, the model the text that arrived.
+    peers[1].checking = false;
+    let gid = peers[1].gid("books", 1).await;
+    peers[1]
+        .apply(&[change(
+            "books",
+            gid,
+            "year",
+            Value::Text("1872".into()),
+            SOON,
+        )])
+        .await;
+    assert_eq!(
+        peers[1]
+            .lines("SELECT typeof(year) || ' ' || year FROM books")
+            .await,
+        ["integer 1872"]
+    );
+    peers[1]
+        .run("UPDATE books SET title = 'Middlemarch!'")
+        .await;
+    let sent = peers[1].push(&mut hub).await;
+    let fields: Vec<&str> = sent.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["title"], "{sent:#?}");
+}
+
+// A row that waits keeps what names it.
+
+#[tokio::test]
+async fn a_row_still_named_by_a_row_whose_write_was_refused_is_not_removed() {
+    let schema = [
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            body TEXT)",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+            Collection::minted("notes", "notes", "id")
+                .owner("book_id", "books")
+                .field("body"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = make(2, &schema, registry).await;
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch'), ('Romola')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'first')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    // Here every write to the note is refused, so it cannot move off the book being deleted.
+    peers[1]
+        .run("CREATE TRIGGER refuse BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        .await;
+    peers[0]
+        .run("UPDATE notes SET book_id = 2, body = 'moved'")
+        .await;
+    peers[0].run("DELETE FROM books WHERE id = 1").await;
+    peers[0].push(&mut hub).await;
+    let applied = peers[1].pull(&hub).await;
+    assert!(!applied.held.is_empty(), "{applied:#?}");
+    assert_eq!(
+        peers[1]
+            .lines(
+                "SELECT n.body || ' on ' || b.title FROM notes n JOIN books b ON b.id = n.book_id"
+            )
+            .await,
+        ["first on Middlemarch"]
+    );
+}
