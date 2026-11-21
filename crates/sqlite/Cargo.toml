@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 fongo-sync-core.workspace = true
+# Matches the version sqlx links: the kernel works on the connection's own handle.
+libsqlite3-sys = "=0.30.1"
 sqlx.workspace = true
 thiserror.workspace = true
 

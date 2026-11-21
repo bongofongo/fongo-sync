@@ -23,3 +23,10 @@ sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "run
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
 proptest = "1"
+
+# The reference model checks every step of the storage tests; unoptimised, it dominates them.
+[profile.dev.package.fongo-sync-core]
+opt-level = 3
+
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

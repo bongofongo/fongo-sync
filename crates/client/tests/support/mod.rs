@@ -407,7 +407,7 @@ const SCHEMA: &[&str] = &[
         id INTEGER PRIMARY KEY,
         book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
         body TEXT)",
-    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE settings (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
 ];
 
 pub fn registry() -> Registry {
@@ -424,23 +424,6 @@ pub fn registry() -> Registry {
     ])
     .unwrap()
 }
-
-const DUMP: &str = "
-    SELECT 'book ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || b.title || ' y='
-           || COALESCE(b.year, '-')
-      FROM books b LEFT JOIN fongo_ids i ON i.collection = 'books' AND i.key = json_array(b.id)
-    UNION ALL
-    SELECT 'note ' || COALESCE(hex(i.gid), 'UNMAPPED') || ' ' || COALESCE(n.body, '-') || ' b='
-           || COALESCE((SELECT hex(gid) FROM fongo_ids
-                        WHERE collection = 'books' AND key = json_array(n.book_id)), '-')
-      FROM notes n LEFT JOIN fongo_ids i ON i.collection = 'notes' AND i.key = json_array(n.id)
-    UNION ALL
-    SELECT 'setting ' || key || '=' || value FROM settings
-    ORDER BY 1";
-
-const SHADOW: &str = "
-    SELECT hex(gid) || ' ' || field || ' ' || quote(value) || ' ' || is_ref || ' ' || clock
-      FROM fongo_shadow ORDER BY 1";
 
 pub struct Peer {
     pub conn: SqliteConnection,
@@ -532,8 +515,61 @@ impl Peer {
             .unwrap()
     }
 
+    /// Every row, each with the global id of its entity and of the entity it names.
     pub async fn dump(&mut self) -> Vec<String> {
-        self.lines(DUMP).await
+        let books: Vec<(i64, String, Option<i64>)> =
+            sqlx::query_as("SELECT id, title, year FROM books")
+                .fetch_all(&mut self.conn)
+                .await
+                .unwrap();
+        let notes: Vec<(i64, Option<String>, Option<i64>)> =
+            sqlx::query_as("SELECT id, body, book_id FROM notes")
+                .fetch_all(&mut self.conn)
+                .await
+                .unwrap();
+        let mut lines = Vec::new();
+        for (id, title, year) in books {
+            let gid = self.gid("books", Some(id)).await;
+            let year = year.map_or("-".to_string(), |y| y.to_string());
+            lines.push(format!(
+                "book {} {title} y={year}",
+                gid.as_deref().unwrap_or("UNMAPPED")
+            ));
+        }
+        for (id, body, book) in notes {
+            let gid = self.gid("notes", Some(id)).await;
+            let book = self.gid("books", book).await;
+            lines.push(format!(
+                "note {} {} b={}",
+                gid.as_deref().unwrap_or("UNMAPPED"),
+                body.as_deref().unwrap_or("-"),
+                book.as_deref().unwrap_or("-"),
+            ));
+        }
+        lines.extend(
+            self.settings()
+                .await
+                .into_iter()
+                .map(|s| format!("setting {s}")),
+        );
+        lines.sort();
+        lines
+    }
+
+    async fn gid(&mut self, collection: &str, id: Option<i64>) -> Option<String> {
+        let id = id?;
+        let gid = self
+            .replica
+            .gid_of(&mut self.conn, collection, id)
+            .await
+            .unwrap();
+        gid.map(|gid| gid.to_hex())
+    }
+
+    /// The merged state: the winning entry of every field, and which entities are one.
+    pub async fn merged(&mut self) -> String {
+        let inspection = self.replica.inspect(&mut self.conn).await.unwrap();
+        format!("{:#?}\n{:#?}", inspection.registers, inspection.aliases)
     }
 
     pub async fn settings(&mut self) -> Vec<String> {
@@ -569,14 +605,14 @@ pub async fn settle(peers: &mut [Peer], server: &Server) {
 /// Every peer holds the same rows and the same merged state, and every row has a global id.
 pub async fn assert_converged(peers: &mut [Peer]) -> Vec<String> {
     let first = peers[0].dump().await;
-    let shadow = peers[0].lines(SHADOW).await;
+    let merged = peers[0].merged().await;
     assert!(
         !first.iter().any(|line| line.contains("UNMAPPED")),
         "a row has no global id: {first:#?}"
     );
     for peer in peers.iter_mut().skip(1) {
         assert_eq!(peer.dump().await, first);
-        assert_eq!(peer.lines(SHADOW).await, shadow);
+        assert_eq!(peer.merged().await, merged);
     }
     first
 }
