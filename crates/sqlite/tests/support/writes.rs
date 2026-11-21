@@ -179,10 +179,19 @@ impl Writes {
                 continue;
             };
             let old = self.after.get(at);
-            // A natural row made again at a key a row held is compared with that row: the
-            // kernel sends only what differs from the key's image.
-            let natural = matches!(c.key, Key::Natural { .. });
-            let new_row = old.is_none() || (remade.contains(at) && !natural);
+            // A natural row made again at a key a row held is compared with that row, as the
+            // kernel compares it with the key's image, unless its key names a row made since:
+            // then the key derives another entity, which is new.
+            let same_entity = match &c.key {
+                Key::Natural { fields } => !c.fields.iter().any(|f| {
+                    fields.contains(&f.name)
+                        && matches!((&f.kind, values.get(&f.name)),
+                            (Kind::Ref { collection: t, .. }, Some(Value::Int(local)))
+                                if fresh.contains(&(t.clone(), format!("[{local}]"))))
+                }),
+                Key::Minted { .. } => false,
+            };
+            let new_row = old.is_none() || (remade.contains(at) && !same_entity);
             if new_row {
                 self.made.insert(at.clone());
             }

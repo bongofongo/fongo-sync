@@ -1275,10 +1275,10 @@ fn a_title_written_while_suspended_as_its_book_merges() {
     run(0, &script).unwrap();
 }
 
-/// Found by a long run (seed 31337) after collect began comparing a natural key a row holds again
-/// with its image; not diagnosed. A tag's NULL note the application wrote is not sent.
+/// Found by a long run (seed 31337). A book and a tag are made again at the local ids and key of
+/// ones removed; the tag's key names the new book, so it is a new entity and its NULL note is
+/// not owed.
 #[test]
-#[ignore = "a NULL written to a natural row made again at its key is not sent"]
 fn a_tag_made_again_with_a_null_note_at_seed_31337() {
     use Op::*;
     let script = vec![
@@ -1312,10 +1312,10 @@ fn a_tag_made_again_with_a_null_note_at_seed_31337() {
     run(8729899457635566058, &script).unwrap();
 }
 
-/// Found by a long run (seed 271828) after collect began comparing a natural key a row holds again
-/// with its image; not diagnosed. A tag's NULL note the application wrote is not sent.
+/// Found by a long run (seed 271828). A book and a tag are made again at the local ids and key of
+/// ones removed; the tag's key names the new book, so it is a new entity and its NULL note is
+/// not owed.
 #[test]
-#[ignore = "a NULL written to a natural row made again at its key is not sent"]
 fn a_tag_made_again_with_a_null_note_at_seed_271828() {
     use Op::*;
     let script = vec![

@@ -976,3 +976,16 @@ proptest! {
         }
     }
 }
+
+/// Found by a gate run: the bound does not hold for this input on main. Kept so that the gate
+/// does not depend on drawing it; for the owner to decide.
+#[test]
+#[ignore = "affected and targets: work 860 for extent 10, keys chained 1 deep (bound 799)"]
+fn affected_and_targets_work_within_their_bound_at_a_seed_found_by_a_gate() {
+    let mut rng = Rng(16231279769609292276 | 1);
+    let schema = random_schema(&mut rng);
+    let n = 1 + rng.below(120);
+    let changes = random_changes(&mut rng, &schema, n);
+    let cut = rng.below(changes.len() + 1);
+    affected_within_bound(&schema, &changes[..cut], &changes[cut..]).unwrap();
+}
