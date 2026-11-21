@@ -983,3 +983,112 @@ fn a_reference_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
     ];
     run(9069292581118449834, &script).unwrap();
 }
+
+/// Found at 4,000 cases with seed 20261119. The application changes a book's author while the
+/// book's row names a shelf row a merge gave up, so collect leaves the row waiting; the next apply
+/// rewrites the row onto the kept shelf and its author with it, and the write is lost. Refusing
+/// that rewrite instead deadlocks: the row waits on the shelf, whose removal waits on the row.
+/// Collect would have to record a row that names a given-up row as the entity it stood for.
+#[test]
+#[ignore = "fails: an apply overwrites a row holding a write that collect left waiting"]
+fn an_uncollected_write_to_a_row_naming_a_given_up_row_is_kept() {
+    use Op::*;
+    let script = vec![
+        (1, SetSetting(0, 0)),
+        (3, AddShelf(0)),
+        (1, AddAuthor(0)),
+        (1, Sync),
+        (0, AddShelf(0)),
+        (4, AddShelf(0)),
+        (2, AddShelf(1)),
+        (4, AddBook(0, 0, 2)),
+        (2, AddBook(0, 0, 3)),
+        (2, Sync),
+        (3, AddAuthor(0)),
+        (0, AddShelf(0)),
+        (0, Deliver(0, false, false)),
+        (3, Deliver(1821843754366452306, false, false)),
+        (0, AddShelf(0)),
+        (3, SetIsbn(0, 2)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (4, Deliver(482915997399765560, false, false)),
+        (4, SetAuthor(5, 0)),
+        (2, DeleteShelf(0)),
+        (4, Sync),
+        (3, Deliver(12548034056711065972, false, false)),
+        (2, Sync),
+        (3, Log(1, false)),
+        (3, SetAuthor(0, 0)),
+    ];
+    run(9069292581118449834, &script).unwrap();
+}
+
+/// Found at 4,000 cases with seed 20261121: a settled replica keeps a given-up shelf row and an
+/// uncollected book. Not investigated; likely the same as the case above.
+#[test]
+#[ignore = "fails: a given-up shelf row and an uncollected book never settle"]
+fn a_book_naming_a_given_up_shelf_settles_to_the_model() {
+    use Op::*;
+    let script = vec![
+        (4, SetSetting(0, 0)),
+        (0, AddShelf(1)),
+        (3, AddAuthor(0)),
+        (3, AddShelf(0)),
+        (4, AddShelf(0)),
+        (0, SetSetting(0, 0)),
+        (4, Sync),
+        (0, Sync),
+        (3, Log(0, false)),
+        (4, Sync),
+        (0, AddCover(0)),
+        (0, AddShelf(0)),
+        (4, AddBook(1, 0, 3)),
+        (3, AddBook(0, 1, 0)),
+        (4, AddNote(0, 0)),
+        (3, Sync),
+        (3, SetIsbn(0, 3)),
+        (3, DeleteShelf(1)),
+        (3, SetAuthor(0, 0)),
+        (3, AddBook(0, 0, 1)),
+        (0, AddShelf(0)),
+        (3, SetSetting(0, 1)),
+        (0, AddShelf(0)),
+        (3, AddNote(0, 0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (4, AddBook(2, 0, 0)),
+        (3, SetTitle(2, 0)),
+        (2, Sync),
+        (4, SetIsbn(5, 1)),
+        (4, DeleteSetting(0)),
+        (3, AddNote(2, 0)),
+        (2, SetSetting(1, 0)),
+        (3, Suspended(0, 0)),
+        (3, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (2, DeleteBook(0)),
+        (3, SetAuthor(1, 0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (3, Sync),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (2, Sync),
+        (4, Sync),
+        (3, Deliver(10212369816065641680, false, false)),
+        (0, AddShelf(0)),
+        (2, Log(0, false)),
+        (2, DeleteShelf(0)),
+        (2, Sync),
+        (3, Deliver(3224780953315842759, false, false)),
+        (3, AddBook(0, 0, 2)),
+    ];
+    run(27569572497282000, &script).unwrap();
+}
