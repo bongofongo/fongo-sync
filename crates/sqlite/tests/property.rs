@@ -990,7 +990,6 @@ fn a_reference_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
 /// that rewrite instead deadlocks: the row waits on the shelf, whose removal waits on the row.
 /// Collect would have to record a row that names a given-up row as the entity it stood for.
 #[test]
-#[ignore = "fails: an apply overwrites a row holding a write that collect left waiting"]
 fn an_uncollected_write_to_a_row_naming_a_given_up_row_is_kept() {
     use Op::*;
     let script = vec![
@@ -1028,7 +1027,6 @@ fn an_uncollected_write_to_a_row_naming_a_given_up_row_is_kept() {
 /// Found at 4,000 cases with seed 20261121: a settled replica keeps a given-up shelf row and an
 /// uncollected book. Not investigated; likely the same as the case above.
 #[test]
-#[ignore = "fails: a given-up shelf row and an uncollected book never settle"]
 fn a_book_naming_a_given_up_shelf_settles_to_the_model() {
     use Op::*;
     let script = vec![

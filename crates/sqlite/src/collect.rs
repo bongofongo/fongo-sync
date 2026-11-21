@@ -6,8 +6,9 @@
 //! taken again stands for a new entity, so rows that name that id now name the new one and are
 //! compared too; a natural row whose key, so read, changed stands for a new entity as well.
 //!
-//! A row a merge gave up, and a row that names one or names a row the kernel has not yet given an
-//! entity, is not collected: it stays marked until that is resolved.
+//! A row a merge gave up, and a row that names a row the kernel has not yet given an entity, is not
+//! collected: it stays marked until that is resolved. A row that names a row a merge gave up is
+//! collected, naming the entity that row stood for, which is a member of the group it joined.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -442,7 +443,7 @@ impl Replica {
         if let Some(&i) = index.get(&(t, key.clone())) {
             let item = &items[i];
             if item.waits {
-                return Ok(match item.usable() {
+                return Ok(match &item.mapped {
                     Some(m) if !item.gone => Named::Gid(m.gid),
                     _ => Named::Waits,
                 });
@@ -457,7 +458,6 @@ impl Replica {
             slot.insert(mapping(db, &c.name, &key)?);
         }
         Ok(match &cache[&(t, local)] {
-            Some(m) if m.doomed => Named::Waits,
             Some(m) => Named::Gid(m.gid),
             None if read_row(db, c, &key)?.is_some() => Named::Waits,
             None => Named::Nothing,

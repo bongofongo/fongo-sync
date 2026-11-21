@@ -656,7 +656,8 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         applied.held
     );
 
-    // Edited, or given a note, the row is still not an entity of its own.
+    // Edited, the row is still not an entity of its own. A note given to it is the application's
+    // and is sent, naming the entity the row stood for: a member of the group it joined.
     peers[1]
         .run(&format!(
             "UPDATE books SET title = 'kept?' WHERE id = {left}"
@@ -668,7 +669,16 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         ))
         .await;
     let sent = peers[1].push(&mut hub).await;
-    assert!(sent.iter().all(|c| c.field == ALIAS), "{sent:#?}");
+    assert!(
+        sent.iter()
+            .all(|c| c.field == ALIAS || c.collection == "notes"),
+        "{sent:#?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|c| c.collection == "notes" && c.value == Value::Text("late".into())),
+        "{sent:#?}"
+    );
 
     // Let go, the merge completes and the note follows the row kept.
     peers[1]
