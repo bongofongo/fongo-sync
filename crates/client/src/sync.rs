@@ -587,6 +587,7 @@ fn varint_len(mut n: usize) -> usize {
 fn merge(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
+    into.held = from.held;
     into.conflicts.extend(from.conflicts);
     let mut at: HashMap<(String, String), usize> = into
         .touched

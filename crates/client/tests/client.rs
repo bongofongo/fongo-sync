@@ -10,7 +10,7 @@ use fongo_sync_client::protocol::{
     DeviceId, LibraryId, LibraryKeys, SigningKey, generate_signing_key, random_nonce, seal,
 };
 use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
-use fongo_sync_client::sqlite::{Conflict, Replica};
+use fongo_sync_client::sqlite::{Conflict, Held, Replica};
 use fongo_sync_client::{
     Blocked, Credentials, Error, Method, Refusal, Request, Response, Transport, TransportError,
     add_device, create_library, join_library, sync, worth_syncing,
@@ -953,6 +953,41 @@ async fn a_concurrent_edit_to_a_field_that_reports_conflicts_reaches_the_report(
         }]
     );
     settle(&mut [a, b], &server).await;
+}
+
+#[tokio::test]
+async fn a_row_this_database_refuses_is_reported_held_until_a_sync_can_write_it() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    b.run(
+        "CREATE TRIGGER no_drafts BEFORE INSERT ON books WHEN NEW.title = 'draft'
+         BEGIN SELECT RAISE(ABORT, 'no drafts'); END",
+    )
+    .await;
+    a.run("INSERT INTO books (title) VALUES ('draft')").await;
+    a.sync(&server).await.unwrap();
+    let book = a.replica.gid_of(&mut a.conn, "books", 1).await.unwrap();
+
+    let report = b.sync(&server).await.unwrap();
+    assert_eq!(report.received, 2);
+    assert_eq!(report.applied.waiting, 1);
+    assert_eq!(
+        report.applied.held,
+        [Held {
+            collection: "books".into(),
+            gid: book.unwrap(),
+            key: None,
+        }]
+    );
+    assert!(b.dump().await.is_empty());
+
+    b.run("DROP TRIGGER no_drafts").await;
+    let report = b.sync(&server).await.unwrap();
+    assert_eq!(report.received, 0);
+    assert_eq!(report.applied.waiting, 0);
+    assert!(report.applied.held.is_empty());
+    let mut peers = [a, b];
+    assert_converged(&mut peers).await;
 }
 
 #[tokio::test]
