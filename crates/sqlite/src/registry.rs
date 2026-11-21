@@ -11,8 +11,9 @@ pub enum Key {
     /// The table has an `INTEGER PRIMARY KEY` column that means nothing outside this database, so
     /// the replica mints a global id for each row.
     Minted { column: String },
-    /// These fields are the identity, so every replica derives the same global id from them. Their
-    /// columns must be declared `NOT NULL`, which [`crate::Replica::install`] checks.
+    /// These fields are the identity, so every replica derives the same global id from them. Each
+    /// of their columns must be declared `NOT NULL` or be the table's `INTEGER PRIMARY KEY`, an
+    /// alias for the rowid, which never holds NULL; [`crate::Replica::install`] checks.
     Natural { fields: Vec<String> },
 }
 

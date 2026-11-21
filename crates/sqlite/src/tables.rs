@@ -178,17 +178,16 @@ pub(crate) fn triggers(c: &Collection) -> Vec<String> {
     ]
 }
 
-/// Which synced columns refuse NULL, read from the tables' definitions. Refuses a registry whose
-/// tables lack a column it names, or whose natural keys accept NULL: two rows with NULL in the key
-/// would be one entity, which no unique constraint enforces.
+/// Which synced columns never hold NULL, read from the tables' definitions: those declared
+/// `NOT NULL` and a rowid alias. Refuses a registry whose tables lack a column it names, or whose
+/// natural keys accept NULL: two rows with NULL in the key would be one entity, which no unique
+/// constraint enforces.
 pub(crate) fn columns(db: &Db, registry: &Registry) -> Result<Columns> {
     let mut columns = Columns::new();
     for c in registry.collections() {
+        let table = sql_text(&c.table);
         let info = db.query(
-            &format!(
-                "SELECT name, \"notnull\" FROM pragma_table_info({})",
-                sql_text(&c.table)
-            ),
+            &format!("SELECT name, \"notnull\", pk, type FROM pragma_table_info({table})"),
             &[],
         )?;
         if info.is_empty() {
@@ -199,12 +198,22 @@ pub(crate) fn columns(db: &Db, registry: &Registry) -> Result<Columns> {
         }
         let mut not_null = BTreeSet::new();
         let mut present = BTreeSet::new();
+        let mut primary = Vec::new();
         for row in &info {
             let name = as_text(&row[0])?.to_string();
             if as_int(&row[1])? == 1 {
                 not_null.insert(name.clone());
             }
+            if as_int(&row[2])? > 0 {
+                primary.push((name.clone(), as_text(&row[3])?.to_string()));
+            }
             present.insert(name);
+        }
+        if let [(name, declared)] = primary.as_slice()
+            && declared.eq_ignore_ascii_case("INTEGER")
+            && !has_primary_key_index(db, &table)?
+        {
+            not_null.insert(name.clone());
         }
         let mut needed: Vec<&str> = c.key_columns();
         needed.extend(c.fields.iter().map(|f| f.name.as_str()));
@@ -219,7 +228,7 @@ pub(crate) fn columns(db: &Db, registry: &Registry) -> Result<Columns> {
             && let Some(open) = fields.iter().find(|f| !not_null.contains(*f))
         {
             return Err(Error::Registry(format!(
-                "key column `{}.{open}` of a natural collection must be NOT NULL",
+                "key column `{}.{open}` of a natural collection must be NOT NULL or the table's INTEGER PRIMARY KEY",
                 c.table
             )));
         }
@@ -230,6 +239,17 @@ pub(crate) fn columns(db: &Db, registry: &Registry) -> Result<Columns> {
         }
     }
     Ok(columns)
+}
+
+/// Whether SQLite keeps an index for the table's primary key. Of rowid tables, only one whose key
+/// is the rowid itself has none; that covers `INTEGER PRIMARY KEY DESC` (an index, not an alias)
+/// and WITHOUT ROWID tables (always an index).
+fn has_primary_key_index(db: &Db, table: &str) -> Result<bool> {
+    let rows = db.query(
+        &format!("SELECT count(*) FROM pragma_index_list({table}) WHERE origin = 'pk'"),
+        &[],
+    )?;
+    Ok(rows.first().map(|r| as_int(&r[0])).transpose()? != Some(0))
 }
 
 /// A string literal for SQL; names are plain identifiers, as the registry requires.
