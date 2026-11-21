@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use fongo_sync_protocol::api::{
     Appended, BatchPage, Devices, ErrorCode, ReadBatches, StoredBatch, batches_path, devices_path,
@@ -101,8 +101,10 @@ pub struct SyncReport {
 /// The cursor is stored after every page read. Received changes are held across pages, up to a
 /// bound, and applied together with the cursor in one transaction, so a crash at any point
 /// leaves either both or neither; re-reading changes already applied is harmless. Local writes
-/// are collected by that apply and compared with every change held, so a concurrent remote edit
-/// to a field that reports conflicts is reported in [`SyncReport::applied`]. Whatever is held is
+/// are collected by that apply. A local edit to a field that reports conflicts is compared with
+/// every remote change to it until the pull has read past the envelope that carried it, so a
+/// concurrent remote edit is reported in [`SyncReport::applied`] and a later one, which may have
+/// been made knowing the local edit, is not. Whatever is held is
 /// also applied before this returns an error, so a failure part-way keeps the progress made.
 ///
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
@@ -151,6 +153,7 @@ pub async fn sync<T: Transport>(
         read: cursor,
         held: Vec::new(),
         applied: false,
+        appended: saved.appended,
     };
     let pulled = read_pages(
         &rpc,
@@ -247,16 +250,19 @@ pub async fn sync<T: Transport>(
 }
 
 /// Where reading the log stands: envelopes through `read` are dealt with, and `held` has the
-/// changes among them not yet applied.
+/// changes among them not yet applied. `appended` lists where this database's own appends landed
+/// past `read`.
 struct Pull {
     read: u64,
     held: Vec<Change>,
     applied: bool,
+    appended: BTreeSet<u64>,
 }
 
 impl Pull {
     /// Applies what is held and stores the cursor at `read`, in one transaction. With `collect`
-    /// it applies even when nothing is held, so local writes are collected.
+    /// it applies even when nothing is held, so local writes are collected. The bases of local
+    /// edits sent in envelopes at or before `read` are then released.
     async fn commit(
         &mut self,
         conn: &mut SqliteConnection,
@@ -272,6 +278,9 @@ impl Pull {
             None
         };
         state::advance(&mut tx, library, self.read).await?;
+        if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
+            replica.release_bases(&mut tx, through).await?;
+        }
         tx.commit().await?;
         if let Some(applied) = applied {
             self.applied = true;
@@ -329,6 +338,11 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
                 }
             }
             pull.read = batch.seq;
+            // A change after this device's own envelope may have been made knowing its edits,
+            // so what came before is compared with their bases, and then the bases released.
+            if pull.appended.remove(&batch.seq) {
+                pull.commit(conn, replica, library, report, false).await?;
+            }
         }
         if !page.more {
             return Ok(());
@@ -527,7 +541,8 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
 }
 
 /// Drops what the server confirmed from the outbox. When the envelope landed right after the
-/// cursor, nothing came between, so the cursor moves past it too.
+/// cursor, nothing came between, so the cursor moves past it too and the bases of its edits are
+/// released; otherwise where it landed is recorded, for the pull that reads past it.
 async fn acknowledge(
     conn: &mut SqliteConnection,
     replica: &Replica,
@@ -542,6 +557,9 @@ async fn acknowledge(
     let follows = Some(seq) == cursor.checked_add(1);
     if follows {
         state::advance(&mut tx, library, seq).await?;
+        replica.release_bases(&mut tx, through).await?;
+    } else {
+        state::record_appended(&mut tx, library, seq, through).await?;
     }
     tx.commit().await?;
     if follows {

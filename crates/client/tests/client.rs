@@ -956,6 +956,86 @@ async fn a_concurrent_edit_to_a_field_that_reports_conflicts_reaches_the_report(
 }
 
 #[tokio::test]
+async fn an_edit_made_after_reading_this_devices_edit_is_not_a_conflict() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+
+    a.run("UPDATE notes SET body = 'one'").await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    later();
+    b.run("UPDATE notes SET body = 'two'").await;
+    b.sync(&server).await.unwrap();
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.applied.conflicts.is_empty(), "{report:#?}");
+    let mut peers = [a, b];
+    settle(&mut peers, &server).await;
+    let state = assert_converged(&mut peers).await;
+    assert!(state.iter().any(|l| l.contains(" two b=")), "{state:#?}");
+}
+
+#[tokio::test]
+async fn edits_before_this_devices_envelope_in_the_log_conflict_and_edits_after_it_do_not() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    let note = a.replica.gid_of(&mut a.conn, "notes", 1).await.unwrap();
+
+    // An edit made without seeing a's, from a device a does not list yet: a's pull stops before
+    // it and a's own envelope lands after it.
+    later();
+    let stranger = generate_signing_key().unwrap();
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let concurrent = Change {
+        collection: "notes".into(),
+        gid: note.unwrap(),
+        field: "body".into(),
+        value: Value::Text("stranger".into()),
+        clock: Hlc {
+            wall_ms,
+            counter: 0,
+            node: Gid([9; 16]),
+        },
+    };
+    server.inject(keys.id, sealed_by(&[concurrent], &keys, &stranger));
+    later();
+    a.run("UPDATE notes SET body = 'one'").await;
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.blocked.is_some());
+    assert_eq!((a.cursor().await, report.head), (1, 3));
+
+    server.register(keys.id, stranger.verifying_key());
+    b.sync(&server).await.unwrap();
+    later();
+    b.run("UPDATE notes SET body = 'two'").await;
+    b.sync(&server).await.unwrap();
+
+    // a reads the stranger's edit, its own envelope and b's edit in one pull.
+    let report = a.sync(&server).await.unwrap();
+    let remote: Vec<&Value> = report.applied.conflicts.iter().map(|c| &c.remote).collect();
+    assert_eq!(remote, [&Value::Text("stranger".into())], "{report:#?}");
+    assert_eq!(report.received, 3);
+    let mut peers = [a, b];
+    settle(&mut peers, &server).await;
+    assert_converged(&mut peers).await;
+}
+
+#[tokio::test]
 async fn a_row_this_database_refuses_is_reported_held_until_a_sync_can_write_it() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;

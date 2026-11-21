@@ -43,8 +43,8 @@ by depending on it.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
-does not hold yet, applies the rest, then seals and appends the outbox. Credentials stay with the application; the client stores only its cursor
-and the envelope it is sending, in a table of its own.
+does not hold yet, applies the rest, then seals and appends the outbox. Credentials stay with the application; the client stores only its cursor,
+the envelope it is sending and where its recent envelopes landed, in tables of its own.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 

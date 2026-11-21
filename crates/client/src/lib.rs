@@ -7,8 +7,9 @@
 //!
 //! Secrets live in [`Credentials`], which the application keeps wherever it keeps secrets and
 //! passes in on each call. This crate never writes them to disk or to the database, and never
-//! logs them. What it does keep in the database, in its own `fongo_client_state` table, is the
-//! position in the server's log and an envelope waiting to be sent, which is already encrypted.
+//! logs them. What it does keep in the database, in its own `fongo_client_state` and
+//! `fongo_client_appended` tables, is the position in the server's log, an envelope waiting to be
+//! sent, which is already encrypted, and where the envelopes it appended landed in the log.
 //!
 //! Native targets only: keys and nonces come from the operating system.
 //!
@@ -16,9 +17,10 @@
 //!
 //! The outbox reports one position for a whole page of changes, so an envelope smaller than a page
 //! is cut by reading the outbox again with a smaller limit; with a position per change it can be
-//! cut from one read. And a conflict is found only between a local edit and the remote changes
-//! given to the same apply, so received changes are held across pages and applied together; once
-//! the kernel keeps a local edit's base across applies, each page can be applied as it arrives.
+//! cut from one read. The kernel keeps the base of each local edit until told the edit has been
+//! read back from the log, after which a change it meets may have been made knowing the edit; so
+//! the client records where each envelope it appends lands, and releases the bases of its edits
+//! once a pull has applied everything before that point.
 
 mod credentials;
 mod error;
