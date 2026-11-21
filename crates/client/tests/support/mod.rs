@@ -48,6 +48,10 @@ pub struct State {
     fail_at: Option<usize>,
     /// The n-th request from when it was set is handled, but its response is lost.
     lose_at: Option<usize>,
+    /// The n-th request from when it was set, handled or not, never gets an answer.
+    hang_at: Option<(usize, bool)>,
+    /// A request has hung.
+    hung: bool,
     /// Rewrites every batch page before it is sent.
     tamper: Option<Tamper>,
     /// Answers a request in the server's place when it returns a response.
@@ -109,6 +113,8 @@ impl Server {
                 counted: 0,
                 fail_at: None,
                 lose_at: None,
+                hang_at: None,
+                hung: false,
                 tamper: None,
                 respond: None,
                 stale_devices: false,
@@ -135,6 +141,22 @@ impl Server {
         });
     }
 
+    /// The n-th request, handled by the server when `handled`, never gets an answer.
+    pub fn hang_at(&self, n: usize, handled: bool) {
+        self.with(|s| {
+            s.counted = 0;
+            s.hang_at = Some((n, handled));
+            s.hung = false;
+        });
+    }
+
+    /// Returns once a request has hung.
+    pub async fn hung(&self) {
+        while !self.with(|s| s.hung) {
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub fn tamper(&self, f: impl FnMut(BatchPage) -> Vec<u8> + Send + 'static) {
         self.with(|s| s.tamper = Some(Box::new(f)));
     }
@@ -147,6 +169,7 @@ impl Server {
         self.with(|s| {
             s.fail_at = None;
             s.lose_at = None;
+            s.hang_at = None;
             s.tamper = None;
             s.respond = None;
             s.stale_devices = false;
@@ -210,11 +233,25 @@ impl Server {
 
 impl Transport for Server {
     async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        match self.exchange(request) {
+            Some(answer) => answer,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Server {
+    /// The answer to one request, or none when it hangs.
+    fn exchange(&self, request: Request) -> Option<Result<Response, TransportError>> {
         let mut state = self.state.lock().unwrap();
         state.counted += 1;
         let n = state.counted;
         if state.fail_at == Some(n) {
-            return Err(TransportError::new("connection refused"));
+            return Some(Err(TransportError::new("connection refused")));
+        }
+        if state.hang_at == Some((n, false)) {
+            state.hung = true;
+            return None;
         }
         state
             .requests
@@ -223,10 +260,14 @@ impl Transport for Server {
             Some(response) => response,
             None => state.handle(&request).unwrap_or_else(error),
         };
-        if state.lose_at == Some(n) {
-            return Err(TransportError::new("connection reset"));
+        if state.hang_at == Some((n, true)) {
+            state.hung = true;
+            return None;
         }
-        Ok(response)
+        if state.lose_at == Some(n) {
+            return Some(Err(TransportError::new("connection reset")));
+        }
+        Some(Ok(response))
     }
 }
 

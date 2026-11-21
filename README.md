@@ -25,7 +25,9 @@ reference may own its row, which then goes with its target. A collection can als
   the two entities become one on every replica: the kernel records that their ids are aliases,
   keeps one row, points every reference at it, and merges the live members' fields by clock.
 - fields that change together, which merge as one write.
-- fields that report conflicts, so an application can combine concurrent edits to text.
+- fields that report conflicts, so an application can combine concurrent edits to text. Through
+  `fongo-sync-client`, of two concurrent edits only the device whose envelope lands later in the
+  log is told; the other takes the winning value without a report.
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 

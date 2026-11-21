@@ -4,7 +4,8 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use fongo_sync_client::protocol::api::{
-    BatchPage, ErrorBody, ErrorCode, Notification, ReadBatches, Route, StoredBatch, devices_path,
+    BatchPage, ErrorBody, ErrorCode, Notification, ReadBatches, Route, StoredBatch, batches_path,
+    devices_path,
 };
 use fongo_sync_client::protocol::{
     DeviceId, LibraryId, LibraryKeys, SigningKey, generate_signing_key, random_nonce, seal,
@@ -800,7 +801,7 @@ async fn a_sync_cut_short_at_any_request_loses_and_repeats_nothing() {
 }
 
 #[tokio::test]
-async fn a_lost_append_is_sent_again_byte_for_byte_before_anything_new() {
+async fn a_lost_append_found_in_the_log_is_not_sent_again() {
     let server = Server::new();
     let [mut a, mut b] = crash_scene(&server).await;
     let keys = a.credentials.library().clone();
@@ -809,7 +810,11 @@ async fn a_lost_append_is_sent_again_byte_for_byte_before_anything_new() {
     assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
     server.behave();
     a.run("INSERT INTO settings VALUES ('font', 'serif')").await;
+    let appends = || server.count(Method::Post, &batches_path(keys.id));
+    let before = appends();
     let report = a.sync(&server).await.unwrap();
+    // Only the new envelope is appended: the lost one was found where the server stored it.
+    assert_eq!(appends() - before, 1);
     assert_eq!(server.log(keys.id).len(), 3);
     assert_no_change_sent_twice(&server, &keys);
     assert_eq!(report.sent, server.changes(&keys).len() - theirs);
@@ -952,7 +957,111 @@ async fn a_concurrent_edit_to_a_field_that_reports_conflicts_reaches_the_report(
             remote_won: false,
         }]
     );
+    // Only the device whose envelope lands later is told: a's edit is replaced without a report.
+    b.sync(&server).await.unwrap();
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.applied.conflicts.is_empty(), "{report:#?}");
+    assert_eq!(a.lines("SELECT body FROM notes").await, ["two"]);
     settle(&mut [a, b], &server).await;
+}
+
+/// Runs a sync until it ends or a request hangs, then drops it. Whether it ended.
+async fn sync_or_drop(peer: &mut Peer, server: &Server) -> bool {
+    tokio::select! {
+        result = peer.sync(server) => {
+            result.unwrap();
+            true
+        }
+        () = server.hung() => false,
+    }
+}
+
+#[tokio::test]
+async fn an_append_whose_answer_never_came_is_found_and_its_edits_released() {
+    for dropped in [false, true] {
+        let server = Server::new();
+        let [mut a, mut b] = pair(&server).await;
+        let id = a.credentials.library_id();
+        a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+            .await;
+        a.sync(&server).await.unwrap();
+        b.sync(&server).await.unwrap();
+
+        // Capabilities, an empty page, then the append: stored, and its answer lost, or the
+        // sync dropped before it could record where the envelope landed.
+        a.run("UPDATE notes SET body = 'one'").await;
+        if dropped {
+            server.hang_at(3, true);
+            assert!(!sync_or_drop(&mut a, &server).await);
+        } else {
+            server.lose_at(3);
+            assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+        }
+        server.behave();
+        assert_eq!(server.log(id).len(), 2);
+
+        b.sync(&server).await.unwrap();
+        later();
+        b.run("UPDATE notes SET body = 'two'").await;
+        b.sync(&server).await.unwrap();
+        let appends = || server.count(Method::Post, &batches_path(id));
+        let before = appends();
+        let report = a.sync(&server).await.unwrap();
+        assert!(
+            report.applied.conflicts.is_empty(),
+            "dropped={dropped}: {report:#?}"
+        );
+        assert_eq!(appends(), before, "dropped={dropped}");
+        assert_eq!(server.log(id).len(), 3, "dropped={dropped}");
+
+        let mut peers = [a, b];
+        settle(&mut peers, &server).await;
+        let state = assert_converged(&mut peers).await;
+        assert!(state.iter().any(|l| l.contains(" two b=")), "{state:#?}");
+        assert_no_change_sent_twice(&server, peers[0].credentials.library());
+    }
+}
+
+#[tokio::test]
+async fn a_sync_dropped_at_any_request_loses_and_repeats_nothing() {
+    for handled in [false, true] {
+        for n in 1.. {
+            assert!(n < 100, "the sync never ended");
+            let server = Server::new();
+            server.with(|s| s.caps.max_page_batches = Some(1));
+            let [mut a, mut b] = pair(&server).await;
+            for i in 0..3 {
+                b.run(&format!("INSERT INTO books (title) VALUES ('theirs {i}')"))
+                    .await;
+                b.sync(&server).await.unwrap();
+            }
+            a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+                .await;
+            for i in 0..3 {
+                a.run(&format!(
+                    "INSERT INTO settings VALUES ('key{i}', 'value{i}')"
+                ))
+                .await;
+            }
+            // Each setting needs an envelope of its own.
+            server.with(|s| s.caps.max_batch_bytes = Some(400));
+            server.hang_at(n, handled);
+            let ended = sync_or_drop(&mut a, &server).await;
+
+            server.behave();
+            let keys = a.credentials.library().clone();
+            let mut peers = [a, b];
+            settle(&mut peers, &server).await;
+            let state = assert_converged(&mut peers).await;
+            assert_eq!(state.len(), 7, "handled={handled} n={n}: {state:#?}");
+            assert_no_change_sent_twice(&server, &keys);
+            if ended {
+                break;
+            }
+        }
+    }
 }
 
 #[tokio::test]

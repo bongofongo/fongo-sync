@@ -20,7 +20,9 @@
 //! cut from one read. The kernel keeps the base of each local edit until told the edit has been
 //! read back from the log, after which a change it meets may have been made knowing the edit; so
 //! the client records where each envelope it appends lands, and releases the bases of its edits
-//! once a pull has applied everything before that point.
+//! once a pull has applied everything before that point. Envelopes carry no record of what their
+//! author had seen, so of two concurrent edits only the device whose envelope lands later in the
+//! log is told of the conflict; the other takes the winning value without a report.
 
 mod credentials;
 mod error;

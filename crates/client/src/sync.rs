@@ -77,9 +77,10 @@ pub struct SyncReport {
     /// Changes this device sent.
     pub sent: usize,
     /// What applying them did, merged over every apply in the sync: changes accepted, rows
-    /// touched, conflicts, and entities still waiting. `touched` lists each key once per entity
-    /// that held it, at that entity's last entry, in the order of those entries: the entities
-    /// that left a key come before the one it was left holding.
+    /// touched, conflicts, and entities still waiting. `touched` lists keys in the order the sync
+    /// first touched them, each key's entries together. Within a key it holds one entry per
+    /// entity, that entity's last, in the order those entries came: the entities that left the
+    /// key come before the one it was left holding.
     pub applied: Applied,
     /// The first refusals, at most 100.
     pub refused: Vec<Refused>,
@@ -104,15 +105,23 @@ pub struct SyncReport {
 /// bound, and applied together with the cursor in one transaction, so a crash at any point
 /// leaves either both or neither; re-reading changes already applied is harmless. Local writes
 /// are collected by that apply. A local edit to a field that reports conflicts is compared with
-/// every remote change to it until the pull has read past the envelope that carried it, so a
-/// concurrent remote edit is reported in [`SyncReport::applied`] and a later one, which may have
-/// been made knowing the local edit, is not. Whatever is held is
+/// every remote change to it until the pull has read past the envelope that carried it, and a
+/// remote change met before that point is reported in [`SyncReport::applied`].
+///
+/// Conflicts are reported on one side only. Of two concurrent edits, only the device whose
+/// envelope lands later in the log is told; the device whose envelope landed first has released
+/// its edit's base by the time it reads the other, and takes the other's value, when that wins,
+/// without a report. Envelopes carry no record of what their author had seen, so a change read
+/// after one's own envelope cannot be told apart from one made knowing it.
+///
+/// Whatever is held is
 /// also applied before this returns an error, so a failure part-way keeps the progress made.
 ///
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
 /// stops between the two, whether or not the server stored the envelope, the next sync appends
-/// the same recorded bytes again before anything new; a server that stores an identical envelope
+/// the same recorded bytes again before anything new, unless its pull found them in the log, in
+/// which case they are not sent again; a server that stores an identical envelope
 /// once makes that harmless, and otherwise the duplicate is applied idempotently by every device.
 /// Changes are not re-sealed into a second, different envelope, with one exception: when the
 /// server refuses the recorded envelope itself, as too large or not one it accepts, the record is
@@ -156,6 +165,8 @@ pub async fn sync<T: Transport>(
         held: Vec::new(),
         applied: false,
         appended: saved.appended,
+        sending: saved.sending,
+        landed: None,
     };
     let pulled = read_pages(
         &rpc,
@@ -175,7 +186,7 @@ pub async fn sync<T: Transport>(
     cursor = pull.read;
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
-    if let Some(sending) = saved.sending {
+    if let Some(sending) = pull.sending.take() {
         let ours = Envelope::decode(&sending.envelope)
             .is_ok_and(|envelope| envelope.library == library && envelope.device == me);
         if ours {
@@ -259,6 +270,10 @@ struct Pull {
     held: Vec<Change>,
     applied: bool,
     appended: BTreeSet<u64>,
+    /// The envelope recorded before an append whose answer never came, until the pull finds it.
+    sending: Option<Sending>,
+    /// The outbox position the recorded envelope covers, once found at `read`.
+    landed: Option<i64>,
 }
 
 impl Pull {
@@ -280,10 +295,16 @@ impl Pull {
             None
         };
         state::advance(&mut tx, library, self.read).await?;
+        if let Some(through) = self.landed {
+            replica.acknowledge(&mut tx, through).await?;
+            state::clear_sending(&mut tx, library).await?;
+            state::record_appended(&mut tx, library, self.read, through).await?;
+        }
         if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
             replica.release_bases(&mut tx, through).await?;
         }
         tx.commit().await?;
+        self.landed = None;
         if let Some(applied) = applied {
             self.applied = true;
             report.received += self.held.len();
@@ -323,6 +344,10 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
             .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
         check_page(&page, pull.read, limit)?;
         for batch in &page.batches {
+            let landed = pull
+                .sending
+                .take_if(|sending| sending.envelope == batch.envelope);
+            let before = pull.held.len();
             match keys.open(rpc, batch).await? {
                 Opened::Changes(changes) => pull.held.extend(changes),
                 Opened::Refused(refused) => {
@@ -340,6 +365,13 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
                 }
             }
             pull.read = batch.seq;
+            // The server stored the recorded envelope although its answer was lost: it is
+            // appended here, and must not be appended again.
+            if let Some(sending) = landed {
+                report.sent += pull.held.len() - before;
+                pull.landed = Some(sending.through);
+                pull.appended.insert(batch.seq);
+            }
             // A change after this device's own envelope may have been made knowing its edits,
             // so what came before is compared with their bases, and then the bases released.
             if pull.appended.remove(&batch.seq) {
@@ -542,9 +574,11 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
     Ok(appended.seq)
 }
 
-/// Drops what the server confirmed from the outbox. When the envelope landed right after the
-/// cursor, nothing came between, so the cursor moves past it too and the bases of its edits are
-/// released; otherwise where it landed is recorded, for the pull that reads past it.
+/// Drops what the server confirmed from the outbox and records where the envelope landed. When it
+/// landed right after the cursor, nothing came between, so the cursor moves past it too. The bases
+/// of its edits are released at once when the cursor is past it, which is also the case when the
+/// server answers with an earlier copy of the same envelope; otherwise by the pull that reads
+/// past it.
 async fn acknowledge(
     conn: &mut SqliteConnection,
     replica: &Replica,
@@ -556,12 +590,14 @@ async fn acknowledge(
     let mut tx = conn.begin().await?;
     replica.acknowledge(&mut tx, through).await?;
     state::clear_sending(&mut tx, library).await?;
+    state::record_appended(&mut tx, library, seq, through).await?;
     let follows = Some(seq) == cursor.checked_add(1);
     if follows {
         state::advance(&mut tx, library, seq).await?;
+    }
+    let read = if follows { seq } else { *cursor };
+    if let Some(through) = state::read_past(&mut tx, library, read).await? {
         replica.release_bases(&mut tx, through).await?;
-    } else {
-        state::record_appended(&mut tx, library, seq, through).await?;
     }
     tx.commit().await?;
     if follows {
