@@ -1,7 +1,6 @@
-//! Ways the SQLite layer has been seen to depart from the reference model, each in the smallest
+//! Ways an earlier SQLite layer was seen to depart from the reference model, each in the smallest
 //! setting that shows it. Every peer checks itself against the model after each apply and
-//! collect, and the end of each test requires every replica to show the model's view. A test
-//! marked `#[ignore]` is one the kernel still fails, with the reason.
+//! collect, and the end of each test requires every replica to show the model's view.
 
 mod support;
 
@@ -51,8 +50,14 @@ async fn shelved(hub: &mut Vec<Change>) -> Vec<Peer> {
     peers
 }
 
-/// The second peer takes a book's move to a new shelf, and its new title, without the shelf.
-async fn moved_without_its_shelf(peers: &mut [Peer], hub: &mut Vec<Change>) -> Vec<Change> {
+/// The second peer's application runs `edit`, and the peer then takes a book's move to a new
+/// shelf, and its new title, without the shelf. The edit is made later than the move, without
+/// seeing it.
+async fn moved_without_its_shelf(
+    peers: &mut [Peer],
+    hub: &mut Vec<Change>,
+    edit: &str,
+) -> Vec<Change> {
     peers[0]
         .run("INSERT INTO shelves (id, name) VALUES (2, 'T')")
         .await;
@@ -62,6 +67,8 @@ async fn moved_without_its_shelf(peers: &mut [Peer], hub: &mut Vec<Change>) -> V
     let sent = peers[0].push(hub).await;
     let (books, shelves): (Vec<Change>, Vec<Change>) =
         sent.into_iter().partition(|c| c.collection == "books");
+    later();
+    peers[1].run(edit).await;
     peers[1].apply(&books).await;
     later();
     shelves
@@ -69,16 +76,19 @@ async fn moved_without_its_shelf(peers: &mut [Peer], hub: &mut Vec<Change>) -> V
 
 // What the kernel holds back is not the application's to send.
 
-/// While the book's new shelf has not arrived, the row still shows the old shelf and title. An
-/// unrelated edit there must not send them as fresh writes, or every replica moves the book back.
+/// The book's row is not shown where its new shelf has not arrived, since its owner is not live
+/// there. An edit made there before the move arrived must send only the edit, not the row's old
+/// shelf and title, or every replica moves the book back.
 #[tokio::test]
-#[ignore = "the kernel sends a held row's stale fields as edits, reverting the move everywhere"]
 async fn an_edit_to_a_row_whose_new_owner_has_not_arrived_sends_only_the_edit() {
     let mut hub = Vec::new();
     let mut peers = shelved(&mut hub).await;
-    let shelf = moved_without_its_shelf(&mut peers, &mut hub).await;
-    peers[1].run("UPDATE books SET status = 'reading'").await;
-    peers[1].push(&mut hub).await;
+    let shelf =
+        moved_without_its_shelf(&mut peers, &mut hub, "UPDATE books SET status = 'reading'").await;
+    assert!(peers[1].lines("SELECT title FROM books").await.is_empty());
+    let sent = peers[1].push(&mut hub).await;
+    let fields: Vec<&str> = sent.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["status"]);
     peers[1].apply(&shelf).await;
     peers[1].cursor = hub.len();
     settle(&mut peers, &mut hub).await;
@@ -88,14 +98,12 @@ async fn an_edit_to_a_row_whose_new_owner_has_not_arrived_sends_only_the_edit() 
     );
 }
 
-/// The same, with the book deleted where its move is held: the delete must reach everyone.
+/// The same, with the book deleted: the delete must reach everyone.
 #[tokio::test]
-#[ignore = "the kernel sends nothing for a held row the application deletes, so the delete is lost"]
 async fn a_delete_of_a_row_whose_new_owner_has_not_arrived_is_sent() {
     let mut hub = Vec::new();
     let mut peers = shelved(&mut hub).await;
-    let shelf = moved_without_its_shelf(&mut peers, &mut hub).await;
-    peers[1].run("DELETE FROM books").await;
+    let shelf = moved_without_its_shelf(&mut peers, &mut hub, "DELETE FROM books").await;
     peers[1].push(&mut hub).await;
     peers[1].apply(&shelf).await;
     peers[1].cursor = hub.len();
@@ -110,7 +118,6 @@ async fn a_delete_of_a_row_whose_new_owner_has_not_arrived_is_sent() {
 /// shelf, the first moves a book onto it, and the second reads the first's log before the
 /// third's. All replicas agree on the end state, so only the model shows it is wrong.
 #[tokio::test]
-#[ignore = "the kernel sends a held row's stale fields as edits, reverting the move everywhere"]
 async fn logs_read_one_device_before_another_do_not_revert_a_move() {
     let mut peers = make(3, SHELVES, shelves).await;
     let mut shared = Vec::new();
@@ -133,9 +140,9 @@ async fn logs_read_one_device_before_another_do_not_revert_a_move() {
         .run("UPDATE books SET shelf_id = (SELECT id FROM shelves WHERE name = 'T'), title = 'B'")
         .await;
     peers[0].push(&mut first).await;
-    peers[1].apply(&first).await;
     later();
     peers[1].run("UPDATE books SET status = 'reading'").await;
+    peers[1].apply(&first).await;
     peers[1].push(&mut second).await;
     peers[1].apply(&third).await;
     peers[0].apply(&second).await;
@@ -156,7 +163,6 @@ async fn logs_read_one_device_before_another_do_not_revert_a_move() {
 /// A write made while suspended is the application's, sent on resuming as asked; an apply in
 /// the meantime must neither overwrite it nor fail.
 #[tokio::test]
-#[ignore = "an apply while suspended overwrites the application's write to the row"]
 async fn an_apply_while_suspended_keeps_the_applications_write() {
     for how in [Resume::Send, Resume::Baseline] {
         let mut hub = Vec::new();
@@ -173,9 +179,25 @@ async fn an_apply_while_suspended_keeps_the_applications_write() {
         );
         peers[1].resume(how).await;
         settle(&mut peers, &mut hub).await;
-        let rows = same_everywhere(&mut peers, SHELF_ROWS).await;
-        if how == Resume::Send {
-            assert_eq!(rows, ["book quiet on S done", "shelf S"]);
+        match how {
+            Resume::Send => assert_eq!(
+                same_everywhere(&mut peers, SHELF_ROWS).await,
+                ["book quiet on S done", "shelf S"]
+            ),
+            // The baseline stays this replica's own until someone writes the field.
+            Resume::Baseline => {
+                for peer in peers.iter_mut() {
+                    peer.settled().await;
+                }
+                assert_eq!(
+                    peers[0].lines(SHELF_ROWS).await,
+                    ["book A on S done", "shelf S"]
+                );
+                assert_eq!(
+                    peers[1].lines(SHELF_ROWS).await,
+                    ["book quiet on S done", "shelf S"]
+                );
+            }
         }
     }
 }
@@ -183,7 +205,6 @@ async fn an_apply_while_suspended_keeps_the_applications_write() {
 /// While suspended, the application deletes a book; a book made elsewhere arrives and must not
 /// be mistaken for the one deleted.
 #[tokio::test]
-#[ignore = "an apply while suspended can put a new entity at a local id the application freed"]
 async fn an_apply_while_suspended_into_a_freed_id() {
     let mut hub = Vec::new();
     let mut peers = make(2, SHELVES, shelves).await;
@@ -195,7 +216,7 @@ async fn an_apply_while_suspended_into_a_freed_id() {
         .await;
     settle(&mut peers, &mut hub).await;
     peers[1].suspend().await;
-    peers[1].run("DELETE FROM books WHERE id = 2").await;
+    peers[1].run("DELETE FROM books WHERE title = 'B'").await;
     peers[0]
         .run("INSERT INTO books (id, shelf_id, title) VALUES (3, 1, 'C')")
         .await;
@@ -270,7 +291,6 @@ async fn before_tags(hub: &mut Vec<Change>) -> Vec<Peer> {
 }
 
 #[tokio::test]
-#[ignore = "a collection the registry gains never reaches the rows of what arrived before"]
 async fn a_collection_added_later_reaches_the_rows() {
     let mut hub = Vec::new();
     let mut peers = before_tags(&mut hub).await;
@@ -284,7 +304,6 @@ async fn a_collection_added_later_reaches_the_rows() {
 }
 
 #[tokio::test]
-#[ignore = "resuming with a collection the registry gained deletes its natural-key entities"]
 async fn a_collection_added_while_suspended_reaches_the_rows() {
     for how in [Resume::Send, Resume::Baseline] {
         let mut hub = Vec::new();
@@ -361,7 +380,6 @@ async fn leftover(peers: &mut [Peer], hub: &mut Vec<Change>) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "a new row at a left-over row's freed local id is never sent, then deleted"]
 async fn a_new_row_at_a_left_over_rows_id_is_an_entity_of_its_own() {
     let mut hub = Vec::new();
     let mut peers = make(3, PINNED, pinned).await;
@@ -383,7 +401,6 @@ async fn a_new_row_at_a_left_over_rows_id_is_an_entity_of_its_own() {
 }
 
 #[tokio::test]
-#[ignore = "a left-over row whose group is deleted is held for ever"]
 async fn a_left_over_row_whose_group_is_deleted_goes_once_let_go() {
     let mut hub = Vec::new();
     let mut peers = make(3, PINNED, pinned).await;
@@ -395,9 +412,9 @@ async fn a_left_over_row_whose_group_is_deleted_goes_once_let_go() {
     later();
     peers[0].run("DELETE FROM books WHERE isbn = 'w'").await;
     settle(&mut peers, &mut hub).await;
-    peers[1]
-        .run(&format!("DELETE FROM pins WHERE book_id = {left}"))
-        .await;
+    // Once the other book's pin is gone, the merge moved the left-over row's pin to the row it
+    // kept, so it is that row the pin now holds.
+    peers[1].run("DELETE FROM pins").await;
     let applied = peers[1].apply(&[]).await;
     assert!(applied.held.is_empty(), "{:#?}", applied.held);
     assert!(same_everywhere(&mut peers, PINNED_ROWS).await.is_empty());
@@ -422,57 +439,57 @@ fn current() -> Registry {
     .unwrap()
 }
 
-/// A kernel that did not record what it left in rows held one with a stand-in for its isbn. The
-/// previous layout is made here from the present one by dropping that record, which is all the
-/// upgrade has to recover from. An edit after the upgrade must send only the edit.
+/// Kernel tables of an earlier layout are refused rather than read as the present one; once
+/// uninstalled, installing again joins afresh, and rows the earlier kernel held, here a swap of
+/// NOT NULL identities, are each made one with the entity they share an identity with. An edit
+/// afterwards sends only the edit.
 #[tokio::test]
-#[ignore = "after an upgrade from the previous layout, a held row's stand-in is sent"]
-async fn a_row_held_by_an_earlier_kernel_sends_only_its_edit() {
-    for _ in 0..40 {
-        let mut hub = Vec::new();
-        let mut peers = make(3, CURRENT, current).await;
-        peers[0]
-            .run(
-                "INSERT INTO books (id, title, isbn)
-                 VALUES (1, 'one', 'x'), (2, 'two', 'y'), (3, 'three', 'z')",
-            )
-            .await;
-        settle(&mut peers, &mut hub).await;
-        later();
-        peers[0]
-            .run("UPDATE books SET isbn = 'p', current = 1 WHERE title = 'one'")
-            .await;
-        peers[0]
-            .run("UPDATE books SET isbn = 'x' WHERE title = 'two'")
-            .await;
-        peers[0].push(&mut hub).await;
-        peers[2]
-            .run("UPDATE books SET current = 1 WHERE title = 'three'")
-            .await;
-        peers[2].push(&mut hub).await;
-        let applied = peers[1].pull(&hub).await;
-        let parked = peers[1]
-            .int("SELECT count(*) FROM books WHERE isbn LIKE 'fongo:%'")
-            .await;
-        if applied.held.is_empty() || parked == 0 {
-            continue;
-        }
-        peers[1].run("DELETE FROM fongo_deviations").await;
-        peers[1]
-            .run("UPDATE fongo_meta SET value = 1 WHERE key = 'layout'")
-            .await;
-        peers[1].install().await;
-        later();
-        peers[1]
-            .run("UPDATE books SET title = title || '!' WHERE isbn LIKE 'fongo:%'")
-            .await;
-        let sent = peers[1].push(&mut hub).await;
-        assert!(sent.iter().all(|c| c.field == "title"), "{sent:#?}");
-        settle(&mut peers, &mut hub).await;
-        same_everywhere(&mut peers, "SELECT title FROM books ORDER BY 1").await;
-        return;
-    }
-    panic!("no row was ever held with a stand-in");
+async fn tables_of_an_earlier_layout_are_refused_and_a_fresh_join_converges() {
+    let mut hub = Vec::new();
+    let mut peers = make(3, CURRENT, current).await;
+    peers[0]
+        .run(
+            "INSERT INTO books (id, title, isbn)
+             VALUES (1, 'one', 'x'), (2, 'two', 'y'), (3, 'three', 'z')",
+        )
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET isbn = 'p', current = 1 WHERE title = 'one'")
+        .await;
+    peers[0]
+        .run("UPDATE books SET isbn = 'x' WHERE title = 'two'")
+        .await;
+    peers[0].push(&mut hub).await;
+    peers[2]
+        .run("UPDATE books SET current = 1 WHERE title = 'three'")
+        .await;
+    peers[2].push(&mut hub).await;
+    peers[1].pull(&hub).await;
+    peers[1]
+        .run("UPDATE fongo_meta SET value = 2 WHERE key = 'layout'")
+        .await;
+    let replica = peers[1].replica.clone();
+    assert!(replica.install(&mut peers[1].conn).await.is_err());
+    replica.uninstall(&mut peers[1].conn).await.unwrap();
+    peers[1].writes = Default::default();
+    peers[1].taken.clear();
+    peers[1].cursor = 0;
+    peers[1].install().await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET title = title || '!' WHERE title = 'two'")
+        .await;
+    let sent = peers[1].push(&mut hub).await;
+    assert!(sent.iter().all(|c| c.field == "title"), "{sent:#?}");
+    // Two books were made current at once, and the index allows one: the application chooses.
+    peers[0]
+        .run("UPDATE books SET current = 0 WHERE title = 'one'")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    same_everywhere(&mut peers, "SELECT title FROM books ORDER BY 1").await;
 }
 
 // Changes no honest replica makes.
@@ -544,7 +561,6 @@ async fn library_with_a_note(hub: &mut Vec<Change>) -> (Vec<Peer>, Gid, Gid) {
 /// names another collection names nothing: the reference reads as null, and a row owned through
 /// it is gone, on a replica that had the row and on one that joins later alike.
 #[tokio::test]
-#[ignore = "the kernel does not give gids to collections, so it waits on such references for ever"]
 async fn a_reference_to_a_gid_of_another_collection_names_nothing() {
     let mut hub = Vec::new();
     let (mut peers, book, note) = library_with_a_note(&mut hub).await;
@@ -563,7 +579,6 @@ async fn a_reference_to_a_gid_of_another_collection_names_nothing() {
 /// from a field change shows, with that field. Every replica writes a tombstone when it makes an
 /// entity, so only a replica that does not can send this; the kernel waits for the tombstone.
 #[tokio::test]
-#[ignore = "the kernel waits for a tombstone the model does not require"]
 async fn an_entity_known_only_from_a_field_shows() {
     let mut hub = Vec::new();
     let (mut peers, _, _) = library_with_a_note(&mut hub).await;

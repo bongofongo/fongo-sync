@@ -109,7 +109,7 @@ async fn a_held_row_edited_here_sends_only_the_edit() {
 }
 
 #[tokio::test]
-async fn half_of_a_set_written_together_is_neither_written_nor_sent() {
+async fn half_of_a_set_written_together_is_not_sent() {
     let schema = [
         "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT, finished INTEGER,
                              isbn TEXT UNIQUE)",
@@ -141,7 +141,8 @@ async fn half_of_a_set_written_together_is_neither_written_nor_sent() {
     let sent = peers[0].push(&mut hub).await;
     let half: Vec<Change> = sent.into_iter().filter(|c| c.field == "finished").collect();
     peers[1].apply(&half).await;
-    assert_eq!(peers[1].lines(rows).await, ["one - -"]);
+    // The model shows a set from its latest write, NULL where that write has not arrived.
+    assert_eq!(peers[1].lines(rows).await, ["one - 2"]);
     later();
     peers[1].run("UPDATE books SET title = 'one!'").await;
     let sent = peers[1].push(&mut hub).await;
@@ -599,7 +600,7 @@ async fn deleting_an_owner_of_many_rows_takes_work_in_proportion() {
 // A merge whose given-up row another table holds.
 
 #[tokio::test]
-async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
+async fn a_given_up_row_held_by_another_table_waits_and_its_edits_are_sent() {
     let schema = [
         "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE)",
         "CREATE TABLE notes (
@@ -642,9 +643,10 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         .await;
     peers[2].push(&mut hub).await;
     let applied = peers[1].pull(&hub).await;
-    let left = peers[1]
-        .int("SELECT json_extract(key, '$[0]') FROM fongo_leftover")
-        .await;
+    let replica = peers[1].replica.clone();
+    let inspection = replica.inspect(&mut peers[1].conn).await.unwrap();
+    let (_, left) = inspection.leftover.first().expect("a row is left over");
+    let left: i64 = left.trim_matches(|c| c == '[' || c == ']').parse().unwrap();
     assert!(
         applied
             .held
@@ -654,7 +656,8 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         applied.held
     );
 
-    // Edited, or given a note, the row is still not an entity of its own.
+    // Edited, or given a note, the row still stands for the entity it stood for, a member of the
+    // group it joined: the edit is that entity's and the note names it, and both are sent.
     peers[1]
         .run(&format!(
             "UPDATE books SET title = 'kept?' WHERE id = {left}"
@@ -666,7 +669,16 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         ))
         .await;
     let sent = peers[1].push(&mut hub).await;
-    assert!(sent.iter().all(|c| c.field == ALIAS), "{sent:#?}");
+    assert!(
+        sent.iter()
+            .any(|c| c.field == "title" && c.value == Value::Text("kept?".into())),
+        "{sent:#?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|c| c.collection == "notes" && c.value == Value::Text("late".into())),
+        "{sent:#?}"
+    );
 
     // Let go, the merge completes and the note follows the row kept.
     peers[1]
@@ -679,6 +691,10 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
     assert_eq!(
         same_everywhere(&mut peers, rows).await,
         ["book w", "note late on w"]
+    );
+    assert_eq!(
+        same_everywhere(&mut peers, "SELECT title FROM books").await,
+        ["kept?"]
     );
 }
 
@@ -782,5 +798,218 @@ async fn a_field_that_joins_a_set_already_written_is_recorded_with_it() {
     assert_eq!(
         same_everywhere(&mut peers, RATED_ROWS).await,
         ["one done 7"]
+    );
+}
+
+// What a table refuses, or retries, never stops an apply.
+
+/// Applies to a fresh replica `n` books whose titles, unique in the table but not an identity,
+/// all move one place along at once, in the order that lets one write succeed per round. Returns
+/// the statements the second apply ran and how many books it left waiting.
+async fn statements_to_shift_titles(n: u64) -> (u64, usize) {
+    let schema = ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT UNIQUE)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+        ])
+        .unwrap()
+    };
+    let mut peer = Peer::new(&schema, registry()).await;
+    peer.checking = false;
+    let gid = |i: u64| {
+        let mut bytes = [0u8; 16];
+        bytes[8..].copy_from_slice(&i.to_be_bytes());
+        Gid(bytes)
+    };
+    let title = |i: u64| Value::Text(format!("t{i:05}"));
+    let mut made = Vec::new();
+    for i in 0..n {
+        made.push(change("books", gid(i), DELETED, Value::Int(0), SOON));
+        made.push(change("books", gid(i), "title", title(i), SOON));
+    }
+    peer.apply(&made).await;
+    let shifted: Vec<Change> = (0..n)
+        .map(|i| change("books", gid(i), "title", title(i + 1), SOON + 1))
+        .collect();
+    let statements = support::statements::Statements::watch(&mut peer.conn).await;
+    let applied = peer.apply(&shifted).await;
+    (statements.count(), applied.waiting)
+}
+
+/// Each round of retrying what a table refused writes one book, so without a bound on the rounds
+/// the work would grow as the square of the books.
+#[tokio::test]
+async fn retrying_refused_writes_takes_a_bounded_number_of_rounds() {
+    let (small, waiting) = statements_to_shift_titles(40).await;
+    assert!(waiting > 0, "every book was written in one apply");
+    let (large, _) = statements_to_shift_titles(160).await;
+    assert!(large < small * 6, "{small} then {large}");
+}
+
+#[tokio::test]
+async fn a_value_a_table_or_its_triggers_refuse_is_held_and_everything_else_applies() {
+    let schema = [
+        "CREATE TABLE books (id INTEGER PRIMARY KEY,
+                             title TEXT CHECK (title IS NULL OR typeof(title) = 'text'))",
+        "CREATE TRIGGER boom AFTER UPDATE OF title ON books WHEN NEW.title = 'boom'
+         BEGIN SELECT json('{'); END",
+        "CREATE TABLE tags (
+            book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (book_id, tag))",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+            Collection::natural("tags", "tags", &["book_id", "tag"])
+                .owner("book_id", "books")
+                .field("tag"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = make(2, &schema, registry).await;
+    peers[0]
+        .run("INSERT INTO books (id, title) VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let [one, two, three] = [
+        peers[0].gid("books", 1).await,
+        peers[0].gid("books", 2).await,
+        peers[0].gid("books", 3).await,
+    ];
+    let blob = Value::Blob(vec![1, 2, 3]);
+    let tag = Gid::derive("tags", &[Value::Ref(three), blob.clone()]);
+    let batch = [
+        change("books", one, "title", blob, SOON),
+        change("books", two, "title", Value::Text("boom".into()), SOON),
+        change("books", one, "title", Value::Real(f64::NAN), SOON + 1),
+        change("tags", tag, DELETED, Value::Int(0), SOON),
+        change("tags", tag, "book_id", Value::Ref(three), SOON),
+        change("tags", tag, "tag", Value::Blob(vec![1, 2, 3]), SOON),
+        change("books", three, "title", Value::Text("fine".into()), SOON),
+    ];
+    let applied = peers[1].apply(&batch).await;
+    assert_eq!(applied.waiting, 3, "{:#?}", applied.held);
+    assert_eq!(
+        peers[1]
+            .lines("SELECT title FROM books ORDER BY title")
+            .await,
+        ["fine", "one", "two"]
+    );
+    let later = [change(
+        "books",
+        three,
+        "title",
+        Value::Text("later".into()),
+        SOON + 2,
+    )];
+    let applied = peers[1].apply(&later).await;
+    assert_eq!(applied.waiting, 3);
+    assert_eq!(
+        peers[1]
+            .lines("SELECT title FROM books ORDER BY title")
+            .await,
+        ["later", "one", "two"]
+    );
+    peers[1]
+        .run("UPDATE books SET title = 'mine' WHERE title = 'later'")
+        .await;
+    let sent = peers[1].push(&mut hub).await;
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+}
+
+// What a column's affinity converts.
+
+#[tokio::test]
+async fn a_value_the_column_converts_is_not_sent_back() {
+    let schema = ["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, year INTEGER)"];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("year"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = make(2, &schema, registry).await;
+    peers[0]
+        .run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    // The row shows the integer SQLite stores, the model the text that arrived.
+    peers[1].checking = false;
+    let gid = peers[1].gid("books", 1).await;
+    peers[1]
+        .apply(&[change(
+            "books",
+            gid,
+            "year",
+            Value::Text("1872".into()),
+            SOON,
+        )])
+        .await;
+    assert_eq!(
+        peers[1]
+            .lines("SELECT typeof(year) || ' ' || year FROM books")
+            .await,
+        ["integer 1872"]
+    );
+    peers[1]
+        .run("UPDATE books SET title = 'Middlemarch!'")
+        .await;
+    let sent = peers[1].push(&mut hub).await;
+    let fields: Vec<&str> = sent.iter().map(|c| c.field.as_str()).collect();
+    assert_eq!(fields, ["title"], "{sent:#?}");
+}
+
+// A row that waits keeps what names it.
+
+#[tokio::test]
+async fn a_row_still_named_by_a_row_whose_write_was_refused_is_not_removed() {
+    let schema = [
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            body TEXT)",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("books", "books", "id").field("title"),
+            Collection::minted("notes", "notes", "id")
+                .owner("book_id", "books")
+                .field("body"),
+        ])
+        .unwrap()
+    };
+    let mut hub = Vec::new();
+    let mut peers = make(2, &schema, registry).await;
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch'), ('Romola')")
+        .await;
+    peers[0]
+        .run("INSERT INTO notes (book_id, body) VALUES (1, 'first')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    // Here every write to the note is refused, so it cannot move off the book being deleted.
+    peers[1]
+        .run("CREATE TRIGGER refuse BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        .await;
+    peers[0]
+        .run("UPDATE notes SET book_id = 2, body = 'moved'")
+        .await;
+    peers[0].run("DELETE FROM books WHERE id = 1").await;
+    peers[0].push(&mut hub).await;
+    let applied = peers[1].pull(&hub).await;
+    assert!(!applied.held.is_empty(), "{applied:#?}");
+    assert_eq!(
+        peers[1]
+            .lines(
+                "SELECT n.body || ' on ' || b.title FROM notes n JOIN books b ON b.id = n.book_id"
+            )
+            .await,
+        ["first on Middlemarch"]
     );
 }

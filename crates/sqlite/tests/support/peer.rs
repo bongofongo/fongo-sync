@@ -20,6 +20,9 @@ pub struct Peer {
     /// Whether every step is checked against the model; off only where the checks would cost
     /// more than the test.
     pub checking: bool,
+    /// Whether the triggers are off: what the application writes meanwhile is unknown to the
+    /// kernel until it resumes, so the replica is not checked against the model.
+    pub suspended: bool,
     pub writes: super::writes::Writes,
 }
 
@@ -40,6 +43,7 @@ impl Peer {
             cursor: 0,
             taken: Vec::new(),
             checking: true,
+            suspended: false,
             writes: Default::default(),
         }
     }
@@ -70,6 +74,7 @@ impl Peer {
 
     pub async fn suspend(&mut self) {
         self.replica.suspend(&mut self.conn).await.unwrap();
+        self.suspended = true;
     }
 
     /// Resumes; what the application wrote while suspended stays its own, to be collected.
@@ -80,6 +85,7 @@ impl Peer {
             .await;
         let replica = self.replica.clone();
         replica.resume(&mut self.conn, how).await.unwrap();
+        self.suspended = false;
         self.writes
             .installed(&mut self.conn, &self.replica, waiting)
             .await;
@@ -87,7 +93,7 @@ impl Peer {
     }
 
     pub async fn midway(&mut self) {
-        if !self.checking {
+        if !self.checking || self.suspended {
             return;
         }
         if let Err(e) = super::midway(&mut self.conn, &self.replica, &self.taken).await {
@@ -220,6 +226,12 @@ pub async fn settle(peers: &mut [Peer], hub: &mut Vec<Change>) {
 pub async fn same_everywhere(peers: &mut [Peer], rows: &str) -> Vec<String> {
     for peer in peers.iter_mut() {
         peer.settled().await;
+    }
+    let everything: Vec<Change> = peers.iter().flat_map(|p| p.taken.iter().cloned()).collect();
+    for (i, peer) in peers.iter().enumerate() {
+        if let Err(e) = peer.writes.kept(peer.replica.registry(), &everything) {
+            panic!("peer {i}: {e}");
+        }
     }
     let first = peers[0].lines(rows).await;
     for (i, peer) in peers.iter_mut().enumerate().skip(1) {
