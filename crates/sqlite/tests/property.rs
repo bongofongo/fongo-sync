@@ -1274,3 +1274,64 @@ fn a_title_written_while_suspended_as_its_book_merges() {
     ];
     run(0, &script).unwrap();
 }
+
+/// Found by a long run (seed 31337) after collect began comparing a natural key a row holds again
+/// with its image; not diagnosed. A tag's NULL note the application wrote is not sent.
+#[test]
+#[ignore = "a NULL written to a natural row made again at its key is not sent"]
+fn a_tag_made_again_with_a_null_note_at_seed_31337() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (4, SetSetting(0, 0)),
+        (0, Sync),
+        (2, Deliver(1567813854110382274, false, false)),
+        (2, AddBook(0, 0, 2)),
+        (2, SetTagNote(0, 0)),
+        (3, AddShelf(0)),
+        (2, AddTag(0, 1)),
+        (1, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (2, SetTagNote(0, 0)),
+        (1, AddBook(0, 0, 0)),
+        (0, DeleteSetting(0)),
+        (0, AddBook(0, 0, 0)),
+        (2, MoveBookDeleteShelf(0, 0)),
+        (4, Sync),
+        (1, Sync),
+        (0, Deliver(5598430481767046809, false, false)),
+        (1, AddShelf(0)),
+        (0, Sync),
+        (2, Sync),
+        (3, Deliver(774416090256426437, false, false)),
+        (3, DeleteShelf(5)),
+        (0, AddShelf(0)),
+        (3, AddBook(0, 0, 0)),
+        (3, AddTag(0, 1)),
+    ];
+    run(8729899457635566058, &script).unwrap();
+}
+
+/// Found by a long run (seed 271828) after collect began comparing a natural key a row holds again
+/// with its image; not diagnosed. A tag's NULL note the application wrote is not sent.
+#[test]
+#[ignore = "a NULL written to a natural row made again at its key is not sent"]
+fn a_tag_made_again_with_a_null_note_at_seed_271828() {
+    use Op::*;
+    let script = vec![
+        (2, AddShelf(0)),
+        (2, AddBook(0, 0, 0)),
+        (0, RenameShelf(0, 0)),
+        (0, RenameShelf(0, 0)),
+        (2, AddTag(0, 0)),
+        (2, Sync),
+        (0, Deliver(9791640996397213198, false, false)),
+        (0, SetTagNote(0, 0)),
+        (0, Suspended(0, 0)),
+        (0, DeleteShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 0)),
+        (0, AddTag(0, 0)),
+    ];
+    run(0, &script).unwrap();
+}

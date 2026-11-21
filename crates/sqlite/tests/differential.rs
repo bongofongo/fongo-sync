@@ -1220,3 +1220,196 @@ fn a_natural_row_removed_and_made_again_sends_the_fields_it_left_null() {
         assert_eq!(fields, vec![("note", &Value::Null)]);
     });
 }
+
+/// Found by a long run (seed 23); a limit of this harness. Two books minted in one collect whose
+/// rows a merge moved in the same step are named by rank, and the two sides mint in different
+/// orders, so the names cross.
+#[test]
+#[ignore = "harness: gids named by rank cross when both sides mint in different orders"]
+fn two_books_minted_together_and_named_by_rank() {
+    use Op::*;
+    let script = vec![
+        Insert {
+            at: 0,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 108,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 94,
+            collection: 190,
+            picks: [0, 0, 0],
+        },
+        Deliver {
+            at: 28,
+            seed: 0,
+            reverse: false,
+            twice: false,
+        },
+        Insert {
+            at: 0,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Deliver {
+            at: 80,
+            seed: 149553245618935222,
+            reverse: false,
+            twice: false,
+        },
+        Delete {
+            at: 176,
+            collection: 118,
+            row: 0,
+        },
+        Insert {
+            at: 20,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 53,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 0,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 40,
+            collection: 105,
+            picks: [0, 8, 0],
+        },
+        Insert {
+            at: 79,
+            collection: 61,
+            picks: [0, 0, 0],
+        },
+        Edit {
+            at: 7,
+            collection: 129,
+            row: 74,
+            field: 0,
+            pick: 0,
+        },
+        Push { at: 29 },
+    ];
+    run(3, 0, &script).unwrap();
+}
+
+/// Found by a long run (seed 7); a limit of this harness. Two shelves from one replica end in one
+/// group, whose canonical gid is the lower raw gid; the sides mint them in different orders, so
+/// the canonical member differs though both agree with the model.
+#[test]
+#[ignore = "harness: a group's canonical member follows raw gid order, which renaming does not keep"]
+fn a_group_of_two_shelves_from_one_replica() {
+    use Op::*;
+    let script = vec![
+        Insert {
+            at: 0,
+            collection: 212,
+            picks: [21, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 144,
+            picks: [1, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 4,
+            picks: [198, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 71,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 52,
+            picks: [108, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 92,
+            picks: [22, 0, 0],
+        },
+        Insert {
+            at: 62,
+            collection: 1,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 53,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 20,
+            picks: [94, 0, 0],
+        },
+        Insert {
+            at: 43,
+            collection: 14,
+            picks: [0, 0, 0],
+        },
+        Insert {
+            at: 0,
+            collection: 116,
+            picks: [43, 0, 0],
+        },
+        Insert {
+            at: 109,
+            collection: 42,
+            picks: [119, 0, 0],
+        },
+        Edit {
+            at: 0,
+            collection: 0,
+            row: 61,
+            field: 0,
+            pick: 0,
+        },
+        Edit {
+            at: 47,
+            collection: 142,
+            row: 44,
+            field: 0,
+            pick: 175,
+        },
+        Push { at: 6 },
+        Push { at: 151 },
+        Deliver {
+            at: 20,
+            seed: 12509316771714229147,
+            reverse: false,
+            twice: false,
+        },
+        Edit {
+            at: 126,
+            collection: 146,
+            row: 0,
+            field: 0,
+            pick: 136,
+        },
+    ];
+    run(2, 0, &script).unwrap();
+}
