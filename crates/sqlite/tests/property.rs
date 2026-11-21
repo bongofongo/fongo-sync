@@ -946,3 +946,41 @@ fn a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
     ];
     run(9069292581118449834, &script).unwrap();
 }
+
+/// Found at 4,000 cases with seed 20261119: as `a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent`
+/// but for a reference, whose cell holds a local id while the change carries an entity.
+#[test]
+#[ignore = "fails: a reference sent while its row waits is owed again"]
+fn a_reference_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
+    use Op::*;
+    let script = vec![
+        (1, SetSetting(0, 0)),
+        (3, AddShelf(0)),
+        (1, AddAuthor(0)),
+        (1, Sync),
+        (0, AddShelf(0)),
+        (4, AddShelf(0)),
+        (2, AddShelf(1)),
+        (4, AddBook(0, 0, 2)),
+        (2, AddBook(0, 0, 3)),
+        (2, Sync),
+        (3, AddAuthor(0)),
+        (0, AddShelf(0)),
+        (0, Deliver(0, false, false)),
+        (3, Deliver(1821843754366452306, false, false)),
+        (0, AddShelf(0)),
+        (3, SetIsbn(0, 2)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (4, Deliver(482915997399765560, false, false)),
+        (3, SetAuthor(0, 0)),
+        (2, DeleteShelf(0)),
+        (4, Sync),
+        (3, Deliver(12548007102727212835, false, false)),
+        (2, Sync),
+        (3, Log(1, false)),
+        (3, SetTitle(0, 0)),
+    ];
+    run(9069292581118449834, &script).unwrap();
+}
