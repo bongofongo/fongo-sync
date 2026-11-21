@@ -489,10 +489,12 @@ impl Replica {
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
     /// and kernel tables of an earlier layout, which [`Replica::uninstall`] removes.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
-        with_db(conn, |db| db.atomically(|db| self.install_in(db))).await
+        with_db(conn, |db| db.atomically(|db| self.install_in(db, None))).await
     }
 
-    fn install_in(&self, db: &Db) -> Result<()> {
+    /// With `resuming`, marks the rows written while suspended before the step that brings rows
+    /// to their targets, which would otherwise overwrite those writes unrecorded.
+    fn install_in(&self, db: &Db, resuming: Option<Resume>) -> Result<()> {
         let installed = !db
             .query(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
@@ -608,6 +610,9 @@ impl Replica {
             }
         }
         set.extend(self.merge(&mut cx, &foreign, false)?);
+        if let Some(how) = resuming {
+            self.resume_in(db, how)?;
+        }
         self.step(&mut cx, &[], set)?;
         cx.finish()
     }
@@ -791,16 +796,10 @@ impl Replica {
     /// whichever `how`; a row whose local id was reused meanwhile is the old entity changed. A
     /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
-        self.install(conn).await?;
         // Collected at once: a row written back to its image before a later collect would
         // otherwise lose both writes.
         with_db(conn, |db| {
-            db.atomically(|db| {
-                self.resume_in(db, how)?;
-                let mut cx = Ctx::begin(db)?;
-                self.step(&mut cx, &[], BTreeSet::new())?;
-                cx.finish()
-            })
+            db.atomically(|db| self.install_in(db, Some(how)))
         })
         .await
     }

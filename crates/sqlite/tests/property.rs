@@ -1223,12 +1223,10 @@ fn a_new_book_at_a_reused_id_whose_row_goes_in_the_same_step() {
     run(4378100637463862824, &script).unwrap();
 }
 
-/// Found by a long run (seed 31337, after the attribution fixes above); not yet diagnosed. Peer 4
-/// writes a title while suspended and resumes with `Resume::Send`; the resume sends only an
-/// alias for the book's group, and the row later shows the group's title, so the write is
-/// neither sent nor kept.
+/// Found by a long run (seed 31337). Peer 4 writes a title while suspended, with a shelf deletion
+/// not yet collected. Resuming must mark the title before the install's step brings the book to
+/// its group's target, or the write is neither sent nor kept.
 #[test]
-#[ignore = "a write made while suspended is neither sent nor kept when the resume merges its book"]
 fn a_title_written_while_suspended_as_its_book_merges() {
     use Op::*;
     let script = vec![
