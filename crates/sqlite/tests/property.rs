@@ -1127,3 +1127,211 @@ fn a_field_adopted_from_a_given_up_row_is_sent() {
     ];
     run(0, &script).unwrap();
 }
+
+/// Found by a long run. A book takes an isbn that a member of another book's group once held.
+/// The collect that mints the new book's entity merges it into that group and removes its row,
+/// so the entity's creation, which the application wrote, is sent while the group's row names it.
+#[test]
+fn a_new_book_whose_collect_merges_it_into_another_row() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (3, AddShelf(1)),
+        (3, Suspended(0, 0)),
+        (3, AddBook(0, 0, 2)),
+        (3, Sync),
+        (0, AddBook(0, 0, 0)),
+        (0, Deliver(10397343180266276659, false, false)),
+        (0, SetIsbn(0, 1)),
+        (0, Sync),
+        (0, DeleteShelf(5)),
+        (0, AddBook(0, 0, 0)),
+        (0, Sync),
+    ];
+    run(2777986060137981915, &script).unwrap();
+}
+
+/// Found by a long run. Peer 1 deletes its book and makes another at the same local id on a shelf
+/// row a merge gave up; the collect sends the new book's entity and the step removes its row, so
+/// only the key it was made at, which the deleted book's entity also held, names the write.
+#[test]
+fn a_new_book_at_a_reused_id_whose_row_goes_in_the_same_step() {
+    use Op::*;
+    let script = vec![
+        (0, AddAuthor(0)),
+        (3, AddShelf(0)),
+        (1, AddAuthor(0)),
+        (3, Sync),
+        (2, AddShelf(1)),
+        (0, DeleteSetting(0)),
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 2)),
+        (2, Sync),
+        (2, AddShelf(0)),
+        (0, AddBook(0, 0, 2)),
+        (0, MoveBookDeleteShelf(0, 0)),
+        (0, AddNote(0, 0)),
+        (1, Upgrade),
+        (1, DeleteAuthor(0)),
+        (4, AddAuthor(0)),
+        (0, SetTitle(0, 0)),
+        (4, Sync),
+        (1, Deliver(2, false, false)),
+        (4, AddBook(0, 0, 0)),
+        (3, AddAuthor(0)),
+        (1, AddBook(0, 0, 0)),
+        (1, Sync),
+        (0, AddAuthor(0)),
+        (3, DeleteShelf(0)),
+        (0, AddNote(0, 0)),
+        (4, SetIsbn(0, 1)),
+        (3, Sync),
+        (2, AddShelf(0)),
+        (0, Sync),
+        (0, AddNote(0, 0)),
+        (0, AddMark(0, 0)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (0, AddShelf(0)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (1, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (0, SetTitle(0, 1)),
+        (4, Log(3, false)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (1, AddShelf(0)),
+        (0, SetIsbn(0, 2)),
+        (4, Deliver(2034325994777331782, false, false)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (0, AddAuthor(0)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (0, SetStatus(0, 1)),
+        (1, MoveBookDeleteShelf(0, 0)),
+        (1, AddBook(0, 0, 0)),
+        (0, AddMark(0, 0)),
+        (2, AddShelf(0)),
+        (0, AddNote(0, 0)),
+        (0, Sync),
+        (2, AddShelf(0)),
+        (0, AddShelf(0)),
+        (4, Sync),
+        (2, AddShelf(0)),
+        (1, Deliver(13447369747061139288, false, false)),
+        (1, DeleteBook(0)),
+        (1, AddBook(2, 0, 0)),
+    ];
+    run(4378100637463862824, &script).unwrap();
+}
+
+/// Found by a long run (seed 31337). Peer 4 writes a title while suspended, with a shelf deletion
+/// not yet collected. Resuming must mark the title before the install's step brings the book to
+/// its group's target, or the write is neither sent nor kept.
+#[test]
+fn a_title_written_while_suspended_as_its_book_merges() {
+    use Op::*;
+    let script = vec![
+        (4, AddShelf(0)),
+        (4, Sync),
+        (2, AddShelf(0)),
+        (4, AddShelf(2)),
+        (1, AddShelf(2)),
+        (0, AddAuthor(0)),
+        (0, AddAuthor(0)),
+        (2, AddShelf(2)),
+        (0, AddShelf(0)),
+        (3, Sync),
+        (1, AddBook(0, 0, 2)),
+        (4, AddBook(2, 0, 1)),
+        (2, DeleteShelf(0)),
+        (2, Sync),
+        (2, SetTitle(0, 0)),
+        (2, SetTitle(0, 0)),
+        (2, SetTitle(0, 0)),
+        (4, Suspended(0, 0)),
+        (2, SetTitle(0, 0)),
+        (2, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (1, AddAuthor(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, Deliver(0, false, false)),
+        (1, AddBook(0, 0, 1)),
+        (1, AddBook(0, 0, 0)),
+        (0, Deliver(0, false, false)),
+        (0, AddShelf(0)),
+        (0, Deliver(0, false, false)),
+        (0, AddShelf(0)),
+        (1, Sync),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (4, Suspended(0, 2)),
+        (0, AddShelf(0)),
+        (4, Sync),
+        (4, DeleteShelf(2)),
+        (4, Suspended(2, 0)),
+    ];
+    run(0, &script).unwrap();
+}
+
+/// Found by a long run (seed 31337). A book and a tag are made again at the local ids and key of
+/// ones removed; the tag's key names the new book, so it is a new entity and its NULL note is
+/// not owed.
+#[test]
+fn a_tag_made_again_with_a_null_note_at_seed_31337() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (4, SetSetting(0, 0)),
+        (0, Sync),
+        (2, Deliver(1567813854110382274, false, false)),
+        (2, AddBook(0, 0, 2)),
+        (2, SetTagNote(0, 0)),
+        (3, AddShelf(0)),
+        (2, AddTag(0, 1)),
+        (1, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (2, SetTagNote(0, 0)),
+        (1, AddBook(0, 0, 0)),
+        (0, DeleteSetting(0)),
+        (0, AddBook(0, 0, 0)),
+        (2, MoveBookDeleteShelf(0, 0)),
+        (4, Sync),
+        (1, Sync),
+        (0, Deliver(5598430481767046809, false, false)),
+        (1, AddShelf(0)),
+        (0, Sync),
+        (2, Sync),
+        (3, Deliver(774416090256426437, false, false)),
+        (3, DeleteShelf(5)),
+        (0, AddShelf(0)),
+        (3, AddBook(0, 0, 0)),
+        (3, AddTag(0, 1)),
+    ];
+    run(8729899457635566058, &script).unwrap();
+}
+
+/// Found by a long run (seed 271828). A book and a tag are made again at the local ids and key of
+/// ones removed; the tag's key names the new book, so it is a new entity and its NULL note is
+/// not owed.
+#[test]
+fn a_tag_made_again_with_a_null_note_at_seed_271828() {
+    use Op::*;
+    let script = vec![
+        (2, AddShelf(0)),
+        (2, AddBook(0, 0, 0)),
+        (0, RenameShelf(0, 0)),
+        (0, RenameShelf(0, 0)),
+        (2, AddTag(0, 0)),
+        (2, Sync),
+        (0, Deliver(9791640996397213198, false, false)),
+        (0, SetTagNote(0, 0)),
+        (0, Suspended(0, 0)),
+        (0, DeleteShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 0)),
+        (0, AddTag(0, 0)),
+    ];
+    run(0, &script).unwrap();
+}

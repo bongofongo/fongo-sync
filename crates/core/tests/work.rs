@@ -976,3 +976,16 @@ proptest! {
         }
     }
 }
+
+/// This input exceeds the bound. It is kept so that whether the suite sees it does not depend on
+/// drawing it at random.
+#[test]
+#[ignore = "affected and targets: work 860 for extent 10, keys chained 1 deep (bound 799)"]
+fn affected_and_targets_exceed_their_bound_on_one_random_input() {
+    let mut rng = Rng(16231279769609292276 | 1);
+    let schema = random_schema(&mut rng);
+    let n = 1 + rng.below(120);
+    let changes = random_changes(&mut rng, &schema, n);
+    let cut = rng.below(changes.len() + 1);
+    affected_within_bound(&schema, &changes[..cut], &changes[cut..]).unwrap();
+}

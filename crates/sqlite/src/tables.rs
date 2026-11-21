@@ -12,6 +12,11 @@ use crate::error::{Error, Result};
 use crate::registry::{Collection, Key, Registry};
 
 /// The wall clock in milliseconds, as the triggers stamp writes.
+/// `fongo_dirty.gone` for a key whose row moved to another key, and for one whose row was
+/// removed or another row was inserted at; a removal outranks a move.
+pub(crate) const MOVED: i64 = 1;
+pub(crate) const REMOVED: i64 = 2;
+
 pub(crate) const NOW: &str = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
 
 const QUIET: &str = "WHEN COALESCE((SELECT value FROM fongo_meta WHERE key = 'applying'), 0) <> 1";
@@ -162,18 +167,24 @@ pub(crate) fn triggers(c: &Collection) -> Vec<String> {
          ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at;"
     );
     vec![
-        format!("CREATE TRIGGER fongo_{name}_ai AFTER INSERT ON {table} {QUIET} BEGIN {touch} END"),
+        // A row inserted at a key another row left is a new row there.
+        format!(
+            "CREATE TRIGGER fongo_{name}_ai AFTER INSERT ON {table} {QUIET} BEGIN
+             INSERT INTO fongo_dirty (collection, key, at) VALUES ('{name}', {new}, {NOW})
+             ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at,
+                gone = CASE WHEN gone > 0 THEN 2 ELSE 0 END; END"
+        ),
         format!(
             "CREATE TRIGGER fongo_{name}_au AFTER UPDATE OF {} ON {table} {QUIET} BEGIN {touch}
              INSERT INTO fongo_dirty (collection, key, at, gone)
              SELECT '{name}', {old}, {NOW}, 1 WHERE {old} <> {new}
-             ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at, gone = 1; END",
+             ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at, gone = max(gone, 1); END",
             watched.join(", ")
         ),
         format!(
             "CREATE TRIGGER fongo_{name}_ad AFTER DELETE ON {table} {QUIET} BEGIN
-             INSERT INTO fongo_dirty (collection, key, at, gone) VALUES ('{name}', {old}, {NOW}, 1)
-             ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at, gone = 1; END"
+             INSERT INTO fongo_dirty (collection, key, at, gone) VALUES ('{name}', {old}, {NOW}, 2)
+             ON CONFLICT (collection, key) DO UPDATE SET at = excluded.at, gone = 2; END"
         ),
     ]
 }

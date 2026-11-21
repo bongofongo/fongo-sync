@@ -33,6 +33,8 @@ pub struct Writes {
     /// Fields the application wrote since the last send, by collection, key and field;
     /// `$deleted` for a row made or removed.
     written: BTreeSet<(String, String, String)>,
+    /// Rows the application made since the last send, at a new key or one a removed row held.
+    made: BTreeSet<(String, String)>,
     /// Rows the application deleted since the last send, by collection and key, with the
     /// members of the entity's group marked live when it did.
     removed: BTreeMap<(String, String), BTreeSet<Gid>>,
@@ -178,6 +180,9 @@ impl Writes {
             };
             let old = self.after.get(at);
             let new_row = old.is_none() || remade.contains(at);
+            if new_row {
+                self.made.insert(at.clone());
+            }
             for f in &c.fields {
                 let value = values.get(&f.name).cloned().unwrap_or(Value::Null);
                 let held = |row: &BTreeMap<String, Value>| {
@@ -446,15 +451,32 @@ impl Writes {
             {
                 keys.push(key);
             }
-            // A row the application made and an apply removed before anything named its entity
-            // can only be matched by collection and field.
-            let unnamed = keys.is_empty()
-                && self.written.iter().any(|(c, k, f)| {
-                    *c == change.collection
-                        && *f == change.field
-                        && !self.gids.contains_key(&(c.clone(), k.clone()))
-                        && !self.after.contains_key(&(c.clone(), k.clone()))
-                });
+            // A row the application made and a kernel step removed before anything named its
+            // entity can only be matched by collection and field: an apply removed it, or the
+            // collect that minted its entity merged that entity into another's row, which `keys`
+            // then names. The row may sit at a key an earlier row held, so `gids` names only that
+            // row's entities.
+            let unnamed = self.written.iter().any(|(c, k, f)| {
+                let at = (c.clone(), k.clone());
+                let cell = (c.clone(), k.clone(), f.clone());
+                // The removed row held the value sent: for a reference, the entity it named
+                // when written, or any if that row was new too.
+                let held = *f == DELETED
+                    || match (self.owed.get(&cell), &change.value) {
+                        (Some(Value::Int(_)), Value::Ref(h)) => {
+                            self.named.get(&cell).is_none_or(|g| {
+                                g == h || canon.iter().any(|((_, x), k)| x == g && k == h)
+                            })
+                        }
+                        (Some(v), sent) => v == sent,
+                        (None, _) => false,
+                    };
+                *c == change.collection
+                    && *f == change.field
+                    && held
+                    && (!self.gids.contains_key(&at) || self.made.contains(&at))
+                    && !self.after.contains_key(&at)
+            });
             let wrote = unnamed
                 || keys.iter().any(|k| {
                     self.written.contains(&(
@@ -599,6 +621,7 @@ impl Writes {
         self.written
             .retain(|(c, k, _)| uncollected.contains(&(c.clone(), k.clone())));
         self.removed.retain(|at, _| uncollected.contains(at));
+        self.made.retain(|at| uncollected.contains(at));
         self.adopted.clear();
         wrong
     }

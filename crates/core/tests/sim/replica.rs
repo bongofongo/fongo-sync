@@ -63,8 +63,11 @@ pub struct Replica<'s> {
     pub outbox: Vec<Change>,
     pub tables: BTreeMap<String, BTreeMap<Key, Row>>,
     images: BTreeMap<(String, Key), Row>,
-    gid_of: BTreeMap<(String, Key), Gid>,
+    pub gid_of: BTreeMap<(String, Key), Gid>,
     dirty: BTreeSet<(String, Key)>,
+    /// The wall of the application's last write to each row since the last collect, which stamps
+    /// the row's changes, as a database's triggers stamp them.
+    written: BTreeMap<(String, Key), u64>,
     pub held: BTreeSet<(String, Gid)>,
     parked: BTreeSet<(String, Key, String)>,
     next_key: Key,
@@ -112,6 +115,7 @@ impl<'s> Replica<'s> {
             images: BTreeMap::new(),
             gid_of: BTreeMap::new(),
             dirty: BTreeSet::new(),
+            written: BTreeMap::new(),
             held: BTreeSet::new(),
             parked: BTreeSet::new(),
             next_key: 1,
@@ -242,6 +246,8 @@ impl<'s> Replica<'s> {
         }
         self.tables.get_mut(collection).unwrap().insert(key, row);
         self.dirty.insert((collection.to_string(), key));
+        self.written
+            .insert((collection.to_string(), key), self.wall);
         Some(key)
     }
 
@@ -256,6 +262,8 @@ impl<'s> Replica<'s> {
         }
         self.tables.get_mut(collection).unwrap().insert(key, row);
         self.dirty.insert((collection.to_string(), key));
+        self.written
+            .insert((collection.to_string(), key), self.wall);
         self.app_cells
             .insert((collection.to_string(), key, field.to_string()));
         for (c, k, f) in self.parked.clone() {
@@ -321,6 +329,7 @@ impl<'s> Replica<'s> {
                     {
                         r.insert(f.clone(), Value::Null);
                         self.dirty.insert((c.clone(), *k));
+                        self.written.insert((c.clone(), *k), self.wall);
                         self.app_cells.insert((c.clone(), *k, f.clone()));
                     }
                 }
@@ -328,6 +337,7 @@ impl<'s> Replica<'s> {
         }
         for (c, k) in doomed {
             self.tables.get_mut(&c).unwrap().remove(&k);
+            self.written.insert((c.clone(), k), self.wall);
             self.dirty.insert((c, k));
         }
         true
@@ -483,7 +493,10 @@ impl<'s> Replica<'s> {
         let mut touched = BTreeSet::new();
         {
             let mut session = self.ev.session(&self.store);
-            for (c, k) in &dirty {
+            // In the order the application wrote the rows, so their clocks keep that order.
+            let mut in_order: Vec<&(String, Key)> = dirty.iter().collect();
+            in_order.sort_by_key(|at| (self.written.get(*at).copied().unwrap_or(0), *at));
+            for (c, k) in in_order {
                 let at = (c.clone(), *k);
                 let image = self.images.get(&at).cloned();
                 let row = self.tables[c].get(k).cloned();
@@ -500,7 +513,8 @@ impl<'s> Replica<'s> {
                     continue;
                 }
                 let old: Option<Target> = old_gid.map(|g| session.target(c, g).unwrap());
-                let clock = self.clock.tick(self.wall);
+                let stamp = self.written.get(&at).copied().unwrap_or(self.wall);
+                let clock = self.clock.tick(stamp);
                 // An owner edit moves the whole entity: every member the replica knows of.
                 let owners: Vec<String> = self
                     .refs(c)
@@ -599,6 +613,7 @@ impl<'s> Replica<'s> {
                 }
             }
         }
+        self.written.clear();
         let mut affected = self.ev.affected(&self.store, &changes).unwrap();
         affected.extend(touched);
         self.absorb(&changes);
