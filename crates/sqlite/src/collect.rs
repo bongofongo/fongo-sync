@@ -204,8 +204,10 @@ impl Replica {
             } else {
                 item.mapped.as_ref()
             };
+            // A key marked gone that a row holds again is compared with the key's image like any
+            // other: only a key with no row is a removal.
             match mapped.map(|m| (m.gid, m.image.clone())) {
-                Some((gid, image)) if !item.gone => {
+                Some((gid, image)) => {
                     let then = self.image_gids(db, c, &image)?;
                     let kept = fields.iter().all(|f| {
                         same(
@@ -219,10 +221,6 @@ impl Replica {
                         item.old = Some(gid);
                         item.new = Some(Gid::derive(&c.name, &values));
                     }
-                }
-                Some((gid, _)) => {
-                    item.old = Some(gid);
-                    item.new = Some(Gid::derive(&c.name, &values));
                 }
                 None => item.new = Some(Gid::derive(&c.name, &values)),
             }

@@ -179,7 +179,10 @@ impl Writes {
                 continue;
             };
             let old = self.after.get(at);
-            let new_row = old.is_none() || remade.contains(at);
+            // A natural row made again at a key a row held is compared with that row: the
+            // kernel sends only what differs from the key's image.
+            let natural = matches!(c.key, Key::Natural { .. });
+            let new_row = old.is_none() || (remade.contains(at) && !natural);
             if new_row {
                 self.made.insert(at.clone());
             }
