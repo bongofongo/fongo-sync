@@ -622,7 +622,7 @@ impl Replica {
         let mut changes = Vec::new();
         let mut set = BTreeSet::new();
         let mapped = db.query(
-            "SELECT key, gid FROM fongo_ids WHERE collection = ?1 AND doomed = 0",
+            "SELECT key, gid FROM fongo_ids WHERE collection = ?1",
             &[Value::Text(c.name.clone())],
         )?;
         for r in mapped {
@@ -682,7 +682,7 @@ impl Replica {
         let mut changes = Vec::new();
         let mut set = BTreeSet::new();
         let mapped = db.query(
-            "SELECT key, gid FROM fongo_ids WHERE collection = ?1 AND doomed = 0",
+            "SELECT key, gid FROM fongo_ids WHERE collection = ?1",
             &[Value::Text(c.name.clone())],
         )?;
         for r in mapped {

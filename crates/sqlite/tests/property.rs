@@ -1091,3 +1091,39 @@ fn a_book_naming_a_given_up_shelf_settles_to_the_model() {
     ];
     run(27569572497282000, &script).unwrap();
 }
+
+/// Found at 4,000 cases with seed 20261119: a book row a merge gave up, kept because a note
+/// still names it, holds a value for a field an upgrade then adopts. The row stands for the
+/// entity it stood for, so the adoption records the value for that entity.
+#[test]
+fn a_field_adopted_from_a_given_up_row_is_sent() {
+    use Op::*;
+    let script = vec![
+        (1, AddShelf(0)),
+        (1, AddBook(0, 0, 3)),
+        (1, Sync),
+        (1, AddTag(0, 1)),
+        (4, AddShelf(1)),
+        (0, Deliver(1488990945943347925, false, false)),
+        (1, AddNote(0, 0)),
+        (4, Sync),
+        (0, AddShelf(2)),
+        (0, SetStatus(0, 2)),
+        (4, AddTag(0, 0)),
+        (4, SetStatus(0, 2)),
+        (1, SetNote(0, 2)),
+        (4, Sync),
+        (1, Sync),
+        (0, AddAuthor(0)),
+        (0, Deliver(629250560763980496, false, false)),
+        (1, AddNote(0, 0)),
+        (0, AddBook(0, 0, 1)),
+        (1, SetNote(0, 1)),
+        (0, AddBook(1, 0, 0)),
+        (0, MoveNoteDeleteShelf(0, 2)),
+        (1, SetExtra(0, 0)),
+        (0, Sync),
+        (1, Deliver(15365404531894706616, false, false)),
+    ];
+    run(0, &script).unwrap();
+}
