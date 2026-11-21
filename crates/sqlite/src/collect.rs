@@ -6,9 +6,9 @@
 //! taken again stands for a new entity, so rows that name that id now name the new one and are
 //! compared too; a natural row whose key, so read, changed stands for a new entity as well.
 //!
-//! A row a merge gave up, and a row that names a row the kernel has not yet given an entity, is not
-//! collected: it stays marked until that is resolved. A row that names a row a merge gave up is
-//! collected, naming the entity that row stood for, which is a member of the group it joined.
+//! A row a merge gave up still stands for the entity it stood for, a member of the group it
+//! joined: its edits are that entity's, and a row that names it names that entity. A row that names
+//! a row the kernel has not yet given an entity is not collected: it stays marked until it has one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -114,6 +114,19 @@ impl Replica {
                 }
             }
         }
+        // An entity whose target cannot be determined waits, and so does every row naming a row
+        // made for it, before anything records a reference to that row's fresh gid.
+        let ev = self.evaluator();
+        let facts = Facts { db };
+        let mut session = ev.session(&facts);
+        for item in items.iter_mut() {
+            if !item.waits
+                && let Some(g) = item.keeps.or(item.old)
+                && session.target(&self.collection(item.idx).name, g).is_err()
+            {
+                item.waits = true;
+            }
+        }
         let mut cache: BTreeMap<(usize, i64), Option<Mapped>> = BTreeMap::new();
         loop {
             let mut changed = false;
@@ -186,7 +199,12 @@ impl Replica {
                 .map(|f| now.get(f).cloned().unwrap_or(Value::Null))
                 .collect();
             let item = &mut items[i];
-            match item.usable().map(|m| (m.gid, m.image.clone())) {
+            let mapped = if item.gone {
+                item.usable()
+            } else {
+                item.mapped.as_ref()
+            };
+            match mapped.map(|m| (m.gid, m.image.clone())) {
                 Some((gid, image)) if !item.gone => {
                     let then = self.image_gids(db, c, &image)?;
                     let kept = fields.iter().all(|f| {
@@ -211,9 +229,6 @@ impl Replica {
         }
 
         // Record, in the order the application wrote.
-        let ev = self.evaluator();
-        let facts = Facts { db };
-        let mut session = ev.session(&facts);
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_by_key(|&i| (items[i].at, i));
         let mut changes: Vec<Change> = Vec::new();
@@ -232,7 +247,7 @@ impl Replica {
                 None => None,
             };
             let item = &items[i];
-            let found = match (item.keeps, item.usable()) {
+            let found = match (item.keeps, item.mapped.as_ref()) {
                 (Some(_), Some(m)) => {
                     let before = self.image_gids(db, c, &m.image)?;
                     plan::edits(&self.schema, &name, Some(&before), after.as_ref())
@@ -314,7 +329,7 @@ impl Replica {
             let at = [Value::Text(c.name.clone()), Value::Text(item.key.clone())];
             match (&item.row, item.keeps.or(item.new)) {
                 (Some(row), Some(gid)) => {
-                    if let (Some(_), Some(m)) = (item.keeps, item.usable()) {
+                    if let (Some(_), Some(m)) = (item.keeps, item.mapped.as_ref()) {
                         for f in &c.fields {
                             let held = m.image.get(&f.name).unwrap_or(&Value::Null);
                             if !same(held, row.get(&f.name).unwrap_or(&Value::Null)) {
@@ -334,10 +349,20 @@ impl Replica {
                         Key::Minted { .. } => local_of(&item.key).map_or(Value::Null, Value::Int),
                         Key::Natural { .. } => Value::Null,
                     };
+                    // A row a merge gave up stays given up.
+                    let doomed =
+                        item.keeps.is_some() && item.mapped.as_ref().is_some_and(|m| m.doomed);
                     db.exec(
                         "INSERT OR REPLACE INTO fongo_ids (collection, key, gid, local, image, doomed)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                        &[at[0].clone(), at[1].clone(), Value::Ref(gid), local, Value::Blob(image::encode(row))],
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        &[
+                            at[0].clone(),
+                            at[1].clone(),
+                            Value::Ref(gid),
+                            local,
+                            Value::Blob(image::encode(row)),
+                            Value::Int(i64::from(doomed)),
+                        ],
                     )?;
                 }
                 _ => {
@@ -401,11 +426,8 @@ impl Replica {
     }
 
     /// What every row decides alone: a row a merge gave up is forgotten once the application
-    /// removes or replaces it, and otherwise waits; a removed row's entity loses its row.
+    /// removes or replaces it; a removed row's entity loses its row.
     fn decide_common(&self, item: &mut Item) {
-        if item.mapped.as_ref().is_some_and(|m| m.doomed) && item.row.is_some() && !item.gone {
-            item.waits = true;
-        }
         if item.row.is_none()
             && let Some(m) = item.usable()
         {
@@ -418,10 +440,12 @@ impl Replica {
         if item.waits || item.row.is_none() {
             return Ok(());
         }
-        match item.usable().map(|m| m.gid) {
+        match item.mapped.as_ref().map(|m| m.gid) {
             Some(gid) if !item.gone => item.keeps = Some(gid),
-            usable => {
-                item.old = usable;
+            _ => {
+                // A given-up row whose id was taken again has no old entity, so no rows naming it
+                // are looked for: with foreign keys enforced, its removal changed or refused them.
+                item.old = item.usable().map(|m| m.gid);
                 let fresh = db.query("SELECT randomblob(16)", &[])?;
                 item.new = Some(as_gid(&fresh[0][0])?);
             }

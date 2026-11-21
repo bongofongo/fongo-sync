@@ -600,7 +600,7 @@ async fn deleting_an_owner_of_many_rows_takes_work_in_proportion() {
 // A merge whose given-up row another table holds.
 
 #[tokio::test]
-async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
+async fn a_given_up_row_held_by_another_table_waits_and_its_edits_are_sent() {
     let schema = [
         "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE)",
         "CREATE TABLE notes (
@@ -656,8 +656,8 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
         applied.held
     );
 
-    // Edited, the row is still not an entity of its own. A note given to it is the application's
-    // and is sent, naming the entity the row stood for: a member of the group it joined.
+    // Edited, or given a note, the row still stands for the entity it stood for, a member of the
+    // group it joined: the edit is that entity's and the note names it, and both are sent.
     peers[1]
         .run(&format!(
             "UPDATE books SET title = 'kept?' WHERE id = {left}"
@@ -671,7 +671,7 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
     let sent = peers[1].push(&mut hub).await;
     assert!(
         sent.iter()
-            .all(|c| c.field == ALIAS || c.collection == "notes"),
+            .any(|c| c.field == "title" && c.value == Value::Text("kept?".into())),
         "{sent:#?}"
     );
     assert!(
@@ -691,6 +691,10 @@ async fn a_given_up_row_held_by_another_table_waits_and_is_never_sent() {
     assert_eq!(
         same_everywhere(&mut peers, rows).await,
         ["book w", "note late on w"]
+    );
+    assert_eq!(
+        same_everywhere(&mut peers, "SELECT title FROM books").await,
+        ["kept?"]
     );
 }
 

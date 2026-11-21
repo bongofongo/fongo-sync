@@ -519,11 +519,18 @@ impl Writes {
             // A row written again and not yet collected may still hold a value an earlier collect
             // recorded: what this send carries of it is matched now, the rest when it is collected.
             let waits = uncollected.contains(&at);
-            if !waits
-                && (leftover.contains(&at)
-                    || pinned.contains(&cell)
-                    || !self.after.contains_key(&at))
-            {
+            // A row gone after the step is owed nothing only when the application removed it, or
+            // when no entity it stood for is live in the model.
+            let gone = !self.after.contains_key(&at)
+                && (self.removed.contains_key(&at)
+                    || !self
+                        .gids
+                        .get(&at)
+                        .into_iter()
+                        .flatten()
+                        .chain(self.latest.get(&at))
+                        .any(|g| after.entities.get(g).is_some_and(|m| m.live)));
+            if !waits && (pinned.contains(&cell) || gone) {
                 continue;
             }
             let Some(collection) = registry.collections().iter().find(|x| x.name == c) else {

@@ -824,10 +824,11 @@ fn a_deleted_tag_whose_books_fate_is_undecided_stays_deleted() {
 /// of another shelf a book moved to, while elsewhere the first shelf is deleted. To write the
 /// result the first shelf's row must go before the other is inserted (one name), the book must
 /// leave it before it goes (a NOT NULL reference), and the other shelf must exist before the book
-/// can move: `plan::order` parks only by writing NULL, which no column of that cycle accepts, so
-/// the rows wait for ever.
+/// can move. That is a NOT NULL cycle, not a swap, and the same accepted limit as the swaps:
+/// `plan::order` parks only by writing NULL, which no column of the cycle accepts, so the rows
+/// wait for the application.
 #[test]
-#[ignore = "plan::order cannot write a cycle none of whose columns accepts NULL"]
+#[ignore = "accepted limit: plan::order parks only by writing NULL; this NOT NULL cycle waits"]
 fn a_shelf_renamed_onto_one_its_book_moved_to() {
     use Op::*;
     let schema: Vec<String> = SCHEMA
