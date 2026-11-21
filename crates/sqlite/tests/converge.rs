@@ -1880,3 +1880,48 @@ async fn merged_shows_what_the_model_shows_for_key_identity_and_grouped_fields()
         assert_eq!(compared, 5, "two books, two tags and one setting");
     }
 }
+
+#[tokio::test]
+async fn a_tag_moved_to_the_book_a_merge_keeps_is_reported_removed_at_its_old_key() {
+    let mut hub = Vec::new();
+    let mut peers = [Peer::new().await, Peer::new().await];
+    peers[0]
+        .run("INSERT INTO books (title, isbn) VALUES ('Middlemarch', 'x')")
+        .await;
+    peers[0].push(&mut hub).await;
+    peers[1].pull(&hub).await;
+    peers[0].run("UPDATE books SET isbn = 'y'").await;
+    peers[0].push(&mut hub).await;
+    // Made here and not yet collected: the apply collects them, then merges the two books.
+    peers[1]
+        .run("INSERT INTO books (title, isbn) VALUES ('Middlemarch, a study', 'y')")
+        .await;
+    peers[1]
+        .run("INSERT INTO tags (book_id, tag) VALUES (2, 'classic')")
+        .await;
+    let tags = "SELECT json_array(book_id, tag) FROM tags";
+    let before = peers[1].lines(tags).await;
+    let applied = peers[1].pull(&hub).await;
+    let after = peers[1].lines(tags).await;
+    assert_eq!(after.len(), 1);
+    for key in before.iter().filter(|k| !after.contains(k)) {
+        assert!(
+            applied
+                .touched
+                .iter()
+                .any(|t| t.collection == "tags" && &t.key == key && t.deleted),
+            "{key} left the table unreported: {:?}",
+            applied.touched
+        );
+    }
+    for key in &after {
+        assert!(
+            applied
+                .touched
+                .iter()
+                .any(|t| t.collection == "tags" && &t.key == key && !t.deleted)
+                || before.contains(key),
+            "{key} came unreported"
+        );
+    }
+}

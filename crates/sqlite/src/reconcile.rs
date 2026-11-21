@@ -650,6 +650,9 @@ impl Replica {
         s.key = Some(now.clone());
         s.image = Some(image);
         let report = s.report;
+        if now != key {
+            cx.touch(idx, &key, report, true);
+        }
         cx.touch(idx, &now, report, false);
         Ok(true)
     }
@@ -675,6 +678,15 @@ impl Replica {
             (rows.slots[i].doomed, kept, local_of(&key), &c.key)
         {
             self.repoint(db, idx, gone, kept)?;
+        }
+        // A row still named by another waits with it: a table's ON DELETE action would otherwise
+        // remove or change, behind the kernel, a row whose own write was refused.
+        if let (Some(local), Key::Minted { .. }) = (local_of(&key), &c.key) {
+            for (referrer, field) in self.referring(idx) {
+                if !tables::rows_naming(db, self.collection(referrer), &field, local)?.is_empty() {
+                    return Ok(false);
+                }
+            }
         }
         let sql = format!("DELETE FROM {} WHERE {}", quoted(&c.table), where_key(c));
         match db.exec(&sql, &[tables::key_param(c, &key)?]) {

@@ -865,82 +865,48 @@ fn a_title_written_while_suspended_and_then_written_back_is_sent() {
     run(0, &script).unwrap();
 }
 
-/// Found at 1,500 cases: a replica sends `$deleted = 0` for a tag its application did not write.
+/// A tag made on a book the same apply merges into another moves to the kept book's row: the
+/// apply reports the row removed at its old key, so the tag is known as the application's write.
 #[test]
-#[ignore = "fails: a tag row the kernel wrote is sent as the application's write"]
-fn a_tag_the_kernel_wrote_is_not_sent_as_the_applications() {
+fn a_natural_row_the_kernel_moves_to_another_key_is_reported_removed_at_the_old_one() {
     use Op::*;
     let script = vec![
         (3, AddShelf(1)),
-        (0, AddAuthor(0)),
-        (0, DeleteSetting(0)),
         (3, AddBook(0, 1, 1)),
         (3, Sync),
         (3, SetIsbn(0, 0)),
-        (0, Sync),
-        (1, Deliver(566648232858420503, false, false)),
-        (1, AddShelf(2)),
         (4, AddAuthor(0)),
-        (2, Deliver(218516460976875544, false, false)),
-        (0, AddShelf(0)),
         (4, Sync),
-        (1, DeleteShelf(0)),
-        (0, AddShelf(0)),
-        (0, AddShelf(0)),
-        (0, AddShelf(0)),
-        (0, Sync),
-        (2, AddAuthor(0)),
-        (0, AddShelf(0)),
-        (2, AddBook(0, 0, 0)),
         (4, AddBook(0, 0, 0)),
         (4, AddTag(1, 0)),
-        (2, AddShelf(2)),
-        (1, Sync),
         (3, Sync),
         (4, Deliver(9274842016017877865, false, false)),
-        (0, AddShelf(0)),
     ];
     run(267643275035851679, &script).unwrap();
 }
 
-/// Found at 4,000 cases: after a delivery joins books of one isbn, a replica holds no row for a
-/// tag of the group, and a book's row names no row.
+/// A book whose new shelf has no row yet waits on its old shelf's row, which the plan removes: the
+/// removal waits too, rather than taking the book and its tags with it by ON DELETE CASCADE.
 #[test]
-#[ignore = "fails: a tag of a book group joined by a delivery has no row"]
-fn a_tag_of_a_book_group_joined_by_a_delivery_keeps_its_row() {
+fn a_row_a_held_row_still_names_is_not_removed() {
     use Op::*;
     let script = vec![
         (1, AddShelf(0)),
         (4, AddShelf(0)),
-        (0, AddShelf(0)),
-        (0, Deliver(0, false, false)),
-        (1, DeleteSetting(0)),
         (1, Sync),
         (4, AddBook(0, 0, 3)),
         (3, Deliver(9599366878112, false, false)),
-        (1, DeleteSetting(0)),
-        (2, RenameShelf(0, 0)),
         (4, AddBook(0, 0, 1)),
         (4, AddBook(0, 0, 2)),
         (2, SetSetting(0, 0)),
         (1, AddBook(0, 0, 0)),
-        (3, AddBook(0, 0, 0)),
         (1, AddTag(0, 0)),
-        (0, AddShelf(0)),
         (1, Sync),
-        (0, AddShelf(0)),
-        (3, AddNote(0, 0)),
         (1, DeleteShelf(0)),
         (4, Push),
-        (0, AddShelf(0)),
-        (0, AddShelf(0)),
         (2, Sync),
-        (0, AddShelf(0)),
-        (3, Push),
         (1, Deliver(8650076728648463482, false, false)),
         (3, AddBook(0, 0, 1)),
-        (4, RenameShelf(0, 0)),
-        (0, AddShelf(0)),
         (3, AddShelf(0)),
         (1, AddNote(0, 0)),
         (1, AddBook(0, 0, 0)),
