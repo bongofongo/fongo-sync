@@ -947,10 +947,9 @@ fn a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
     run(9069292581118449834, &script).unwrap();
 }
 
-/// Found at 4,000 cases with seed 20261119: as `a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent`
-/// but for a reference, whose cell holds a local id while the change carries an entity.
+/// As `a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent`, for a reference: the
+/// cell holds a local id and the change the entity that row stands for.
 #[test]
-#[ignore = "fails: a reference sent while its row waits is owed again"]
 fn a_reference_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
     use Op::*;
     let script = vec![

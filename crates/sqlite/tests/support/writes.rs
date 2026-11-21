@@ -515,42 +515,21 @@ impl Writes {
         let named = std::mem::take(&mut self.named);
         for ((c, key, field), value) in std::mem::take(&mut self.owed) {
             let at = (c.clone(), key.clone());
+            let cell = (c.clone(), key.clone(), field.clone());
             // A row written again and not yet collected may still hold a value an earlier collect
             // recorded: what this send carries of it is matched now, the rest when it is collected.
-            let reference = registry
-                .collections()
-                .iter()
-                .find(|x| x.name == c)
-                .and_then(|x| x.fields.iter().find(|f| f.name == field))
-                .is_some_and(|f| matches!(f.kind, Kind::Ref { .. }));
-            let carried_now = !reference
-                && sent.iter().any(|ch| {
-                    ch.collection == c
-                        && ch.field == field
-                        && ch.value.total_cmp(&value) == std::cmp::Ordering::Equal
-                        && self
-                            .gids
-                            .get(&at)
-                            .into_iter()
-                            .flatten()
-                            .chain(self.latest.get(&at))
-                            .any(|g| canonical(&c, *g) == canonical(&c, ch.gid))
-                });
-            if uncollected.contains(&at) && !carried_now {
-                let cell = (c, key, field);
-                if let Some(g) = named.get(&cell) {
-                    self.named.insert(cell.clone(), *g);
-                }
-                self.owed.insert(cell, value);
-                continue;
-            }
-            if leftover.contains(&at)
-                || pinned.contains(&(c.clone(), key.clone(), field.clone()))
-                || !self.after.contains_key(&at)
+            let waits = uncollected.contains(&at);
+            if !waits
+                && (leftover.contains(&at)
+                    || pinned.contains(&cell)
+                    || !self.after.contains_key(&at))
             {
                 continue;
             }
             let Some(collection) = registry.collections().iter().find(|x| x.name == c) else {
+                if waits {
+                    self.owed.insert(cell, value);
+                }
                 continue;
             };
             let kind = collection
@@ -564,11 +543,7 @@ impl Writes {
             // entity, is known by none, and then any entity carried will do.
             let mut names: BTreeSet<Gid> = BTreeSet::new();
             if let (Some(Kind::Ref { collection: t, .. }), Value::Int(local)) = (kind, &value) {
-                names.extend(
-                    named
-                        .get(&(c.clone(), key.clone(), field.clone()))
-                        .map(|g| canonical(t, *g)),
-                );
+                names.extend(named.get(&cell).map(|g| canonical(t, *g)));
                 let held = (t.clone(), format!("[{local}]"));
                 names.extend(
                     self.gids
@@ -602,6 +577,12 @@ impl Writes {
             });
             match carried {
                 Some(change) => self.expected.push(change.clone()),
+                None if waits => {
+                    if let Some(g) = named.get(&cell) {
+                        self.named.insert(cell.clone(), *g);
+                    }
+                    self.owed.insert(cell, value);
+                }
                 None => wrong.push(format!(
                     "the application wrote {c} row {key}.{field} = {value:?} and nothing sent it"
                 )),
