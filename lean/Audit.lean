@@ -5,7 +5,9 @@ import FongoSync
 `propext`, `Classical.choice` and `Quot.sound`. -/
 
 #print axioms FongoSync.Laws.tick_later
+#print axioms FongoSync.Laws.tick_encodable
 #print axioms FongoSync.Laws.observe_ignores_unencodable
+#print axioms FongoSync.Laws.observe_keeps_room
 #print axioms FongoSync.Laws.tick_after_observe
 #print axioms FongoSync.Laws.tick_after_any_history
 #print axioms FongoSync.Laws.merge_comm
@@ -31,7 +33,12 @@ import FongoSync
 #print axioms FongoSync.Laws.view_twice
 #print axioms FongoSync.Laws.view_runs
 #print axioms FongoSync.Laws.view_set
+#print axioms FongoSync.Laws.key_writes_set
+#print axioms FongoSync.Laws.key_write_redelivered
+#print axioms FongoSync.Laws.key_write_dropped_for_good
+#print axioms FongoSync.Laws.full_view_runs_from_inputs
 #print axioms FongoSync.Laws.full_view_set
 #print axioms FongoSync.Laws.full_view_ignores_unencodable
 #print axioms FongoSync.Laws.full_view_ignores_unknown_collection
 #print axioms FongoSync.Laws.full_view_ignores_bad_alias
+#print axioms FongoSync.Laws.full_view_ignores_bad_tombstone

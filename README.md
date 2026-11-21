@@ -92,10 +92,12 @@ One chain, each link checked against the one above it:
    place; the other files prove them. Among them: a replica's registers, groups and view do not
    depend on the order changes arrive in or on duplicates, given that no two changes to one
    register share a clock with different values (an example shows that condition is needed); the
-   view depends on nothing but registers, the gids seen and the groups; and every `Clock::tick`
-   is later than every reading issued or observed before it, for a clock that ignores observed
-   readings `Hlc::encode` cannot hold. `make lean` builds the proofs and fails if any law rests
-   on an unproven step; `make check` includes it.
+   view depends on nothing but registers, the gids seen and the groups; which writes to a natural
+   key field count depends only on the set of writes; and every `Clock::tick` is later than every
+   reading issued or observed before it, for a clock that ignores observed readings in or past
+   the last millisecond `Hlc::encode` holds and has not yet issued the last reading it holds.
+   `make lean` builds the proofs and fails if any law rests on an unproven step; `make check`
+   includes it.
 2. **The reference model, in Rust.** `fongo_sync_core::model::view` states the same semantics in
    full and executably: a slow, plain function from a schema and a set of changes to what an
    application sees. Its own tests check that it ignores order and duplicates and hold one case
@@ -123,11 +125,15 @@ One chain, each link checked against the one above it:
 
 Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
 `clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
-faithful. The one cross-check is `make lean-diff` (part of `make check`): it runs a handful of
-fixed cases through the single-collection Lean view, computed and proven equal to its
-specification, and through `model::view`, and compares the output. The Lean view covers several collections, which collection a gid belongs to, the
-changes `model::view` ignores, `together` sets and natural keys, but not `Real` values, and it is
-a specification: it states the least groups and least live set rather than computing them.
+faithful. The one cross-check is `make lean-diff` (part of `make check`), which compares output
+on fixed cases: `model::view` against the single-collection Lean view, computed and proven equal
+to its specification, and against a computed view over several collections, whose liveness is
+proven to be its specification's but whose keys and groups are computed without proof;
+`Schema::check` against `Schema.Restricted` on schemas that differ in their `together` sets,
+ownership and natural keys; and `Clock` against `Clock.lean` on fixed histories. The Lean view
+covers several collections, which collection a gid belongs to, the changes `model::view` ignores,
+`together` sets and natural keys, but not `Real` values, and it is a specification: it states the
+least groups and least live set rather than computing them.
 
 ## Licence
 
