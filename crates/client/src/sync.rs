@@ -7,7 +7,7 @@ use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED};
-use fongo_sync_sqlite::{Applied, Replica};
+use fongo_sync_sqlite::{Applied, Replica, Touched};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::credentials::Credentials;
@@ -77,7 +77,9 @@ pub struct SyncReport {
     /// Changes this device sent.
     pub sent: usize,
     /// What applying them did, merged over every apply in the sync: changes accepted, rows
-    /// touched (each row once, as it was left), conflicts, and entities still waiting.
+    /// touched, conflicts, and entities still waiting. `touched` lists each key once per entity
+    /// that held it, at that entity's last entry, in the order of those entries: the entities
+    /// that left a key come before the one it was left holding.
     pub applied: Applied,
     /// The first refusals, at most 100.
     pub refused: Vec<Refused>,
@@ -607,23 +609,22 @@ fn merge(into: &mut Applied, from: Applied) {
     into.waiting = from.waiting;
     into.held = from.held;
     into.conflicts.extend(from.conflicts);
-    let mut at: HashMap<(String, String), usize> = into
-        .touched
-        .iter()
-        .enumerate()
-        .map(|(i, t)| ((t.collection.clone(), t.key.clone()), i))
-        .collect();
-    for touched in from.touched {
-        match at.get(&(touched.collection.clone(), touched.key.clone())) {
-            Some(&i) => into.touched[i] = touched,
-            None => {
-                at.insert(
-                    (touched.collection.clone(), touched.key.clone()),
-                    into.touched.len(),
-                );
-                into.touched.push(touched);
-            }
-        }
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let mut at: HashMap<(String, String), Vec<Touched>> = HashMap::new();
+    for touched in std::mem::take(&mut into.touched)
+        .into_iter()
+        .chain(from.touched)
+    {
+        let key = (touched.collection.clone(), touched.key.clone());
+        let entries = at.entry(key.clone()).or_insert_with(|| {
+            keys.push(key);
+            Vec::new()
+        });
+        entries.retain(|e| e.gid != touched.gid);
+        entries.push(touched);
+    }
+    for key in keys {
+        into.touched.extend(at.remove(&key).unwrap_or_default());
     }
 }
 
@@ -671,6 +672,52 @@ mod tests {
             clock: Hlc::zero(Gid([2; 16])),
         };
         assert_eq!(encode_batch(&[empty]).len(), SMALLEST_BATCH);
+    }
+
+    fn touched(entries: &[(&str, u8, bool)]) -> Applied {
+        Applied {
+            touched: entries
+                .iter()
+                .map(|&(key, gid, deleted)| Touched {
+                    collection: "books".into(),
+                    key: key.into(),
+                    gid: Gid([gid; 16]),
+                    deleted,
+                })
+                .collect(),
+            ..Applied::default()
+        }
+    }
+
+    #[test]
+    fn merged_reports_keep_each_entity_that_left_a_key_before_the_one_it_holds() {
+        let cases: [(&[_], &[_], &[_]); 3] = [
+            (
+                &[("[1]", 1, true), ("[1]", 2, false)],
+                &[("[1]", 2, false), ("[2]", 3, false)],
+                &[("[1]", 1, true), ("[1]", 2, false), ("[2]", 3, false)],
+            ),
+            (
+                &[("[1]", 1, true), ("[1]", 2, false)],
+                &[("[1]", 2, true), ("[1]", 1, false)],
+                &[("[1]", 2, true), ("[1]", 1, false)],
+            ),
+            (
+                &[("[2]", 3, false), ("[1]", 1, false)],
+                &[("[1]", 1, true)],
+                &[("[2]", 3, false), ("[1]", 1, true)],
+            ),
+        ];
+        for (first, second, want) in cases {
+            let mut report = Applied::default();
+            merge(&mut report, touched(first));
+            merge(&mut report, touched(second));
+            assert_eq!(
+                report.touched,
+                touched(want).touched,
+                "{first:?} then {second:?}"
+            );
+        }
     }
 
     #[test]

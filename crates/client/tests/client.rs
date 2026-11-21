@@ -1036,6 +1036,49 @@ async fn edits_before_this_devices_envelope_in_the_log_conflict_and_edits_after_
 }
 
 #[tokio::test]
+async fn a_local_id_another_entity_takes_in_a_sync_reports_both_entities() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    for peer in [&mut a, &mut b] {
+        peer.run("CREATE UNIQUE INDEX books_title ON books (title)")
+            .await;
+    }
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    let old = b.replica.gid_of(&mut b.conn, "books", 1).await.unwrap();
+
+    // b can write the new row only once the old one is gone, and it then takes its local id.
+    a.run("DELETE FROM books").await;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.sync(&server).await.unwrap();
+    let new = a.replica.gid_of(&mut a.conn, "books", 1).await.unwrap();
+    let report = b.sync(&server).await.unwrap();
+    let touched: Vec<_> = report
+        .applied
+        .touched
+        .iter()
+        .map(|t| {
+            (
+                t.collection.as_str(),
+                t.key.as_str(),
+                Some(t.gid),
+                t.deleted,
+            )
+        })
+        .collect();
+    assert_eq!(
+        touched,
+        [("books", "[1]", old, true), ("books", "[1]", new, false)]
+    );
+    assert_ne!(old, new);
+    let mut peers = [a, b];
+    assert_converged(&mut peers).await;
+}
+
+#[tokio::test]
 async fn a_row_this_database_refuses_is_reported_held_until_a_sync_can_write_it() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;
