@@ -9,6 +9,7 @@ The kernel knows nothing about any particular application.
 | `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules; `model`, the reference model of what replicas converge to; the evaluator and row planner that make every merge decision. No I/O. |
 | `fongo-sync-sqlite` | the storage adapter: change capture by trigger, the core's facts kept in SQLite, and every row written as the core plans it. |
 | `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
+| `fongo-sync-client` | a device's side: creating and joining a library, and one sync round against a server, over a transport the application implements with its own HTTP client. |
 
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
 its database, `Replica::collect` to turn local writes into changes, and `Replica::apply` to merge
@@ -24,7 +25,9 @@ reference may own its row, which then goes with its target. A collection can als
   the two entities become one on every replica: the kernel records that their ids are aliases,
   keeps one row, points every reference at it, and merges the live members' fields by clock.
 - fields that change together, which merge as one write.
-- fields that report conflicts, so an application can combine concurrent edits to text.
+- fields that report conflicts, so an application can combine concurrent edits to text. Through
+  `fongo-sync-client`, of two concurrent edits only the device whose envelope lands later in the
+  log is told; the other takes the winning value without a report.
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 
@@ -40,7 +43,12 @@ their content: it sees a library id, a device id, a key epoch, a size and an arr
 `fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
 by depending on it.
 
-Not yet here: an HTTP client, a server, and blob transfer.
+`fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
+after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
+does not hold yet, applies the rest, then seals and appends the outbox. Credentials stay with the application; the client stores only its cursor,
+the envelope it is sending and where its recent envelopes landed, in tables of its own.
+
+Not yet here: a server, an HTTP transport, and blob transfer.
 
 ```
 make check

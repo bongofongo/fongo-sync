@@ -52,9 +52,10 @@ pub struct Applied {
     /// The rows this apply wrote or removed, by collection in registry order, then by key. A key
     /// whose entity was removed and whose local id went to another lists both, in that order.
     pub touched: Vec<Touched>,
-    /// Fields flagged to report conflicts that were edited here and elsewhere concurrently. Only
-    /// a local edit this apply collects is compared, one not yet sent, so a sync that wants these
-    /// applies what it receives before it collects and sends.
+    /// Fields flagged to report conflicts that were edited here and elsewhere concurrently. Every
+    /// collect remembers the base of each local edit to such a field, and every apply compares
+    /// the changes it receives with every base remembered until [`Replica::release_bases`]
+    /// forgets it, whether or not the edit has been sent.
     pub conflicts: Vec<Conflict>,
     /// The entities counted in `waiting`, by collection and id.
     pub held: Vec<Held>,
