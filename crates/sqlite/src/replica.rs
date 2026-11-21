@@ -808,7 +808,7 @@ impl Replica {
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut session = ev.session(&facts);
-        let mark = |collection: &str, key: &str, gone: bool| {
+        let mark = |collection: &str, key: &str, removed: bool| {
             db.exec(
                 &format!(
                     "INSERT INTO fongo_dirty (collection, key, at, gone) VALUES (?1, ?2, {NOW}, ?3)
@@ -818,7 +818,7 @@ impl Replica {
                 &[
                     Value::Text(collection.into()),
                     Value::Text(key.into()),
-                    Value::Int(i64::from(gone)),
+                    Value::Int(if removed { tables::REMOVED } else { 0 }),
                 ],
             )
         };

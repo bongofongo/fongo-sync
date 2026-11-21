@@ -29,6 +29,8 @@ struct Item {
     key: String,
     at: i64,
     gone: bool,
+    /// The key's row was removed, not only moved to another key: a row there again is new.
+    removed: bool,
     /// Not marked by a trigger: found through a row whose local id was taken again.
     found: bool,
     row: Option<Row>,
@@ -79,7 +81,7 @@ impl Replica {
                 )?;
                 continue;
             };
-            let item = self.item(db, idx, key, as_int(&r[2])?, as_int(&r[3])? == 1, false)?;
+            let item = self.item(db, idx, key, as_int(&r[2])?, as_int(&r[3])?, false)?;
             index.insert((idx, item.key.clone()), items.len());
             items.push(item);
         }
@@ -107,7 +109,7 @@ impl Replica {
                         if index.contains_key(&(referrer, key.clone())) {
                             continue;
                         }
-                        let found = self.item(db, referrer, key, at, false, true)?;
+                        let found = self.item(db, referrer, key, at, 0, true)?;
                         index.insert((referrer, found.key.clone()), items.len());
                         items.push(found);
                     }
@@ -204,10 +206,10 @@ impl Replica {
             } else {
                 item.mapped.as_ref()
             };
-            // A key marked gone that a row holds again is compared with the key's image like any
-            // other: only a key with no row is a removal.
+            // A key whose row moved away and back is compared with the key's image; one whose
+            // row was removed and made again is a new entity.
             match mapped.map(|m| (m.gid, m.image.clone())) {
-                Some((gid, image)) => {
+                Some((gid, image)) if !item.removed => {
                     let then = self.image_gids(db, c, &image)?;
                     let kept = fields.iter().all(|f| {
                         same(
@@ -221,6 +223,10 @@ impl Replica {
                         item.old = Some(gid);
                         item.new = Some(Gid::derive(&c.name, &values));
                     }
+                }
+                Some((gid, _)) => {
+                    item.old = Some(gid);
+                    item.new = Some(Gid::derive(&c.name, &values));
                 }
                 None => item.new = Some(Gid::derive(&c.name, &values)),
             }
@@ -404,7 +410,7 @@ impl Replica {
         idx: usize,
         key: String,
         at: i64,
-        gone: bool,
+        gone: i64,
         found: bool,
     ) -> Result<Item> {
         let c = self.collection(idx);
@@ -414,7 +420,8 @@ impl Replica {
             mapped: mapping(db, &c.name, &key)?,
             key,
             at,
-            gone,
+            gone: gone >= tables::MOVED,
+            removed: gone == tables::REMOVED,
             found,
             waits: false,
             keeps: None,

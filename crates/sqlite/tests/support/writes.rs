@@ -179,19 +179,7 @@ impl Writes {
                 continue;
             };
             let old = self.after.get(at);
-            // A natural row made again at a key a row held is compared with that row, as the
-            // kernel compares it with the key's image, unless its key names a row made since:
-            // then the key derives another entity, which is new.
-            let same_entity = match &c.key {
-                Key::Natural { fields } => !c.fields.iter().any(|f| {
-                    fields.contains(&f.name)
-                        && matches!((&f.kind, values.get(&f.name)),
-                            (Kind::Ref { collection: t, .. }, Some(Value::Int(local)))
-                                if fresh.contains(&(t.clone(), format!("[{local}]"))))
-                }),
-                Key::Minted { .. } => false,
-            };
-            let new_row = old.is_none() || (remade.contains(at) && !same_entity);
+            let new_row = old.is_none() || remade.contains(at);
             if new_row {
                 self.made.insert(at.clone());
             }
@@ -470,8 +458,22 @@ impl Writes {
             // row's entities.
             let unnamed = self.written.iter().any(|(c, k, f)| {
                 let at = (c.clone(), k.clone());
+                let cell = (c.clone(), k.clone(), f.clone());
+                // The removed row held the value sent: for a reference, the entity it named
+                // when written, or any if that row was new too.
+                let held = *f == DELETED
+                    || match (self.owed.get(&cell), &change.value) {
+                        (Some(Value::Int(_)), Value::Ref(h)) => {
+                            self.named.get(&cell).is_none_or(|g| {
+                                g == h || canon.iter().any(|((_, x), k)| x == g && k == h)
+                            })
+                        }
+                        (Some(v), sent) => v == sent,
+                        (None, _) => false,
+                    };
                 *c == change.collection
                     && *f == change.field
+                    && held
                     && (!self.gids.contains_key(&at) || self.made.contains(&at))
                     && !self.after.contains_key(&at)
             });
