@@ -515,7 +515,28 @@ impl Writes {
         let named = std::mem::take(&mut self.named);
         for ((c, key, field), value) in std::mem::take(&mut self.owed) {
             let at = (c.clone(), key.clone());
-            if uncollected.contains(&at) {
+            // A row written again and not yet collected may still hold a value an earlier collect
+            // recorded: what this send carries of it is matched now, the rest when it is collected.
+            let reference = registry
+                .collections()
+                .iter()
+                .find(|x| x.name == c)
+                .and_then(|x| x.fields.iter().find(|f| f.name == field))
+                .is_some_and(|f| matches!(f.kind, Kind::Ref { .. }));
+            let carried_now = !reference
+                && sent.iter().any(|ch| {
+                    ch.collection == c
+                        && ch.field == field
+                        && ch.value.total_cmp(&value) == std::cmp::Ordering::Equal
+                        && self
+                            .gids
+                            .get(&at)
+                            .into_iter()
+                            .flatten()
+                            .chain(self.latest.get(&at))
+                            .any(|g| canonical(&c, *g) == canonical(&c, ch.gid))
+                });
+            if uncollected.contains(&at) && !carried_now {
                 let cell = (c, key, field);
                 if let Some(g) = named.get(&cell) {
                     self.named.insert(cell.clone(), *g);

@@ -920,3 +920,29 @@ fn a_row_a_held_row_still_names_is_not_removed() {
     ];
     run(13014502829616582930, &script).unwrap();
 }
+
+/// A value an earlier collect recorded is carried by the next send, though the application has
+/// since written the row again and that write waits: the value is not owed a second time.
+#[test]
+fn a_value_sent_while_its_row_waits_on_a_later_write_counts_as_sent() {
+    use Op::*;
+    let script = vec![
+        (1, SetSetting(0, 0)),
+        (1, AddAuthor(0)),
+        (1, Sync),
+        (4, AddShelf(0)),
+        (2, AddShelf(1)),
+        (4, AddBook(0, 0, 2)),
+        (2, AddBook(0, 0, 3)),
+        (2, Sync),
+        (3, Deliver(1821843754366452306, false, false)),
+        (3, SetIsbn(0, 2)),
+        (2, DeleteShelf(0)),
+        (4, Sync),
+        (3, Deliver(12548034056379798152, false, false)),
+        (2, Sync),
+        (3, Log(1, false)),
+        (3, SetTitle(0, 0)),
+    ];
+    run(9069292581118449834, &script).unwrap();
+}
