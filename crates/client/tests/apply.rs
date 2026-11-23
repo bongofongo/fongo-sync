@@ -333,9 +333,11 @@ async fn settled(peer: &mut Peer) -> Vec<i64> {
 }
 
 /// Every change in the first `envelopes` of the log, which `signer` sealed, was marked exactly
-/// once, and no change was marked twice.
+/// once, and no change was marked twice. Marking per change says this only because no change is
+/// in the log twice here; an application works from what the apply touched.
 async fn marked_once(peer: &mut Peer, server: &Server, signer: &Credentials, envelopes: usize) {
     let keys = peer.credentials.library().clone();
+    assert_no_change_sent_twice(server, &keys);
     let key = signer.device().verifying_key();
     let mut theirs = BTreeSet::new();
     for envelope in &server.log(keys.id)[..envelopes] {
@@ -808,8 +810,12 @@ const ROWS: &str = "SELECT 'books', json_array(id) FROM books
     UNION ALL SELECT 'notes', json_array(id) FROM notes
     UNION ALL SELECT 'settings', json_array(key) FROM settings";
 
-/// Keeps a count of rows per collection, from what each apply touched.
-struct Counting;
+/// Keeps a count of rows per collection, from what each apply touched, and counts its calls once
+/// a pull is complete.
+#[derive(Default)]
+struct Counting {
+    caught_up: usize,
+}
 
 impl Apply for Counting {
     async fn apply(
@@ -842,6 +848,15 @@ impl Apply for Counting {
             .await?;
         }
         Ok(applied)
+    }
+
+    async fn caught_up(
+        &mut self,
+        _conn: &mut SqliteConnection,
+        _replica: &Replica,
+    ) -> Result<Option<Applied>, Error> {
+        self.caught_up += 1;
+        Ok(None)
     }
 }
 
@@ -882,7 +897,9 @@ async fn assert_counted(peer: &mut Peer, at: &str) {
 }
 
 async fn counted_sync(peer: &mut Peer, server: &Server, at: &str) -> SyncReport {
-    let report = sync_hooked(peer, server, &mut Counting).await.unwrap();
+    let report = sync_hooked(peer, server, &mut Counting::default())
+        .await
+        .unwrap();
     assert_counted(peer, at).await;
     report
 }
@@ -955,6 +972,246 @@ async fn three_devices_keep_counts_from_what_each_apply_touched() {
     );
     for (n, peer) in peers.iter_mut().enumerate() {
         assert_counted(peer, &format!("device {n} at the end")).await;
+    }
+}
+
+/// Ends the transaction it is given, as SQLite does for `INSERT OR ROLLBACK` on a conflict, and
+/// swallows the error, in its apply or once the pull is complete.
+struct Swallowing {
+    in_caught_up: bool,
+}
+
+async fn end_the_transaction(conn: &mut SqliteConnection) -> Result<(), Error> {
+    sqlx::query("INSERT OR IGNORE INTO once VALUES (1)")
+        .execute(&mut *conn)
+        .await?;
+    let ended = sqlx::query("INSERT OR ROLLBACK INTO once VALUES (1)")
+        .execute(&mut *conn)
+        .await;
+    assert!(ended.is_err());
+    Ok(())
+}
+
+impl Apply for Swallowing {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        let applied = replica.apply(conn, changes).await?;
+        if !self.in_caught_up {
+            end_the_transaction(conn).await?;
+        }
+        Ok(applied)
+    }
+
+    async fn caught_up(
+        &mut self,
+        conn: &mut SqliteConnection,
+        _replica: &Replica,
+    ) -> Result<Option<Applied>, Error> {
+        if self.in_caught_up {
+            end_the_transaction(conn).await?;
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn an_apply_that_ends_the_transaction_and_hides_it_fails_the_sync_and_moves_no_cursor() {
+    let server = Server::new();
+    let [mut a, mut b] = crash_scene(&server).await;
+    let id = a.credentials.library_id();
+    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
+    let mut hook = Swallowing {
+        in_caught_up: false,
+    };
+    let result = sync_hooked(&mut a, &server, &mut hook).await;
+    assert!(matches!(result, Err(Error::TransactionEnded)), "{result:?}");
+    assert_eq!(a.cursor().await, 0);
+    assert!(a.settings().await.is_empty());
+    assert_eq!(server.log(id).len(), 1);
+    // No transaction is left open.
+    a.run("BEGIN").await;
+    a.run("ROLLBACK").await;
+
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.received, 3);
+    assert_eq!(a.settings().await, ["theme=dark"]);
+    assert_eq!(a.cursor().await, 2);
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn caught_up_that_ends_the_transaction_and_hides_it_fails_the_sync_and_sends_nothing() {
+    let server = Server::new();
+    let [mut a, mut b] = crash_scene(&server).await;
+    let id = a.credentials.library_id();
+    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
+    let mut hook = Swallowing { in_caught_up: true };
+    let result = sync_hooked(&mut a, &server, &mut hook).await;
+    assert!(matches!(result, Err(Error::TransactionEnded)), "{result:?}");
+    assert_eq!(a.cursor().await, 1);
+    assert_eq!(a.settings().await, ["theme=dark"]);
+    assert_eq!(server.log(id).len(), 1);
+    a.run("BEGIN").await;
+    a.run("ROLLBACK").await;
+
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.sent > 0);
+    assert_eq!(server.log(id).len(), 2);
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_copy_of_an_envelope_gives_its_changes_again_and_touches_nothing() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    a.run("INSERT INTO settings VALUES ('theme', 'dark')").await;
+    a.sync(&server).await.unwrap();
+    let mut hook = Marking::default();
+    let first = sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+    assert_eq!(first.applied.touched.len(), 1);
+    assert_eq!(marked(&mut b, "dark").await, 1);
+
+    // A server that stores an identical envelope twice, which the client does not rely on.
+    let copy = server.log(id)[0].clone();
+    server.inject(id, copy);
+    let again = sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+    assert_eq!(again.received, first.received);
+    assert!(again.applied.touched.is_empty(), "{again:#?}");
+    assert_eq!(marked(&mut b, "dark").await, 2);
+    assert_eq!(b.settings().await, ["theme=dark"]);
+    assert_converged(&mut [a, b]).await;
+}
+
+/// Statements a random step runs on one device.
+const WRITES: &[&str] = &[
+    "INSERT OR IGNORE INTO books (title) VALUES ('Middlemarch')",
+    "INSERT OR IGNORE INTO books (title) VALUES ('Persuasion')",
+    "INSERT OR REPLACE INTO settings VALUES ('theme', 'dark')",
+    "INSERT OR REPLACE INTO settings VALUES ('theme', 'light')",
+    "INSERT OR REPLACE INTO settings VALUES ('font', 'serif')",
+    "DELETE FROM settings WHERE key = 'theme'",
+    "UPDATE books SET year = coalesce(year, 1870) + 1",
+    "UPDATE books SET year = 1871",
+    "INSERT INTO notes (book_id, body) SELECT id, 'n' FROM books LIMIT 1",
+    "DELETE FROM books WHERE title = 'Persuasion'",
+    "DELETE FROM books WHERE title = 'Middlemarch'",
+    "DELETE FROM notes WHERE id = (SELECT min(id) FROM notes)",
+];
+
+/// A small xorshift generator, so a case is a function of its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Three devices write at random and sync through a server that fails, loses or hangs a random
+/// request, stores copies of envelopes already in the log, and pages one to three envelopes at a
+/// time. After every sync the counts kept from what each apply touched are right, and `caught_up`
+/// was called exactly when the pull read to the head; at the end every device agrees.
+///
+/// `FONGO_CLIENT_CASES` sets how many seeds run from `FONGO_CLIENT_SEED`. A seed fixes the steps;
+/// keys and ids are still drawn afresh, so a failure names its seed but may need a few runs.
+#[tokio::test]
+async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge() {
+    let first = env("FONGO_CLIENT_SEED", 1);
+    for seed in first..first + env("FONGO_CLIENT_CASES", 25) {
+        let mut rng = Rng::new(seed);
+        let server = Server::new();
+        server.with(|s| s.caps.max_page_batches = Some(1 + (seed % 3) as u32));
+        let [made, joined] = credentials(&server).await;
+        let key = generate_signing_key().unwrap();
+        fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
+            .await
+            .unwrap();
+        let third = Credentials::new(made.library().clone(), key, 0);
+        let id = made.library_id();
+        let mut peers = [
+            Peer::new(made).await,
+            Peer::new(joined).await,
+            Peer::new(third).await,
+        ];
+        for peer in &mut peers {
+            peer.run(PRESENT).await;
+            peer.run(COUNTS).await;
+        }
+        for step in 0..40 {
+            let who = rng.below(3) as usize;
+            let at = format!("seed {seed} step {step} device {who}");
+            match rng.below(6) {
+                0 | 1 => {
+                    let sql = WRITES[rng.below(WRITES.len() as u64) as usize];
+                    write(&mut peers[who], sql).await;
+                }
+                2 => {
+                    let log = server.log(id);
+                    if !log.is_empty() {
+                        let copy = log[rng.below(log.len() as u64) as usize].clone();
+                        server.inject(id, copy);
+                    }
+                }
+                _ => {
+                    let n = 1 + rng.below(8) as usize;
+                    match rng.below(4) {
+                        0 => server.fail_at(n),
+                        1 => server.lose_at(n),
+                        2 => server.hang_at(n, rng.below(2) == 0),
+                        _ => {}
+                    }
+                    let mut hook = Counting::default();
+                    let peer = &mut peers[who];
+                    let result = tokio::select! {
+                        result = sync_hooked(peer, &server, &mut hook) => Some(result),
+                        () = server.hung() => None,
+                    };
+                    match result {
+                        Some(Ok(report)) => {
+                            let complete = report.blocked.is_none() && !report.more;
+                            assert_eq!(hook.caught_up, usize::from(complete), "{at}");
+                        }
+                        _ => assert!(hook.caught_up <= 1, "{at}"),
+                    }
+                    server.behave();
+                    assert_counted(&mut peers[who], &at).await;
+                }
+            }
+        }
+        for round in 0.. {
+            assert!(round < 12, "seed {seed}: the devices never stopped sending");
+            let mut moved = false;
+            for (n, peer) in peers.iter_mut().enumerate() {
+                let at = format!("seed {seed} round {round} device {n}");
+                let report = counted_sync(peer, &server, &at).await;
+                moved |= report.sent > 0 || report.received > 0;
+            }
+            if !moved {
+                break;
+            }
+        }
+        assert_converged(&mut peers).await;
     }
 }
 

@@ -147,7 +147,7 @@ pub async fn sync<T: Transport>(
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<SyncReport, Error> {
-    sync_with(conn, replica, transport, credentials, now, &mut ()).await
+    run(conn, replica, transport, credentials, now, &mut (), false).await
 }
 
 /// How [`sync_with`] applies what it receives, and what it does once a pull has read the whole
@@ -159,25 +159,39 @@ pub async fn sync<T: Transport>(
 /// whatever the client writes in that transaction. A write to a synced table is a local edit like
 /// any other, collected by the next apply.
 ///
+/// Some statements end the transaction as a side effect: SQLite answers some failures by rolling
+/// it back, as with `INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)` or a full disk. When a
+/// method returns with the client's transaction ended, even having caught that error, the sync
+/// fails with [`Error::TransactionEnded`] and the cursor does not move; whatever the method wrote
+/// after the transaction ended was committed on its own.
+///
 /// Implement it with `async fn`; the futures must be `Send`.
 pub trait Apply: Send {
     /// Applies a batch of received changes and returns what that did, which is merged into
     /// [`SyncReport::applied`]. By default, `replica.apply(conn, changes)`. An implementation
     /// passes `changes` to [`Replica::apply`] once, may apply again with no changes, and returns
-    /// those applies merged. `changes` may hold this device's own, read back from the log.
+    /// those applies combined with [`merge_applied`].
+    ///
+    /// `changes` may hold this device's own, read back from the log, and may hold changes an
+    /// earlier apply was given: the log can hold a second copy of an envelope, from a server that
+    /// stores an identical envelope twice or from an envelope sealed again after the server
+    /// refused it. Applying a change again is a no-op, so an implementation works from what the
+    /// apply did, such as [`Applied::touched`], and not from the changes it is given.
     ///
     /// It is called for every apply the client makes, including the apply with no changes a sync
     /// makes when it receives nothing: that apply collects local writes and may write rows held
     /// back before, so what it touched need not be empty.
     ///
-    /// In the same transaction, after this returns, the client stores the cursor past `changes`,
-    /// so the rows applied, everything this wrote and the cursor are committed together or not at
-    /// all; once committed, `changes` are not offered again. When this or anything after it in the
-    /// transaction fails, the transaction is rolled back, the cursor stays before `changes`, and
-    /// the sync returns an error, so there is no report. A failure part-way through a pull stops
-    /// the reading, and, as after any failure there, the client applies what it holds once more,
-    /// calling this again with the same changes and keeping what that commits, before it returns
-    /// the first error. The next sync reads whatever was not committed again.
+    /// In the same transaction, after this returns, the client stores the cursor past the
+    /// envelopes `changes` came in, so the rows applied, everything this wrote and the cursor are
+    /// committed together or not at all; once committed, those envelopes are not read again. When
+    /// this or anything after it in the transaction fails, the transaction is rolled back, the
+    /// cursor stays before them, and the sync returns an error, so there is no report. A failure
+    /// part-way through a pull stops the reading, and, as after any failure there, the client
+    /// applies what it holds once more, calling this again with the same changes and keeping what
+    /// that commits, before it returns the first error. The database is rolled back before that
+    /// second call; nothing this kept in `self` during the first is. The next sync reads whatever
+    /// was not committed again.
     fn apply(
         &mut self,
         conn: &mut SqliteConnection,
@@ -229,6 +243,19 @@ pub async fn sync_with<T: Transport, A: Apply>(
     now: impl Fn() -> u64 + Sync,
     apply: &mut A,
 ) -> Result<SyncReport, Error> {
+    run(conn, replica, transport, credentials, now, apply, true).await
+}
+
+/// One sync; `settles` says whether to call [`Apply::caught_up`], which `()` leaves empty.
+async fn run<T: Transport, A: Apply>(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    transport: &T,
+    credentials: &Credentials,
+    now: impl Fn() -> u64 + Sync,
+    apply: &mut A,
+    settles: bool,
+) -> Result<SyncReport, Error> {
     let rpc = Rpc {
         transport,
         now: &now,
@@ -269,12 +296,14 @@ pub async fn sync_with<T: Transport, A: Apply>(
     cursor = pull.read;
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
-    if report.blocked.is_none() && !report.more {
+    if settles && report.blocked.is_none() && !report.more {
         let mut tx = conn.begin().await?;
+        begin_watch(&mut tx).await?;
         let settled = apply.caught_up(&mut tx, replica).await?;
+        end_watch(&mut tx).await?;
         tx.commit().await?;
         if let Some(settled) = settled {
-            merge(&mut report.applied, settled);
+            merge_applied(&mut report.applied, settled);
         }
     }
 
@@ -354,6 +383,24 @@ pub async fn sync_with<T: Transport, A: Apply>(
     Ok(report)
 }
 
+/// Marks the client's transaction before the application's step, so [`end_watch`] can tell whether
+/// the step ended it.
+async fn begin_watch(conn: &mut SqliteConnection) -> Result<(), Error> {
+    sqlx::query("SAVEPOINT fongo_client_watch")
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Fails when the transaction [`begin_watch`] marked has ended: its savepoint is gone with it.
+async fn end_watch(conn: &mut SqliteConnection) -> Result<(), Error> {
+    sqlx::query("RELEASE fongo_client_watch")
+        .execute(conn)
+        .await
+        .map_err(|_| Error::TransactionEnded)?;
+    Ok(())
+}
+
 /// The replica received changes are applied to, and how.
 struct Applier<'a, A> {
     replica: &'a Replica,
@@ -389,7 +436,10 @@ impl Pull {
         let replica = applier.replica;
         let mut tx = conn.begin().await?;
         let applied = if collect || !self.held.is_empty() {
-            Some(applier.apply.apply(&mut tx, replica, &self.held).await?)
+            begin_watch(&mut tx).await?;
+            let applied = applier.apply.apply(&mut tx, replica, &self.held).await?;
+            end_watch(&mut tx).await?;
+            Some(applied)
         } else {
             None
         };
@@ -407,7 +457,7 @@ impl Pull {
         if let Some(applied) = applied {
             self.applied = true;
             report.received += self.held.len();
-            merge(&mut report.applied, applied);
+            merge_applied(&mut report.applied, applied);
         }
         self.held.clear();
         Ok(())
@@ -739,7 +789,15 @@ fn varint_len(mut n: usize) -> usize {
     len
 }
 
-fn merge(into: &mut Applied, from: Applied) {
+/// Adds what a later apply did to what earlier ones did, as [`SyncReport::applied`] is built.
+///
+/// - `accepted` is summed and `conflicts` appended.
+/// - `waiting` and `held` are taken from `from`: each apply reports every entity still held, so
+///   the later report replaces the earlier.
+/// - `touched` lists keys in the order they were first touched, each key's entries together.
+///   Within a key it holds one entry per entity, that entity's last, in the order those entries
+///   came, so the entities that left a key come before the one it was left holding.
+pub fn merge_applied(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
     into.held = from.held;
@@ -845,8 +903,8 @@ mod tests {
         ];
         for (first, second, want) in cases {
             let mut report = Applied::default();
-            merge(&mut report, touched(first));
-            merge(&mut report, touched(second));
+            merge_applied(&mut report, touched(first));
+            merge_applied(&mut report, touched(second));
             assert_eq!(
                 report.touched,
                 touched(want).touched,

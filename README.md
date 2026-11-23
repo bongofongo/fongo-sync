@@ -59,6 +59,9 @@ by depending on it.
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
 does not hold yet, applies the rest, then seals and appends the outbox. Credentials stay with the application; the client stores only its cursor,
 the envelope it is sending and where its recent envelopes landed, in tables of its own.
+`sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
+application derives from the rows an apply touched is committed with them and the cursor, and that
+is called once a pull has read the whole log, before the outbox is sent.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 
