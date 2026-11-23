@@ -65,6 +65,7 @@ pub struct Target {
 /// Where a live group's state came from: which writes made its members, and which put each
 /// field's value in its row. A clock names the replica that issued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Origin {
     /// The earliest of the writes that made the live members. Each live member's `$deleted`
     /// holds the `Int(0)` that [`crate::plan::record`] wrote when a row was last inserted for
@@ -72,7 +73,9 @@ pub struct Origin {
     pub made: Option<Hlc>,
     /// The clock of the write behind each field of the target's row: the strategy winner among
     /// the live members, or for a field in a `together` set the latest write to the set. A field
-    /// no such write covers is absent.
+    /// no such write covers is absent. A natural key's key field counts only its earliest
+    /// [`crate::model::KEY_ENTRIES`] writes, so its clock is the latest of those holding the key,
+    /// not necessarily the latest making.
     pub fields: BTreeMap<String, Hlc>,
 }
 

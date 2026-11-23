@@ -99,14 +99,16 @@ pub enum Made {
     Here,
     /// Another replica, or one this replica cannot name yet.
     Elsewhere,
-    /// No replica: the entity, or one merged with it, was a row found when its collection was
-    /// first installed.
+    /// No replica: the making that counts is a row found when its collection was first
+    /// installed. It is known by a clock with wall time 0, so a making on a machine whose clock
+    /// read the epoch or earlier is taken for one.
     Adopted,
 }
 
 /// What a replica holds, in a form that does not depend on how it is stored, so tests can compare
 /// it with what it should hold. Every list is sorted.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Inspection {
     /// This replica's id: the node of every clock it issues.
     pub node: Option<Gid>,
@@ -1211,7 +1213,9 @@ impl Replica {
     }
 
     /// An entity's merged field values, following its alias group, with `$deleted` among them.
-    /// Empty when nothing is known of it.
+    /// Empty when nothing is known of it. Each field is picked on its own, so for a field in a
+    /// set that changes together whose latest write has only partly arrived, it can show a value
+    /// the row does not: the row, like [`Replica::written_here`], takes the set's latest write.
     pub async fn merged(
         &self,
         conn: &mut SqliteConnection,
@@ -1250,19 +1254,28 @@ impl Replica {
     /// changes agree and at most one answers [`Made::Here`]. `None` when no member of its group
     /// is live, nothing is known of it, or its group is past what the kernel evaluates.
     ///
-    /// An entity is made by the replica that inserted a row for it. A natural key's entity can
-    /// be made more than once, by replicas that insert a row at the key independently or after
-    /// its removal; it was made by whichever did so last, by clock. A group of entities merged
-    /// by identity or alias was made by whoever made the earliest of its live members, whichever
-    /// row each replica keeps for it. A row found when a collection was first installed was made
-    /// by no replica: it, and any group it joins, is [`Made::Adopted`] on every replica, and
-    /// [`Replica::written_here`] is the question to ask of it. Values adopted for a field the
-    /// registry gains later leave the answer as it was.
+    /// Each entity was made by the replica that last inserted a row for it, by clock. A minted
+    /// entity gets a row inserted once; a natural key's entity gets one each time a replica
+    /// inserts a row at the key, independently or after its removal, so a natural row found
+    /// when its collection was first installed and inserted since elsewhere was made by that
+    /// replica. A group of entities merged by identity or alias was made by the maker of its
+    /// earliest-made live member, whichever row each replica keeps for it. Where that making is
+    /// a row found when its collection was first installed, the group was made by no replica:
+    /// it is [`Made::Adopted`] on every replica, and [`Replica::written_here`] is the question to
+    /// ask of it. Values adopted for a field the registry gains later leave the answer as it was.
     ///
     /// While changes are in flight a replica answers from what it holds: a member whose making
     /// has not arrived makes the answer [`Made::Elsewhere`], and a replica that made a member
     /// answers [`Made::Here`] until the making of an earlier member reaches it, so two replicas
     /// can both answer it until each holds the other's.
+    ///
+    /// Nothing guarantees that any replica answers [`Made::Here`]. The maker may be gone, may no
+    /// longer register the collection, or may have uninstalled and installed again, which gives
+    /// it a new id and adopts its rows afresh, so a group with an identity becomes
+    /// [`Made::Adopted`]. An application that waits for the maker to act needs its own way on
+    /// for a maker that never does.
+    ///
+    /// Read in one savepoint, so from one state of the database.
     pub async fn made(
         &self,
         conn: &mut SqliteConnection,
@@ -1270,15 +1283,17 @@ impl Replica {
         gid: Gid,
     ) -> Result<Option<Made>> {
         with_db(conn, |db| {
-            let Some(origin) = self.origin_in(db, collection, gid)? else {
-                return Ok(None);
-            };
-            let node = node_of(db)?;
-            Ok(Some(match origin.made {
-                Some(clock) if clock.wall_ms == 0 => Made::Adopted,
-                Some(clock) if clock.node == node => Made::Here,
-                _ => Made::Elsewhere,
-            }))
+            db.atomically(|db| {
+                let Some(origin) = self.origin_in(db, collection, gid)? else {
+                    return Ok(None);
+                };
+                let node = node_of(db)?;
+                Ok(Some(match origin.made {
+                    Some(clock) if clock.wall_ms == 0 => Made::Adopted,
+                    Some(clock) if clock.node == node => Made::Here,
+                    _ => Made::Elsewhere,
+                }))
+            })
         })
         .await
     }
@@ -1291,8 +1306,14 @@ impl Replica {
     /// member is live, the field is not declared, no live member has a write to it, or the group
     /// is past what the kernel evaluates.
     ///
+    /// A natural key's key fields keep only their earliest few writes
+    /// ([`fongo_sync_core::model::KEY_ENTRIES`]), so for a key field the answer names the latest
+    /// of those that holds the key, which can be an earlier maker than [`Replica::made`] names.
+    ///
     /// While changes are in flight a replica answers from what it holds: two replicas that
     /// wrote the field concurrently both answer `true` until each holds the other's write.
+    ///
+    /// Read in one savepoint, so from one state of the database.
     pub async fn written_here(
         &self,
         conn: &mut SqliteConnection,
@@ -1301,11 +1322,13 @@ impl Replica {
         field: &str,
     ) -> Result<Option<bool>> {
         with_db(conn, |db| {
-            let Some(origin) = self.origin_in(db, collection, gid)? else {
-                return Ok(None);
-            };
-            let node = node_of(db)?;
-            Ok(origin.fields.get(field).map(|clock| clock.node == node))
+            db.atomically(|db| {
+                let Some(origin) = self.origin_in(db, collection, gid)? else {
+                    return Ok(None);
+                };
+                let node = node_of(db)?;
+                Ok(origin.fields.get(field).map(|clock| clock.node == node))
+            })
         })
         .await
     }

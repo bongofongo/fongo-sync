@@ -4,13 +4,14 @@
 
 mod support;
 
-use fongo_sync_sqlite::core::{Change, Gid, Value};
+use fongo_sync_sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_sqlite::{Collection, Held, Made, Registry};
 use support::peer::{Peer, later, make, same_everywhere, settle};
 
 const SHELVES: &[&str] = &[
     "CREATE TABLE shelves (id INTEGER PRIMARY KEY, name TEXT UNIQUE, note TEXT)",
     "CREATE TABLE settings (key TEXT NOT NULL PRIMARY KEY, value TEXT)",
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, status TEXT, finished TEXT)",
 ];
 
 fn shelves() -> Registry {
@@ -22,6 +23,10 @@ fn shelves() -> Registry {
         Collection::natural("settings", "settings", &["key"])
             .field("key")
             .field("value"),
+        Collection::minted("books", "books", "id")
+            .field("status")
+            .field("finished")
+            .together(&["status", "finished"]),
     ])
     .unwrap()
 }
@@ -55,6 +60,25 @@ async fn written(peer: &mut Peer, collection: &str, gid: Gid, field: &str) -> Op
         .written_here(&mut peer.conn, collection, gid, field)
         .await
         .unwrap()
+}
+
+fn theme() -> Gid {
+    Gid::derive("settings", &[Value::Text("theme".into())])
+}
+
+/// A change from a replica outside the test, at a chosen clock.
+fn from_elsewhere(collection: &str, gid: Gid, field: &str, value: Value, wall_ms: u64) -> Change {
+    Change {
+        collection: collection.into(),
+        gid,
+        field: field.into(),
+        value,
+        clock: Hlc {
+            wall_ms,
+            counter: 1,
+            node: Gid([7; 16]),
+        },
+    }
 }
 
 async fn gid_at(peer: &mut Peer, collection: &str, key: &str) -> Gid {
@@ -385,6 +409,217 @@ async fn a_local_id_taken_again_names_the_new_entity_and_its_maker() {
         made(&mut peers[1], "shelves", mine).await,
         Some(Made::Elsewhere)
     );
+}
+
+#[tokio::test]
+async fn a_member_removed_before_its_group_formed_does_not_count_as_its_maker() {
+    let mut peers = make(3, SHELVES, shelves).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO shelves (name) VALUES ('fiction')")
+        .await;
+    let first = peers[0].push(&mut hub).await[0].gid;
+    peers[2].pull(&hub).await;
+    later();
+    peers[1]
+        .run("INSERT INTO shelves (name) VALUES ('fiction')")
+        .await;
+    let second = peers[1].push(&mut hub).await[0].gid;
+    peers[1].sync(&mut hub).await;
+    // The third replica removes the first shelf without knowing of the second, so the group
+    // keeps a member that is not live.
+    later();
+    peers[2].run("DELETE FROM shelves").await;
+    peers[2].push(&mut hub).await;
+    settle(&mut peers, &mut hub).await;
+    same_everywhere(&mut peers, "SELECT name FROM shelves").await;
+    let mut answers = Vec::new();
+    for peer in peers.iter_mut() {
+        answers.push(made(peer, "shelves", first).await);
+        assert_eq!(
+            made(peer, "shelves", second).await,
+            *answers.last().unwrap()
+        );
+    }
+    assert_eq!(
+        answers,
+        [
+            Some(Made::Elsewhere),
+            Some(Made::Here),
+            Some(Made::Elsewhere)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_field_in_a_set_was_written_by_the_sets_latest_write_even_half_delivered() {
+    let mut peers = make(2, SHELVES, shelves).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO books (status, finished) VALUES ('done', 'monday')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let gid = peers[0].gid("books", 1).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'again', finished = 'friday'")
+        .await;
+    let sent = peers[1].push(&mut hub).await;
+    let (status, finished): (Vec<Change>, Vec<Change>) =
+        sent.into_iter().partition(|c| c.field == "status");
+    assert_eq!(finished.len(), 1);
+    peers[0].apply(&status).await;
+    // `merged` picks the field alone and still shows the first write; the row and the answer
+    // follow the set, whose latest write is the second replica's.
+    let merged = {
+        let peer = &mut peers[0];
+        peer.replica
+            .merged(&mut peer.conn, "books", gid)
+            .await
+            .unwrap()
+    };
+    assert_eq!(merged["finished"], Value::Text("monday".into()));
+    assert_eq!(
+        peers[0]
+            .lines("SELECT status || ' ' || COALESCE(finished, 'null') FROM books")
+            .await,
+        ["again null"]
+    );
+    assert_eq!(
+        written(&mut peers[0], "books", gid, "status").await,
+        Some(false)
+    );
+    assert_eq!(
+        written(&mut peers[0], "books", gid, "finished").await,
+        Some(false)
+    );
+    assert_eq!(
+        written(&mut peers[1], "books", gid, "finished").await,
+        Some(true)
+    );
+    peers[0].apply(&finished).await;
+    assert_eq!(
+        written(&mut peers[0], "books", gid, "finished").await,
+        Some(false)
+    );
+    assert_eq!(
+        peers[0]
+            .lines("SELECT status || ' ' || finished FROM books")
+            .await,
+        ["again friday"]
+    );
+}
+
+#[tokio::test]
+async fn a_natural_row_found_at_install_and_made_since_elsewhere_was_made_there() {
+    let mut first = Peer::bare(SHELVES, shelves()).await;
+    first
+        .run("INSERT INTO settings VALUES ('theme', 'dark')")
+        .await;
+    first.install().await;
+    let mut peers = vec![first, Peer::new(SHELVES, shelves()).await];
+    later();
+    peers[1]
+        .run("INSERT INTO settings VALUES ('theme', 'light')")
+        .await;
+    let mut hub = Vec::new();
+    settle(&mut peers, &mut hub).await;
+    let answers = [
+        made(&mut peers[0], "settings", theme()).await,
+        made(&mut peers[1], "settings", theme()).await,
+    ];
+    assert_eq!(answers, [Some(Made::Elsewhere), Some(Made::Here)]);
+}
+
+#[tokio::test]
+async fn a_natural_key_made_five_times_names_its_last_maker_and_an_earlier_key_writer() {
+    let mut peers = make(5, SHELVES, shelves).await;
+    let mut hub = Vec::new();
+    for i in 0..5 {
+        later();
+        peers[i]
+            .run("INSERT INTO settings VALUES ('theme', 'dark')")
+            .await;
+        settle(&mut peers, &mut hub).await;
+        if i < 4 {
+            later();
+            peers[i].run("DELETE FROM settings").await;
+            settle(&mut peers, &mut hub).await;
+        }
+    }
+    let (mut makers, mut values, mut keys) = (Vec::new(), Vec::new(), Vec::new());
+    for peer in peers.iter_mut() {
+        makers.push(made(peer, "settings", theme()).await == Some(Made::Here));
+        values.push(written(peer, "settings", theme(), "value").await == Some(true));
+        keys.push(written(peer, "settings", theme(), "key").await == Some(true));
+    }
+    assert_eq!(makers, [false, false, false, false, true]);
+    assert_eq!(values, [false, false, false, false, true]);
+    // Only the earliest four writes to a key field count.
+    assert_eq!(keys, [false, false, false, true, false]);
+}
+
+#[tokio::test]
+async fn a_maker_that_installs_again_leaves_no_replica_that_made_its_rows() {
+    let mut peers = make(2, SHELVES, shelves).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO settings VALUES ('theme', 'dark')")
+        .await;
+    peers[0]
+        .run("INSERT INTO shelves (name) VALUES ('fiction')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let shelf = peers[0].gid("shelves", 1).await;
+    assert_eq!(
+        made(&mut peers[0], "settings", theme()).await,
+        Some(Made::Here)
+    );
+    let replica = peers[0].replica.clone();
+    replica.uninstall(&mut peers[0].conn).await.unwrap();
+    // A fresh join: what it held before is unknown to its new self.
+    peers[0].taken.clear();
+    peers[0].cursor = 0;
+    peers[0].writes = Default::default();
+    later();
+    peers[0].install().await;
+    settle(&mut peers, &mut hub).await;
+    for peer in peers.iter_mut() {
+        assert_eq!(made(peer, "settings", theme()).await, Some(Made::Elsewhere));
+        assert_eq!(made(peer, "shelves", shelf).await, Some(Made::Adopted));
+    }
+}
+
+#[tokio::test]
+async fn a_making_at_wall_time_zero_reads_as_adopted() {
+    let mut peer = Peer::new(SHELVES, shelves()).await;
+    let gid = Gid([5; 16]);
+    peer.apply(&[
+        from_elsewhere("shelves", gid, "$deleted", Value::Int(0), 0),
+        from_elsewhere("shelves", gid, "name", Value::Text("x".into()), 0),
+    ])
+    .await;
+    assert_eq!(made(&mut peer, "shelves", gid).await, Some(Made::Adopted));
+}
+
+#[tokio::test]
+async fn the_reads_write_nothing() {
+    let mut peers = make(2, SHELVES, shelves).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO shelves (name) VALUES ('fiction')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    let gid = peers[0].gid("shelves", 1).await;
+    let changes = "SELECT total_changes()";
+    let before = peers[1].int(changes).await;
+    for _ in 0..3 {
+        made(&mut peers[1], "shelves", gid).await;
+        written(&mut peers[1], "shelves", gid, "name").await;
+        made(&mut peers[1], "nothing", gid).await;
+        made(&mut peers[1], "settings", gid).await;
+    }
+    assert_eq!(peers[1].int(changes).await, before);
 }
 
 /// The open items under a parent, in id order.

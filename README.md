@@ -35,7 +35,10 @@ When two replicas each make a row that is valid alone and together break a rule 
 application's own, such as a partial unique index, the kernel holds one of them back and the
 application settles it. `Replica::made` says which replica made an entity and
 `Replica::written_here` whether this replica wrote the value a field shows, each read from the
-merged changes alone, so that one replica decides and the others wait for its write.
+merged changes alone, so that one replica decides and the others wait for its write. Nothing
+guarantees the maker ever acts: it may be gone, may no longer register the collection, or may
+have uninstalled and installed again under a new id, so an application that waits for it needs
+its own way on.
 
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as

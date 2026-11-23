@@ -6,7 +6,7 @@ use common::{
 };
 use std::collections::BTreeMap;
 
-use fongo_sync_core::eval::{Evaluator, Limits, Origin, Undetermined};
+use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
 use fongo_sync_core::model::{ALIAS, Collection, Merge as Merged, Schema, View, merge, view};
 use fongo_sync_core::source::{Source, Store};
 use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value, wins};
@@ -19,6 +19,9 @@ fn store(schema: &Schema, changes: &[Change]) -> Store {
     }
     store
 }
+
+/// `Session::origin`'s `made` and `fields`.
+type Origin = (Option<Hlc>, BTreeMap<String, Hlc>);
 
 /// Where the group `canonical` came from, read off the model: the earliest making among its live
 /// members, and for each field the clock of the write `model::view` shows.
@@ -68,7 +71,7 @@ fn origin(schema: &Schema, merged: &Merged, collection: &str, canonical: Gid) ->
             fields.insert(f.name.clone(), clock);
         }
     }
-    Some(Origin { made, fields })
+    Some((made, fields))
 }
 
 /// Asks about every mentioned gid in every collection, in one session, and checks each answer
@@ -91,7 +94,10 @@ fn agrees(schema: &Schema, changes: &[Change]) -> Result<(), TestCaseError> {
             prop_assert!(t.members.contains(&g));
             prop_assert_eq!(t.canonical, t.members[0]);
             prop_assert_eq!(
-                session.origin(&c.name, g).unwrap(),
+                session
+                    .origin(&c.name, g)
+                    .unwrap()
+                    .map(|o| (o.made, o.fields)),
                 origin(schema, &merged, &c.name, t.canonical)
             );
             prop_assert!(t.live.iter().all(|m| t.members.contains(m)));
