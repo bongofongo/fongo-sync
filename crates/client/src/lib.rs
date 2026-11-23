@@ -1,5 +1,7 @@
 //! A device's side of a synced library: creating and joining a library, and [`sync`], one round
 //! of reading what other devices sent, applying it, and sending this device's own changes.
+//! [`sync_with`] lets the application do work of its own in the transaction of each apply, and
+//! once a pull has read the whole log.
 //!
 //! The crate picks no HTTP client and no async runtime. An application implements [`Transport`]
 //! over whatever HTTP client it uses; every request and response is plain bytes and headers, and
@@ -40,5 +42,5 @@ pub use fongo_sync_sqlite as sqlite;
 pub use library::{add_device, create_library, join_library};
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::cursor;
-pub use sync::{Blocked, Refusal, Refused, SyncReport, sync};
+pub use sync::{Apply, Blocked, Refusal, Refused, SyncReport, sync, sync_with};
 pub use transport::{Method, Request, Response, Transport, TransportError};

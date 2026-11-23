@@ -147,6 +147,88 @@ pub async fn sync<T: Transport>(
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<SyncReport, Error> {
+    sync_with(conn, replica, transport, credentials, now, &mut ()).await
+}
+
+/// How [`sync_with`] applies what it receives, and what it does once a pull has read the whole
+/// log. [`sync`] uses `()`, which keeps both defaults.
+///
+/// Both methods are given the connection inside a transaction the client opened, and must neither
+/// commit nor roll it back; a savepoint of their own is fine, as [`Replica::apply`] makes one.
+/// Everything they write there is the application's, and is committed or rolled back with
+/// whatever the client writes in that transaction. A write to a synced table is a local edit like
+/// any other, collected by the next apply.
+///
+/// Implement it with `async fn`; the futures must be `Send`.
+pub trait Apply: Send {
+    /// Applies a batch of received changes and returns what that did, which is merged into
+    /// [`SyncReport::applied`]. By default, `replica.apply(conn, changes)`. An implementation
+    /// passes `changes` to [`Replica::apply`] once, may apply again with no changes, and returns
+    /// those applies merged. `changes` may hold this device's own, read back from the log.
+    ///
+    /// It is called for every apply the client makes, including the apply with no changes a sync
+    /// makes when it receives nothing: that apply collects local writes and may write rows held
+    /// back before, so what it touched need not be empty.
+    ///
+    /// In the same transaction, after this returns, the client stores the cursor past `changes`,
+    /// so the rows applied, everything this wrote and the cursor are committed together or not at
+    /// all; once committed, `changes` are not offered again. When this or anything after it in the
+    /// transaction fails, the transaction is rolled back, the cursor stays before `changes`, and
+    /// the sync returns an error, so there is no report. A failure part-way through a pull stops
+    /// the reading, and, as after any failure there, the client applies what it holds once more,
+    /// calling this again with the same changes and keeping what that commits, before it returns
+    /// the first error. The next sync reads whatever was not committed again.
+    fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> impl Future<Output = Result<Applied, Error>> + Send {
+        async move { Ok(replica.apply(conn, changes).await?) }
+    }
+
+    /// Called once in a sync whose pull read to the head of the log, after its last apply and
+    /// before the outbox is sent, even when nothing was received. It is not called when the pull
+    /// stopped with more waiting ([`SyncReport::more`]), stopped at an envelope it is blocked at
+    /// ([`SyncReport::blocked`]), or failed. By default it does nothing and returns `None`.
+    ///
+    /// It runs in a transaction of its own, begun once the transaction that stored the cursor at
+    /// the end of the pull has committed, so nothing it writes is atomic with the cursor. What it
+    /// returns is merged into [`SyncReport::applied`]. An apply it makes with no changes,
+    /// `replica.apply(conn, &[])`, collects what it wrote to synced tables, and this sync sends
+    /// that.
+    ///
+    /// When it fails, its transaction is rolled back and the sync returns the error without
+    /// sending the outbox; what the pull applied, and the cursor, stay. Since a failure or a crash
+    /// can come between the pull's commit and this one, the next sync that reads to the head
+    /// calls it again: it should act on the database as it stands, not on what one pull touched.
+    fn caught_up(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+    ) -> impl Future<Output = Result<Option<Applied>, Error>> + Send {
+        let _ = (conn, replica);
+        async { Ok(None) }
+    }
+}
+
+impl Apply for () {}
+
+/// [`sync`], with the application's own [`Apply`] in place of [`Replica::apply`] alone. Nothing
+/// else changes: the order of pull and append, the cursor, and the conflict bases are as `sync`
+/// keeps them.
+///
+/// What the client guarantees about atomicity with its cursor: what [`Apply::apply`] writes is
+/// committed in one transaction with the changes it applied and the cursor past them, and with the
+/// client's other writes there; what [`Apply::caught_up`] writes is committed on its own.
+pub async fn sync_with<T: Transport, A: Apply>(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    transport: &T,
+    credentials: &Credentials,
+    now: impl Fn() -> u64 + Sync,
+    apply: &mut A,
+) -> Result<SyncReport, Error> {
     let rpc = Rpc {
         transport,
         now: &now,
@@ -168,10 +250,11 @@ pub async fn sync<T: Transport>(
         sending: saved.sending,
         landed: None,
     };
+    let mut applier = Applier { replica, apply };
     let pulled = read_pages(
         &rpc,
         conn,
-        replica,
+        &mut applier,
         &mut keys,
         limit,
         &mut pull,
@@ -180,11 +263,20 @@ pub async fn sync<T: Transport>(
     .await;
     let collect = !pull.applied;
     let committed = pull
-        .commit(conn, replica, library, &mut report, collect)
+        .commit(conn, &mut applier, library, &mut report, collect)
         .await;
     pulled.and(committed)?;
     cursor = pull.read;
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
+
+    if report.blocked.is_none() && !report.more {
+        let mut tx = conn.begin().await?;
+        let settled = apply.caught_up(&mut tx, replica).await?;
+        tx.commit().await?;
+        if let Some(settled) = settled {
+            merge(&mut report.applied, settled);
+        }
+    }
 
     if let Some(sending) = pull.sending.take() {
         let ours = Envelope::decode(&sending.envelope)
@@ -262,6 +354,12 @@ pub async fn sync<T: Transport>(
     Ok(report)
 }
 
+/// The replica received changes are applied to, and how.
+struct Applier<'a, A> {
+    replica: &'a Replica,
+    apply: &'a mut A,
+}
+
 /// Where reading the log stands: envelopes through `read` are dealt with, and `held` has the
 /// changes among them not yet applied. `appended` lists where this database's own appends landed
 /// past `read`.
@@ -280,17 +378,18 @@ impl Pull {
     /// Applies what is held and stores the cursor at `read`, in one transaction. With `collect`
     /// it applies even when nothing is held, so local writes are collected. The bases of local
     /// edits sent in envelopes at or before `read` are then released.
-    async fn commit(
+    async fn commit<A: Apply>(
         &mut self,
         conn: &mut SqliteConnection,
-        replica: &Replica,
+        applier: &mut Applier<'_, A>,
         library: fongo_sync_protocol::LibraryId,
         report: &mut SyncReport,
         collect: bool,
     ) -> Result<(), Error> {
+        let replica = applier.replica;
         let mut tx = conn.begin().await?;
         let applied = if collect || !self.held.is_empty() {
-            Some(replica.apply(&mut tx, &self.held).await?)
+            Some(applier.apply.apply(&mut tx, replica, &self.held).await?)
         } else {
             None
         };
@@ -317,10 +416,10 @@ impl Pull {
 
 /// Reads pages after `pull.read` until the log ends, an unlisted signer blocks, or the page limit.
 /// Stores the cursor after each page unless changes are held to be applied together.
-async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
+async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     rpc: &Rpc<'_, T, N>,
     conn: &mut SqliteConnection,
-    replica: &Replica,
+    applier: &mut Applier<'_, A>,
     keys: &mut Keys<'_>,
     limit: u32,
     pull: &mut Pull,
@@ -375,14 +474,14 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync>(
             // A change after this device's own envelope may have been made knowing its edits,
             // so what came before is compared with their bases, and then the bases released.
             if pull.appended.remove(&batch.seq) {
-                pull.commit(conn, replica, library, report, false).await?;
+                pull.commit(conn, applier, library, report, false).await?;
             }
         }
         if !page.more {
             return Ok(());
         }
         if pull.held.is_empty() || pull.held.len() >= APPLY_CHUNK {
-            pull.commit(conn, replica, library, report, false).await?;
+            pull.commit(conn, applier, library, report, false).await?;
         }
     }
     report.more = true;

@@ -45,6 +45,9 @@ pub enum Error {
     Randomness,
     #[error("database: {0}")]
     Database(#[from] fongo_sync_sqlite::Error),
+    /// The application's own step, given through [`crate::Apply`], failed.
+    #[error("the application's step failed: {0}")]
+    Application(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<sqlx::Error> for Error {
