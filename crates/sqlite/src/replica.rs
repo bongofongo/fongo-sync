@@ -100,8 +100,9 @@ pub enum Made {
     /// Another replica, or one this replica cannot name yet.
     Elsewhere,
     /// No replica: the making that counts is a row found when its collection was first
-    /// installed. It is known by a clock with wall time 0, so a making on a machine whose clock
-    /// read the epoch or earlier is taken for one.
+    /// installed. It is known by a clock with wall time 0, so a making whose clock reads exactly
+    /// 0 is taken for one; a making stamped before the epoch may be, since its replica ticks from
+    /// 0 and reads 0 only if its clock has never moved past it.
     Adopted,
 }
 
@@ -1275,7 +1276,9 @@ impl Replica {
     /// [`Made::Adopted`]. An application that waits for the maker to act needs its own way on
     /// for a maker that never does.
     ///
-    /// Read in one savepoint, so from one state of the database.
+    /// Read in one savepoint, so from one state of the database. The savepoint holds a read lock
+    /// while it lasts: in rollback-journal mode another connection's write waits for it, or fails
+    /// at once with no busy timeout; in WAL mode writers are not blocked.
     pub async fn made(
         &self,
         conn: &mut SqliteConnection,
@@ -1313,7 +1316,9 @@ impl Replica {
     /// While changes are in flight a replica answers from what it holds: two replicas that
     /// wrote the field concurrently both answer `true` until each holds the other's write.
     ///
-    /// Read in one savepoint, so from one state of the database.
+    /// Read in one savepoint, so from one state of the database. The savepoint holds a read lock
+    /// while it lasts: in rollback-journal mode another connection's write waits for it, or fails
+    /// at once with no busy timeout; in WAL mode writers are not blocked.
     pub async fn written_here(
         &self,
         conn: &mut SqliteConnection,
