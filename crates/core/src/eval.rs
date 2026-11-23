@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::change::{DELETED, wins};
 use crate::clock::Hlc;
-use crate::model::{Collection, FieldKind, Identity, Row, Schema};
+use crate::model::{Collection, Field, FieldKind, Identity, Row, Schema};
 use crate::source::{Alias, Slot, Source, slot};
 use crate::total::{Total, same_row};
 use crate::value::{Gid, Value};
@@ -60,6 +60,20 @@ pub struct Target {
     pub live: Vec<Gid>,
     /// The row `model::view` shows under `canonical`; `Some` exactly when a member is live.
     pub row: Option<Row>,
+}
+
+/// Where a live group's state came from: which writes made its members, and which put each
+/// field's value in its row. A clock names the replica that issued it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The earliest of the writes that made the live members. Each live member's `$deleted`
+    /// holds the `Int(0)` that [`crate::plan::record`] wrote when a row was last inserted for
+    /// it. `None` while some live member's is not among the facts.
+    pub made: Option<Hlc>,
+    /// The clock of the write behind each field of the target's row: the strategy winner among
+    /// the live members, or for a field in a `together` set the latest write to the set. A field
+    /// no such write covers is absent.
+    pub fields: BTreeMap<String, Hlc>,
 }
 
 impl PartialEq for Target {
@@ -176,6 +190,9 @@ struct Group {
 
 type Answer<T> = Result<T, Undetermined>;
 
+/// A field, the value a row shows for it, and the clock of the write behind that value.
+type Shown<'a> = (&'a Field, Option<Value>, Option<Hlc>);
+
 /// Questions about one source, sharing a cache. Every cached answer is exact, so the cache changes
 /// how much work a question takes but never its answer.
 pub struct Session<'a, S> {
@@ -189,7 +206,7 @@ pub struct Session<'a, S> {
     targets: BTreeMap<Gid, Answer<Rc<Target>>>,
 }
 
-impl<S: Source> Session<'_, S> {
+impl<'a, S: Source> Session<'a, S> {
     /// The target of the group `gid` belongs to in `collection`, as `model::view` of the changes
     /// behind the source would show it.
     ///
@@ -257,11 +274,30 @@ impl<S: Source> Session<'_, S> {
     }
 
     fn present(&mut self, home: usize, live: &[Gid]) -> Answer<Row> {
-        let coll = &self.schema.collections[home];
+        let schema = self.schema;
+        let coll = &schema.collections[home];
         crate::work::add(live.len() * (coll.fields.len() + 1));
-        let infos: Vec<Rc<Info>> = live.iter().map(|&m| self.info(m)).collect::<Answer<_>>()?;
         let mut row = Row::new();
+        for (f, value, _) in self.shown(home, live)? {
+            let value = match value {
+                Some(v) => self.read(&f.kind, &v)?,
+                None => Value::Null,
+            };
+            row.insert(f.name.clone(), value);
+        }
+        Ok(row)
+    }
+
+    /// Each field of a group with live members `live`, the value its row shows before references
+    /// are read, and the clock of the write behind it: the strategy winner among the live
+    /// members, or for a `together` set the latest write to the set, whose fields it did not
+    /// write show NULL. A field no live member has written has neither.
+    fn shown(&mut self, home: usize, live: &[Gid]) -> Answer<Vec<Shown<'a>>> {
+        let schema = self.schema;
+        let coll = &schema.collections[home];
+        let infos: Vec<Rc<Info>> = live.iter().map(|&m| self.info(m)).collect::<Answer<_>>()?;
         let in_together = |name: &str| coll.together.iter().any(|s| s.iter().any(|f| f == name));
+        let mut out = Vec::with_capacity(coll.fields.len());
         for f in coll.fields.iter().filter(|f| !in_together(&f.name)) {
             let mut best: Option<&(Value, Hlc)> = None;
             for info in &infos {
@@ -271,11 +307,7 @@ impl<S: Source> Session<'_, S> {
                     best = Some(entry);
                 }
             }
-            let value = match best {
-                Some((v, _)) => self.read(&f.kind, v)?,
-                None => Value::Null,
-            };
-            row.insert(f.name.clone(), value);
+            out.push((f, best.map(|(v, _)| v.clone()), best.map(|(_, k)| *k)));
         }
         for set in &coll.together {
             let mut best: Option<(Hlc, usize)> = None;
@@ -291,23 +323,52 @@ impl<S: Source> Session<'_, S> {
                 }
             }
             for name in set {
-                let kind = &coll
+                let f = coll
                     .fields
                     .iter()
                     .find(|f| &f.name == name)
-                    .expect("checked schema")
-                    .kind;
-                let value = match best {
-                    Some((at, i)) => match infos[i].registers.get(name) {
-                        Some((v, k)) if *k == at => self.read(kind, v)?,
-                        _ => Value::Null,
-                    },
-                    None => Value::Null,
-                };
-                row.insert(name.clone(), value);
+                    .expect("checked schema");
+                let value = best.and_then(|(at, i)| match infos[i].registers.get(name) {
+                    Some((v, k)) if *k == at => Some(v.clone()),
+                    _ => None,
+                });
+                out.push((f, value, best.map(|(at, _)| at)));
             }
         }
-        Ok(row)
+        Ok(out)
+    }
+
+    /// Where the target of the group `gid` belongs to in `collection` comes from, or `None` when
+    /// no member is live; see [`Origin`]. A function of the same facts as the target.
+    pub fn origin(&mut self, collection: &str, gid: Gid) -> Answer<Option<Origin>> {
+        let target = self.shared(collection, gid)?;
+        let Some(home) = self
+            .schema
+            .collections
+            .iter()
+            .position(|c| c.name == collection)
+            .filter(|_| !target.live.is_empty())
+        else {
+            return Ok(None);
+        };
+        let mut made: Option<Hlc> = None;
+        let mut whole = true;
+        for &m in &target.live {
+            match self.info(m)?.registers.get(DELETED) {
+                Some((Value::Int(0), k)) => made = Some(made.map_or(*k, |f| f.min(*k))),
+                _ => whole = false,
+            }
+        }
+        let mut fields = BTreeMap::new();
+        for (f, _, clock) in self.shown(home, &target.live)? {
+            if let Some(clock) = clock {
+                fields.insert(f.name.clone(), clock);
+            }
+        }
+        Ok(Some(Origin {
+            made: made.filter(|_| whole),
+            fields,
+        }))
     }
 
     fn read(&mut self, kind: &FieldKind, value: &Value) -> Answer<Value> {

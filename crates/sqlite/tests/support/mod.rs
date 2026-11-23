@@ -24,8 +24,8 @@ pub mod writes;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_sqlite::core::model::{self, Merge, Row, View};
-use fongo_sync_sqlite::core::{Change, Gid, Hlc, Value};
-use fongo_sync_sqlite::{Collection, Key, Kind, Registry, Replica};
+use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Value, wins};
+use fongo_sync_sqlite::{Collection, Key, Kind, Made, Registry, Replica};
 use sqlx::SqliteConnection;
 
 pub(crate) async fn rows(
@@ -97,6 +97,8 @@ pub(crate) fn key_columns(c: &Collection) -> Vec<String> {
 /// them. Nothing here reads the kernel's own tables.
 #[derive(Debug, Default)]
 pub struct Kernel {
+    /// The replica's own id.
+    pub node: Option<Gid>,
     /// The registers of each registered collection: (collection, gid) to field to entry.
     pub registers: BTreeMap<(String, Gid), BTreeMap<String, (Value, Hlc)>>,
     /// Each aliased gid's canonical gid, by collection.
@@ -137,7 +139,10 @@ pub async fn read(conn: &mut SqliteConnection, replica: &Replica) -> Kernel {
         .map(|c| c.name.as_str())
         .collect();
     let inspection = replica.inspect(conn).await.unwrap();
-    let mut kernel = Kernel::default();
+    let mut kernel = Kernel {
+        node: inspection.node,
+        ..Kernel::default()
+    };
     for (collection, gid, field, value, clock) in inspection.registers {
         if known.contains(collection.as_str()) {
             kernel
@@ -470,6 +475,16 @@ pub async fn midway(
     replica: &Replica,
     taken: &[Change],
 ) -> Result<(), String> {
+    midway_answering(conn, replica, taken).await.map(|_| ())
+}
+
+/// [`midway`], returning the changes the replica has taken in and what it answers of who made
+/// each live group and wrote each field.
+pub async fn midway_answering(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    taken: &[Change],
+) -> Result<(Vec<Change>, Origins), String> {
     let seen = seen(conn, replica, taken).await;
     let registry = replica.registry();
     let schema = registry.model_schema();
@@ -488,10 +503,12 @@ pub async fn midway(
         },
         |c, g, f| pinned.contains(&(c.to_string(), g, f.to_string())),
     ));
+    let (differ, answered) = origins_differ(conn, replica, &merge, &kernel).await;
+    wrong.extend(differ);
     if !wrong.is_empty() {
         wrong.push(context(&merge, &kernel));
     }
-    verdict(wrong, "the replica departs from the model")
+    verdict(wrong, "the replica departs from the model").map(|()| (seen, answered))
 }
 
 /// The groups and what waits, to read a failure by.
@@ -544,8 +561,129 @@ pub async fn settled(
     for (collection, a, b) in model::unmerged_identities(&schema, &expected) {
         wrong.push(format!("{collection} {a:?} and {b:?} share an identity"));
     }
+    wrong.extend(origins_differ(conn, replica, &merge, &kernel).await.0);
     if !wrong.is_empty() {
         wrong.push(context(&merge, &kernel));
     }
     verdict(wrong, "the settled replica is not the model's view")
+}
+
+/// Which replica made each live group of `merge` and wrote each field its row shows, by the
+/// definitions `Replica::made` and `Replica::written_here` document, read off the model.
+pub fn origins(registry: &Registry, merge: &Merge, node: Option<Gid>) -> Origins {
+    let schema = registry.model_schema();
+    let mut live: BTreeMap<(String, Gid), Vec<Gid>> = BTreeMap::new();
+    for (gid, e) in &merge.entities {
+        if e.live && schema.collection(&e.collection).is_some() {
+            live.entry((e.collection.clone(), e.canonical))
+                .or_default()
+                .push(*gid);
+        }
+    }
+    let mine = |clock: &Hlc| Some(clock.node) == node;
+    let mut out = Origins::new();
+    for ((collection, canonical), members) in live {
+        let c = schema
+            .collection(&collection)
+            .expect("a registered collection");
+        let register = |m: &Gid, f: &str| merge.entities[m].registers.get(f).cloned();
+        let mut made: Option<Hlc> = None;
+        let mut whole = true;
+        for m in &members {
+            match register(m, DELETED) {
+                Some((Value::Int(0), k)) => made = Some(made.map_or(k, |f| f.min(k))),
+                _ => whole = false,
+            }
+        }
+        let made = match made.filter(|_| whole) {
+            Some(k) if k.wall_ms == 0 => Made::Adopted,
+            Some(k) if mine(&k) => Made::Here,
+            _ => Made::Elsewhere,
+        };
+        let mut fields = BTreeMap::new();
+        for f in &c.fields {
+            let set = c.together.iter().find(|s| s.contains(&f.name));
+            let clock = match set {
+                Some(set) => members
+                    .iter()
+                    .flat_map(|m| set.iter().filter_map(move |g| register(m, g)))
+                    .map(|(_, k)| k)
+                    .max(),
+                None => {
+                    let mut best: Option<(Value, Hlc)> = None;
+                    for m in &members {
+                        if let Some((v, k)) = register(m, &f.name)
+                            && wins(f.strategy, best.as_ref().map(|(v, k)| (v, k)), &v, &k)
+                        {
+                            best = Some((v, k));
+                        }
+                    }
+                    best.map(|(_, k)| k)
+                }
+            };
+            fields.insert(f.name.clone(), clock.map(|k| mine(&k)));
+        }
+        let largest = *members.iter().max().expect("a live group has a member");
+        out.insert((collection, canonical), (made, fields, largest));
+    }
+    out
+}
+
+/// For each live group by collection and canonical gid: who made it, whether each field's value
+/// was written here, and its largest live member, which must answer for the group too.
+pub type Origins = BTreeMap<(String, Gid), (Made, BTreeMap<String, Option<bool>>, Gid)>;
+
+/// What `Replica::made` and `Replica::written_here` answer of every live group, by canonical gid
+/// and by its largest live member.
+pub async fn answers(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    expected: &Origins,
+) -> Origins {
+    let mut out = Origins::new();
+    for ((collection, canonical), (_, fields, largest)) in expected {
+        for gid in [*canonical, *largest] {
+            let made = replica.made(conn, collection, gid).await.unwrap();
+            let mut written = BTreeMap::new();
+            for f in fields.keys() {
+                let here = replica
+                    .written_here(conn, collection, gid, f)
+                    .await
+                    .unwrap();
+                written.insert(f.clone(), here);
+            }
+            let Some(made) = made else {
+                continue;
+            };
+            let at = (collection.clone(), gid);
+            out.insert(at, (made, written, *largest));
+        }
+    }
+    out
+}
+
+async fn origins_differ(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+    merge: &Merge,
+    kernel: &Kernel,
+) -> (Vec<String>, Origins) {
+    let expected = origins(replica.registry(), merge, kernel.node);
+    let actual = answers(conn, replica, &expected).await;
+    let mut wrong = Vec::new();
+    for ((collection, canonical), (made, fields, largest)) in &expected {
+        for gid in [*canonical, *largest] {
+            match actual.get(&(collection.clone(), gid)) {
+                Some((m, f, _)) if m == made && f == fields => {}
+                Some((m, f, _)) => wrong.push(format!(
+                    "{collection} {gid:?} (group {canonical:?}): made {m:?}, written here {f:?}; \
+                     the model says {made:?}, {fields:?}"
+                )),
+                None => wrong.push(format!(
+                    "{collection} {gid:?} (group {canonical:?}) has no maker; the model says {made:?}"
+                )),
+            }
+        }
+    }
+    (wrong, actual)
 }

@@ -10,7 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use fongo_sync_core::eval::Evaluator;
+use fongo_sync_core::eval::{Evaluator, Origin};
 use fongo_sync_core::model::{Row, Schema};
 use fongo_sync_core::plan::{self, FieldEdit};
 use fongo_sync_core::source::admit;
@@ -65,7 +65,7 @@ pub struct Applied {
 /// not let go of. When the kernel cannot resolve what holds it back, such as a partial unique
 /// index another row already satisfies, the application can read the entity's merged values with
 /// [`Replica::merged`], change its own rows, and call [`Replica::apply`] with no changes to try
-/// again.
+/// again. [`Replica::made`] and [`Replica::written_here`] let one replica alone make that change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub collection: String,
@@ -92,10 +92,24 @@ pub struct Conflict {
     pub remote_won: bool,
 }
 
+/// Which replica made an entity, as [`Replica::made`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    /// This replica.
+    Here,
+    /// Another replica, or one this replica cannot name yet.
+    Elsewhere,
+    /// No replica: the entity, or one merged with it, was a row found when its collection was
+    /// first installed.
+    Adopted,
+}
+
 /// What a replica holds, in a form that does not depend on how it is stored, so tests can compare
 /// it with what it should hold. Every list is sorted.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inspection {
+    /// This replica's id: the node of every clock it issues.
+    pub node: Option<Gid>,
     /// The winning entry of each field of each entity, `$deleted` included, as (collection, gid,
     /// field, value, clock).
     pub registers: Vec<(String, Gid, String, Value, Hlc)>,
@@ -165,6 +179,13 @@ pub(crate) fn meta_set(db: &Db, key: &str, value: Value) -> Result<()> {
         &[Value::Text(key.into()), value],
     )?;
     Ok(())
+}
+
+fn node_of(db: &Db) -> Result<Gid> {
+    match meta_get(db, "node")? {
+        Some(node) => as_gid(&node),
+        None => Err(Error::Corrupt("the replica is not installed".into())),
+    }
 }
 
 fn now_ms(db: &Db) -> Result<u64> {
@@ -272,10 +293,7 @@ pub(crate) struct Base {
 
 impl<'d> Ctx<'d> {
     fn begin(db: &'d Db) -> Result<Ctx<'d>> {
-        let node = match meta_get(db, "node")? {
-            Some(node) => as_gid(&node)?,
-            None => return Err(Error::Corrupt("the replica is not installed".into())),
-        };
+        let node = node_of(db)?;
         let clock = match meta_get(db, "clock")? {
             Some(clock) => Clock::resume(as_clock(&clock)?),
             None => Clock::new(node),
@@ -1228,6 +1246,81 @@ impl Replica {
         .await
     }
 
+    /// Which replica made an entity, read from the facts alone, so replicas that hold the same
+    /// changes agree and at most one answers [`Made::Here`]. `None` when no member of its group
+    /// is live, nothing is known of it, or its group is past what the kernel evaluates.
+    ///
+    /// An entity is made by the replica that inserted a row for it. A natural key's entity can
+    /// be made more than once, by replicas that insert a row at the key independently or after
+    /// its removal; it was made by whichever did so last, by clock. A group of entities merged
+    /// by identity or alias was made by whoever made the earliest of its live members, whichever
+    /// row each replica keeps for it. A row found when a collection was first installed was made
+    /// by no replica: it, and any group it joins, is [`Made::Adopted`] on every replica, and
+    /// [`Replica::written_here`] is the question to ask of it. Values adopted for a field the
+    /// registry gains later leave the answer as it was.
+    ///
+    /// While changes are in flight a replica answers from what it holds: a member whose making
+    /// has not arrived makes the answer [`Made::Elsewhere`], and a replica that made a member
+    /// answers [`Made::Here`] until the making of an earlier member reaches it, so two replicas
+    /// can both answer it until each holds the other's.
+    pub async fn made(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        gid: Gid,
+    ) -> Result<Option<Made>> {
+        with_db(conn, |db| {
+            let Some(origin) = self.origin_in(db, collection, gid)? else {
+                return Ok(None);
+            };
+            let node = node_of(db)?;
+            Ok(Some(match origin.made {
+                Some(clock) if clock.wall_ms == 0 => Made::Adopted,
+                Some(clock) if clock.node == node => Made::Here,
+                _ => Made::Elsewhere,
+            }))
+        })
+        .await
+    }
+
+    /// Whether this replica wrote the value a field of an entity's group shows: the winning
+    /// entry among the live members by the field's strategy, or for a field in a set that
+    /// changes together, the latest write to the set. Read from the facts alone, so replicas
+    /// that hold the same changes agree on which one wrote it. A value adopted when a collection
+    /// was first installed counts as written by the replica that adopted it. `None` when no
+    /// member is live, the field is not declared, no live member has a write to it, or the group
+    /// is past what the kernel evaluates.
+    ///
+    /// While changes are in flight a replica answers from what it holds: two replicas that
+    /// wrote the field concurrently both answer `true` until each holds the other's write.
+    pub async fn written_here(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        gid: Gid,
+        field: &str,
+    ) -> Result<Option<bool>> {
+        with_db(conn, |db| {
+            let Some(origin) = self.origin_in(db, collection, gid)? else {
+                return Ok(None);
+            };
+            let node = node_of(db)?;
+            Ok(origin.fields.get(field).map(|clock| clock.node == node))
+        })
+        .await
+    }
+
+    fn origin_in(&self, db: &Db, collection: &str, gid: Gid) -> Result<Option<Origin>> {
+        if self.registry.index(collection).is_none() {
+            return Ok(None);
+        }
+        let ev = self.evaluator();
+        let facts = Facts { db };
+        let origin = ev.session(&facts).origin(collection, gid).ok().flatten();
+        db.check()?;
+        Ok(origin)
+    }
+
     /// The id of the entity a local row holds, by the row's key as the change-capture triggers
     /// write it. The id is the group's own when the entity has been merged with others.
     pub async fn gid_for_key(
@@ -1301,7 +1394,10 @@ impl Replica {
     }
 
     fn inspect_in(&self, db: &Db) -> Result<Inspection> {
-        let mut out = Inspection::default();
+        let mut out = Inspection {
+            node: meta_get(db, "node")?.map(|n| as_gid(&n)).transpose()?,
+            ..Inspection::default()
+        };
         let schema = &self.schema;
         let mut home: BTreeMap<Gid, (Hlc, String)> = BTreeMap::new();
         for r in db.query("SELECT gid, collection, first FROM fongo_claims", &[])? {

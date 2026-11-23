@@ -31,6 +31,12 @@ reference may own its row, which then goes with its target. A collection can als
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 
+When two replicas each make a row that is valid alone and together break a rule of the
+application's own, such as a partial unique index, the kernel holds one of them back and the
+application settles it. `Replica::made` says which replica made an entity and
+`Replica::written_here` whether this replica wrote the value a field shows, each read from the
+merged changes alone, so that one replica decides and the others wait for its write.
+
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
 the application asks. `uninstall` removes everything the kernel added.
@@ -64,7 +70,8 @@ Three layers, each tested against the one above it:
    - `source`: what a replica keeps of each change (`admit`), and the `Source` trait: the
      indexed questions the evaluator asks of those facts.
    - `eval`: `Session::target` computes one entity's group, liveness and row on demand, pulling
-     only the facts it needs, within explicit `Limits`. `Evaluator::affected` names the entities
+     only the facts it needs, within explicit `Limits`; `Session::origin`, the writes that made
+     the group and that put each value in its row. `Evaluator::affected` names the entities
      whose rows may change when a batch is merged.
    - `plan`: `edits` and `record` turn an application's row edits (a row compared with its
      image) into changes; `write` turns a target into a row action; `clashes` finds groups an
@@ -81,7 +88,7 @@ What is tested against what (`crates/core/tests`):
 
 | test | checks |
 |---|---|
-| `eval.rs` | `target` for every gid equals `model::view`, over schemas from a small family and random schemas, with hostile change sets; answers under tight limits do not depend on what was asked before; hostile rewrites of a natural key neither hide the entity nor grow the store |
+| `eval.rs` | `target` for every gid equals `model::view`, and `origin` the writes behind it, over schemas from a small family and random schemas, with hostile change sets; answers under tight limits do not depend on what was asked before; hostile rewrites of a natural key neither hide the entity nor grow the store |
 | `affected.rs` | the incremental law: re-evaluating only what `affected` names after each batch, delivered in random order with repeats, keeps the rows equal to `model::view`, over both kinds of schema |
 | `plan.rs` | recorded edits round-trip; `edits` never reports what an adapter wrote; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps NOT NULL, unique and foreign-key constraints, and nothing is parked or stuck where no cycle forces it |
 | `scaling.rs` | the work of `affected` and `target` grows with what changed, not with what is stored, checked as a ratio between two sizes |
@@ -118,7 +125,8 @@ One chain, each link checked against the one above it:
    from what the kernel wrote by comparing tables between kernel steps, since a replica that
    sends a value it only held back makes every replica agree on a wrong answer; and every value
    the application wrote must be sent and, once everything is exchanged, be in the merged
-   state. The tests read
+   state. Who made each live group and wrote each field, as `Replica::made` and
+   `Replica::written_here` answer, is checked against the model at the same steps. The tests read
    the kernel only through `Replica::inspect` and the public lookups, so they hold any
    implementation to the same account, and `Registry::model_schema` gives the model's schema; a
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,

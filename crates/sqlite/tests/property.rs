@@ -4,8 +4,10 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use fongo_sync_sqlite::core::Change;
-use fongo_sync_sqlite::{Collection, LocalDefault, Registry, Replica, Resume};
+use fongo_sync_sqlite::{Collection, LocalDefault, Made, Registry, Replica, Resume};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use sqlx::SqliteConnection;
@@ -110,6 +112,9 @@ struct Peer {
     /// Every change applied here or sent from here.
     taken: Vec<Change>,
     writes: support::writes::Writes,
+    /// What this replica answered of who made each live group and wrote each field, and the
+    /// changes and registry it answered from, as of its last step.
+    origins: Option<(BTreeSet<String>, support::Origins)>,
 }
 
 impl Peer {
@@ -128,11 +133,19 @@ impl Peer {
             sent: None,
             taken: Vec::new(),
             writes: Default::default(),
+            origins: None,
         }
     }
 
+    /// Checks the replica against the model, and records what it answers of who made each live
+    /// group and wrote each field, with the changes and registry it answers from.
     async fn midway(&mut self) -> Result<(), String> {
-        support::midway(&mut self.conn, &self.replica, &self.taken).await
+        let (seen, answers) =
+            support::midway_answering(&mut self.conn, &self.replica, &self.taken).await?;
+        let mut held: BTreeSet<String> = seen.iter().map(|c| format!("{c:?}")).collect();
+        held.insert(format!("upgraded {}", self.upgraded));
+        self.origins = Some((held, answers));
+        Ok(())
     }
 
     async fn upgrade(&mut self) -> Result<(), String> {
@@ -642,7 +655,60 @@ async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) -> Result<(), String>
     Err("the peers never stopped sending".into())
 }
 
+/// Replicas that hold the same changes under the same registry agree on who made each live
+/// group and wrote each field: at most one says it made a group, and at most one that it wrote a
+/// field. Returns how many pairs of replicas were compared.
+fn agree(peers: &[Peer], with: usize) -> Result<usize, String> {
+    let Some((held, mine)) = &peers[with].origins else {
+        return Ok(0);
+    };
+    let alike: Vec<usize> = (0..peers.len())
+        .filter(|&i| peers[i].origins.as_ref().is_some_and(|(h, _)| h == held))
+        .collect();
+    if alike.len() < 2 {
+        return Ok(0);
+    }
+    for (group, (_, fields, _)) in mine {
+        let mut makers = 0;
+        let mut writers: std::collections::BTreeMap<&String, usize> = Default::default();
+        for &i in &alike {
+            let theirs = peers[i].origins.as_ref().map(|(_, a)| a).unwrap();
+            let Some((made, written, _)) = theirs.get(group) else {
+                return Err(format!(
+                    "peers {with} and {i} hold the same changes; {i} has no {group:?}"
+                ));
+            };
+            makers += usize::from(*made == Made::Here);
+            for (f, here) in written {
+                if here.is_some() != fields[f].is_some() {
+                    return Err(format!(
+                        "peers {with} and {i} disagree on whether {group:?}.{f} was written"
+                    ));
+                }
+                *writers.entry(f).or_default() += usize::from(*here == Some(true));
+            }
+        }
+        if makers > 1 {
+            return Err(format!(
+                "{makers} replicas holding the same changes made {group:?}"
+            ));
+        }
+        if let Some((f, n)) = writers.iter().find(|(_, n)| **n > 1) {
+            return Err(format!(
+                "{n} replicas holding the same changes wrote {group:?}.{f}"
+            ));
+        }
+    }
+    Ok(alike.len() - 1)
+}
+
 async fn check(peers: &mut [Peer]) -> Result<(), String> {
+    for peer in peers.iter_mut() {
+        peer.midway().await?;
+    }
+    if agree(peers, 0)? != peers.len() - 1 {
+        return Err("after exchanging everything, replicas hold different changes".into());
+    }
     let everything: Vec<Change> = peers.iter().flat_map(|p| p.taken.iter().cloned()).collect();
     for (i, peer) in peers.iter().enumerate() {
         peer.writes
@@ -691,6 +757,7 @@ fn run_on(schema: &[&str], seed: u64, script: &[(usize, Op)]) -> Result<(), Stri
             perform(&mut peers[who], op, &mut hub)
                 .await
                 .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
+            agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
         finish(&mut peers, &mut hub)
             .await
