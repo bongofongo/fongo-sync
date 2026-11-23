@@ -1107,18 +1107,22 @@ async fn a_reference_to_a_merged_parent_counts_the_write_that_set_it() {
     );
 }
 
-/// Who gives way when a task moves under a parent that already has an open task.
+/// Who gives way when a task moves under a parent that already has an open task, and how.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Decider {
-    /// The replica that made the latest write among the fields the index reads.
+    /// The replica that made the latest write among the fields the index reads closes the task
+    /// where it finds it open under that parent in its own table.
     Latest,
-    /// The replica that wrote the state set.
+    /// The replica that wrote the state set, likewise.
     State,
+    /// The replica that made the latest write among the fields the index reads closes its own
+    /// row of the task, wherever that row stands.
+    Own,
 }
 
 /// The application's resolution: of two open tasks under one parent the one with the larger gid
-/// gives way and is closed, by the replica `decider` names, which can do it only where the task
-/// is open under that parent in its own table. Returns how many it closed.
+/// gives way and is closed, by the replica and in the way `decider` names. Returns how many it
+/// closed.
 async fn give_way(
     peer: &mut Peer,
     held: &[Held],
@@ -1126,7 +1130,7 @@ async fn give_way(
     log: &mut Vec<Change>,
 ) -> usize {
     let fields = match decider {
-        Decider::Latest => INDEXED,
+        Decider::Latest | Decider::Own => INDEXED,
         Decider::State => STATE,
     };
     let mut closed = 0;
@@ -1158,9 +1162,21 @@ async fn give_way(
             .collect();
         for id in open {
             let other = peer.gid("tasks", id).await;
-            if other > h.gid && latest(peer, "tasks", other, fields).await == Some(true) {
+            let loser = other.max(h.gid);
+            let row = match decider {
+                Decider::Own => peer
+                    .replica
+                    .key_for_gid(&mut peer.conn, "tasks", loser)
+                    .await
+                    .unwrap()
+                    .map(|key| key.trim_matches(|c| c == '[' || c == ']').to_string()),
+                _ => (loser == other).then(|| id.to_string()),
+            };
+            if let Some(row) = row
+                && latest(peer, "tasks", loser, fields).await == Some(true)
+            {
                 peer.run(&format!(
-                    "UPDATE tasks SET open = 0, since = 'gave way' WHERE id = {id}"
+                    "UPDATE tasks SET open = 0, since = 'gave way' WHERE id = {row}"
                 ))
                 .await;
                 closed += 1;
@@ -1181,13 +1197,14 @@ async fn give_way(
 /// parent, and only the latest writer among the index's fields finds it so: it gives way once
 /// and every replica ends alike. Asking who wrote the state set names the task's maker, which
 /// can give way only where the move reached it before the other task; in the other orders the
-/// move is held there and the clash is never resolved.
+/// move is held there and the clash is never resolved. The latest writer closing its own row of
+/// the task gives way once too.
 #[tokio::test]
 async fn the_latest_writer_among_the_indexed_fields_gives_way_in_every_order() {
     let mut stuck = 0;
     let mut runs = 0;
     for order in orders(5) {
-        for decider in [Decider::Latest, Decider::State] {
+        for decider in [Decider::Latest, Decider::State, Decider::Own] {
             runs += 1;
             let (mut peers, mut hub) = three_with_parents().await;
             for peer in peers.iter_mut() {
@@ -1244,7 +1261,7 @@ async fn the_latest_writer_among_the_indexed_fields_gives_way_in_every_order() {
                 held += peer.apply(&[]).await.held.len();
             }
             match decider {
-                Decider::Latest => {
+                Decider::Latest | Decider::Own => {
                     assert_eq!(gave_way, [0, 0, 1], "order {order:?}");
                     assert_eq!(held, 0, "order {order:?}");
                     let rows = same_everywhere(
@@ -1268,9 +1285,182 @@ async fn the_latest_writer_among_the_indexed_fields_gives_way_in_every_order() {
             }
         }
     }
-    assert_eq!(runs, 240);
+    assert_eq!(runs, 360);
     assert!(
         stuck > 0,
         "deciding by the state set never left the clash held"
     );
+}
+
+/// The latest writer of a task's indexed fields reopened it, under its old parent, while a move
+/// that makes it clash was on its way: there the move is held, and its own row of the task stands
+/// open under the old parent, where nothing clashes. Closing only what it finds in the clash, no
+/// replica gives way and the task stays held everywhere; closing its own row of the task, by key,
+/// the latest writer gives way and every replica ends alike.
+#[tokio::test]
+async fn the_latest_writer_gives_way_on_its_own_row_held_at_an_older_state() {
+    for decider in [Decider::Latest, Decider::Own] {
+        let (mut peers, mut hub) = three_with_parents().await;
+        later();
+        for (i, title) in [(0, "a"), (1, "b")] {
+            peers[i]
+                .run(&format!(
+                    "INSERT INTO tasks (parent, open, title)
+                     SELECT id, 0, '{title}' FROM parents WHERE name = 'p'"
+                ))
+                .await;
+        }
+        settle(&mut peers, &mut hub).await;
+        let gids = [
+            peers[0].gid("tasks", 1).await,
+            peers[1].gid("tasks", 1).await,
+        ];
+        let (loser, winner) = if gids[0] > gids[1] {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        let lost = gids[0].max(gids[1]);
+        let under_q = "(SELECT id FROM parents WHERE name = 'q')";
+        // The second replica opens the winner under q, and only the third receives it now.
+        later();
+        peers[1]
+            .run(&format!(
+                "UPDATE tasks SET parent = {under_q}, open = 1, since = 'm' WHERE title = '{winner}'"
+            ))
+            .await;
+        let opened_winner = peers[1].push(&mut Vec::new()).await;
+        peers[2].apply(&opened_winner).await;
+        // The first moves the loser, closed, under q.
+        later();
+        peers[0]
+            .run(&format!(
+                "UPDATE tasks SET parent = {under_q} WHERE title = '{loser}'"
+            ))
+            .await;
+        let moved = peers[0].push(&mut Vec::new()).await;
+        // The third, without the move, opens the loser under p: the latest write to its fields.
+        later();
+        peers[2]
+            .run(&format!(
+                "UPDATE tasks SET open = 1, since = 'w' WHERE title = '{loser}'"
+            ))
+            .await;
+        let opened_loser = peers[2].push(&mut Vec::new()).await;
+        let mut gave_way = [0; 3];
+        let mut log = Vec::new();
+        for (to, batch) in [
+            (2, &moved),
+            (0, &opened_winner),
+            (0, &opened_loser),
+            (1, &moved),
+            (1, &opened_loser),
+        ] {
+            let applied = peers[to].apply(batch).await;
+            gave_way[to] += give_way(&mut peers[to], &applied.held, decider, &mut log).await;
+        }
+        hub.extend(
+            opened_winner
+                .into_iter()
+                .chain(moved)
+                .chain(opened_loser)
+                .chain(log),
+        );
+        for peer in peers.iter_mut() {
+            peer.cursor = 0;
+        }
+        for _ in 0..6 {
+            for (i, peer) in peers.iter_mut().enumerate() {
+                let applied = peer.pull(&hub).await;
+                gave_way[i] += give_way(peer, &applied.held, decider, &mut hub).await;
+                peer.push(&mut hub).await;
+            }
+        }
+        assert_eq!(
+            answers(&mut peers, lost, INDEXED).await,
+            [Some(false), Some(false), Some(true)]
+        );
+        let mut held = Vec::new();
+        for peer in peers.iter_mut() {
+            held.push(peer.apply(&[]).await.held.len());
+        }
+        let rows = "SELECT t.title || ' ' || p.name || ' ' || t.open FROM tasks t
+                      JOIN parents p ON p.id = t.parent ORDER BY t.title";
+        match decider {
+            Decider::Latest => {
+                assert_eq!(gave_way, [0, 0, 0]);
+                assert_eq!(held, [1, 1, 1]);
+                // The latest writer's own row still stands at the state it wrote.
+                assert_eq!(
+                    peers[2]
+                        .lines(&format!(
+                            "SELECT p.name || ' ' || t.open FROM tasks t
+                               JOIN parents p ON p.id = t.parent WHERE t.title = '{loser}'"
+                        ))
+                        .await,
+                    ["p 1"]
+                );
+            }
+            _ => {
+                assert_eq!(gave_way, [0, 0, 1]);
+                assert_eq!(held, [0, 0, 0]);
+                let shown = same_everywhere(&mut peers, rows).await;
+                assert!(shown.contains(&format!("{loser} q 0")), "{shown:?}");
+                assert!(shown.contains(&format!("{winner} q 1")), "{shown:?}");
+            }
+        }
+    }
+}
+
+/// The latest writer keeps a row of the group when a merge gives its own row up; a replica that
+/// removes its row while a member it has not seen lives on no longer counts, and takes the live
+/// member's row.
+#[tokio::test]
+async fn the_latest_writer_keeps_a_row_of_the_group_its_row_merged_into() {
+    let mut peers = make(2, TASKS, tasks).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO parents (name) VALUES ('p')")
+        .await;
+    let first = peers[0].push(&mut hub).await[0].gid;
+    later();
+    peers[1]
+        .run("INSERT INTO parents (name) VALUES ('p')")
+        .await;
+    let second = peers[1].push(&mut hub).await[0].gid;
+    settle(&mut peers, &mut hub).await;
+    let mut written = Vec::new();
+    for peer in peers.iter_mut() {
+        written.push(latest(peer, "parents", first, &["name"]).await);
+        let row = peer
+            .replica
+            .key_for_gid(&mut peer.conn, "parents", second)
+            .await
+            .unwrap();
+        assert!(row.is_some());
+        assert_eq!(peer.int("SELECT count(*) FROM parents").await, 1);
+    }
+    assert_eq!(written, [Some(false), Some(true)]);
+
+    let mut peers = make(2, TASKS, tasks).await;
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO parents (name) VALUES ('p')")
+        .await;
+    let first = peers[0].push(&mut hub).await[0].gid;
+    later();
+    peers[1]
+        .run("INSERT INTO parents (name) VALUES ('p')")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    peers[1].run("DELETE FROM parents").await;
+    peers[1].push(&mut hub).await;
+    settle(&mut peers, &mut hub).await;
+    let mut written = Vec::new();
+    for peer in peers.iter_mut() {
+        written.push(latest(peer, "parents", first, &["name"]).await);
+        assert_eq!(peer.lines("SELECT name FROM parents").await, ["p"]);
+    }
+    assert_eq!(written, [Some(true), Some(false)]);
 }

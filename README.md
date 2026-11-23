@@ -36,10 +36,12 @@ application's own, such as a partial unique index, the kernel holds one of them 
 application settles it. `Replica::made` says which replica made an entity and
 `Replica::written_here` whether this replica made the latest write among a list of its fields,
 such as those a unique index reads. Each is read from
-the merged changes alone, so that one replica decides and the others wait for its write. Nothing
-guarantees the maker ever acts: it may be gone, may no longer register the collection, or may
-have uninstalled and installed again under a new id, so an application that waits for it needs
-its own way on.
+the merged changes alone, so that one replica decides and the others wait for its write. The
+replica that decides acts on its own row of the entity that gives way, found by key: that row
+may be held back at an older state than the merge shows, away from the clash. Nothing
+guarantees the maker or the latest writer ever acts: it may be gone, may no longer register the
+collection, or may have uninstalled and installed again under a new id, so an application that
+waits for it needs its own way on.
 
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as

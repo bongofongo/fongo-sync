@@ -1323,6 +1323,16 @@ impl Replica {
     /// While changes are in flight a replica answers from what it holds: two replicas that
     /// wrote named fields concurrently each answer `true` until each holds the other's write.
     ///
+    /// The replica that answers `true` wrote from a row it held, but that row need not stand at
+    /// the state the group's fields now show: a write it cannot make, such as one a unique index
+    /// refuses, is held back, and its row stays at an older state. An application settling a
+    /// clash acts on its own row of the entity that gives way, the one [`Replica::key_for_gid`]
+    /// names, wherever it stands, and not only on rows it finds standing in the clash. Where a
+    /// merge gives its row up, it keeps the group's row; where it removed its row while a member
+    /// it had not seen lives on, its writes to the removed one no longer count; an entity whose
+    /// owner goes is no longer live, so nothing answers. Beyond that, nothing guarantees the
+    /// replica that answers `true` still has a row, or is still there to act.
+    ///
     /// Read in one savepoint, so from one state of the database. The savepoint holds a read lock
     /// while it lasts: in rollback-journal mode another connection's write waits for it, or fails
     /// at once with no busy timeout; in WAL mode writers are not blocked.
