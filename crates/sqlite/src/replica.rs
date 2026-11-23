@@ -1301,20 +1301,37 @@ impl Replica {
         .await
     }
 
-    /// Whether this replica wrote the value a field of an entity's group shows: the winning
-    /// entry among the live members by the field's strategy, or for a field in a set that
-    /// changes together, the latest write to the set. Read from the facts alone, so replicas
-    /// that hold the same changes agree on which one wrote it. A value adopted when a collection
-    /// was first installed counts as written by the replica that adopted it. `None` when no
-    /// member is live, the field is not declared, no live member has a write to it, or the group
-    /// is past what the kernel evaluates.
+    /// Whether this replica made the latest of the writes behind the values `fields` of an
+    /// entity's group show. Behind each field is its winning entry among the live members by the
+    /// field's strategy, or for a field in a set that changes together, the latest write to the
+    /// set; the latest of those, by clock, is the one that counts. Asked of one field, it is
+    /// whether this replica wrote that field's value. Read from the facts alone, so of replicas
+    /// that hold the same changes at most one answers `true`.
+    ///
+    /// A field no live member has written takes no part. A value adopted when a collection was
+    /// first installed takes part like any other, written by the replica that adopted it. A
+    /// reference counts the write that set it, whatever the entity it names has become, merged
+    /// or given up. `None` when no named field has a write, no member is live, nothing is known
+    /// of the entity, or its group is past what the kernel evaluates; [`Error::Registry`] when
+    /// the collection declares no field of one of the names.
     ///
     /// A natural key's key fields keep only their earliest few writes
-    /// ([`fongo_sync_core::model::KEY_ENTRIES`]), so for a key field the answer names the latest
-    /// of those that holds the key, which can be an earlier maker than [`Replica::made`] names.
+    /// ([`fongo_sync_core::model::KEY_ENTRIES`]), so for a key field the write that counts is the
+    /// latest of those that holds the key, which can be an earlier maker than [`Replica::made`]
+    /// names.
     ///
     /// While changes are in flight a replica answers from what it holds: two replicas that
-    /// wrote the field concurrently both answer `true` until each holds the other's write.
+    /// wrote named fields concurrently each answer `true` until each holds the other's write.
+    ///
+    /// The replica that answers `true` wrote from a row it held, but that row need not stand at
+    /// the state the group's fields now show: a write it cannot make, such as one a unique index
+    /// refuses, is held back, and its row stays at an older state. An application settling a
+    /// clash acts on its own row of the entity that gives way, the one [`Replica::key_for_gid`]
+    /// names, wherever it stands, and not only on rows it finds standing in the clash. Where a
+    /// merge gives its row up, it keeps the group's row; where it removed its row while a member
+    /// it had not seen lives on, its writes to the removed one no longer count; an entity whose
+    /// owner goes is no longer live, so nothing answers. Beyond that, nothing guarantees the
+    /// replica that answers `true` still has a row, or is still there to act.
     ///
     /// Read in one savepoint, so from one state of the database. The savepoint holds a read lock
     /// while it lasts: in rollback-journal mode another connection's write waits for it, or fails
@@ -1324,15 +1341,25 @@ impl Replica {
         conn: &mut SqliteConnection,
         collection: &str,
         gid: Gid,
-        field: &str,
+        fields: &[&str],
     ) -> Result<Option<bool>> {
         with_db(conn, |db| {
             db.atomically(|db| {
+                if let Some(c) = self.registry.index(collection).map(|i| self.collection(i))
+                    && let Some(f) = fields
+                        .iter()
+                        .find(|f| !c.fields.iter().any(|d| d.name == **f))
+                {
+                    return Err(Error::Registry(format!(
+                        "{collection} declares no field {f}"
+                    )));
+                }
                 let Some(origin) = self.origin_in(db, collection, gid)? else {
                     return Ok(None);
                 };
                 let node = node_of(db)?;
-                Ok(origin.fields.get(field).map(|clock| clock.node == node))
+                let latest = fields.iter().filter_map(|f| origin.fields.get(*f)).max();
+                Ok(latest.map(|clock| clock.node == node))
             })
         })
         .await

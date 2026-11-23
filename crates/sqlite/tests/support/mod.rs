@@ -600,7 +600,7 @@ pub fn origins(registry: &Registry, merge: &Merge, node: Option<Gid>) -> Origins
             Some(k) if mine(&k) => Made::Here,
             _ => Made::Elsewhere,
         };
-        let mut fields = BTreeMap::new();
+        let mut clocks: BTreeMap<&str, Option<Hlc>> = BTreeMap::new();
         for f in &c.fields {
             let set = c.together.iter().find(|s| s.contains(&f.name));
             let clock = match set {
@@ -621,7 +621,12 @@ pub fn origins(registry: &Registry, merge: &Merge, node: Option<Gid>) -> Origins
                     best.map(|(_, k)| k)
                 }
             };
-            fields.insert(f.name.clone(), clock.map(|k| mine(&k)));
+            clocks.insert(&f.name, clock);
+        }
+        let mut fields = BTreeMap::new();
+        for list in lists(c.fields.iter().map(|f| f.name.as_str()).collect()) {
+            let latest = list.iter().filter_map(|f| clocks[f]).max();
+            fields.insert(list.join("+"), latest.map(|k| mine(&k)));
         }
         let largest = *members.iter().max().expect("a live group has a member");
         out.insert((collection, canonical), (made, fields, largest));
@@ -629,8 +634,21 @@ pub fn origins(registry: &Registry, merge: &Merge, node: Option<Gid>) -> Origins
     out
 }
 
-/// For each live group by collection and canonical gid: who made it, whether each field's value
-/// was written here, and its largest live member, which must answer for the group too.
+/// The lists of fields `written_here` is asked about: each field alone, every two neighbours, and
+/// all of them in order and reversed, written joined by `+`.
+fn lists(fields: Vec<&str>) -> Vec<Vec<&str>> {
+    let mut out: Vec<Vec<&str>> = fields.iter().map(|f| vec![*f]).collect();
+    out.extend(fields.windows(2).map(<[&str]>::to_vec));
+    let mut reversed = fields.clone();
+    reversed.reverse();
+    out.extend([fields, reversed]);
+    out.dedup();
+    out
+}
+
+/// For each live group by collection and canonical gid: who made it, whether this replica made
+/// the latest write among each list of fields `lists` names, keyed by the list joined with `+`,
+/// and its largest live member, which must answer for the group too.
 pub type Origins = BTreeMap<(String, Gid), (Made, BTreeMap<String, Option<bool>>, Gid)>;
 
 /// What `Replica::made` and `Replica::written_here` answer of every live group, by canonical gid
@@ -645,12 +663,13 @@ pub async fn answers(
         for gid in [*canonical, *largest] {
             let made = replica.made(conn, collection, gid).await.unwrap();
             let mut written = BTreeMap::new();
-            for f in fields.keys() {
+            for list in fields.keys() {
+                let names: Vec<&str> = list.split('+').collect();
                 let here = replica
-                    .written_here(conn, collection, gid, f)
+                    .written_here(conn, collection, gid, &names)
                     .await
                     .unwrap();
-                written.insert(f.clone(), here);
+                written.insert(list.clone(), here);
             }
             let Some(made) = made else {
                 continue;
