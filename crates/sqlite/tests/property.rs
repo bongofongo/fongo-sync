@@ -1,11 +1,14 @@
-//! Replicas that use every feature at once, exchange changes in any order, part by part and more
-//! than once, and change their registry midway, agree with the reference model after every step
-//! and show exactly its view once everything is exchanged.
+//! Replicas that use every feature at once, some holding rows before the kernel is installed,
+//! exchange changes in any order, part by part and more than once, and change their registry
+//! midway, agree with the reference model after every step and show exactly its view once
+//! everything is exchanged.
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use fongo_sync_sqlite::core::Change;
-use fongo_sync_sqlite::{Collection, LocalDefault, Registry, Replica, Resume};
+use fongo_sync_sqlite::{Collection, LocalDefault, Made, Registry, Replica, Resume};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use sqlx::SqliteConnection;
@@ -110,29 +113,48 @@ struct Peer {
     /// Every change applied here or sent from here.
     taken: Vec<Change>,
     writes: support::writes::Writes,
+    /// What this replica answered of who made each live group and wrote each field, and the
+    /// changes and registry it answered from, as of its last step.
+    origins: Option<(BTreeSet<String>, support::Origins)>,
 }
 
 impl Peer {
-    async fn new(world: &World, n: u64, schema: &[&str]) -> Peer {
+    /// A replica whose tables hold `rows` before the kernel is installed.
+    async fn new(world: &World, n: u64, schema: &[&str], rows: &[&str]) -> Peer {
         let mut conn = world.connect(n).await;
-        for sql in schema {
+        for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
-        let replica = Replica::new(registry(false));
-        replica.install(&mut conn).await.unwrap();
-        Peer {
+        let mut peer = Peer {
             conn,
-            replica,
+            replica: Replica::new(registry(false)),
             upgraded: false,
             seen: Vec::new(),
             sent: None,
             taken: Vec::new(),
             writes: Default::default(),
-        }
+            origins: None,
+        };
+        let waiting = peer
+            .writes
+            .installing(&mut peer.conn, &peer.replica, &peer.taken)
+            .await;
+        peer.replica.install(&mut peer.conn).await.unwrap();
+        peer.writes
+            .installed(&mut peer.conn, &peer.replica, waiting)
+            .await;
+        peer
     }
 
+    /// Checks the replica against the model, and records what it answers of who made each live
+    /// group and wrote each field, with the changes and registry it answers from.
     async fn midway(&mut self) -> Result<(), String> {
-        support::midway(&mut self.conn, &self.replica, &self.taken).await
+        let (seen, answers) =
+            support::midway_answering(&mut self.conn, &self.replica, &self.taken).await?;
+        let mut held: BTreeSet<String> = seen.iter().map(|c| format!("{c:?}")).collect();
+        held.insert(format!("upgraded {}", self.upgraded));
+        self.origins = Some((held, answers));
+        Ok(())
     }
 
     async fn upgrade(&mut self) -> Result<(), String> {
@@ -642,7 +664,60 @@ async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) -> Result<(), String>
     Err("the peers never stopped sending".into())
 }
 
+/// Replicas that hold the same changes under the same registry agree on who made each live
+/// group and wrote each field: at most one says it made a group, and at most one that it wrote a
+/// field. Returns how many pairs of replicas were compared.
+fn agree(peers: &[Peer], with: usize) -> Result<usize, String> {
+    let Some((held, mine)) = &peers[with].origins else {
+        return Ok(0);
+    };
+    let alike: Vec<usize> = (0..peers.len())
+        .filter(|&i| peers[i].origins.as_ref().is_some_and(|(h, _)| h == held))
+        .collect();
+    if alike.len() < 2 {
+        return Ok(0);
+    }
+    for (group, (_, fields, _)) in mine {
+        let mut makers = 0;
+        let mut writers: std::collections::BTreeMap<&String, usize> = Default::default();
+        for &i in &alike {
+            let theirs = peers[i].origins.as_ref().map(|(_, a)| a).unwrap();
+            let Some((made, written, _)) = theirs.get(group) else {
+                return Err(format!(
+                    "peers {with} and {i} hold the same changes; {i} has no {group:?}"
+                ));
+            };
+            makers += usize::from(*made == Made::Here);
+            for (f, here) in written {
+                if here.is_some() != fields[f].is_some() {
+                    return Err(format!(
+                        "peers {with} and {i} disagree on whether {group:?}.{f} was written"
+                    ));
+                }
+                *writers.entry(f).or_default() += usize::from(*here == Some(true));
+            }
+        }
+        if makers > 1 {
+            return Err(format!(
+                "{makers} replicas holding the same changes made {group:?}"
+            ));
+        }
+        if let Some((f, n)) = writers.iter().find(|(_, n)| **n > 1) {
+            return Err(format!(
+                "{n} replicas holding the same changes wrote {group:?}.{f}"
+            ));
+        }
+    }
+    Ok(alike.len() - 1)
+}
+
 async fn check(peers: &mut [Peer]) -> Result<(), String> {
+    for peer in peers.iter_mut() {
+        peer.midway().await?;
+    }
+    if agree(peers, 0)? != peers.len() - 1 {
+        return Err("after exchanging everything, replicas hold different changes".into());
+    }
     let everything: Vec<Change> = peers.iter().flat_map(|p| p.taken.iter().cloned()).collect();
     for (i, peer) in peers.iter().enumerate() {
         peer.writes
@@ -670,13 +745,39 @@ async fn check(peers: &mut [Peer]) -> Result<(), String> {
     Ok(())
 }
 
+/// Rows each replica holds before the kernel is installed: the same shelf, setting and book on
+/// several, so identities and natural keys join rows no replica made, and others on one.
+fn found_at_install(n: u64) -> &'static [&'static str] {
+    match n {
+        0 | 1 => &[
+            "INSERT INTO shelves (id, name) VALUES (1, 'shelf0')",
+            "INSERT INTO settings VALUES ('key0', 'value0')",
+            "INSERT INTO books (id, shelf_id, title, isbn, seen) VALUES (1, 1, 'title0', 'i0', 1)",
+        ],
+        2 => &[
+            "INSERT INTO shelves (id, name) VALUES (1, 'shelf0')",
+            "INSERT INTO settings VALUES ('key0', 'value1')",
+        ],
+        3 => &[
+            "INSERT INTO shelves (id, name) VALUES (1, 'shelf1')",
+            "INSERT INTO books (id, shelf_id, title, isbn, seen) VALUES (1, 1, 'title1', NULL, 1)",
+        ],
+        _ => &[],
+    }
+}
+
 /// Runs a script on five peers of a world made from `seed`. The same seed and script always do
 /// the same thing.
 fn run(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, seed, script)
+    run_on(SCHEMA, false, seed, script)
 }
 
-fn run_on(schema: &[&str], seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
+/// [`run`] on replicas that hold [`found_at_install`] before they install.
+fn run_found(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
+    run_on(SCHEMA, true, seed, script)
+}
+
+fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -685,29 +786,32 @@ fn run_on(schema: &[&str], seed: u64, script: &[(usize, Op)]) -> Result<(), Stri
         let mut hub = Vec::new();
         let mut peers = Vec::new();
         for n in 0..5 {
-            peers.push(Peer::new(&world, n, schema).await);
+            let rows = if found { found_at_install(n) } else { &[] };
+            peers.push(Peer::new(&world, n, schema, rows).await);
         }
         for (step, (who, op)) in script.iter().cloned().enumerate() {
             perform(&mut peers[who], op, &mut hub)
                 .await
                 .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
+            agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
         finish(&mut peers, &mut hub)
             .await
             .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers).await
     });
-    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(seed, script)))
+    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, script)))
 }
 
 /// A failing case as a test to paste below.
-fn reproduction(seed: u64, script: &[(usize, Op)]) -> String {
+fn reproduction(found: bool, seed: u64, script: &[(usize, Op)]) -> String {
+    let run = if found { "run_found" } else { "run" };
     let steps: Vec<String> = script
         .iter()
         .map(|(who, op)| format!("        ({who}, {op:?}),"))
         .collect();
     format!(
-        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    run({seed}, &script).unwrap();\n}}",
+        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    {run}({seed}, &script).unwrap();\n}}",
         steps.join("\n")
     )
 }
@@ -739,9 +843,11 @@ proptest! {
     #[test]
     fn replicas_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
         seed in any::<u64>(),
+        found in any::<bool>(),
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
-        if let Err(error) = run(seed, &script) {
+        let outcome = if found { run_found(seed, &script) } else { run(seed, &script) };
+        if let Err(error) = outcome {
             prop_assert!(false, "{}", error);
         }
     }
@@ -847,7 +953,7 @@ fn a_shelf_renamed_onto_one_its_book_moved_to() {
         (4, MoveBookDeleteShelf(0, 0)),
         (1, RenameShelf(0, 2)),
     ];
-    run_on(&schema, 0, &script).unwrap();
+    run_on(&schema, false, 0, &script).unwrap();
 }
 
 /// A title written while suspended is sent on resuming, so writing it back afterwards is an edit

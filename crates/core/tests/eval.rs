@@ -4,10 +4,12 @@ use common::{
     Counting, Rng, arb_case, arb_random_case, dense_changes, gid, mentioned, nested_schema,
     random_schema,
 };
+use std::collections::BTreeMap;
+
 use fongo_sync_core::eval::{Evaluator, Limits, Undetermined};
-use fongo_sync_core::model::{ALIAS, Collection, Schema, View, view};
+use fongo_sync_core::model::{ALIAS, Collection, Merge as Merged, Schema, View, merge, view};
 use fongo_sync_core::source::{Source, Store};
-use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value};
+use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value, wins};
 use proptest::prelude::*;
 
 fn store(schema: &Schema, changes: &[Change]) -> Store {
@@ -18,10 +20,65 @@ fn store(schema: &Schema, changes: &[Change]) -> Store {
     store
 }
 
+/// `Session::origin`'s `made` and `fields`.
+type Origin = (Option<Hlc>, BTreeMap<String, Hlc>);
+
+/// Where the group `canonical` came from, read off the model: the earliest making among its live
+/// members, and for each field the clock of the write `model::view` shows.
+fn origin(schema: &Schema, merged: &Merged, collection: &str, canonical: Gid) -> Option<Origin> {
+    let c = schema.collection(collection)?;
+    let live: Vec<_> = merged
+        .entities
+        .values()
+        .filter(|e| e.collection == collection && e.canonical == canonical && e.live)
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    let made: Vec<Option<Hlc>> = live
+        .iter()
+        .map(|e| match e.registers.get(DELETED) {
+            Some((Value::Int(0), k)) => Some(*k),
+            _ => None,
+        })
+        .collect();
+    let made = made
+        .iter()
+        .copied()
+        .collect::<Option<Vec<Hlc>>>()
+        .and_then(|all| all.into_iter().min());
+    let mut fields = BTreeMap::new();
+    for f in &c.fields {
+        let clock = match c.together.iter().find(|s| s.contains(&f.name)) {
+            Some(set) => live
+                .iter()
+                .flat_map(|e| set.iter().filter_map(|g| e.registers.get(g)))
+                .map(|(_, k)| *k)
+                .max(),
+            None => {
+                let mut best: Option<&(Value, Hlc)> = None;
+                for e in &live {
+                    if let Some(entry) = e.registers.get(&f.name)
+                        && wins(f.strategy, best.map(|(v, k)| (v, k)), &entry.0, &entry.1)
+                    {
+                        best = Some(entry);
+                    }
+                }
+                best.map(|(_, k)| *k)
+            }
+        };
+        if let Some(clock) = clock {
+            fields.insert(f.name.clone(), clock);
+        }
+    }
+    Some((made, fields))
+}
+
 /// Asks about every mentioned gid in every collection, in one session, and checks each answer
 /// against `model::view` and against a fresh session.
 fn agrees(schema: &Schema, changes: &[Change]) -> Result<(), TestCaseError> {
     let expected = view(schema, changes);
+    let merged = merge(schema, changes);
     let store = store(schema, changes);
     let ev = Evaluator::new(schema).unwrap();
     let mut session = ev.session(&store);
@@ -36,6 +93,13 @@ fn agrees(schema: &Schema, changes: &[Change]) -> Result<(), TestCaseError> {
             }
             prop_assert!(t.members.contains(&g));
             prop_assert_eq!(t.canonical, t.members[0]);
+            prop_assert_eq!(
+                session
+                    .origin(&c.name, g)
+                    .unwrap()
+                    .map(|o| (o.made, o.fields)),
+                origin(schema, &merged, &c.name, t.canonical)
+            );
             prop_assert!(t.live.iter().all(|m| t.members.contains(m)));
             match &t.row {
                 Some(row) => {
