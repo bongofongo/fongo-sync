@@ -119,7 +119,7 @@ unsafe extern "C" fn drop_counter(counter: *mut c_void) {
 /// Replaces `randomblob` so that the node id takes 0 and the n-th gid minted takes n, as the
 /// sim's replica `replica` numbers them.
 async fn count_blobs(conn: &mut SqliteConnection, replica: u8) {
-    let mut handle = conn.lock_handle().await.unwrap();
+    let mut handle = support::lock(conn).await;
     let db = handle.as_raw_handle().as_ptr();
     let counter = Box::new(Counter {
         replica,

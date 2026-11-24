@@ -1752,6 +1752,9 @@ async fn a_pooled_connection_a_panicked_sync_left_is_refused_and_detached() {
 /// Fails the next commit on `conn` once `armed` is set, as SQLite does when a commit hook refuses:
 /// the commit becomes a rollback.
 async fn fail_commits(conn: &mut SqliteConnection, armed: Arc<AtomicBool>) {
+    // As the adapter does: a `lock_handle` straight after another can leave sqlx an unlock to
+    // answer later, and enough of those deadlock the connection.
+    conn.ping().await.unwrap();
     conn.lock_handle()
         .await
         .unwrap()
