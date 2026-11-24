@@ -184,7 +184,7 @@ impl Peer {
     pub async fn count_work(&mut self) -> Arc<AtomicU64> {
         let work = Arc::new(AtomicU64::new(0));
         let counter = work.clone();
-        let mut handle = self.conn.lock_handle().await.unwrap();
+        let mut handle = super::lock(&mut self.conn).await;
         handle.set_progress_handler(1000, move || {
             counter.fetch_add(1, Ordering::Relaxed);
             true

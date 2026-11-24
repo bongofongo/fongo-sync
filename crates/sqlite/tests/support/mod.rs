@@ -26,7 +26,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use fongo_sync_sqlite::core::model::{self, Merge, Row, View};
 use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Value, wins};
 use fongo_sync_sqlite::{Collection, Key, Kind, Made, Registry, Replica};
-use sqlx::SqliteConnection;
+use sqlx::sqlite::LockedSqliteHandle;
+use sqlx::{Connection, SqliteConnection};
+
+/// The connection's SQLite handle, taken as the adapter takes it: after a ping, without which a
+/// run of these can leave sqlx unlock commands to answer later and in time deadlock the connection.
+pub async fn lock(conn: &mut SqliteConnection) -> LockedSqliteHandle<'_> {
+    conn.ping().await.unwrap();
+    conn.lock_handle().await.unwrap()
+}
 
 pub(crate) async fn rows(
     conn: &mut SqliteConnection,

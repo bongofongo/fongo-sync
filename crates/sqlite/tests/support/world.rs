@@ -63,7 +63,7 @@ impl World {
         // Streams that start at mixed states, not at neighbouring ones, never overlap in practice.
         let mut rng = self.seed ^ n.wrapping_mul(0xD1B5_4A32_D192_ED03);
         let rng = splitmix(&mut rng);
-        let mut handle = conn.lock_handle().await.unwrap();
+        let mut handle = super::lock(&mut conn).await;
         let db = handle.as_raw_handle().as_ptr();
         for (name, args, call) in [
             ("randomblob", 1, randomblob as Call),
