@@ -54,11 +54,16 @@ pub enum Error {
     /// made before it. Nothing in that transaction was kept and the cursor did not move.
     #[error("the transaction a sync opened ended inside the application's step")]
     TransactionEnded,
-    /// The connection has a transaction open, so a sync will not run on it: it commits
-    /// transactions of its own, and a step that ended its transaction would end the caller's.
-    /// Nothing was read or written.
-    #[error("the connection is inside a transaction; a sync runs only outside one")]
-    InTransaction,
+    /// The connection cannot carry a sync: SQLite has a transaction open on it, or sqlx counts one
+    /// that SQLite does not have, as a sync that panicked or was dropped can leave it. Nothing was
+    /// read or written. Finish a transaction the application opened; otherwise close the
+    /// connection and open a fresh one, detaching a pooled one rather than giving it back.
+    #[error(
+        "the connection cannot carry a sync: a transaction is open on it, or sqlx counts one SQLite \
+         does not have; finish a transaction you opened, or else close this connection and open a \
+         fresh one (from a pool, detach it rather than return it)"
+    )]
+    ConnectionUnsound,
 }
 
 impl From<sqlx::Error> for Error {
