@@ -3,9 +3,12 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
@@ -13,9 +16,9 @@ use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
     Apply, Credentials, Error, Method, Request, Response, SyncReport, Transport, TransportError,
-    create_library, join_library, sync_with,
+    create_library, join_library, sync, sync_with,
 };
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection, SqliteConnection};
 use support::{Library, Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch};
 
@@ -39,16 +42,14 @@ async fn file_peer(credentials: Credentials) -> Peer {
 /// The connection is out of every transaction as sqlx and SQLite both count them, and a second
 /// connection to the file reads every table as this one does.
 async fn assert_durable(peer: &mut Peer, at: &str) {
-    drop(peer.conn.begin().await.unwrap());
-    let begun = sqlx::query("BEGIN").execute(&mut peer.conn).await;
-    assert!(begun.is_ok(), "{at}: still in a transaction: {begun:?}");
-    sqlx::query("ROLLBACK")
-        .execute(&mut peer.conn)
-        .await
-        .unwrap();
+    assert_durable_on(&mut peer.conn, at).await;
+}
+
+async fn assert_durable_on(conn: &mut SqliteConnection, at: &str) {
+    assert_clean_on(conn, at).await;
     let file: String =
         sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_one(&mut peer.conn)
+            .fetch_one(&mut *conn)
             .await
             .unwrap();
     assert!(!file.is_empty(), "{at}: the database is not a file");
@@ -59,9 +60,17 @@ async fn assert_durable(peer: &mut Peer, at: &str) {
         .unwrap();
     assert_eq!(
         everything(&mut other).await,
-        everything(&mut peer.conn).await,
+        everything(&mut *conn).await,
         "{at}"
     );
+}
+
+/// sqlx and SQLite agree that the connection is in no transaction.
+async fn assert_clean_on(conn: &mut SqliteConnection, at: &str) {
+    drop(conn.begin().await.unwrap());
+    let begun = sqlx::query("BEGIN").execute(&mut *conn).await;
+    assert!(begun.is_ok(), "{at}: still in a transaction: {begun:?}");
+    sqlx::query("ROLLBACK").execute(&mut *conn).await.unwrap();
 }
 
 /// An envelope from `signer` setting `name`, sealed outside any peer the test syncs.
@@ -80,9 +89,12 @@ async fn pair(server: &Server) -> [Peer; 2] {
     let mut peers = [file_peer(made).await, file_peer(joined).await];
     for peer in &mut peers {
         peer.run(MARKS).await;
+        peer.run(ONCE).await;
     }
     peers
 }
+
+const ONCE: &str = "CREATE TABLE once (id INTEGER PRIMARY KEY)";
 
 fn later() {
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -873,6 +885,16 @@ struct Counting {
     caught_up: usize,
     /// Fail the next apply, at this point.
     fail: Option<Fail>,
+    /// End the next apply's transaction once the counts are written, and then give up on it.
+    abandon: Option<Abandon>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Abandon {
+    /// Panic.
+    Panics,
+    /// Never return; the flag tells the test to drop the sync.
+    Hangs(&'static AtomicBool),
 }
 
 impl Apply for Counting {
@@ -911,6 +933,16 @@ impl Apply for Counting {
             .bind(by)
             .execute(&mut *conn)
             .await?;
+        }
+        if let Some(abandon) = self.abandon.take() {
+            end_the_transaction(conn).await?;
+            match abandon {
+                Abandon::Panics => panic!("abandoned after ending the transaction"),
+                Abandon::Hangs(hung) => {
+                    hung.store(true, Ordering::Relaxed);
+                    std::future::pending::<()>().await;
+                }
+            }
         }
         Ok(applied)
     }
@@ -1097,7 +1129,6 @@ async fn an_apply_that_ends_the_transaction_and_hides_it_fails_the_sync_and_move
     let server = Server::new();
     let [mut a, mut b] = crash_scene(&server).await;
     let id = a.credentials.library_id();
-    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
     let mut hook = Swallowing {
         applies: 1,
         in_caught_up: false,
@@ -1123,7 +1154,6 @@ async fn caught_up_that_ends_the_transaction_and_hides_it_fails_the_sync_and_sen
     let server = Server::new();
     let [mut a, mut b] = crash_scene(&server).await;
     let id = a.credentials.library_id();
-    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
     let mut hook = Swallowing {
         applies: 0,
         in_caught_up: true,
@@ -1148,7 +1178,6 @@ async fn an_apply_that_ends_the_transaction_part_way_through_a_pull_is_tried_onc
     for applies in [1, 2] {
         let server = Server::new();
         let [mut a, mut b] = behind_its_own_append(&server).await;
-        a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
         let mut hook = Swallowing {
             applies,
             in_caught_up: false,
@@ -1185,7 +1214,6 @@ async fn an_apply_that_ends_the_transaction_part_way_through_a_pull_is_tried_onc
 async fn after_a_transaction_ends_inside_a_step_later_syncs_reach_the_file() {
     let server = Server::new();
     let [mut a, mut b] = crash_scene(&server).await;
-    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
     let mut swallowing = Swallowing {
         applies: 1,
         in_caught_up: false,
@@ -1298,6 +1326,281 @@ async fn a_step_that_rolls_back_or_releases_the_clients_savepoint_fails_the_sync
     }
 }
 
+/// Ends the transaction after applying, then returns, fails, or panics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Then {
+    Returns,
+    Fails,
+    Panics,
+}
+
+impl Apply for Then {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        let applied = replica.apply(conn, changes).await?;
+        end_the_transaction(conn).await?;
+        match self {
+            Then::Returns => Ok(applied),
+            Then::Fails => Err(failed("ended")),
+            Then::Panics => panic!("ended"),
+        }
+    }
+}
+
+/// After a sync whose step ended its transaction and was given up on, the verifier's sequence:
+/// a sync whose step fails, then plain syncs; every write reaches the file.
+async fn then_fail_then_sync(a: &mut Peer, b: &mut Peer, server: &Server, at: &str) {
+    let mut failing = Marking {
+        fail: Some((Fail::AfterApplying, 1)),
+        ..Marking::default()
+    };
+    let result = sync_hooked(a, server, &mut failing).await;
+    assert!(
+        matches!(result, Err(Error::Application(_))),
+        "{at}: {result:?}"
+    );
+    a.sync(server).await.unwrap();
+    b.sync(server).await.unwrap();
+    a.sync(server).await.unwrap();
+    assert_eq!(a.settings().await, ["theme=dark"], "{at}");
+}
+
+#[tokio::test]
+async fn a_step_that_ends_the_transaction_and_panics_leaves_the_next_sync_to_repair() {
+    let server = Server::new();
+    let [mut a, mut b] = crash_scene(&server).await;
+    let panicked = CatchUnwind(Box::pin(sync_hooked(&mut a, &server, &mut Then::Panics))).await;
+    assert!(panicked.is_err());
+    then_fail_then_sync(&mut a, &mut b, &server, "panicked").await;
+    assert_durable(&mut a, "panicked, then synced").await;
+    assert_converged(&mut [a, b]).await;
+
+    // The same on databases in memory, where no second connection can look.
+    let server = Server::new();
+    let [made, joined] = credentials(&server).await;
+    let (mut a, mut b) = (Peer::new(made).await, Peer::new(joined).await);
+    for peer in [&mut a, &mut b] {
+        peer.run(MARKS).await;
+        peer.run(ONCE).await;
+    }
+    b.run("INSERT INTO settings VALUES ('theme', 'dark')").await;
+    b.sync(&server).await.unwrap();
+    let panicked = CatchUnwind(Box::pin(sync_hooked(&mut a, &server, &mut Then::Panics))).await;
+    assert!(panicked.is_err());
+    then_fail_then_sync(&mut a, &mut b, &server, "in memory").await;
+    assert_clean(&mut a, "in memory").await;
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_sync_dropped_anywhere_around_an_ended_transaction_is_repaired_by_the_next() {
+    for then in [Then::Fails, Then::Returns] {
+        for k in 1.. {
+            assert!(k < 1_000, "the sync never ended");
+            let server = Server::new();
+            let [mut a, mut b] = crash_scene(&server).await;
+            let mut hook = then;
+            let ended = {
+                let mut sync = Box::pin(sync_hooked(&mut a, &server, &mut hook));
+                let mut pending = 0;
+                loop {
+                    match std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))).await {
+                        Poll::Ready(_) => break true,
+                        Poll::Pending => {
+                            pending += 1;
+                            if pending == k {
+                                break false;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+            };
+            let at = format!("{then:?} dropped at {k}");
+            then_fail_then_sync(&mut a, &mut b, &server, &at).await;
+            assert_durable(&mut a, &at).await;
+            assert_converged(&mut [a, b]).await;
+            if ended {
+                break;
+            }
+        }
+    }
+}
+
+/// sqlx counts a transaction SQLite does not have, as a sync given up on can leave it.
+async fn miscount(peer: &mut Peer) {
+    let mut tx = peer.conn.begin().await.unwrap();
+    sqlx::query("ROLLBACK").execute(&mut *tx).await.unwrap();
+    std::mem::forget(tx);
+}
+
+#[tokio::test]
+async fn a_miscounted_connection_is_repaired_before_the_sync_begins() {
+    for left_open in [false, true] {
+        let server = Server::new();
+        let [mut a, mut b] = crash_scene(&server).await;
+        miscount(&mut a).await;
+        if left_open {
+            // As a repair dropped part-way leaves it.
+            a.run("SAVEPOINT fongo_client_repair").await;
+        }
+        a.sync(&server).await.unwrap();
+        assert_eq!(a.settings().await, ["theme=dark"], "{left_open}");
+        assert_durable(&mut a, &format!("left open: {left_open}")).await;
+        b.sync(&server).await.unwrap();
+        assert_converged(&mut [a, b]).await;
+    }
+}
+
+#[tokio::test]
+async fn a_repair_dropped_at_any_point_is_finished_by_the_next() {
+    for k in 1.. {
+        assert!(k < 100, "the repair never ended");
+        let server = Server::new();
+        let [mut a, mut b] = crash_scene(&server).await;
+        miscount(&mut a).await;
+        let ended = {
+            let mut check = Box::pin(fongo_sync_client::check_connection(&mut a.conn));
+            let mut pending = 0;
+            loop {
+                match std::future::poll_fn(|cx| Poll::Ready(check.as_mut().poll(cx))).await {
+                    Poll::Ready(result) => {
+                        result.unwrap();
+                        break true;
+                    }
+                    Poll::Pending => {
+                        pending += 1;
+                        if pending == k {
+                            break false;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        };
+        let at = format!("dropped at {k}");
+        then_fail_then_sync(&mut a, &mut b, &server, &at).await;
+        assert_durable(&mut a, &at).await;
+        assert_converged(&mut [a, b]).await;
+        if ended {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sync_inside_a_transaction_is_refused_and_leaves_it_whole() {
+    for step in [None, Some(Then::Fails)] {
+        let server = Server::new();
+        let [mut a, mut b] = crash_scene(&server).await;
+        let requests = server.with(|s| s.requests.len());
+        let mut tx = a.conn.begin().await.unwrap();
+        sqlx::query("INSERT INTO marks VALUES ('c', 'g', 'f', 'k', 'callers')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let result = match step {
+            None => sync(&mut tx, &a.replica, &server, &a.credentials, now).await,
+            Some(mut then) => {
+                sync_with(&mut tx, &a.replica, &server, &a.credentials, now, &mut then).await
+            }
+        };
+        assert!(matches!(result, Err(Error::InTransaction)), "{result:?}");
+        assert_eq!(server.with(|s| s.requests.len()), requests);
+        tx.commit().await.unwrap();
+        assert_eq!(marked(&mut a, "callers").await, 1);
+        assert_eq!(a.cursor().await, 0);
+        assert_durable(&mut a, "the caller committed").await;
+
+        // A transaction opened with a statement, which sqlx does not count, is refused too.
+        a.run("BEGIN").await;
+        let result = a.sync(&server).await;
+        assert!(matches!(result, Err(Error::InTransaction)), "{result:?}");
+        a.run("ROLLBACK").await;
+        a.sync(&server).await.unwrap();
+        b.sync(&server).await.unwrap();
+        assert_converged(&mut [a, b]).await;
+    }
+}
+
+async fn changes_and_level(conn: &mut SqliteConnection) -> (i64, i64, Vec<String>) {
+    let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let level: i64 = sqlx::query_scalar("PRAGMA main.synchronous")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    (changes, level, everything(conn).await)
+}
+
+#[tokio::test]
+async fn checking_a_sound_connection_writes_nothing() {
+    let server = Server::new();
+    let [mut a, _b] = crash_scene(&server).await;
+    a.sync(&server).await.unwrap();
+    let before = changes_and_level(&mut a.conn).await;
+    fongo_sync_client::check_connection(&mut a.conn)
+        .await
+        .unwrap();
+    assert_eq!(changes_and_level(&mut a.conn).await, before);
+}
+
+#[tokio::test]
+async fn a_pooled_connection_given_back_after_a_panicked_sync_is_repaired_by_the_next() {
+    let server = Server::new();
+    let [a, mut b] = crash_scene(&server).await;
+    let Peer {
+        mut conn,
+        replica,
+        credentials,
+    } = a;
+    let file: String =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    drop(conn);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&file)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    {
+        let mut conn = pool.acquire().await.unwrap();
+        let panicked = CatchUnwind(Box::pin(sync_with(
+            &mut conn,
+            &replica,
+            &server,
+            &credentials,
+            now,
+            &mut Then::Panics,
+        )))
+        .await;
+        assert!(panicked.is_err());
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    sync(&mut conn, &replica, &server, &credentials, now)
+        .await
+        .unwrap();
+    let settings: Vec<String> = sqlx::query_scalar("SELECT key FROM settings")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(settings, ["theme"]);
+    assert_durable_on(&mut conn, "pooled").await;
+    b.sync(&server).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_copy_of_an_envelope_gives_its_changes_again_and_touches_nothing() {
     let server = Server::new();
@@ -1360,6 +1663,28 @@ fn env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Polls a future, turning a panic inside it into `Err`.
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let future = self.0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| future.poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
+}
+
+async fn until(flag: &AtomicBool) {
+    while !flag.load(Ordering::Relaxed) {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Carries requests to the server and notes whether any was an append.
 struct Noting<'a> {
     server: &'a Server,
@@ -1375,15 +1700,8 @@ impl Transport for Noting<'_> {
     }
 }
 
-/// sqlx and SQLite agree that the connection is in no transaction.
 async fn assert_clean(peer: &mut Peer, at: &str) {
-    drop(peer.conn.begin().await.unwrap());
-    let begun = sqlx::query("BEGIN").execute(&mut peer.conn).await;
-    assert!(begun.is_ok(), "{at}: still in a transaction: {begun:?}");
-    sqlx::query("ROLLBACK")
-        .execute(&mut peer.conn)
-        .await
-        .unwrap();
+    assert_clean_on(&mut peer.conn, at).await;
 }
 
 /// Three devices write at random and sync through a server that fails, loses or hangs a random
@@ -1421,6 +1739,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             peer.run(PRESENT).await;
             peer.run(COUNTS).await;
             peer.run(CAUGHT_UP).await;
+            peer.run(ONCE).await;
         }
         let mut unlisted: Vec<SigningKey> = Vec::new();
         let mut strangers = 0;
@@ -1468,11 +1787,17 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         2 => server.hang_at(n, rng.below(2) == 0),
                         _ => {}
                     }
+                    let hung = Box::leak(Box::new(AtomicBool::new(false)));
                     let mut hook = Counting {
                         caught_up: 0,
                         fail: match rng.below(4) {
                             0 => Some(Fail::BeforeApplying),
                             1 => Some(Fail::AfterApplying),
+                            _ => None,
+                        },
+                        abandon: match rng.below(8) {
+                            0 => Some(Abandon::Panics),
+                            1 => Some(Abandon::Hangs(hung)),
                             _ => None,
                         },
                     };
@@ -1485,12 +1810,14 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         .lines("SELECT CAST(count(*) AS TEXT) FROM caught_up")
                         .await;
                     let result = tokio::select! {
-                        result = sync_with(
+                        result = CatchUnwind(Box::pin(sync_with(
                             &mut peer.conn, &peer.replica, &noting, &peer.credentials, now,
                             &mut hook,
-                        ) => Some(result),
+                        ))) => result.ok(),
                         () = server.hung() => None,
+                        () = until(hung) => None,
                     };
+                    let abandoned = result.is_none();
                     match result {
                         Some(Ok(report)) => {
                             let complete = report.blocked.is_none() && !report.more;
@@ -1511,7 +1838,14 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                     let kept =
                         after[0].parse::<usize>().unwrap() - before[0].parse::<usize>().unwrap();
                     assert_eq!(kept, hook.caught_up, "{at}");
-                    assert_clean(&mut peers[who], &at).await;
+                    // A sync given up on after its transaction ended leaves the connection for
+                    // the next sync to repair, or for the application.
+                    if !abandoned || rng.below(2) == 0 {
+                        fongo_sync_client::check_connection(&mut peers[who].conn)
+                            .await
+                            .unwrap();
+                        assert_clean(&mut peers[who], &at).await;
+                    }
                     assert_counted(&mut peers[who], &at).await;
                 }
             }

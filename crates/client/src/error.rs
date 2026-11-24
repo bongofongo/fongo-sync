@@ -54,6 +54,11 @@ pub enum Error {
     /// made before it. Nothing in that transaction was kept and the cursor did not move.
     #[error("the transaction a sync opened ended inside the application's step")]
     TransactionEnded,
+    /// The connection has a transaction open, so a sync will not run on it: it commits
+    /// transactions of its own, and a step that ended its transaction would end the caller's.
+    /// Nothing was read or written.
+    #[error("the connection is inside a transaction; a sync runs only outside one")]
+    InTransaction,
 }
 
 impl From<sqlx::Error> for Error {

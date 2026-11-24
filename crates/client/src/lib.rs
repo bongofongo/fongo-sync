@@ -42,5 +42,7 @@ pub use fongo_sync_sqlite as sqlite;
 pub use library::{add_device, create_library, join_library};
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::cursor;
-pub use sync::{Apply, Blocked, Refusal, Refused, SyncReport, merge_applied, sync, sync_with};
+pub use sync::{
+    Apply, Blocked, Refusal, Refused, SyncReport, check_connection, merge_applied, sync, sync_with,
+};
 pub use transport::{Method, Request, Response, Transport, TransportError};

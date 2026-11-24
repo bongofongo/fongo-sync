@@ -134,6 +134,16 @@ pub struct SyncReport {
 /// may not hold them. An append the server places right after the cursor moves the cursor past
 /// it, so a device does not usually read back what it sent.
 ///
+/// # The connection
+///
+/// A sync runs on a connection with no transaction open, and commits transactions of its own. It
+/// does not run inside a caller's transaction: a step given through [`Apply`] that ended the
+/// transaction would end the caller's too. So it begins with [`check_connection`], and a sync
+/// started inside a transaction fails with [`Error::InTransaction`] having touched nothing. A
+/// sync that panicked or was dropped can leave sqlx counting a transaction SQLite has ended; the
+/// next sync repairs that first, and an application that uses the connection before syncing
+/// again calls [`check_connection`] itself.
+///
 /// # What the server is relied on for
 ///
 /// - Numbering each library's envelopes 1, 2, 3 and so on without gaps, as the protocol states. A
@@ -169,6 +179,9 @@ pub async fn sync<T: Transport>(
 /// name are the client's: a method must not release the savepoint, roll back to it, or write the
 /// table. Rolling back to it fails the sync as an ended transaction does; releasing it fails the
 /// sync too, though nothing was lost.
+///
+/// Because a method can end the transaction it is given, a sync never runs inside a caller's
+/// transaction; see [`sync`].
 ///
 /// Implement it with `async fn`; the futures must be `Send`.
 pub trait Apply: Send {
@@ -234,8 +247,8 @@ pub trait Apply: Send {
 impl Apply for () {}
 
 /// [`sync`], with the application's own [`Apply`] in place of [`Replica::apply`] alone. Nothing
-/// else changes: the order of pull and append, the cursor, and the conflict bases are as `sync`
-/// keeps them.
+/// else changes: the order of pull and append, the cursor, the conflict bases, and the connection
+/// it needs, with no transaction open, are as `sync` keeps them.
 ///
 /// What the client guarantees about atomicity with its cursor: what [`Apply::apply`] writes is
 /// committed in one transaction with the changes it applied and the cursor past them, and with the
@@ -261,6 +274,7 @@ async fn run<T: Transport, A: Apply>(
     apply: &mut A,
     settles: bool,
 ) -> Result<SyncReport, Error> {
+    check_connection(conn).await?;
     let rpc = Rpc {
         transport,
         now: &now,
@@ -268,7 +282,6 @@ async fn run<T: Transport, A: Apply>(
     let caps = rpc.capabilities().await?;
     let library = credentials.library_id();
     let me = credentials.device_id();
-    let depth = <Sqlite as Database>::TransactionManager::get_transaction_depth(conn);
     let saved = state::load(conn, library).await?;
     let mut cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
@@ -282,7 +295,6 @@ async fn run<T: Transport, A: Apply>(
         appended: saved.appended,
         sending: saved.sending,
         landed: None,
-        depth,
     };
     let mut applier = Applier { replica, apply };
     let pulled = read_pages(
@@ -295,6 +307,12 @@ async fn run<T: Transport, A: Apply>(
         &mut report,
     )
     .await;
+    // A commit that failed part-way through the pull is the one way to reach this with the
+    // connection unsound; then there is nothing to retry on.
+    let pulled = match pulled {
+        Err(error) if check_connection(conn).await.is_err() => return Err(error),
+        pulled => pulled,
+    };
     let collect = !pull.applied;
     let committed = pull
         .commit(conn, &mut applier, library, &mut report, collect)
@@ -316,7 +334,7 @@ async fn run<T: Transport, A: Apply>(
         match settled {
             Ok(Some(settled)) => merge_applied(&mut report.applied, settled),
             Ok(None) => {}
-            Err(error) => return Err(realign(conn, depth, error).await),
+            Err(error) => return Err(realign(conn, error).await),
         }
     }
 
@@ -330,16 +348,7 @@ async fn run<T: Transport, A: Apply>(
             .map_or(0, |opened| opened.changes.len());
             match append(&rpc, credentials, sending.envelope).await {
                 Ok(seq) => {
-                    acknowledge(
-                        conn,
-                        replica,
-                        library,
-                        sending.through,
-                        seq,
-                        &mut cursor,
-                        depth,
-                    )
-                    .await?;
+                    acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
@@ -398,16 +407,7 @@ async fn run<T: Transport, A: Apply>(
         };
         state::record_sending(conn, library, &sending).await?;
         let seq = append(&rpc, credentials, sending.envelope).await?;
-        acknowledge(
-            conn,
-            replica,
-            library,
-            sending.through,
-            seq,
-            &mut cursor,
-            depth,
-        )
-        .await?;
+        acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
@@ -449,20 +449,75 @@ async fn end_watch(conn: &mut SqliteConnection) -> Result<(), Error> {
     Ok(())
 }
 
-/// Returns `error` once sqlx's count of open transactions is back to `depth`, where it stood when
-/// the sync began, after a transaction of the client's failed and was dropped. A statement that
-/// ended SQLite's transaction leaves the rollback sqlx queued on drop with nothing to end, and sqlx
-/// then still counts it open: every later transaction on the connection would be a savepoint, and
-/// nothing they commit would reach the file.
-async fn realign(conn: &mut SqliteConnection, depth: usize, error: Error) -> Error {
-    // The queued rollback runs before this statement does.
-    let _ = sqlx::query("SELECT 1").execute(&mut *conn).await;
-    if depth == 0 && <Sqlite as Database>::TransactionManager::get_transaction_depth(conn) > 0 {
-        // Fails, harmlessly, when SQLite is still in the transaction.
-        let _ = sqlx::query("BEGIN").execute(&mut *conn).await;
-        let _ = <Sqlite as Database>::TransactionManager::rollback(conn).await;
-    }
+/// Returns `error` once the connection is sound again, after a transaction of the client's failed
+/// and was dropped. A statement that ended SQLite's transaction leaves the rollback sqlx queued on
+/// drop with nothing to end, and sqlx then still counts the transaction open, so every later one
+/// would be a savepoint that never reaches the file; [`check_connection`] brings the count back to
+/// zero. When it cannot, the next sync refuses to start.
+async fn realign(conn: &mut SqliteConnection, error: Error) -> Error {
+    let _ = check_connection(conn).await;
     error
+}
+
+/// Whether SQLite has a transaction open on `conn`. SQLite refuses a change of safety level inside
+/// a transaction and ignores one for the temporary schema outside, and checks when it prepares
+/// the statement, so it is prepared afresh each time. It also runs after any rollback a dropped
+/// transaction queued.
+async fn in_transaction(conn: &mut SqliteConnection) -> bool {
+    sqlx::query("PRAGMA temp.synchronous = OFF")
+        .persistent(false)
+        .execute(&mut *conn)
+        .await
+        .is_err()
+}
+
+/// Makes sure `conn` has no transaction open, as both SQLite and sqlx count them, so a sync can
+/// run on it. [`sync`] and [`sync_with`] call it first; an application calls it after a sync that
+/// panicked or was dropped, before using the connection for anything else.
+///
+/// - SQLite has no transaction open and sqlx counts none: nothing to do.
+/// - SQLite has none and sqlx counts some, as a sync that panicked or was dropped after a statement
+///   ended its transaction leaves it: sqlx's count is brought back to zero, writing nothing.
+/// - SQLite has one open: [`Error::InTransaction`], and nothing is touched. The one exception is
+///   the empty transaction a repair dropped part-way leaves, under the savepoint
+///   `fongo_client_repair`; it is released and the repair finished.
+pub async fn check_connection(conn: &mut SqliteConnection) -> Result<(), Error> {
+    if in_transaction(conn).await {
+        let ours = sqlx::query("RELEASE fongo_client_repair")
+            .execute(&mut *conn)
+            .await
+            .is_ok();
+        if !ours || in_transaction(conn).await {
+            return Err(Error::InTransaction);
+        }
+    }
+    let depth = <Sqlite as Database>::TransactionManager::get_transaction_depth(conn);
+    if depth > 0 {
+        // sqlx ends its transactions with a rollback that needs one open, and a savepoint of its
+        // own name for each level past the first.
+        sqlx::query("SAVEPOINT fongo_client_repair")
+            .execute(&mut *conn)
+            .await?;
+        for level in 1..depth {
+            sqlx::query(&format!("SAVEPOINT _sqlx_savepoint_{level}"))
+                .execute(&mut *conn)
+                .await?;
+        }
+        for _ in 0..depth {
+            <Sqlite as Database>::TransactionManager::rollback(conn).await?;
+        }
+    }
+    if <Sqlite as Database>::TransactionManager::get_transaction_depth(conn) > 0 {
+        return Err(Error::InTransaction);
+    }
+    // A rollback above whose answer was dropped with its sync leaves sqlx set to skip the next
+    // rollback a dropped transaction queues, and none follows one made without a transaction.
+    // With none open, a queued rollback clears that and does nothing else.
+    <Sqlite as Database>::TransactionManager::start_rollback(conn);
+    if in_transaction(conn).await {
+        return Err(Error::InTransaction);
+    }
+    Ok(())
 }
 
 /// The replica received changes are applied to, and how.
@@ -483,8 +538,6 @@ struct Pull {
     sending: Option<Sending>,
     /// The outbox position the recorded envelope covers, once found at `read`.
     landed: Option<i64>,
-    /// sqlx's count of open transactions when the sync began.
-    depth: usize,
 }
 
 impl Pull {
@@ -525,7 +578,7 @@ impl Pull {
         .await;
         let applied = match written {
             Ok(applied) => applied,
-            Err(error) => return Err(realign(conn, self.depth, error).await),
+            Err(error) => return Err(realign(conn, error).await),
         };
         self.landed = None;
         if let Some(applied) = applied {
@@ -809,7 +862,6 @@ async fn acknowledge(
     through: i64,
     seq: u64,
     cursor: &mut u64,
-    depth: usize,
 ) -> Result<(), Error> {
     let follows = Some(seq) == cursor.checked_add(1);
     let written = async {
@@ -829,7 +881,7 @@ async fn acknowledge(
     }
     .await;
     if let Err(error) = written {
-        return Err(realign(conn, depth, error).await);
+        return Err(realign(conn, error).await);
     }
     if follows {
         *cursor = seq;
