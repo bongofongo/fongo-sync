@@ -30,7 +30,16 @@ impl Gid {
     }
 
     pub fn to_hex(&self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
+        let mut hex = String::with_capacity(32);
+        self.push_hex(&mut hex);
+        hex
+    }
+
+    /// Appends [`Gid::to_hex`] to `out`.
+    pub(crate) fn push_hex(&self, out: &mut String) {
+        for &byte in &self.0 {
+            push_hex_digits(out, u64::from(byte), 2);
+        }
     }
 
     pub fn from_hex(hex: &str) -> Option<Gid> {
@@ -42,6 +51,14 @@ impl Gid {
             *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
         }
         Some(Gid(id))
+    }
+}
+
+/// Appends the low `digits` hex digits of `value`, most significant first, in lower case.
+pub(crate) fn push_hex_digits(out: &mut String, value: u64, digits: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in (0..digits).rev() {
+        out.push(HEX[((value >> (4 * i)) & 0xf) as usize] as char);
     }
 }
 
