@@ -6,7 +6,6 @@ mod support;
 
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Hlc, Value};
 use fongo_sync_sqlite::{Collection, Registry, Resume};
-use sqlx::ConnectOptions;
 use support::peer::{Peer, later, make, same_everywhere, settle};
 
 fn change(collection: &str, gid: Gid, field: &str, value: Value, wall_ms: u64) -> Change {
@@ -543,284 +542,8 @@ async fn rows_removed_and_added_while_suspended_are_deleted_and_made() {
 
 // Work that grows with what an apply touches, not with its square.
 
-/// Elapsed time and, on Linux, process CPU time, resident memory and threads, on every line.
-struct Diag(std::time::Instant);
-
-impl Diag {
-    fn line(&self, what: &str) {
-        use std::io::Write;
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(
-            err,
-            "[diag {:8.3}s{}] {what}",
-            self.0.elapsed().as_secs_f64(),
-            proc_stats()
-        );
-        let _ = err.flush();
-    }
-}
-
-fn proc_stats() -> String {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return String::new();
-    };
-    let after: Vec<&str> = stat
-        .rsplit_once(')')
-        .map_or("", |(_, r)| r)
-        .split_whitespace()
-        .collect();
-    let ticks = |i: usize| {
-        after
-            .get(i)
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    };
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let field = |name: &str| {
-        status
-            .lines()
-            .find(|l| l.starts_with(name))
-            .map_or(String::new(), |l| l[name.len()..].trim().to_string())
-    };
-    format!(
-        " user={:.1}s sys={:.1}s rss={} thr={}",
-        ticks(11) / 100.0,
-        ticks(12) / 100.0,
-        field("VmRSS:"),
-        field("Threads:")
-    )
-}
-
-fn first_line(path: &str, prefix: &str) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with(prefix))
-        .unwrap_or("-")
-        .to_string()
-}
-
-async fn diag_probes(d: &Diag) {
-    use std::hint::black_box;
-    d.line(&format!(
-        "env {} {} parallelism={:?} debug_assertions={} cpu={:?} mem={:?} avail={:?} load={:?}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::thread::available_parallelism().map(|n| n.get()),
-        cfg!(debug_assertions),
-        first_line("/proc/cpuinfo", "model name"),
-        first_line("/proc/meminfo", "MemTotal"),
-        first_line("/proc/meminfo", "MemAvailable"),
-        std::fs::read_to_string("/proc/loadavg")
-            .unwrap_or_default()
-            .trim(),
-    ));
-    let schema = [
-        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
-        "CREATE TABLE notes (
-            id INTEGER PRIMARY KEY,
-            book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-            body TEXT)",
-    ];
-    let registry = Registry::new(vec![
-        Collection::minted("books", "books", "id").field("title"),
-        Collection::minted("notes", "notes", "id")
-            .owner("book_id", "books")
-            .field("body"),
-    ])
-    .unwrap();
-    let mut probe = Peer::new(&schema, registry).await;
-    d.line(&format!(
-        "sqlite {:?} database {:?}",
-        probe.lines("SELECT sqlite_version()").await,
-        probe
-            .lines("SELECT name || '=' || file FROM pragma_database_list")
-            .await,
-    ));
-    d.line(&format!(
-        "sqlite options {}",
-        probe
-            .lines("SELECT compile_options FROM pragma_compile_options")
-            .await
-            .join(",")
-    ));
-    let t = std::time::Instant::now();
-    for _ in 0..1000 {
-        probe.int("SELECT 1").await;
-    }
-    d.line(&format!(
-        "probe 1000 x SELECT 1 on a test connection: {:?}",
-        t.elapsed()
-    ));
-    let mut plain = sqlx::sqlite::SqliteConnectOptions::new()
-        .in_memory(true)
-        .shared_cache(false)
-        .connect()
-        .await
-        .unwrap();
-    let t = std::time::Instant::now();
-    for _ in 0..1000 {
-        let _: i64 = sqlx::query_scalar("SELECT 1")
-            .fetch_one(&mut plain)
-            .await
-            .unwrap();
-    }
-    d.line(&format!(
-        "probe 1000 x SELECT 1 on a private in-memory connection: {:?}",
-        t.elapsed()
-    ));
-    let t = std::time::Instant::now();
-    for i in 0..5_000_000u32 {
-        let a = black_box("notes").to_string();
-        let b = black_box("[1234]").to_string();
-        black_box((&a, &b, i));
-    }
-    d.line(&format!(
-        "probe 5M x two small String allocations: {:?}",
-        t.elapsed()
-    ));
-    let t = std::time::Instant::now();
-    for i in 0..20_000usize {
-        let v = vec![i as u8; 300_000];
-        black_box(&v);
-    }
-    d.line(&format!("probe 20k x 300 kB allocation: {:?}", t.elapsed()));
-    let t = std::time::Instant::now();
-    let mut map = std::collections::BTreeMap::new();
-    for i in 0..12_000 {
-        map.insert(
-            ("notes".to_string(), format!("[{i}]"), "body".to_string()),
-            i,
-        );
-    }
-    let mut hits = 0;
-    for i in 0..2_000_000 {
-        let key = (
-            "notes".to_string(),
-            format!("[{}]", i % 15_000),
-            "body".to_string(),
-        );
-        hits += usize::from(map.contains_key(&key));
-    }
-    d.line(&format!(
-        "probe 2M x BTreeMap lookups by three new Strings: {:?} ({hits})",
-        t.elapsed()
-    ));
-    probe
-        .run("INSERT INTO books (id, title) VALUES (1, 'Middlemarch')")
-        .await;
-    let mut steps = Vec::new();
-    let t = std::time::Instant::now();
-    probe
-        .run("INSERT INTO notes (book_id, body) VALUES (1, 'first')")
-        .await;
-    steps.push(format!("one row first {:?}", t.elapsed()));
-    for chunk in 0..8 {
-        let t = std::time::Instant::now();
-        probe
-            .run(&format!(
-                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500)
-                 INSERT INTO notes (book_id, body) SELECT 1, 'note {chunk} ' || x FROM n"
-            ))
-            .await;
-        steps.push(format!("500 rows {:?}", t.elapsed()));
-    }
-    let t = std::time::Instant::now();
-    probe
-        .run("INSERT INTO notes (book_id, body) VALUES (1, 'last')")
-        .await;
-    steps.push(format!("one row last {:?}", t.elapsed()));
-    d.line(&format!(
-        "probe inserts with the kernel's triggers: {}",
-        steps.join(", ")
-    ));
-}
-
-async fn diag_push(peer: &mut Peer, log: &mut Vec<Change>, d: &Diag, at: &str) -> Vec<Change> {
-    d.line(&format!("{at} push > harness before"));
-    peer.writes
-        .before(&mut peer.conn, &peer.replica, &peer.taken)
-        .await;
-    d.line(&format!("{at} push > kernel collect"));
-    peer.replica.collect(&mut peer.conn).await.unwrap();
-    d.line(&format!("{at} push > harness after"));
-    peer.writes.after(&mut peer.conn, &peer.replica).await;
-    d.line(&format!("{at} push > kernel outbox"));
-    let outbox = peer.replica.outbox(&mut peer.conn, u32::MAX).await.unwrap();
-    d.line(&format!(
-        "{at} push > harness unwritten ({} changes)",
-        outbox.changes.len()
-    ));
-    let unwritten = peer
-        .writes
-        .unwritten(&mut peer.conn, &peer.replica, &peer.taken, &outbox.changes)
-        .await;
-    if peer.checking && !unwritten.is_empty() {
-        panic!("{}", unwritten.join("\n"));
-    }
-    log.extend(outbox.changes.iter().cloned());
-    peer.taken.extend(outbox.changes.iter().cloned());
-    d.line(&format!("{at} push > kernel acknowledge"));
-    peer.replica
-        .acknowledge(&mut peer.conn, outbox.through)
-        .await
-        .unwrap();
-    d.line(&format!("{at} push > harness midway"));
-    peer.midway().await;
-    d.line(&format!("{at} push done"));
-    outbox.changes
-}
-
-async fn diag_pull(peer: &mut Peer, hub: &[Change], d: &Diag, at: &str) {
-    let changes = &hub[peer.cursor..];
-    peer.taken.extend(changes.iter().cloned());
-    d.line(&format!(
-        "{at} pull > harness before ({} changes)",
-        changes.len()
-    ));
-    peer.writes
-        .before(&mut peer.conn, &peer.replica, &peer.taken)
-        .await;
-    d.line(&format!("{at} pull > kernel apply"));
-    let applied = peer.replica.apply(&mut peer.conn, changes).await.unwrap();
-    peer.writes.touched(&applied.touched);
-    d.line(&format!(
-        "{at} pull > harness after ({} touched)",
-        applied.touched.len()
-    ));
-    peer.writes.after(&mut peer.conn, &peer.replica).await;
-    d.line(&format!("{at} pull > harness midway"));
-    peer.midway().await;
-    peer.cursor = hub.len();
-    d.line(&format!("{at} pull done"));
-}
-
-async fn diag_settle(peers: &mut [Peer], hub: &mut Vec<Change>, d: &Diag, at: &str) {
-    for round in 0..20 {
-        let before = hub.len();
-        for (i, peer) in peers.iter_mut().enumerate() {
-            let at = format!("{at} round {round} peer {i}");
-            diag_push(peer, hub, d, &at).await;
-            diag_pull(peer, hub, d, &at).await;
-        }
-        let mut quiet = hub.len() == before && peers.iter().all(|p| p.cursor == hub.len());
-        for (i, peer) in peers.iter_mut().enumerate() {
-            d.line(&format!("{at} round {round} peer {i} > kernel collect"));
-            peer.replica.collect(&mut peer.conn).await.unwrap();
-            d.line(&format!("{at} round {round} peer {i} > kernel outbox"));
-            let left = peer.replica.outbox(&mut peer.conn, 1).await.unwrap();
-            quiet &= left.changes.is_empty();
-        }
-        if quiet {
-            d.line(&format!("{at} quiet after round {round}"));
-            return;
-        }
-    }
-    panic!("the peers never stopped sending");
-}
-
 /// The work SQLite does on the replica that takes a book's delete, the book owning `notes`.
-async fn work_to_delete_an_owner_of(notes: i64, d: &Diag) -> u64 {
+async fn work_to_delete_an_owner_of(notes: i64) -> u64 {
     let schema = [
         "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
         "CREATE TABLE notes (
@@ -838,38 +561,30 @@ async fn work_to_delete_an_owner_of(notes: i64, d: &Diag) -> u64 {
         .unwrap()
     };
     let mut hub = Vec::new();
-    d.line(&format!("[{notes}] make peers"));
     let mut peers = make(2, &schema, registry).await;
     for peer in peers.iter_mut() {
         peer.checking = false;
     }
-    d.line(&format!("[{notes}] insert the book"));
     peers[0]
         .run("INSERT INTO books (id, title) VALUES (1, 'Middlemarch')")
         .await;
-    d.line(&format!("[{notes}] insert the notes"));
     peers[0]
         .run(&format!(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {notes})
              INSERT INTO notes (book_id, body) SELECT 1, 'note ' || x FROM n"
         ))
         .await;
-    d.line(&format!("[{notes}] settle"));
-    diag_settle(&mut peers, &mut hub, d, &format!("[{notes}] settle")).await;
+    settle(&mut peers, &mut hub).await;
     assert_eq!(peers[1].int("SELECT count(*) FROM notes").await, notes);
-    d.line(&format!("[{notes}] delete the book"));
     peers[0].run("DELETE FROM books").await;
-    diag_push(&mut peers[0], &mut hub, d, &format!("[{notes}] delete")).await;
+    peers[0].push(&mut hub).await;
     let work = peers[1].count_work().await;
-    diag_pull(&mut peers[1], &hub, d, &format!("[{notes}] measured")).await;
+    peers[1].pull(&hub).await;
     let done = work.load(std::sync::atomic::Ordering::Relaxed);
-    d.line(&format!("[{notes}] work {done}"));
     assert_eq!(peers[1].int("SELECT count(*) FROM notes").await, 0);
-    for (i, peer) in peers.iter_mut().enumerate() {
-        d.line(&format!("[{notes}] peer {i} > harness settled"));
+    for peer in peers.iter_mut() {
         peer.settled().await;
     }
-    d.line(&format!("[{notes}] done"));
     done
 }
 
@@ -877,12 +592,8 @@ async fn work_to_delete_an_owner_of(notes: i64, d: &Diag) -> u64 {
 /// the square of the rows grows sixteenfold when they grow fourfold.
 #[tokio::test]
 async fn deleting_an_owner_of_many_rows_takes_work_in_proportion() {
-    let d = Diag(std::time::Instant::now());
-    d.line("start");
-    diag_probes(&d).await;
-    let small = work_to_delete_an_owner_of(1_000, &d).await;
-    let large = work_to_delete_an_owner_of(4_000, &d).await;
-    d.line("end");
+    let small = work_to_delete_an_owner_of(1_000).await;
+    let large = work_to_delete_an_owner_of(4_000).await;
     assert!(large < small * 8, "{small} then {large}");
 }
 
