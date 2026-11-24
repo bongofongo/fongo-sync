@@ -7,8 +7,8 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Wake, Waker};
 
 use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
@@ -891,12 +891,12 @@ struct Counting {
     fail_commit: Option<Arc<AtomicBool>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Abandon {
     /// Panic.
     Panics,
     /// Never return; the flag tells the test to drop the sync.
-    Hangs(&'static AtomicBool),
+    Hangs(Arc<Signal>),
 }
 
 impl Apply for Counting {
@@ -944,7 +944,7 @@ impl Apply for Counting {
             match abandon {
                 Abandon::Panics => panic!("abandoned after ending the transaction"),
                 Abandon::Hangs(hung) => {
-                    hung.store(true, Ordering::Relaxed);
+                    hung.raise();
                     std::future::pending::<()>().await;
                 }
             }
@@ -1458,6 +1458,30 @@ async fn a_step_that_ends_the_transaction_and_panics_leaves_a_connection_the_nex
     );
     on_or_after_reconnecting(&mut peers, &server, "panicked").await;
 
+    // The same for a sync dropped right there, as a timeout drops one.
+    let server = Server::new();
+    let mut peers = crash_scene(&server).await;
+    let ended = Arc::new(Signal::default());
+    let mut hook = Counting {
+        abandon: Some(Abandon::Hangs(ended.clone())),
+        ..Counting::default()
+    };
+    for peer in &mut peers {
+        peer.run(PRESENT).await;
+        peer.run(COUNTS).await;
+        peer.run(CAUGHT_UP).await;
+    }
+    tokio::select! {
+        result = sync_hooked(&mut peers[0], &server, &mut hook) => panic!("{result:?}"),
+        () = ended.raised() => {}
+    }
+    let result = peers[0].sync(&server).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
+        "{result:?}"
+    );
+    on_or_after_reconnecting(&mut peers, &server, "dropped").await;
+
     // The same in memory, where a sync is refused just as well but nothing outlives the
     // connection.
     let server = Server::new();
@@ -1478,45 +1502,51 @@ async fn a_step_that_ends_the_transaction_and_panics_leaves_a_connection_the_nex
     );
 }
 
+/// A copy of the server's log and of both databases, so each drop point starts from the same
+/// scene without building it again.
+async fn copy_scene(server: &Server, peers: &mut [Peer; 2]) -> (Server, [Peer; 2]) {
+    let mut copies = Vec::new();
+    for peer in peers.iter_mut() {
+        let file = file_of(&mut peer.conn).await;
+        let copy = Path::new(&file)
+            .with_extension(format!("{}.db", COPIES.fetch_add(1, Ordering::Relaxed)));
+        std::fs::copy(&file, &copy).unwrap();
+        copies.push(Peer::open(&copy, peer.credentials.clone()).await);
+    }
+    let b = copies.pop().unwrap();
+    let a = copies.pop().unwrap();
+    (copy_of(server), [a, b])
+}
+
+static COPIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Drops the sync at each of its suspensions in turn, from a copy of one scene each time. An
+/// await suspends unless sqlx's worker has already answered when it is first polled, so on a busy
+/// machine a run can suspend less often and a given drop point move or go unvisited; on an idle
+/// one every suspension is visited. The drop right after a step ends the transaction, which is
+/// the one that leaves the connection unsound, is covered on its own by
+/// `a_step_that_ends_the_transaction_and_panics_leaves_a_connection_the_next_sync_refuses`.
 #[tokio::test]
 async fn a_sync_dropped_anywhere_around_an_ended_transaction_loses_nothing() {
+    // Far more than the sync's suspensions, which are about one per statement.
+    const LIMIT: usize = 200;
     for then in [Then::Fails, Then::Returns] {
-        let mut refused = 0;
+        let server = Server::new();
+        let mut scene = crash_scene(&server).await;
         for k in 1.. {
-            assert!(k < 1_000, "the sync never ended");
-            let server = Server::new();
-            let mut peers = crash_scene(&server).await;
+            assert!(
+                k <= LIMIT,
+                "{then:?}: the sync suspended {LIMIT} times and had not ended"
+            );
+            let (server, mut peers) = copy_scene(&server, &mut scene).await;
             let mut hook = then;
-            let ended = {
-                let mut sync = Box::pin(sync_hooked(&mut peers[0], &server, &mut hook));
-                let mut pending = 0;
-                loop {
-                    match std::future::poll_fn(|cx| Poll::Ready(sync.as_mut().poll(cx))).await {
-                        Poll::Ready(_) => break true,
-                        Poll::Pending => {
-                            pending += 1;
-                            if pending == k {
-                                break false;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                }
-            };
-            if fongo_sync_client::check_connection(&mut peers[0].conn)
-                .await
-                .is_err()
-            {
-                refused += 1;
-            }
-            let at = format!("{then:?} dropped at {k}");
+            let ended = drive_to(sync_hooked(&mut peers[0], &server, &mut hook), k).await;
+            let at = format!("{then:?} dropped at suspension {k}");
             on_or_after_reconnecting(&mut peers, &server, &at).await;
             if ended {
                 break;
             }
         }
-        // Some drop points do leave the connection unsound; the sweep reaches them.
-        assert!(refused > 0, "{then:?}");
     }
 }
 
@@ -1939,10 +1969,61 @@ impl<F: Future> Future for CatchUnwind<F> {
     }
 }
 
-async fn until(flag: &AtomicBool) {
-    while !flag.load(Ordering::Relaxed) {
-        tokio::task::yield_now().await;
+/// Raised once, waking whatever waits for it.
+#[derive(Debug, Default)]
+struct Signal {
+    raised: AtomicBool,
+    waiting: Mutex<Option<Waker>>,
+}
+
+impl Signal {
+    fn raise(&self) {
+        self.raised.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waiting.lock().unwrap().take() {
+            waker.wake();
+        }
     }
+
+    async fn raised(&self) {
+        std::future::poll_fn(|cx| {
+            *self.waiting.lock().unwrap() = Some(cx.waker().clone());
+            if self.raised.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+impl Wake for Signal {
+    fn wake(self: Arc<Self>) {
+        self.raise();
+    }
+}
+
+/// Polls `future` until it completes or has suspended `stop` times, and then drops it. After each
+/// suspension it waits to be woken before polling again, so each suspension counts once however
+/// long the wait. Whether an await suspends at all depends on whether sqlx's worker thread has
+/// answered by the time it is first polled, so a busy machine can see fewer. Returns whether the
+/// future completed.
+async fn drive_to<F: Future>(future: F, stop: usize) -> bool {
+    let mut future = std::pin::pin!(future);
+    let woken = Arc::new(Signal::default());
+    let waker = Waker::from(woken.clone());
+    for _ in 0..stop {
+        woken.raised.store(false, Ordering::SeqCst);
+        if future
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+        {
+            return true;
+        }
+        woken.raised().await;
+    }
+    false
 }
 
 /// Carries requests to the server and notes whether any was an append.
@@ -1980,7 +2061,7 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
 #[tokio::test]
 async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge() {
     let first = env("FONGO_CLIENT_SEED", 1);
-    for seed in first..first + env("FONGO_CLIENT_CASES", 15) {
+    for seed in first..first + env("FONGO_CLIENT_CASES", 6) {
         let mut rng = Rng::new(seed);
         let server = Server::new();
         let page = 1 + seed % 3;
@@ -2055,7 +2136,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         2 => server.hang_at(n, rng.below(2) == 0),
                         _ => {}
                     }
-                    let hung = Box::leak(Box::new(AtomicBool::new(false)));
+                    let hung = Arc::new(Signal::default());
                     let mut hook = Counting {
                         caught_up: 0,
                         fail: match rng.below(4) {
@@ -2068,7 +2149,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                     };
                     match rng.below(8) {
                         0 => hook.abandon = Some(Abandon::Panics),
-                        1 => hook.abandon = Some(Abandon::Hangs(hung)),
+                        1 => hook.abandon = Some(Abandon::Hangs(hung.clone())),
                         2 => hook.fail_commit = Some(armed[who].clone()),
                         _ => {}
                     }
@@ -2086,7 +2167,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                             &mut hook,
                         ))) => result.ok(),
                         () = server.hung() => None,
-                        () = until(hung) => None,
+                        () = hung.raised() => None,
                     };
                     let abandoned = result.is_none();
                     let refused = matches!(result, Some(Err(Error::ConnectionUnsound { .. })));

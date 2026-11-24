@@ -52,6 +52,8 @@ pub struct State {
     hang_at: Option<(usize, bool)>,
     /// A request has hung.
     hung: bool,
+    /// Woken when a request hangs.
+    hung_waker: Option<std::task::Waker>,
     /// Rewrites every batch page before it is sent.
     tamper: Option<Tamper>,
     /// Answers a request in the server's place when it returns a response.
@@ -115,6 +117,7 @@ impl Server {
                 lose_at: None,
                 hang_at: None,
                 hung: false,
+                hung_waker: None,
                 tamper: None,
                 respond: None,
                 stale_devices: false,
@@ -152,9 +155,17 @@ impl Server {
 
     /// Returns once a request has hung.
     pub async fn hung(&self) {
-        while !self.with(|s| s.hung) {
-            tokio::task::yield_now().await;
-        }
+        std::future::poll_fn(|cx| {
+            self.with(|s| {
+                if s.hung {
+                    std::task::Poll::Ready(())
+                } else {
+                    s.hung_waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            })
+        })
+        .await
     }
 
     pub fn tamper(&self, f: impl FnMut(BatchPage) -> Vec<u8> + Send + 'static) {
@@ -250,7 +261,7 @@ impl Server {
             return Some(Err(TransportError::new("connection refused")));
         }
         if state.hang_at == Some((n, false)) {
-            state.hung = true;
+            state.hang();
             return None;
         }
         state
@@ -261,7 +272,7 @@ impl Server {
             None => state.handle(&request).unwrap_or_else(error),
         };
         if state.hang_at == Some((n, true)) {
-            state.hung = true;
+            state.hang();
             return None;
         }
         if state.lose_at == Some(n) {
@@ -272,6 +283,13 @@ impl Server {
 }
 
 impl State {
+    fn hang(&mut self) {
+        self.hung = true;
+        if let Some(waker) = self.hung_waker.take() {
+            waker.wake();
+        }
+    }
+
     fn authenticate(&mut self, request: &Request, key: &VerifyingKey) -> Result<(), ErrorCode> {
         let auth = RequestAuth::from_headers(
             header(request, HEADER_DEVICE)?,
