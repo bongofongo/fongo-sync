@@ -139,7 +139,7 @@ async fn small_batch(replica: &Replica, a: &mut SqliteConnection) -> Vec<Change>
 async fn count_work(conn: &mut SqliteConnection) -> Arc<AtomicU64> {
     let work = Arc::new(AtomicU64::new(0));
     let counter = work.clone();
-    let mut handle = conn.lock_handle().await.unwrap();
+    let mut handle = support::lock(conn).await;
     handle.set_progress_handler(64, move || {
         counter.fetch_add(1, Ordering::Relaxed);
         true

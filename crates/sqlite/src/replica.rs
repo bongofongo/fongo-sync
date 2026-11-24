@@ -15,7 +15,7 @@ use fongo_sync_core::model::{Row, Schema};
 use fongo_sync_core::plan::{self, FieldEdit};
 use fongo_sync_core::source::admit;
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
-use sqlx::SqliteConnection;
+use sqlx::{Connection, SqliteConnection};
 
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
@@ -215,8 +215,12 @@ fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
     Ok(())
 }
 
-/// Locks the connection and runs `work` on its handle.
+/// Locks the connection and runs `work` on its handle. It pings first: the worker answers only
+/// once it has run every earlier command and holds the handle, which it keeps until our unlock
+/// arrives, so `lock_handle` cannot find the lock free and leave that unlock behind (see the
+/// crate documentation).
 async fn with_db<T>(conn: &mut SqliteConnection, work: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+    conn.ping().await?;
     let mut handle = conn.lock_handle().await?;
     // SAFETY: the handle is locked for as long as `db` lives, and nothing else uses it meanwhile.
     let db = unsafe { Db::new(handle.as_raw_handle()) };

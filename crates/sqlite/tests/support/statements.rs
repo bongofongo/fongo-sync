@@ -55,7 +55,7 @@ unsafe extern "C" fn traced(
 impl Statements {
     /// Starts counting on `conn`.
     pub async fn watch(conn: &mut SqliteConnection) -> Statements {
-        let mut handle = conn.lock_handle().await.unwrap();
+        let mut handle = super::lock(conn).await;
         let db = handle.as_raw_handle().as_ptr();
         let state = Arc::new(State {
             db,
