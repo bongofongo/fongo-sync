@@ -24,8 +24,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
 proptest = "1"
 
-# Tests run optimised, with debug assertions and overflow checks still on: the slowest storage
-# tests take half the time, for a build that takes a little longer.
+# Debug assertions and overflow checks stay on in tests; only the optimisation level differs.
 [profile.test]
 opt-level = 1
 

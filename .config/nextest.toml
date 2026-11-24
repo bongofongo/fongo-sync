@@ -1,6 +1,6 @@
 [profile.default]
-# The slowest tests take two to three minutes, longer on a loaded machine. One still running
-# after ten minutes is taken to hang: it is killed and fails the run.
+# A hung test is killed after ten minutes and fails the run, rather than holding it until the job
+# times out.
 slow-timeout = { period = "60s", terminate-after = 10 }
 # A test that passes only when tried again is a failing test.
 retries = 0
