@@ -24,6 +24,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
 proptest = "1"
 
+# Tests run optimised, with debug assertions and overflow checks still on: the slowest storage
+# tests take half the time, for a build that takes a little longer.
+[profile.test]
+opt-level = 1
+
 # The reference model checks every step of the storage tests; unoptimised, it dominates them.
 [profile.dev.package.fongo-sync-core]
 opt-level = 3

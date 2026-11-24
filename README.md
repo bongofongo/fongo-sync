@@ -69,6 +69,10 @@ Not yet here: a server, an HTTP transport, and blob transfer.
 make check
 ```
 
+`make check` formats, lints, tests, builds the protocol for wasm and checks the proofs, as CI
+does. It needs [cargo-nextest](https://nexte.st), which runs every test in a process of its own
+with all test binaries at once, and [Lean](#verification) through `elan`.
+
 ## Structure
 
 Three layers, each tested against the one above it:

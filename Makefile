@@ -10,8 +10,13 @@ fmt-check:
 lint:
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+# cargo-nextest runs each test in a process of its own, every binary at once; it runs no doc
+# tests, so `cargo test --doc` follows. Timeouts are in .config/nextest.toml.
 test:
-	cargo test --workspace --all-features --locked
+	@cargo nextest --version >/dev/null 2>&1 \
+		|| { echo 'make test needs cargo-nextest: cargo install cargo-nextest --locked' >&2; exit 1; }
+	cargo nextest run --workspace --all-features --locked
+	cargo test --doc --workspace --all-features --locked
 
 wasm:
 	cargo build -p fongo-sync-protocol --target wasm32-unknown-unknown --locked
