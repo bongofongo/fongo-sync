@@ -430,19 +430,52 @@ impl Writes {
             .into_iter()
             .map(|(c, g, k)| ((c, g), k))
             .collect();
-        let canonical = |c: &str, g: Gid| *canon.get(&(c.to_string(), g)).unwrap_or(&g);
+        let mut canon_in: BTreeMap<&str, BTreeMap<Gid, Gid>> = BTreeMap::new();
+        for ((c, g), k) in &canon {
+            canon_in.entry(c.as_str()).or_default().insert(*g, *k);
+        }
+        let canonical = |c: &str, g: Gid| {
+            canon_in
+                .get(c)
+                .and_then(|m| m.get(&g))
+                .copied()
+                .unwrap_or(g)
+        };
+        // Indexed once rather than searched for each change sent, since both grow with the
+        // library: the rows that have held each entity, by collection and canonical gid.
+        let mut holders: BTreeMap<(&str, Gid), BTreeSet<&str>> = BTreeMap::new();
+        for ((c, k), held) in &self.gids {
+            for g in held {
+                holders
+                    .entry((c.as_str(), canonical(c, *g)))
+                    .or_default()
+                    .insert(k.as_str());
+            }
+        }
+        // The fields written to rows that are gone and were made by the application or never
+        // held an entity, by collection and field.
+        let mut unheld: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
+        for (c, k, f) in &self.written {
+            let at = (c.clone(), k.clone());
+            if (!self.gids.contains_key(&at) || self.made.contains(&at))
+                && !self.after.contains_key(&at)
+            {
+                unheld
+                    .entry((c.as_str(), f.as_str()))
+                    .or_default()
+                    .push(k.as_str());
+            }
+        }
         for change in sent {
             if change.field == ALIAS || self.adopted.contains(change) {
                 continue;
             }
             let target = canonical(&change.collection, change.gid);
-            let mut keys: Vec<String> = self
-                .gids
-                .iter()
-                .filter(|((c, _), held)| {
-                    *c == change.collection && held.iter().any(|g| canonical(c, *g) == target)
-                })
-                .map(|((_, k), _)| k.clone())
+            let mut keys: Vec<String> = holders
+                .get(&(change.collection.as_str(), target))
+                .into_iter()
+                .flatten()
+                .map(|k| k.to_string())
                 .collect();
             if let Some(key) = replica
                 .key_for_gid(conn, &change.collection, change.gid)
@@ -456,27 +489,29 @@ impl Writes {
             // collect that minted its entity merged that entity into another's row, which `keys`
             // then names. The row may sit at a key an earlier row held, so `gids` names only that
             // row's entities.
-            let unnamed = self.written.iter().any(|(c, k, f)| {
-                let at = (c.clone(), k.clone());
-                let cell = (c.clone(), k.clone(), f.clone());
-                // The removed row held the value sent: for a reference, the entity it named
-                // when written, or any if that row was new too.
-                let held = *f == DELETED
-                    || match (self.owed.get(&cell), &change.value) {
-                        (Some(Value::Int(_)), Value::Ref(h)) => {
-                            self.named.get(&cell).is_none_or(|g| {
-                                g == h || canon.iter().any(|((_, x), k)| x == g && k == h)
-                            })
+            let unnamed = unheld
+                .get(&(change.collection.as_str(), change.field.as_str()))
+                .into_iter()
+                .flatten()
+                .any(|k| {
+                    let cell = (
+                        change.collection.clone(),
+                        k.to_string(),
+                        change.field.clone(),
+                    );
+                    // The removed row held the value sent: for a reference, the entity it named
+                    // when written, or any if that row was new too.
+                    change.field == DELETED
+                        || match (self.owed.get(&cell), &change.value) {
+                            (Some(Value::Int(_)), Value::Ref(h)) => {
+                                self.named.get(&cell).is_none_or(|g| {
+                                    g == h || canon.iter().any(|((_, x), k)| x == g && k == h)
+                                })
+                            }
+                            (Some(v), sent) => v == sent,
+                            (None, _) => false,
                         }
-                        (Some(v), sent) => v == sent,
-                        (None, _) => false,
-                    };
-                *c == change.collection
-                    && *f == change.field
-                    && held
-                    && (!self.gids.contains_key(&at) || self.made.contains(&at))
-                    && !self.after.contains_key(&at)
-            });
+                });
             let wrote = unnamed
                 || keys.iter().any(|k| {
                     self.written.contains(&(
