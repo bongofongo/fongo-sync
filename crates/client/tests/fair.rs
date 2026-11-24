@@ -348,8 +348,12 @@ fn writer_process() {
 /// | DELETE | 50,000 | default | 1.62–1.63 s | 0.39–0.40 s | 0.39–0.40 s | 0.09 s |
 /// | DELETE | 200,000 | unbounded | 4.24–4.27 s | 1.13–1.14 s, 3 of 40 | 1.12–1.14 s, 3 of 40 | 1.13–1.14 s, 2 of 95 |
 /// | DELETE | 200,000 | default, 6 runs | 9.6–10.6 s | 0.40–0.82 s | 0.41–1.14 s, 1 of 184 in one run | 0.17–0.28 s |
-/// | DELETE | 200,000 | pause 250 ms, 3 runs | 11.8–12.0 s | 0.40–0.49 s | 0.50–0.62 s | 0.15–0.16 s |
 /// | DELETE | 200,000 | default, 5 s timeout | 9.6 s | 0.40–0.82 s | 0.93–0.95 s | 0.17–0.40 s |
+///
+/// Over ten runs each with a pause of 150, 200 and 250 ms (rollback-journal mode, 200,000
+/// changes, 1 s timeout), no write failed at any of them and each had a run whose worst wait was
+/// just over 1 s; each 50 ms more pause cost about a second of sync time. With a 1 s busy timeout
+/// the wait is marginal at all of them, and the remedy is a longer timeout, not a longer pause.
 ///
 /// A writer through the application's gate alone (`FAIR_GATED=1`), with the pause at zero, waited
 /// at most 0.14 s at 50,000 changes and 0.23 s at 200,000 in WAL mode (sync 1.16 s and 6.97 s), and

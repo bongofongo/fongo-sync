@@ -1414,24 +1414,38 @@ impl Replica {
         collection: &str,
         gid: Gid,
     ) -> Result<Option<String>> {
+        Ok(self.group_of(conn, collection, gid).await?.1)
+    }
+
+    /// The id an entity's group is known by, the entity's own when it is merged with none, as
+    /// [`Conflict::gid`] gives it; and the key of the local row that holds the entity, or any
+    /// entity merged with it, as [`Replica::key_for_gid`] finds it.
+    pub async fn group_of(
+        &self,
+        conn: &mut SqliteConnection,
+        collection: &str,
+        gid: Gid,
+    ) -> Result<(Gid, Option<String>)> {
         with_db(conn, |db| {
             if self.registry.index(collection).is_none() {
-                return Ok(None);
+                return Ok((gid, None));
             }
             let ev = self.evaluator();
             let facts = Facts { db };
+            let mut canonical = gid;
             let mut candidates = vec![gid];
             if let Ok(t) = ev.target(&facts, collection, gid) {
+                canonical = t.canonical;
                 candidates.insert(0, t.canonical);
                 candidates.extend(t.members);
             }
             db.check()?;
             for g in candidates {
                 if let Some((key, _)) = rows_of(db, collection, g)?.into_iter().find(|(_, d)| !d) {
-                    return Ok(Some(key));
+                    return Ok((canonical, Some(key)));
                 }
             }
-            Ok(None)
+            Ok((canonical, None))
         })
         .await
     }

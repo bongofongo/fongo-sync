@@ -10,7 +10,7 @@ use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
-use fongo_sync_sqlite::{Applied, Replica, Touched};
+use fongo_sync_sqlite::{Applied, Conflict, Replica, Touched};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 use crate::credentials::Credentials;
@@ -37,11 +37,11 @@ const SMALLEST_BATCH: usize = 3 + 1 + 16 + 1 + 1 + 8 + 4 + 16;
 /// With the defaults, a writer on another connection that waits in SQLite's busy handler usually
 /// waits about `hold`, one apply and `pause`, and longer when several connections compete for the
 /// same gap. Joining 200,000 changes on a fast laptop while two writers and a reader each used the
-/// database every 20 ms, writers waited at most 0.4 to 1.1 s and readers, which wait too in
-/// rollback-journal mode, at most 0.3 s; with a 1 s busy timeout one write in about 1,200 failed in
-/// rollback-journal mode. A busy timeout near 1 s is therefore marginal: give other connections
-/// several seconds, such as sqlx's default of 5 s, or raise `pause` (250 ms kept every wait there
-/// under 0.65 s, for about 2 s more sync time).
+/// database every 20 ms, the worst wait in a run was about a second, with a pause of 150, 200 or
+/// 250 ms alike; each 50 ms more pause cost about a second of sync time and did not remove that
+/// tail. Readers wait too in rollback-journal mode, up to about 0.3 s there. A busy timeout near
+/// 1 s is therefore marginal whatever the pause: give other connections several seconds, such as
+/// sqlx's default of 5 s.
 ///
 /// Setting `pause` to zero, without letting writers through in [`Apply::between`], makes a large
 /// sync slower than one bounded by nothing and no fairer to writers in the busy handler; it suits
@@ -168,10 +168,14 @@ pub struct SyncReport {
     pub sent: usize,
     /// What applying them did, merged over every apply in the sync with [`merge_applied`]:
     /// changes accepted, rows touched, conflicts, one for each local edit with the latest remote
-    /// change it met, and entities still waiting. A conflict's `key` is that of the row holding
-    /// its entity, or any entity merged with it, once the sync is done, and `None` if no row
-    /// does: a later apply of the same sync may have removed the row it had, and its key may
-    /// since hold another entity. `touched` lists keys in the order the sync
+    /// change it met, and entities still waiting. A conflict's `gid` and `key` are as the sync
+    /// leaves them, looked up once it is done: `gid` is the id of the entity's group, and `key`
+    /// that of the row holding the entity or any entity merged with it, `None` if no row does. A
+    /// later apply of the same sync may have merged the entity into a group, removed its row, or
+    /// given the row's key to another entity, and a local edit an earlier apply reported under
+    /// the entity's own id is reported once, under the group's. Each lookup takes about 75 µs on
+    /// a fast laptop; if one fails, the conflict keeps the id and key its apply reported, and the
+    /// sync still returns its report. `touched` lists keys in the order the sync
     /// first touched them, each key's entries together. Within a key it holds one entry per
     /// entity, that entity's last, in the order those entries came: the entities that left the
     /// key come before the one it was left holding.
@@ -324,9 +328,10 @@ pub trait Apply: Send {
     /// `changes` holds whole envelopes, at most [`Pace::apply`] changes unless one envelope holds
     /// more. A pull can thus make many applies, and a field changed remotely more than once before
     /// this device's own edit of it was read back can be reported as a conflict by more than one
-    /// of them, each with a later change; [`merge_applied`] keeps the last. A conflict's `key`
-    /// here is the row's as this apply leaves it; a later apply of the same sync can remove that
-    /// row or give its key to another entity, so a key is not kept from one apply to the next.
+    /// of them, each with a later change; [`merge_applied`] keeps the last. A conflict's `gid`
+    /// and `key` here are as this apply leaves them; a later apply of the same sync can merge the
+    /// entity into a group, remove its row or give the row's key to another entity, so neither is
+    /// kept from one apply to the next. [`SyncReport::applied`] gives them as the sync ends.
     ///
     /// In the same transaction, after this returns, the client stores the cursor past the
     /// envelopes `changes` came in, so the rows applied, everything this wrote and the cursor are
@@ -476,7 +481,7 @@ async fn run<T: Transport, A: Apply>(
     let me = credentials.device_id();
     let pace = apply.pace();
     let mut held = pace.held;
-    if !pace.pause.is_zero() && held >= pace.hold {
+    if !pace.pause.is_zero() && !held.is_zero() && held >= pace.hold {
         pause(pace.pause).await;
         held = Duration::ZERO;
     }
@@ -502,6 +507,7 @@ async fn run<T: Transport, A: Apply>(
         committed: false,
         failed: false,
         held,
+        conflicts: Vec::new(),
     };
     let pulled = read_pages(
         &rpc,
@@ -541,6 +547,7 @@ async fn run<T: Transport, A: Apply>(
         tx.commit().await?;
         steps.committed(began);
         if let Some(settled) = settled {
+            steps.conflicts.push(settled.conflicts.clone());
             merge_applied(&mut report.applied, settled);
         }
     }
@@ -623,11 +630,20 @@ async fn run<T: Transport, A: Apply>(
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
-    for conflict in &mut report.applied.conflicts {
-        conflict.key = replica
-            .key_for_gid(conn, &conflict.collection, conflict.gid)
-            .await?;
+    let mut conflicts = Vec::new();
+    for mut applied in std::mem::take(&mut steps.conflicts) {
+        for conflict in &mut applied {
+            if let Ok((gid, key)) = replica
+                .group_of(conn, &conflict.collection, conflict.gid)
+                .await
+            {
+                conflict.gid = gid;
+                conflict.key = key;
+            }
+        }
+        merge_conflicts(&mut conflicts, applied);
     }
+    report.applied.conflicts = conflicts;
     report.held = steps.held;
     Ok(report)
 }
@@ -657,6 +673,8 @@ struct Steps<'a, A> {
     failed: bool,
     /// How long this sync held the write lock since it last paused.
     held: Duration,
+    /// The conflicts each apply reported, in order.
+    conflicts: Vec<Vec<Conflict>>,
 }
 
 impl<A: Apply> Steps<'_, A> {
@@ -834,6 +852,7 @@ impl Pull {
         if let Some(applied) = applied {
             self.applied = true;
             report.received += self.held.len();
+            steps.conflicts.push(applied.conflicts.clone());
             merge_applied(&mut report.applied, applied);
         }
         self.held.clear();
@@ -1200,30 +1219,7 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
     into.held = from.held;
-    type Edits<'a> = Vec<(&'a Option<Value>, &'a Value)>;
-    let mut again: HashMap<(String, Gid, String), Edits> = HashMap::new();
-    for c in &from.conflicts {
-        again
-            .entry((c.collection.clone(), c.gid, c.field.clone()))
-            .or_default()
-            .push((&c.base, &c.local));
-    }
-    into.conflicts.retain(|c| {
-        let Some(edits) = again.get_mut(&(c.collection.clone(), c.gid, c.field.clone())) else {
-            return true;
-        };
-        match edits
-            .iter()
-            .position(|&(base, local)| *base == c.base && *local == c.local)
-        {
-            Some(at) => {
-                edits.swap_remove(at);
-                false
-            }
-            None => true,
-        }
-    });
-    into.conflicts.extend(from.conflicts);
+    merge_conflicts(&mut into.conflicts, from.conflicts);
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut at: HashMap<(String, String), Vec<Touched>> = HashMap::new();
     for touched in std::mem::take(&mut into.touched)
@@ -1243,10 +1239,37 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
     }
 }
 
+/// Appends `from` to `into` as [`merge_applied`] merges conflicts.
+fn merge_conflicts(into: &mut Vec<Conflict>, from: Vec<Conflict>) {
+    type Edits<'a> = Vec<(&'a Option<Value>, &'a Value)>;
+    let mut again: HashMap<(String, Gid, String), Edits> = HashMap::new();
+    for c in &from {
+        again
+            .entry((c.collection.clone(), c.gid, c.field.clone()))
+            .or_default()
+            .push((&c.base, &c.local));
+    }
+    into.retain(|c| {
+        let Some(edits) = again.get_mut(&(c.collection.clone(), c.gid, c.field.clone())) else {
+            return true;
+        };
+        match edits
+            .iter()
+            .position(|&(base, local)| *base == c.base && *local == c.local)
+        {
+            Some(at) => {
+                edits.swap_remove(at);
+                false
+            }
+            None => true,
+        }
+    });
+    into.extend(from);
+}
+
 #[cfg(test)]
 mod tests {
     use fongo_sync_protocol::{LibraryId, LibraryKeys, SigningKey};
-    use fongo_sync_sqlite::Conflict;
     use fongo_sync_sqlite::core::Hlc;
 
     use super::*;

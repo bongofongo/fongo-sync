@@ -14,7 +14,7 @@ use std::time::Duration;
 use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
 use fongo_sync_client::sqlite::core::Change;
-use fongo_sync_client::sqlite::{Applied, Replica};
+use fongo_sync_client::sqlite::{Applied, Collection, Registry, Replica};
 use fongo_sync_client::{
     Apply, Credentials, Error, Method, Pace, Request, Response, SyncReport, Transport,
     TransportError, create_library, join_library, sync, sync_with,
@@ -1132,6 +1132,207 @@ async fn a_caller_that_syncs_again_at_once_carries_the_held_time_into_the_next_s
     let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
     assert!(began.elapsed() >= pause, "{:?}", began.elapsed());
     assert!(report.held > Duration::ZERO);
+}
+
+const TAGS: &str = "CREATE TABLE tags (id INTEGER PRIMARY KEY, isbn TEXT UNIQUE, note TEXT)";
+
+/// A replica of tags, one entity per isbn, over a file of its own.
+async fn tag_peer(dir: &Path, name: &str, credentials: Credentials) -> Peer {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(dir.join(name))
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query(TAGS).execute(&mut conn).await.unwrap();
+    let registry = Registry::new(vec![
+        Collection::minted("tags", "tags", "id")
+            .field("isbn")
+            .field_reporting_conflicts("note")
+            .identity(&["isbn"]),
+    ])
+    .unwrap();
+    let replica = Replica::new(registry);
+    replica.install(&mut conn).await.unwrap();
+    Peer {
+        conn,
+        replica,
+        credentials,
+    }
+}
+
+/// Two tags this device edited become one entity part-way through a pull, and a later envelope
+/// changes the merged tag's note again. However many envelopes an apply takes, each local edit is
+/// reported once, under the group's id and the key of its row.
+#[tokio::test]
+async fn edits_of_entities_merged_part_way_through_a_pull_are_reported_once_each() {
+    let dir = scratch("merged-mid-pull");
+    let mut runs = Vec::new();
+    for (n, pace) in [
+        one_envelope(),
+        Pace::default(),
+        Pace {
+            apply: usize::MAX,
+            ..Pace::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = Server::new();
+        server.with(|s| s.caps.max_page_batches = None);
+        let [made, joined] = credentials(&server).await;
+        let key = generate_signing_key().unwrap();
+        fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
+            .await
+            .unwrap();
+        let third = Credentials::new(made.library().clone(), key, 0);
+        let mut a = tag_peer(&dir, &format!("a{n}.db"), made).await;
+        let mut b = tag_peer(&dir, &format!("b{n}.db"), joined).await;
+        let mut c = tag_peer(&dir, &format!("c{n}.db"), third).await;
+        a.run("INSERT INTO tags (isbn, note) VALUES ('Z', 'z0'), ('Y', 'y0')")
+            .await;
+        for peer in [&mut a, &mut b, &mut c] {
+            peer.sync(&server).await.unwrap();
+        }
+        b.run("UPDATE tags SET note = 'mine z' WHERE isbn = 'Z'")
+            .await;
+        b.run("UPDATE tags SET note = 'mine y' WHERE isbn = 'Y'")
+            .await;
+        b.replica.collect(&mut b.conn).await.unwrap();
+        later();
+        a.run("UPDATE tags SET isbn = 'X', note = 'theirs 1' WHERE isbn = 'Z'")
+            .await;
+        a.sync(&server).await.unwrap();
+        later();
+        c.run("UPDATE tags SET isbn = 'X', note = 'theirs c' WHERE isbn = 'Y'")
+            .await;
+        c.sync(&server).await.unwrap();
+        later();
+        a.sync(&server).await.unwrap();
+        a.run("UPDATE tags SET note = 'theirs 2' WHERE isbn = 'X'")
+            .await;
+        a.sync(&server).await.unwrap();
+
+        let mut hook = Marking {
+            pace,
+            ..Marking::default()
+        };
+        b.run(MARKS).await;
+        let report = sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+        let rows = b
+            .lines("SELECT '[' || id || '] ' || coalesce(isbn, '-') || ' ' || note FROM tags")
+            .await;
+        let mut found = Vec::new();
+        for conflict in &report.applied.conflicts {
+            let group = b
+                .replica
+                .group_of(&mut b.conn, "tags", conflict.gid)
+                .await
+                .unwrap();
+            assert_eq!((conflict.gid, conflict.key.clone()), group, "{pace:?}");
+            found.push(format!(
+                "{:?} {:?} against {:?}, key {:?}",
+                conflict.base, conflict.local, conflict.remote, conflict.key
+            ));
+        }
+        found.sort();
+        eprintln!("{pace:?}: {found:#?} rows {rows:?}");
+        runs.push((found, rows));
+    }
+    assert_eq!(runs[1], runs[0]);
+    assert_eq!(runs[2], runs[0]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Ends the sync unable to look a conflict's entity up: `caught_up` moves the kernel's table of
+/// rows away.
+struct HidesRows;
+
+impl Apply for HidesRows {
+    async fn caught_up(
+        &mut self,
+        conn: &mut SqliteConnection,
+        _: &Replica,
+    ) -> Result<Option<Applied>, Error> {
+        sqlx::query("ALTER TABLE fongo_ids RENAME TO fongo_ids_away")
+            .execute(&mut *conn)
+            .await?;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn a_conflict_that_cannot_be_looked_up_at_the_end_keeps_what_its_apply_said() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    b.run("UPDATE notes SET body = 'mine'").await;
+    b.replica.collect(&mut b.conn).await.unwrap();
+    later();
+    a.run("UPDATE notes SET body = 'theirs'").await;
+    a.sync(&server).await.unwrap();
+    let note = b.replica.gid_of(&mut b.conn, "notes", 1).await.unwrap();
+    let report = sync_hooked(&mut b, &server, &mut HidesRows).await.unwrap();
+    b.run("ALTER TABLE fongo_ids_away RENAME TO fongo_ids")
+        .await;
+    assert_eq!(report.sent, 1);
+    assert_eq!(report.applied.conflicts.len(), 1);
+    let conflict = &report.applied.conflicts[0];
+    assert_eq!(
+        (Some(conflict.gid), conflict.key.as_deref()),
+        (note, Some("[1]"))
+    );
+    a.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+/// Notes when the first apply begins.
+struct FirstApply {
+    pace: Pace,
+    at: Option<std::time::Instant>,
+}
+
+impl Apply for FirstApply {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        self.at.get_or_insert_with(std::time::Instant::now);
+        Ok(replica.apply(conn, changes).await?)
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
+    }
+}
+
+#[tokio::test]
+async fn a_sync_that_has_not_held_the_lock_does_not_pause_before_its_first_write() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.sync(&server).await.unwrap();
+    let mut hook = FirstApply {
+        pace: Pace {
+            hold: Duration::ZERO,
+            pause: Duration::from_secs(1),
+            ..Pace::default()
+        },
+        at: None,
+    };
+    let began = std::time::Instant::now();
+    sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+    let first = hook.at.unwrap() - began;
+    assert!(first < Duration::from_millis(750), "{first:?}");
 }
 
 /// Drops a sync that applies one envelope at a time at each of its suspensions in turn, from a
