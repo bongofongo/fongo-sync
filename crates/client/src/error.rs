@@ -7,6 +7,7 @@ use crate::transport::TransportError;
 /// Why a call failed. None of them leaves the database or the server's log inconsistent: the
 /// next call picks up where this one stopped.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The transport had no response to give. Retry later.
     #[error("transport: {0}")]
@@ -45,6 +46,26 @@ pub enum Error {
     Randomness,
     #[error("database: {0}")]
     Database(#[from] fongo_sync_sqlite::Error),
+    /// The application's own step, given through [`crate::Apply`], failed.
+    #[error("the application's step failed: {0}")]
+    Application(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A step given through [`crate::Apply`] returned with the client's transaction ended, as a
+    /// statement SQLite answers by rolling back ends it, or rolled back to the savepoint the client
+    /// made before it. Nothing in that transaction was kept and the cursor did not move.
+    #[error("the transaction a sync opened ended inside the application's step")]
+    TransactionEnded,
+    /// The connection cannot be trusted: SQLite has a transaction open on it, or sqlx counts one
+    /// that SQLite does not have. Either a sync found it so before reading or writing anything, or
+    /// a sync that failed left it so, and `source` is that failure. Finish a transaction the
+    /// application opened; otherwise close the connection, awaiting the close, before writing
+    /// anything more, and open a fresh one. A pooled connection is detached and closed rather
+    /// than given back.
+    #[error(
+        "the connection cannot be trusted: a transaction is open on it, or sqlx counts one SQLite \
+         does not have; finish a transaction you opened, or else close this connection, awaiting \
+         the close, and open a fresh one (from a pool, detach and close it rather than return it)"
+    )]
+    ConnectionUnsound { source: Option<Box<Error>> },
 }
 
 impl From<sqlx::Error> for Error {
