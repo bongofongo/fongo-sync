@@ -181,6 +181,11 @@ async fn sync_via(via: Via, peer: &mut Peer, server: &Server) -> String {
         Via::Sync => peer.sync(server).await,
         Via::Default => sync_hooked(peer, server, &mut ()).await,
     };
+    // How long it held the lock is a matter of timing.
+    let result = result.map(|report| SyncReport {
+        held: Duration::ZERO,
+        ..report
+    });
     format!("{result:?}")
 }
 
@@ -311,8 +316,8 @@ struct Marking {
     fail_between: Option<usize>,
     /// Never return from the `between` call with this number, raising the signal instead.
     hang_between: Option<(usize, Arc<Signal>)>,
-    /// Run in every `between` call.
-    in_between: Option<&'static str>,
+    /// Run in the `between` call with this number.
+    in_between: Option<(usize, &'static str)>,
     /// What happened, in order: each apply's changes, each gap.
     events: Vec<String>,
 }
@@ -412,7 +417,9 @@ impl Apply for Marking {
         if self.fail_between == Some(self.betweens) {
             return Err(failed("between"));
         }
-        if let Some(sql) = self.in_between {
+        if let Some((at, sql)) = self.in_between
+            && at == self.betweens
+        {
             sqlx::query(sql).execute(&mut *conn).await?;
         }
         if let Some((at, hung)) = &self.hang_between
@@ -898,7 +905,7 @@ async fn a_between_that_leaves_a_transaction_open_stops_the_sync_as_unsound() {
     let id = a.credentials.library_id();
     let mut hook = Marking {
         pace: one_envelope(),
-        in_between: Some("BEGIN"),
+        in_between: Some((1, "BEGIN")),
         ..Marking::default()
     };
     let result = sync_hooked(&mut a, &server, &mut hook).await;
@@ -919,6 +926,212 @@ async fn a_between_that_leaves_a_transaction_open_stops_the_sync_as_unsound() {
     let signer = b.credentials.clone();
     marked_once(&mut a, &server, &signer, 3).await;
     assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn between_is_not_called_after_a_failure() {
+    let server = Server::new();
+    let [mut a, _b] = three_envelopes(&server).await;
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    // Capabilities, the first page, the device list, the second page; the third page fails after
+    // both envelopes were committed, and the gap after the second was given.
+    server.fail_at(5);
+    let mut hook = Marking {
+        pace: one_envelope(),
+        ..Marking::default()
+    };
+    let result = sync_hooked(&mut a, &server, &mut hook).await;
+    assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
+    let events: Vec<&str> = hook.events.iter().map(|e| &e[..5]).collect();
+    assert_eq!(events, ["apply", "betwe", "apply"]);
+    assert_eq!(applied_with_the_cursor(&mut a, "a page failed").await, 2);
+}
+
+/// A sync whose apply reads before the kernel's first write, while another connection tries to
+/// write in between. The sync's transaction holds the write lock from its first statement, so the
+/// other connection waits and gives up, and the sync goes on. With a transaction that only takes
+/// the lock at its first write, in WAL mode the other connection commits and the sync's write then
+/// fails at once, since its snapshot is out of date; in rollback-journal mode the other connection
+/// is kept out either way.
+#[tokio::test]
+async fn an_apply_that_reads_first_keeps_other_writers_out_and_completes() {
+    struct ReadsFirst {
+        path: PathBuf,
+        other_wrote: Vec<bool>,
+    }
+
+    impl Apply for ReadsFirst {
+        async fn apply(
+            &mut self,
+            conn: &mut SqliteConnection,
+            replica: &Replica,
+            changes: &[Change],
+        ) -> Result<Applied, Error> {
+            let _: i64 = sqlx::query_scalar("SELECT count(*) FROM books")
+                .fetch_one(&mut *conn)
+                .await?;
+            let path = self.path.clone();
+            let wrote = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut other = SqliteConnectOptions::new()
+                        .filename(&path)
+                        .busy_timeout(Duration::from_millis(50))
+                        .connect()
+                        .await
+                        .unwrap();
+                    sqlx::query("INSERT INTO once VALUES (1)")
+                        .execute(&mut other)
+                        .await
+                        .is_ok()
+                })
+            })
+            .join()
+            .unwrap();
+            self.other_wrote.push(wrote);
+            Ok(replica.apply(conn, changes).await?)
+        }
+    }
+
+    for mode in ["WAL", "DELETE"] {
+        let server = Server::new();
+        let [mut a, mut b] = pair(&server).await;
+        a.run(&format!("PRAGMA journal_mode = {mode}")).await;
+        b.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        b.sync(&server).await.unwrap();
+        let path = PathBuf::from(file_of(&mut a.conn).await);
+        let mut hook = ReadsFirst {
+            path,
+            other_wrote: Vec::new(),
+        };
+        let result = sync_hooked(&mut a, &server, &mut hook).await;
+        assert!(result.is_ok(), "{mode}: {result:?}");
+        assert_eq!(hook.other_wrote, [false], "{mode}");
+        assert_eq!(a.lines("SELECT title FROM books").await, ["Middlemarch"]);
+    }
+}
+
+#[tokio::test]
+async fn a_local_edit_written_between_two_applies_is_a_conflict_of_its_own() {
+    for pace in paces() {
+        let server = Server::new();
+        let [mut a, mut b] = pair(&server).await;
+        a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+            .await;
+        a.sync(&server).await.unwrap();
+        b.sync(&server).await.unwrap();
+        b.run("UPDATE notes SET body = 'mine 1'").await;
+        b.replica.collect(&mut b.conn).await.unwrap();
+        for n in 1..=2 {
+            later();
+            a.run(&format!("UPDATE notes SET body = 'theirs {n}'"))
+                .await;
+            a.sync(&server).await.unwrap();
+        }
+        later();
+        let mut hook = Marking {
+            pace,
+            in_between: Some((1, "UPDATE notes SET body = 'mine 2'")),
+            ..Marking::default()
+        };
+        let report = sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+        let mut found: Vec<String> = report
+            .applied
+            .conflicts
+            .iter()
+            .map(|c| format!("{:?} against {:?}", c.local, c.remote))
+            .collect();
+        found.sort();
+        // With one apply for both envelopes the second edit is written after the pull, and only
+        // the first is a conflict; with one apply each, both are, and neither hides the other.
+        let want: &[&str] = if pace == one_envelope() {
+            &[
+                "Text(\"mine 1\") against Text(\"theirs 1\")",
+                "Text(\"mine 2\") against Text(\"theirs 2\")",
+            ]
+        } else {
+            &["Text(\"mine 1\") against Text(\"theirs 2\")"]
+        };
+        assert_eq!(found, want, "{pace:?}");
+    }
+}
+
+/// A conflict on a note, then, in later envelopes of the same pull, the note deleted, and a new
+/// note that takes the local id the first had. The report's key is the row as the sync leaves it,
+/// whatever an earlier apply saw.
+#[tokio::test]
+async fn a_conflicts_key_is_the_row_its_entity_has_at_the_end_of_the_sync() {
+    for (pace, reused) in paces().into_iter().flat_map(|p| [(p, false), (p, true)]) {
+        let server = Server::new();
+        let [mut a, mut b] = pair(&server).await;
+        a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+            .await;
+        a.sync(&server).await.unwrap();
+        b.sync(&server).await.unwrap();
+        b.run("UPDATE notes SET body = 'mine'").await;
+        b.replica.collect(&mut b.conn).await.unwrap();
+        later();
+        a.run("UPDATE notes SET body = 'theirs'").await;
+        a.sync(&server).await.unwrap();
+        let note = a.replica.gid_of(&mut a.conn, "notes", 1).await.unwrap();
+        a.run("DELETE FROM notes").await;
+        a.sync(&server).await.unwrap();
+        if reused {
+            a.run("INSERT INTO notes (book_id, body) VALUES (1, 'another')")
+                .await;
+            a.sync(&server).await.unwrap();
+        }
+        let mut hook = Marking {
+            pace,
+            ..Marking::default()
+        };
+        let report = sync_hooked(&mut b, &server, &mut hook).await.unwrap();
+        let at = format!("{pace:?} reused={reused}");
+        assert_eq!(report.applied.conflicts.len(), 1, "{at}");
+        let conflict = &report.applied.conflicts[0];
+        assert_eq!(
+            (Some(conflict.gid), conflict.key.as_deref()),
+            (note, None),
+            "{at}"
+        );
+        let ids = b.lines("SELECT CAST(id AS TEXT) FROM notes").await;
+        assert_eq!(ids.len(), usize::from(reused), "{at}");
+        if reused && pace == one_envelope() {
+            // Applied apart from the deletion, the new note took the deleted one's local id.
+            assert_eq!(ids, ["1"], "{at}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_caller_that_syncs_again_at_once_carries_the_held_time_into_the_next_sync() {
+    let server = Server::new();
+    let [mut a, _b] = three_envelopes(&server).await;
+    let report = sync_hooked(&mut a, &server, &mut Marking::default())
+        .await
+        .unwrap();
+    assert!(report.held > Duration::ZERO);
+    let pause = Duration::from_millis(300);
+    let mut hook = Marking {
+        pace: Pace {
+            hold: Duration::from_millis(100),
+            pause,
+            held: Duration::from_millis(100),
+            ..Pace::default()
+        },
+        ..Marking::default()
+    };
+    let began = std::time::Instant::now();
+    let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
+    assert!(began.elapsed() >= pause, "{:?}", began.elapsed());
+    assert!(report.held > Duration::ZERO);
 }
 
 /// Drops a sync that applies one envelope at a time at each of its suspensions in turn, from a
@@ -2615,6 +2828,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             seal: [1, 2, 3, 1_000][rng.below(4) as usize],
             hold: Duration::ZERO,
             pause: Duration::from_millis(rng.below(2)),
+            held: Duration::ZERO,
         };
         let [made, joined] = credentials(&server).await;
         let key = generate_signing_key().unwrap();

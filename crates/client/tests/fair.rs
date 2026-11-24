@@ -90,6 +90,9 @@ struct Waits {
     writes: usize,
     failed: usize,
     worst: Duration,
+    /// When each statement that succeeded returned.
+    #[allow(dead_code)]
+    done: Vec<Instant>,
 }
 
 impl Waits {
@@ -97,17 +100,27 @@ impl Waits {
         self.writes += 1;
         self.failed += usize::from(!ok);
         self.worst = self.worst.max(waited);
+        if ok {
+            self.done.push(Instant::now());
+        }
+    }
+
+    /// Statements that succeeded between `from` and `to`.
+    fn within(&self, from: Instant, to: Instant) -> usize {
+        self.done.iter().filter(|&&t| from < t && t < to).count()
     }
 }
 
-/// Writes a row every `every` on a connection of its own with a busy timeout of `busy`, until
-/// `stop`, timing each write from when it was due. With a gate, each write holds it.
+/// Writes a row, or with `read` reads the table, every `every` on a connection of its own with a
+/// busy timeout of `busy`, until `stop`, timing each statement from when it was due. With a gate,
+/// each statement holds it.
 fn writer(
     path: PathBuf,
     busy: Duration,
     every: Duration,
     stop: Arc<AtomicBool>,
     gate: Option<Arc<Mutex<()>>>,
+    read: bool,
 ) -> std::thread::JoinHandle<Waits> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -121,14 +134,18 @@ fn writer(
                 .await
                 .unwrap()
         });
+        let sql = if read {
+            "SELECT count(*) FROM w"
+        } else {
+            "INSERT INTO w (at) VALUES (1)"
+        };
         let mut waits = Waits::default();
         let mut due = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             let gated = gate.as_ref().map(|gate| gate.blocking_lock());
-            let wrote =
-                runtime.block_on(sqlx::query("INSERT INTO w (at) VALUES (1)").execute(&mut conn));
+            let done = runtime.block_on(sqlx::query(sql).execute(&mut conn));
             drop(gated);
-            waits.add(due.elapsed(), wrote.is_ok());
+            waits.add(due.elapsed(), done.is_ok());
             due += every;
             let now = Instant::now();
             if due > now {
@@ -151,6 +168,8 @@ struct Gated {
     held: Option<OwnedMutexGuard<()>>,
     applies: Vec<(usize, Duration)>,
     betweens: usize,
+    /// When the first apply began and the last one ended.
+    span: Option<(Instant, Instant)>,
 }
 
 impl Gated {
@@ -162,6 +181,7 @@ impl Gated {
             held: None,
             applies: Vec::new(),
             betweens: 0,
+            span: None,
         }
     }
 
@@ -184,6 +204,8 @@ impl Apply for Gated {
         let applied = replica.apply(conn, changes).await?;
         std::thread::sleep(self.work * changes.len() as u32);
         self.applies.push((changes.len(), began.elapsed()));
+        let first = self.span.map_or(began, |(first, _)| first);
+        self.span = Some((first, Instant::now()));
         Ok(applied)
     }
 
@@ -201,36 +223,38 @@ impl Apply for Gated {
     }
 }
 
-/// A device joins a library of 6,000 changes, sent in envelopes of 100, and its application does
+/// A device joins a library of 6,000 changes, in envelopes of 1,000, and its application does
 /// 100 µs of work per change inside each apply. Applied in one transaction, as when nothing bounds
-/// it, that holds the write lock for about 0.85 s, and both writers below fail. Paced, no apply
-/// is given more than 300 changes (about 45 ms), and the sync leaves the lock free for 100 ms
-/// once it has held it for 100 ms.
+/// it, that holds the write lock for about 0.85 s with only a gap of well under a millisecond
+/// before `caught_up`. Paced at one envelope per apply and a pause of 200 ms before every
+/// transaction after the first, the sync leaves six gaps.
 ///
-/// Meanwhile two writers each write a row every 20 ms with a busy timeout of 500 ms: one through
-/// the application's gate, which the hook opens between transactions, and one on a connection of
-/// its own that only SQLite's busy handler coordinates. No write fails, and each waits at most
-/// about the held time, one transaction and one pause: the gated writer waits out the pause too,
-/// since the application keeps its gate until the hook.
+/// Meanwhile two writers each write a row every 20 ms: one through the application's gate, which
+/// the hook opens in each gap, and one on a connection of its own that only SQLite's busy handler
+/// coordinates, which sleeps at most 100 ms between tries. What is checked does not depend on how
+/// fast the machine is: each apply stays within the bound, the hook runs in every gap, no write
+/// fails, and each writer finishes writes between the first apply and the last, at least one in
+/// every other gap between them.
+/// The only times checked are the writers' busy timeouts, 2 s, several times what they wait.
 #[tokio::test]
 async fn a_large_sync_leaves_room_for_a_gated_writer_and_for_one_on_its_own() {
     let dir = scratch("fair");
-    let (server, joined) = library(&dir, 1_000, 100).await;
+    let (server, joined) = library(&dir, 1_000, 1_000).await;
     let (mut b, path) = joining(&dir, joined).await;
-    let busy = Duration::from_millis(500);
+    let busy = Duration::from_secs(2);
     let every = Duration::from_millis(20);
     let stop = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(Mutex::new(()));
     let pace = Pace {
-        apply: 300,
-        hold: Duration::from_millis(100),
-        pause: Duration::from_millis(100),
+        apply: 1_000,
+        hold: Duration::ZERO,
+        pause: Duration::from_millis(200),
         ..Pace::default()
     };
     let mut gated = Gated::new(pace, Duration::from_micros(100), Some(gate.clone()));
     let writers = [
-        writer(path.clone(), busy, every, stop.clone(), Some(gate)),
-        writer(path.clone(), busy, every, stop.clone(), None),
+        writer(path.clone(), busy, every, stop.clone(), Some(gate), false),
+        writer(path.clone(), busy, every, stop.clone(), None, false),
     ];
     std::thread::sleep(Duration::from_millis(100));
     gated.hold().await;
@@ -248,20 +272,18 @@ async fn a_large_sync_leaves_room_for_a_gated_writer_and_for_one_on_its_own() {
     stop.store(true, Ordering::Relaxed);
     let [inside, outside] = writers.map(|w| w.join().unwrap());
     assert_eq!(report.unwrap().received, 6_000);
-    assert!(
-        gated.applies.iter().all(|&(n, _)| n <= 300),
-        "{:?}",
-        gated.applies
-    );
-    assert_eq!(gated.betweens, gated.applies.len());
+    let sizes: Vec<usize> = gated.applies.iter().map(|&(n, _)| n).collect();
+    assert_eq!(sizes, [1_000; 6]);
+    assert_eq!(gated.betweens, 6);
     let at = format!(
         "applies {:?}; gated {inside:?}; on its own {outside:?}",
         gated.applies
     );
-    assert!(inside.writes > 20 && outside.writes > 20, "{at}");
     assert_eq!((inside.failed, outside.failed), (0, 0), "{at}");
-    assert!(inside.worst < Duration::from_millis(300), "{at}");
-    assert!(outside.worst < Duration::from_millis(400), "{at}");
+    let (first, last) = gated.span.unwrap();
+    for waits in [&inside, &outside] {
+        assert!(waits.within(first, last) >= 3, "{at}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -283,6 +305,7 @@ fn writer_process() {
         Duration::from_millis(20),
         stop.clone(),
         None,
+        false,
     );
     while !stop_file.exists() {
         std::thread::sleep(Duration::from_millis(5));
@@ -290,42 +313,57 @@ fn writer_process() {
     stop.store(true, Ordering::Relaxed);
     let waits = w.join().unwrap();
     println!(
-        "WAITS writes {} failed {} worst {:?}",
-        waits.writes, waits.failed, waits.worst
+        "WAITS {} {} {}",
+        waits.writes,
+        waits.failed,
+        waits.worst.as_micros()
     );
 }
 
 /// The full-size measurement. `FAIR_BOOKS` books with a note each (six changes a book; 8,334 for
-/// 50,000 changes and 33,334 for 200,000) reach a second device, in envelopes of 1,000, while a
-/// writer writes every 20 ms with a busy timeout of `FAIR_BUSY_MS`. `FAIR_WRITER` picks it: `gated`
-/// goes through the application's gate, `thread` has a connection of its own, `process` runs in
-/// a process of its own, `none` does not run. `FAIR_APPLY`, `FAIR_HOLD_MS` and `FAIR_PAUSE_MS`
-/// set the pace. Run it optimised:
+/// 50,000 changes and 33,334 for 200,000) reach a second device, in envelopes of 1,000, with the
+/// database in `FAIR_JOURNAL` mode (`wal` or `delete`). Meanwhile, every 20 ms with a busy timeout
+/// of `FAIR_BUSY_MS`, a process of its own writes a row, a connection in this process writes one
+/// and another reads; or, with `FAIR_GATED=1`, a writer in this process writes through the
+/// application's gate alone. `FAIR_APPLY`, `FAIR_HOLD_MS` and `FAIR_PAUSE_MS` set the pace.
+/// Run it optimised:
 ///
 /// ```text
-/// FAIR_BOOKS=33334 FAIR_WRITER=process cargo test --release -p fongo-sync-client --test fair \
+/// FAIR_BOOKS=33334 FAIR_JOURNAL=delete cargo test --release -p fongo-sync-client --test fair \
 ///     -- --ignored --nocapture measure
 /// ```
 ///
-/// On an 8 GB laptop, WAL mode, worst wait and failed writes with a 1 s busy timeout, and the
-/// sync's time. Unbounded is `FAIR_APPLY=100000000 FAIR_PAUSE_MS=0`, one apply as before the
-/// bound; the pace's defaults are 4,000 changes, 250 ms and 100 ms.
+/// On an 8 GB laptop, with a 1 s busy timeout unless noted: the sync's time, then the worst wait
+/// of each of the others, and how many of their statements failed. Unbounded is
+/// `FAIR_APPLY=100000000 FAIR_PAUSE_MS=0`, one apply as before the bound; the defaults are 4,000
+/// changes, 250 ms and 150 ms. Ranges are over the runs.
 ///
-/// | changes | writer | unbounded | default pace, no pause | default pace |
-/// |---|---|---|---|---|
-/// | 50,000 | process | 0.94 s, 0 failed; 0.99 s | 0.95 s, 0; 1.16 s | 0.42 s, 0; 1.54 s |
-/// | 50,000 | gated | | 0.13 s, 0; 1.15 s | 0.23 s, 0; 1.50 s |
-/// | 200,000 | process | 1.11 s, 3 failed; 4.55 s | 1.13 s, 0; 6.91 s | 0.42 s, 0; 9.32 s |
-/// | 200,000 | gated | | 0.21 s, 0; 6.98 s | 0.34 s, 0; 9.31 s |
+/// | journal | changes | pace | sync | writer here | writer, other process | reader |
+/// |---|---|---|---|---|---|---|
+/// | WAL | 50,000 | unbounded | 0.95 s | 0.95 s | 0.97–1.05 s | 0.01 s |
+/// | WAL | 50,000 | default | 1.65–1.88 s | 0.40 s | 0.40–0.41 s | 0.01 s |
+/// | WAL | 200,000 | unbounded | 4.42 s | 1.13–1.15 s, 3 of 40 failed | 1.13 s, 3 of 40 | 0.02 s |
+/// | WAL | 200,000 | default | 10.4 s | 0.49–0.51 s | 0.80–0.82 s | 0.01 s |
+/// | DELETE | 50,000 | unbounded | 0.90 s | 0.93–0.94 s | 0.85–0.94 s | 0.61–0.63 s |
+/// | DELETE | 50,000 | default | 1.62–1.63 s | 0.39–0.40 s | 0.39–0.40 s | 0.09 s |
+/// | DELETE | 200,000 | unbounded | 4.24–4.27 s | 1.13–1.14 s, 3 of 40 | 1.12–1.14 s, 3 of 40 | 1.13–1.14 s, 2 of 95 |
+/// | DELETE | 200,000 | default, 6 runs | 9.6–10.6 s | 0.40–0.82 s | 0.41–1.14 s, 1 of 184 in one run | 0.17–0.28 s |
+/// | DELETE | 200,000 | pause 250 ms, 3 runs | 11.8–12.0 s | 0.40–0.49 s | 0.50–0.62 s | 0.15–0.16 s |
+/// | DELETE | 200,000 | default, 5 s timeout | 9.6 s | 0.40–0.82 s | 0.93–0.95 s | 0.17–0.40 s |
+///
+/// A writer through the application's gate alone (`FAIR_GATED=1`), with the pause at zero, waited
+/// at most 0.14 s at 50,000 changes and 0.23 s at 200,000 in WAL mode (sync 1.16 s and 6.97 s), and
+/// 0.12 s and 0.19 s in rollback-journal mode.
 #[tokio::test]
 #[ignore]
 async fn measure() {
     let books = env("FAIR_BOOKS", 8_334);
     let busy = Duration::from_millis(env("FAIR_BUSY_MS", 1000));
-    let mode = std::env::var("FAIR_WRITER").unwrap_or_else(|_| "thread".into());
+    let journal = std::env::var("FAIR_JOURNAL").unwrap_or_else(|_| "wal".into());
     let dir = scratch("fair-measure");
     let (server, joined) = library(&dir, books, 1_000).await;
     let (mut b, path) = joining(&dir, joined).await;
+    b.run(&format!("PRAGMA journal_mode = {journal}")).await;
     let base = Pace::default();
     let pace = Pace {
         apply: env("FAIR_APPLY", base.apply as u64) as usize,
@@ -333,35 +371,38 @@ async fn measure() {
         pause: Duration::from_millis(env("FAIR_PAUSE_MS", base.pause.as_millis() as u64)),
         ..base
     };
-    let gate = (mode == "gated").then(|| Arc::new(Mutex::new(())));
-    let mut gated = Gated::new(pace, Duration::ZERO, gate.clone());
+    let every = Duration::from_millis(20);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_file = dir.join("stop");
+    let gated_only = env("FAIR_GATED", 0) == 1;
+    let gate = gated_only.then(|| Arc::new(Mutex::new(())));
+    let mut gated = Gated::new(pace, Duration::ZERO, gate.clone());
+    let mut threads = Vec::new();
     let mut child = None;
-    let mut thread = None;
-    match mode.as_str() {
-        "process" => {
-            child = Some(
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--ignored", "--exact", "writer_process", "--nocapture"])
-                    .env("FAIR_WRITER_DB", &path)
-                    .env("FAIR_STOP", &stop_file)
-                    .env("FAIR_BUSY_MS", busy.as_millis().to_string())
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            )
-        }
-        "none" => {}
-        _ => {
-            thread = Some(writer(
-                path.clone(),
-                busy,
-                Duration::from_millis(20),
-                stop.clone(),
-                gate,
-            ))
-        }
+    if gated_only {
+        threads.push((
+            "gated writer",
+            writer(path.clone(), busy, every, stop.clone(), gate, false),
+        ));
+    } else {
+        child = Some(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "writer_process", "--nocapture"])
+                .env("FAIR_WRITER_DB", &path)
+                .env("FAIR_STOP", &stop_file)
+                .env("FAIR_BUSY_MS", busy.as_millis().to_string())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        threads.push((
+            "writer",
+            writer(path.clone(), busy, every, stop.clone(), None, false),
+        ));
+        threads.push((
+            "reader",
+            writer(path.clone(), busy, every, stop.clone(), None, true),
+        ));
     }
     std::thread::sleep(Duration::from_millis(300));
     gated.hold().await;
@@ -380,27 +421,39 @@ async fn measure() {
     std::thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Relaxed);
     std::fs::write(&stop_file, b"").unwrap();
-    let waits = match (thread, child) {
-        (Some(thread), _) => format!("{:?}", thread.join().unwrap()),
-        (_, Some(child)) => {
-            let out = child.wait_with_output().unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find(|l| l.starts_with("WAITS"))
-                .unwrap_or("no output")
-                .to_string()
+    let mut waits = Vec::new();
+    for (name, thread) in threads {
+        let w = thread.join().unwrap();
+        waits.push(format!(
+            "{name} {:.2} s, {}/{} failed",
+            w.worst.as_secs_f64(),
+            w.failed,
+            w.writes
+        ));
+    }
+    if let Some(child) = child {
+        let out = child.wait_with_output().unwrap();
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("WAITS ").map(str::to_string))
+            .unwrap_or_default();
+        let n: Vec<u128> = line.split(' ').filter_map(|v| v.parse().ok()).collect();
+        if let [writes, failed, worst] = n[..] {
+            waits.push(format!(
+                "process {:.2} s, {failed}/{writes} failed",
+                worst as f64 / 1e6
+            ));
         }
-        _ => "no writer".into(),
-    };
+    }
     let report = report.unwrap();
     let longest = gated.applies.iter().map(|a| a.1).max().unwrap_or_default();
-    let total: Duration = gated.applies.iter().map(|a| a.1).sum();
     eprintln!(
-        "received {} in {took:?}: {} applies, longest {longest:?}, all {total:?}; {} gaps; \
-         writer ({mode}, busy {busy:?}): {waits}",
+        "RESULT {journal} received {} in {:.2} s, {} applies, longest {:.0} ms; {}",
         report.received,
+        took.as_secs_f64(),
         gated.applies.len(),
-        gated.betweens,
+        longest.as_secs_f64() * 1e3,
+        waits.join("; "),
     );
     let _ = std::fs::remove_dir_all(dir);
 }

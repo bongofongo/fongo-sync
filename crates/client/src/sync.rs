@@ -9,7 +9,7 @@ use fongo_sync_protocol::api::{
 use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
-use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid};
+use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
 use fongo_sync_sqlite::{Applied, Replica, Touched};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
@@ -33,13 +33,28 @@ const SMALLEST_BATCH: usize = 3 + 1 + 16 + 1 + 1 + 8 + 4 + 16;
 /// apply, `caught_up`, and the record and acknowledgment of each envelope it sends. These settings
 /// keep each turn short and leave room between them. [`Apply::pace`] gives them; [`sync`] uses the
 /// defaults.
+///
+/// With the defaults, a writer on another connection that waits in SQLite's busy handler usually
+/// waits about `hold`, one apply and `pause`, and longer when several connections compete for the
+/// same gap. Joining 200,000 changes on a fast laptop while two writers and a reader each used the
+/// database every 20 ms, writers waited at most 0.4 to 1.1 s and readers, which wait too in
+/// rollback-journal mode, at most 0.3 s; with a 1 s busy timeout one write in about 1,200 failed in
+/// rollback-journal mode. A busy timeout near 1 s is therefore marginal: give other connections
+/// several seconds, such as sqlx's default of 5 s, or raise `pause` (250 ms kept every wait there
+/// under 0.65 s, for about 2 s more sync time).
+///
+/// Setting `pause` to zero, without letting writers through in [`Apply::between`], makes a large
+/// sync slower than one bounded by nothing and no fairer to writers in the busy handler; it suits
+/// an application whose writers all wait on a gate of its own that `between` opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pace {
     /// Most changes one apply transaction is given. Received envelopes are held until the next
     /// would take the count past this, and what is held is then applied and the cursor stored past
     /// it; an envelope is never split, so one holding more than this is applied alone. 0 counts as
-    /// 1, one envelope per apply. Default 4,000: about 100 ms on a fast laptop for the kernel's own
-    /// work, more with an application's [`Apply::apply`] and on slower devices.
+    /// 1, one envelope per apply. Default 4,000. An apply takes longer the larger the library: on
+    /// a fast laptop, the kernel's work for 4,000 changes took about 50 ms in a new library and
+    /// about 180 ms in one of 200,000 changes, before an application's own [`Apply::apply`] work
+    /// and on slower devices more.
     pub apply: usize,
     /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
     /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
@@ -49,10 +64,16 @@ pub struct Pace {
     /// Default 250 ms.
     pub hold: Duration,
     /// How long it then leaves the write lock free before its next transaction, so that a writer
-    /// waiting in SQLite's busy handler, which sleeps up to 100 ms between tries, finds it free.
+    /// waiting in SQLite's busy handler, which sleeps up to 100 ms between tries, wakes inside it.
     /// The pause is timed by a thread of the client's own and is taken only when another
-    /// transaction follows. Zero never pauses. Default 100 ms.
+    /// transaction follows. Zero never pauses. Default 150 ms.
     pub pause: Duration,
+    /// How long syncs that ran just before this one held the write lock since they last paused:
+    /// [`SyncReport::held`] of the last of them. The time a sync holds the lock starts from this,
+    /// so a caller that syncs again at once, as while [`SyncReport::more`] is set, keeps the
+    /// pauses it would have had in one longer sync; when it is already `hold` or more, the sync
+    /// pauses before its first write. Default zero.
+    pub held: Duration,
 }
 
 impl Default for Pace {
@@ -61,7 +82,8 @@ impl Default for Pace {
             apply: 4_000,
             seal: 1_000,
             hold: Duration::from_millis(250),
-            pause: Duration::from_millis(100),
+            pause: Duration::from_millis(150),
+            held: Duration::ZERO,
         }
     }
 }
@@ -145,8 +167,11 @@ pub struct SyncReport {
     /// Changes this device sent.
     pub sent: usize,
     /// What applying them did, merged over every apply in the sync with [`merge_applied`]:
-    /// changes accepted, rows touched, conflicts, one for each field of an entity with the latest
-    /// remote change, and entities still waiting. `touched` lists keys in the order the sync
+    /// changes accepted, rows touched, conflicts, one for each local edit with the latest remote
+    /// change it met, and entities still waiting. A conflict's `key` is that of the row holding
+    /// its entity, or any entity merged with it, once the sync is done, and `None` if no row
+    /// does: a later apply of the same sync may have removed the row it had, and its key may
+    /// since hold another entity. `touched` lists keys in the order the sync
     /// first touched them, each key's entries together. Within a key it holds one entry per
     /// entity, that entity's last, in the order those entries came: the entities that left the
     /// key come before the one it was left holding.
@@ -163,6 +188,9 @@ pub struct SyncReport {
     pub more: bool,
     /// The last sequence number this sync knows the library's log to hold.
     pub head: u64,
+    /// How long this sync held the write lock since it last paused, counting [`Pace::held`] when
+    /// it did not pause; give it as [`Pace::held`] to a sync that follows at once.
+    pub held: Duration,
 }
 
 /// One round with the server: reads the envelopes after the stored cursor, applies what other
@@ -296,7 +324,9 @@ pub trait Apply: Send {
     /// `changes` holds whole envelopes, at most [`Pace::apply`] changes unless one envelope holds
     /// more. A pull can thus make many applies, and a field changed remotely more than once before
     /// this device's own edit of it was read back can be reported as a conflict by more than one
-    /// of them, each with a later change; [`merge_applied`] keeps the last.
+    /// of them, each with a later change; [`merge_applied`] keeps the last. A conflict's `key`
+    /// here is the row's as this apply leaves it; a later apply of the same sync can remove that
+    /// row or give its key to another entity, so a key is not kept from one apply to the next.
     ///
     /// In the same transaction, after this returns, the client stores the cursor past the
     /// envelopes `changes` came in, so the rows applied, everything this wrote and the cursor are
@@ -356,6 +386,14 @@ pub trait Apply: Send {
     /// every transaction it begins; what it writes to a synced table is a local edit, collected by
     /// the next apply. If it returns with a transaction open on the connection, the sync writes
     /// nothing more and fails with [`Error::ConnectionUnsound`].
+    ///
+    /// An application that sends its own writes through a gate, such as a fair async mutex, can
+    /// hold the gate for the whole sync and, here, release it and take it again: the writers
+    /// queued on it go first and find the database free. The client's pause comes before this
+    /// call, with the gate still held, so those writers wait out the pause too; when every writer
+    /// goes through the gate, `pause` can be zero. A connection of the application must not wait
+    /// on the gate inside a write transaction of its own: it then holds SQLite's lock while the
+    /// sync waits for it, and the sync's next write fails when its busy timeout runs out.
     ///
     /// When it fails, the sync stops: as after any failure in a pull, it applies what it holds
     /// once more, without calling this again, and returns the error; nothing is sent. When the
@@ -436,6 +474,12 @@ async fn run<T: Transport, A: Apply>(
     let caps = rpc.capabilities().await?;
     let library = credentials.library_id();
     let me = credentials.device_id();
+    let pace = apply.pace();
+    let mut held = pace.held;
+    if !pace.pause.is_zero() && held >= pace.hold {
+        pause(pace.pause).await;
+        held = Duration::ZERO;
+    }
     let saved = state::load(conn, library).await?;
     let mut cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
@@ -453,11 +497,11 @@ async fn run<T: Transport, A: Apply>(
     let mut steps = Steps {
         replica,
         library,
-        pace: apply.pace(),
+        pace,
         apply,
         committed: false,
         failed: false,
-        held: Duration::ZERO,
+        held,
     };
     let pulled = read_pages(
         &rpc,
@@ -579,6 +623,12 @@ async fn run<T: Transport, A: Apply>(
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
+    for conflict in &mut report.applied.conflicts {
+        conflict.key = replica
+            .key_for_gid(conn, &conflict.collection, conflict.gid)
+            .await?;
+    }
+    report.held = steps.held;
     Ok(report)
 }
 
@@ -1135,9 +1185,12 @@ fn varint_len(mut n: usize) -> usize {
 /// Adds what a later apply did to what earlier ones did, as [`SyncReport::applied`] is built.
 ///
 /// - `accepted` is summed.
-/// - `conflicts` are appended, after dropping those an earlier apply reported for a field of an
-///   entity that `from` reports again: a later apply reports a field only for a change later than
-///   the one already reported, and one apply of everything would have reported only that.
+/// - `conflicts` are appended, after dropping each earlier one that `from` reports again: the same
+///   local edit, that is the same collection, entity, field, base and local value. A later apply
+///   reports a local edit again only for a remote change later than the one already reported,
+///   and one apply of everything would have reported only that. Each conflict in `from` replaces
+///   at most one earlier one. A different local edit of the same field, such as one written
+///   between two applies, is a different conflict, and both are kept.
 /// - `waiting` and `held` are taken from `from`: each apply reports every entity still held, so
 ///   the later report replaces the earlier.
 /// - `touched` lists keys in the order they were first touched, each key's entries together.
@@ -1147,13 +1200,29 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
     into.held = from.held;
-    let again: HashSet<(&str, Gid, &str)> = from
-        .conflicts
-        .iter()
-        .map(|c| (c.collection.as_str(), c.gid, c.field.as_str()))
-        .collect();
-    into.conflicts
-        .retain(|c| !again.contains(&(c.collection.as_str(), c.gid, c.field.as_str())));
+    type Edits<'a> = Vec<(&'a Option<Value>, &'a Value)>;
+    let mut again: HashMap<(String, Gid, String), Edits> = HashMap::new();
+    for c in &from.conflicts {
+        again
+            .entry((c.collection.clone(), c.gid, c.field.clone()))
+            .or_default()
+            .push((&c.base, &c.local));
+    }
+    into.conflicts.retain(|c| {
+        let Some(edits) = again.get_mut(&(c.collection.clone(), c.gid, c.field.clone())) else {
+            return true;
+        };
+        match edits
+            .iter()
+            .position(|&(base, local)| *base == c.base && *local == c.local)
+        {
+            Some(at) => {
+                edits.swap_remove(at);
+                false
+            }
+            None => true,
+        }
+    });
     into.conflicts.extend(from.conflicts);
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut at: HashMap<(String, String), Vec<Touched>> = HashMap::new();
@@ -1177,7 +1246,8 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
 #[cfg(test)]
 mod tests {
     use fongo_sync_protocol::{LibraryId, LibraryKeys, SigningKey};
-    use fongo_sync_sqlite::core::{Gid, Hlc, Value};
+    use fongo_sync_sqlite::Conflict;
+    use fongo_sync_sqlite::core::Hlc;
 
     use super::*;
 
@@ -1261,6 +1331,73 @@ mod tests {
             assert_eq!(
                 report.touched,
                 touched(want).touched,
+                "{first:?} then {second:?}"
+            );
+        }
+    }
+
+    fn conflict(gid: u8, local: &str, remote: &str) -> Conflict {
+        Conflict {
+            collection: "notes".into(),
+            gid: Gid([gid; 16]),
+            key: None,
+            field: "body".into(),
+            base: Some(Value::Text("base".into())),
+            local: Value::Text(local.into()),
+            remote: Value::Text(remote.into()),
+            remote_won: true,
+        }
+    }
+
+    #[test]
+    fn a_conflict_reported_again_replaces_only_the_same_local_edit() {
+        let cases: [(&[_], &[_], &[_]); 6] = [
+            // The same edit, met by a later remote change.
+            (&[(1, "m1", "t1")], &[(1, "m1", "t2")], &[(1, "m1", "t2")]),
+            // Another local edit of the field, written between the two applies.
+            (
+                &[(1, "m1", "t1")],
+                &[(1, "m2", "t2")],
+                &[(1, "m1", "t1"), (1, "m2", "t2")],
+            ),
+            // Another entity's conflict stays.
+            (
+                &[(1, "m1", "t1"), (2, "m1", "t1")],
+                &[(2, "m1", "t2")],
+                &[(1, "m1", "t1"), (2, "m1", "t2")],
+            ),
+            // Two members of one group, reported under its id with different edits.
+            (
+                &[(1, "m1", "t1"), (1, "m2", "t1")],
+                &[(1, "m1", "t2")],
+                &[(1, "m2", "t1"), (1, "m1", "t2")],
+            ),
+            // Two members with the same edit: each report replaces one.
+            (
+                &[(1, "m1", "t1"), (1, "m1", "t1")],
+                &[(1, "m1", "t2")],
+                &[(1, "m1", "t1"), (1, "m1", "t2")],
+            ),
+            (
+                &[(1, "m1", "t1"), (1, "m1", "t1")],
+                &[(1, "m1", "t2"), (1, "m1", "t2")],
+                &[(1, "m1", "t2"), (1, "m1", "t2")],
+            ),
+        ];
+        let applied = |list: &[(u8, &str, &str)]| Applied {
+            conflicts: list
+                .iter()
+                .map(|&(gid, local, remote)| conflict(gid, local, remote))
+                .collect(),
+            ..Applied::default()
+        };
+        for (first, second, want) in cases {
+            let mut report = Applied::default();
+            merge_applied(&mut report, applied(first));
+            merge_applied(&mut report, applied(second));
+            assert_eq!(
+                report.conflicts,
+                applied(want).conflicts,
                 "{first:?} then {second:?}"
             );
         }
