@@ -1,4 +1,4 @@
-use crate::value::Gid;
+use crate::value::{Gid, push_hex_digits};
 
 const WALL_MAX: u64 = 0xFFFF_FFFF_FFFF;
 
@@ -28,12 +28,11 @@ impl Hlc {
 
     /// Fixed-width text whose byte order is the clock order, so a database can compare it.
     pub fn encode(&self) -> String {
-        format!(
-            "{:012x}{:08x}{}",
-            self.wall_ms.min(WALL_MAX),
-            self.counter,
-            self.node.to_hex()
-        )
+        let mut text = String::with_capacity(52);
+        push_hex_digits(&mut text, self.wall_ms.min(WALL_MAX), 12);
+        push_hex_digits(&mut text, u64::from(self.counter), 8);
+        self.node.push_hex(&mut text);
+        text
     }
 
     pub fn decode(text: &str) -> Option<Hlc> {
@@ -106,6 +105,39 @@ mod tests {
 
     fn node(n: u8) -> Gid {
         Gid([n; 16])
+    }
+
+    #[test]
+    fn the_text_form_is_the_formatted_one() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in 0..1000 {
+            let mut gid = [0u8; 16];
+            gid[..8].copy_from_slice(&next().to_le_bytes());
+            gid[8..].copy_from_slice(&next().to_le_bytes());
+            let reading = Hlc {
+                wall_ms: if n % 7 == 0 {
+                    u64::MAX
+                } else {
+                    next() >> (n % 64)
+                },
+                counter: next() as u32,
+                node: Gid(gid),
+            };
+            let hex: String = gid.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(reading.node.to_hex(), hex);
+            let text = format!(
+                "{:012x}{:08x}{hex}",
+                reading.wall_ms.min(WALL_MAX),
+                reading.counter
+            );
+            assert_eq!(reading.encode(), text);
+        }
     }
 
     #[test]

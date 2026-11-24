@@ -1,4 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
+use std::time::{Duration, Instant};
 
 use fongo_sync_protocol::api::{
     Appended, BatchPage, Devices, ErrorCode, ReadBatches, StoredBatch, batches_path, devices_path,
@@ -6,8 +9,8 @@ use fongo_sync_protocol::api::{
 use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
-use fongo_sync_sqlite::core::{ALIAS, Change, DELETED};
-use fongo_sync_sqlite::{Applied, Replica, Touched};
+use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
+use fongo_sync_sqlite::{Applied, Conflict, Replica, Touched};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 use crate::credentials::Credentials;
@@ -18,16 +21,103 @@ use crate::transport::{Method, Transport};
 
 /// Envelopes asked for per page when the server states no maximum.
 const DEFAULT_PAGE: u32 = 256;
-/// Received changes held in memory before they are applied and the cursor moves.
-const APPLY_CHUNK: usize = 50_000;
 /// Pages read in one call; [`SyncReport::more`] says when the log held more.
 const MAX_PAGES: usize = 1_000;
 /// Refusals listed in [`SyncReport::refused`]; [`SyncReport::refused_total`] counts them all.
 const REFUSALS_LISTED: usize = 100;
 /// The encoded size of a batch of one change with an empty collection and field and a null value.
 const SMALLEST_BATCH: usize = 3 + 1 + 16 + 1 + 1 + 8 + 4 + 16;
-/// Most changes sealed into one envelope.
-const OUTBOX_PAGE: u32 = 1_000;
+
+/// How a sync shares the database with other connections that write to it. SQLite lets one
+/// connection write at a time, and a sync takes that turn for each of its transactions: each
+/// apply, `caught_up`, and the record and acknowledgment of each envelope it sends. These settings
+/// keep each turn short and leave room between them. [`Apply::pace`] gives them; [`sync`] uses the
+/// defaults.
+///
+/// With the defaults, a writer on another connection that waits in SQLite's busy handler usually
+/// waits about `hold`, one apply and `pause`, and longer when several connections compete for the
+/// same gap. Joining 200,000 changes on a fast laptop while two writers and a reader each used the
+/// database every 20 ms, the worst wait in a run was about a second, with a pause of 150, 200 or
+/// 250 ms alike; each 50 ms more pause cost about a second of sync time and did not remove that
+/// tail. Readers wait too in rollback-journal mode, up to about 0.3 s there. A busy timeout near
+/// 1 s is therefore marginal whatever the pause: give other connections several seconds, such as
+/// sqlx's default of 5 s.
+///
+/// Setting `pause` to zero, without letting writers through in [`Apply::between`], makes a large
+/// sync slower than one bounded by nothing and no fairer to writers in the busy handler; it suits
+/// an application whose writers all wait on a gate of its own that `between` opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    /// Most changes one apply transaction is given. Received envelopes are held until the next
+    /// would take the count past this, and what is held is then applied and the cursor stored past
+    /// it; an envelope is never split, so one holding more than this is applied alone. 0 counts as
+    /// 1, one envelope per apply. Default 4,000. An apply takes longer the larger the library: on
+    /// a fast laptop, the kernel's work for 4,000 changes took about 50 ms in a new library and
+    /// about 180 ms in one of 200,000 changes, before an application's own [`Apply::apply`] work
+    /// and on slower devices more.
+    pub apply: usize,
+    /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
+    /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
+    /// Default 1,000.
+    pub seal: u32,
+    /// How long the sync holds the write lock, summed over its transactions, before it pauses.
+    /// Default 250 ms.
+    pub hold: Duration,
+    /// How long it then leaves the write lock free before its next transaction, so that a writer
+    /// waiting in SQLite's busy handler, which sleeps up to 100 ms between tries, wakes inside it.
+    /// The pause is timed by a thread of the client's own and is taken only when another
+    /// transaction follows. Zero never pauses. Default 150 ms.
+    pub pause: Duration,
+    /// How long syncs that ran just before this one held the write lock since they last paused:
+    /// [`SyncReport::held`] of the last of them. The time a sync holds the lock starts from this,
+    /// so a caller that syncs again at once, as while [`SyncReport::more`] is set, keeps the
+    /// pauses it would have had in one longer sync; when it is already `hold` or more, the sync
+    /// pauses before its first write. Default zero.
+    pub held: Duration,
+}
+
+impl Default for Pace {
+    fn default() -> Pace {
+        Pace {
+            apply: 4_000,
+            seal: 1_000,
+            hold: Duration::from_millis(250),
+            pause: Duration::from_millis(150),
+            held: Duration::ZERO,
+        }
+    }
+}
+
+/// Waits `duration`. A thread of its own sleeps and wakes the task, so a sync needs no particular
+/// runtime's timer; if the thread cannot be made, it does not wait.
+async fn pause(duration: Duration) {
+    let state: Arc<Mutex<(bool, Option<Waker>)>> = Arc::default();
+    let mut started = false;
+    std::future::poll_fn(|cx| {
+        let mut shared = state.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.0 {
+            return Poll::Ready(());
+        }
+        shared.1 = Some(cx.waker().clone());
+        if !started {
+            started = true;
+            let state = state.clone();
+            let spawned = std::thread::Builder::new().spawn(move || {
+                std::thread::sleep(duration);
+                let mut shared = state.lock().unwrap_or_else(|e| e.into_inner());
+                shared.0 = true;
+                if let Some(waker) = shared.1.take() {
+                    waker.wake();
+                }
+            });
+            if spawned.is_err() {
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 /// Why an envelope from the server's log was skipped instead of applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,8 +166,16 @@ pub struct SyncReport {
     pub received: usize,
     /// Changes this device sent.
     pub sent: usize,
-    /// What applying them did, merged over every apply in the sync: changes accepted, rows
-    /// touched, conflicts, and entities still waiting. `touched` lists keys in the order the sync
+    /// What applying them did, merged over every apply in the sync with [`merge_applied`]:
+    /// changes accepted, rows touched, conflicts, one for each local edit with the latest remote
+    /// change it met, and entities still waiting. A conflict's `gid` and `key` are as the sync
+    /// leaves them, looked up once it is done: `gid` is the id of the entity's group, and `key`
+    /// that of the row holding the entity or any entity merged with it, `None` if no row does. A
+    /// later apply of the same sync may have merged the entity into a group, removed its row, or
+    /// given the row's key to another entity, and a local edit an earlier apply reported under
+    /// the entity's own id is reported once, under the group's. Each lookup takes about 75 µs on
+    /// a fast laptop; if one fails, the conflict keeps the id and key its apply reported, and the
+    /// sync still returns its report. `touched` lists keys in the order the sync
     /// first touched them, each key's entries together. Within a key it holds one entry per
     /// entity, that entity's last, in the order those entries came: the entities that left the
     /// key come before the one it was left holding.
@@ -94,6 +192,9 @@ pub struct SyncReport {
     pub more: bool,
     /// The last sequence number this sync knows the library's log to hold.
     pub head: u64,
+    /// How long this sync held the write lock since it last paused, counting [`Pace::held`] when
+    /// it did not pause; give it as [`Pace::held`] to a sync that follows at once.
+    pub held: Duration,
 }
 
 /// One round with the server: reads the envelopes after the stored cursor, applies what other
@@ -101,12 +202,13 @@ pub struct SyncReport {
 ///
 /// `now` gives the current unix time in seconds; every request is stamped with it.
 ///
-/// The cursor is stored after every page read. Received changes are held across pages, up to a
-/// bound, and applied together with the cursor in one transaction, so a crash at any point
-/// leaves either both or neither; re-reading changes already applied is harmless. Local writes
-/// are collected by that apply. A local edit to a field that reports conflicts is compared with
-/// every remote change to it until the pull has read past the envelope that carried it, and a
-/// remote change met before that point is reported in [`SyncReport::applied`].
+/// The cursor is stored after every page read. Received changes are held, whole envelopes at a
+/// time and across pages, until the next envelope would take them past [`Pace::apply`], and then
+/// applied together with the cursor in one transaction, so a crash at any point leaves either both
+/// or neither; re-reading changes already applied is harmless. Local writes are collected by each
+/// apply. A local edit to a field that reports conflicts is compared with every remote change to
+/// it until the pull has read past the envelope that carried it, and a remote change met before
+/// that point is reported in [`SyncReport::applied`].
 ///
 /// Conflicts are reported on one side only. Of two concurrent edits, only the device whose
 /// envelope lands later in the log is told; the device whose envelope landed first has released
@@ -114,8 +216,8 @@ pub struct SyncReport {
 /// without a report. Envelopes carry no record of what their author had seen, so a change read
 /// after one's own envelope cannot be told apart from one made knowing it.
 ///
-/// Whatever is held is
-/// also applied before this returns an error, so a failure part-way keeps the progress made.
+/// Whatever is held is also applied before this returns an error, so a failure part-way keeps the
+/// progress made.
 ///
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
@@ -133,6 +235,18 @@ pub struct SyncReport {
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
 /// may not hold them. An append the server places right after the cursor moves the cursor past
 /// it, so a device does not usually read back what it sent.
+///
+/// # Other writers
+///
+/// SQLite lets one connection write at a time. A sync writes in transactions of its own: each
+/// apply, then [`Apply::caught_up`], then a record and an acknowledgment for each envelope it
+/// sends. Each takes the write lock with its first statement, waiting for it in the connection's
+/// busy handler, and holds it until it commits, so the longest hold is the largest apply, which
+/// [`Pace::apply`] bounds. Between them no transaction is open; once the sync has held the lock
+/// for [`Pace::hold`] in all, it leaves it free for [`Pace::pause`] before the next, long enough
+/// for a writer waiting in SQLite's busy handler on another connection to wake and write. A sync
+/// that holds the lock for less than [`Pace::hold`] never pauses. [`sync_with`] also calls
+/// [`Apply::between`] in each gap, where an application can let its own writers through.
 ///
 /// # The connection
 ///
@@ -170,14 +284,15 @@ pub async fn sync<T: Transport>(
     finish(conn, result).await
 }
 
-/// How [`sync_with`] applies what it receives, and what it does once a pull has read the whole
-/// log. [`sync`] uses `()`, which keeps both defaults.
+/// How [`sync_with`] applies what it receives, what it does once a pull has read the whole log,
+/// what it does between transactions, and how it paces them. [`sync`] uses `()`, which keeps every
+/// default.
 ///
-/// Both methods are given the connection inside a transaction the client opened, and must neither
-/// commit nor roll it back; a savepoint of their own is fine, as [`Replica::apply`] makes one.
-/// Everything they write there is the application's, and is committed or rolled back with
-/// whatever the client writes in that transaction. A write to a synced table is a local edit like
-/// any other, collected by the next apply.
+/// [`Apply::apply`] and [`Apply::caught_up`] are given the connection inside a transaction the
+/// client opened, and must neither commit nor roll it back; a savepoint of their own is fine, as
+/// [`Replica::apply`] makes one. Everything they write there is the application's, and is
+/// committed or rolled back with whatever the client writes in that transaction. A write to a
+/// synced table is a local edit like any other, collected by the next apply.
 ///
 /// Some statements end the transaction as a side effect: SQLite answers some failures by rolling
 /// it back, as with `INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)` or a full disk. When a
@@ -209,6 +324,14 @@ pub trait Apply: Send {
     /// It is called for every apply the client makes, including the apply with no changes a sync
     /// makes when it receives nothing: that apply collects local writes and may write rows held
     /// back before, so what it touched need not be empty.
+    ///
+    /// `changes` holds whole envelopes, at most [`Pace::apply`] changes unless one envelope holds
+    /// more. A pull can thus make many applies, and a field changed remotely more than once before
+    /// this device's own edit of it was read back can be reported as a conflict by more than one
+    /// of them, each with a later change; [`merge_applied`] keeps the last. A conflict's `gid`
+    /// and `key` here are as this apply leaves them; a later apply of the same sync can merge the
+    /// entity into a group, remove its row or give the row's key to another entity, so neither is
+    /// kept from one apply to the next. [`SyncReport::applied`] gives them as the sync ends.
     ///
     /// In the same transaction, after this returns, the client stores the cursor past the
     /// envelopes `changes` came in, so the rows applied, everything this wrote and the cursor are
@@ -252,6 +375,47 @@ pub trait Apply: Send {
         let _ = (conn, replica);
         async { Ok(None) }
     }
+
+    /// Called between two of the sync's write transactions: after one has committed and before
+    /// the next begins, with no transaction open, so that another writer can take its turn. An
+    /// application whose own writes wait on a gate of its own can let them through here, or it
+    /// can yield or sleep. By default it does nothing.
+    ///
+    /// It is called once in each gap: before every apply but the first, before `caught_up`, and
+    /// before each record and acknowledgment of an envelope sent, whenever a transaction of this
+    /// sync committed before it; and after the client's own pause, when [`Pace`] calls for one. It
+    /// is never called inside a transaction, before the sync's first write, after its last, or
+    /// once anything in the sync has failed.
+    ///
+    /// It may use the connection for statements and transactions of its own, provided it ends
+    /// every transaction it begins; what it writes to a synced table is a local edit, collected by
+    /// the next apply. If it returns with a transaction open on the connection, the sync writes
+    /// nothing more and fails with [`Error::ConnectionUnsound`].
+    ///
+    /// An application that sends its own writes through a gate, such as a fair async mutex, can
+    /// hold the gate for the whole sync and, here, release it and take it again: the writers
+    /// queued on it go first and find the database free. The client's pause comes before this
+    /// call, with the gate still held, so those writers wait out the pause too; when every writer
+    /// goes through the gate, `pause` can be zero. A connection of the application must not wait
+    /// on the gate inside a write transaction of its own: it then holds SQLite's lock while the
+    /// sync waits for it, and the sync's next write fails when its busy timeout runs out.
+    ///
+    /// When it fails, the sync stops: as after any failure in a pull, it applies what it holds
+    /// once more, without calling this again, and returns the error; nothing is sent. When the
+    /// sync is dropped while this runs, no transaction of the client's is open, and the next
+    /// sync reads again whatever was not committed.
+    fn between(
+        &mut self,
+        conn: &mut SqliteConnection,
+    ) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = conn;
+        async { Ok(()) }
+    }
+
+    /// How this sync paces its transactions. By default, [`Pace::default`].
+    fn pace(&self) -> Pace {
+        Pace::default()
+    }
 }
 
 impl Apply for () {}
@@ -262,7 +426,8 @@ impl Apply for () {}
 ///
 /// What the client guarantees about atomicity with its cursor: what [`Apply::apply`] writes is
 /// committed in one transaction with the changes it applied and the cursor past them, and with the
-/// client's other writes there; what [`Apply::caught_up`] writes is committed on its own.
+/// client's other writes there; what [`Apply::caught_up`] and [`Apply::between`] write is committed
+/// on its own.
 pub async fn sync_with<T: Transport, A: Apply>(
     conn: &mut SqliteConnection,
     replica: &Replica,
@@ -314,6 +479,12 @@ async fn run<T: Transport, A: Apply>(
     let caps = rpc.capabilities().await?;
     let library = credentials.library_id();
     let me = credentials.device_id();
+    let pace = apply.pace();
+    let mut held = pace.held;
+    if !pace.pause.is_zero() && !held.is_zero() && held >= pace.hold {
+        pause(pace.pause).await;
+        held = Duration::ZERO;
+    }
     let saved = state::load(conn, library).await?;
     let mut cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
@@ -328,30 +499,43 @@ async fn run<T: Transport, A: Apply>(
         sending: saved.sending,
         landed: None,
     };
-    let mut applier = Applier { replica, apply };
+    let mut steps = Steps {
+        replica,
+        library,
+        pace,
+        apply,
+        committed: false,
+        failed: false,
+        held,
+        conflicts: Vec::new(),
+    };
     let pulled = read_pages(
         &rpc,
         conn,
-        &mut applier,
+        &mut steps,
         &mut keys,
         limit,
         &mut pull,
         &mut report,
     )
     .await;
+    steps.failed |= pulled.is_err();
     let collect = !pull.applied;
-    let committed = pull
-        .commit(conn, &mut applier, library, &mut report, collect)
-        .await;
+    let committed = if matches!(pulled, Err(Error::ConnectionUnsound { .. })) {
+        Ok(())
+    } else {
+        pull.commit(conn, &mut steps, library, &mut report, collect)
+            .await
+    };
     pulled.and(committed)?;
     cursor = pull.read;
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
     if settles && report.blocked.is_none() && !report.more {
-        let mut tx = conn.begin().await?;
+        let (mut tx, began) = steps.begin(conn).await?;
         let settled = async {
             begin_watch(&mut tx).await?;
-            let settled = apply.caught_up(&mut tx, replica).await?;
+            let settled = steps.apply.caught_up(&mut tx, replica).await?;
             end_watch(&mut tx).await?;
             Ok(settled)
         }
@@ -361,7 +545,9 @@ async fn run<T: Transport, A: Apply>(
             Err(error) => return Err(abandon(tx, error).await),
         };
         tx.commit().await?;
+        steps.committed(began);
         if let Some(settled) = settled {
+            steps.conflicts.push(settled.conflicts.clone());
             merge_applied(&mut report.applied, settled);
         }
     }
@@ -376,23 +562,25 @@ async fn run<T: Transport, A: Apply>(
             .map_or(0, |opened| opened.changes.len());
             match append(&rpc, credentials, sending.envelope).await {
                 Ok(seq) => {
-                    acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
+                    acknowledge(conn, &mut steps, library, sending.through, seq, &mut cursor)
+                        .await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
                 Err(Error::Server { code, .. }) if refuses_the_envelope(code) => {
-                    state::clear_sending(conn, library).await?;
+                    clear_sending(conn, &mut steps, library).await?;
                 }
                 Err(error) => return Err(error),
             }
         } else {
-            state::clear_sending(conn, library).await?;
+            clear_sending(conn, &mut steps, library).await?;
         }
     }
 
     let max = caps.max_batch_bytes;
+    let seal_at_most = steps.pace.seal.max(1);
     loop {
-        let full = replica.outbox(conn, OUTBOX_PAGE).await?;
+        let full = replica.outbox(conn, seal_at_most).await?;
         let Some(first) = full.changes.first() else {
             break;
         };
@@ -433,13 +621,106 @@ async fn run<T: Transport, A: Apply>(
             through: outbox.through,
             envelope,
         };
+        steps.turn(conn).await?;
+        let began = Instant::now();
         state::record_sending(conn, library, &sending).await?;
+        steps.committed(began);
         let seq = append(&rpc, credentials, sending.envelope).await?;
-        acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
+        acknowledge(conn, &mut steps, library, sending.through, seq, &mut cursor).await?;
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
+    let mut conflicts = Vec::new();
+    for mut applied in std::mem::take(&mut steps.conflicts) {
+        for conflict in &mut applied {
+            if let Ok((gid, key)) = replica
+                .group_of(conn, &conflict.collection, conflict.gid)
+                .await
+            {
+                conflict.gid = gid;
+                conflict.key = key;
+            }
+        }
+        merge_conflicts(&mut conflicts, applied);
+    }
+    report.applied.conflicts = conflicts;
+    report.held = steps.held;
     Ok(report)
+}
+
+/// Forgets the recorded envelope, in a write of its own.
+async fn clear_sending<A: Apply>(
+    conn: &mut SqliteConnection,
+    steps: &mut Steps<'_, A>,
+    library: fongo_sync_protocol::LibraryId,
+) -> Result<(), Error> {
+    steps.turn(conn).await?;
+    let began = Instant::now();
+    state::clear_sending(conn, library).await?;
+    steps.committed(began);
+    Ok(())
+}
+
+/// The replica received changes are applied to, how, and the turns the sync takes at writing.
+struct Steps<'a, A> {
+    replica: &'a Replica,
+    library: fongo_sync_protocol::LibraryId,
+    apply: &'a mut A,
+    pace: Pace,
+    /// A transaction of this sync committed since the last turn was given.
+    committed: bool,
+    /// Something in this sync failed: no turn is given after that.
+    failed: bool,
+    /// How long this sync held the write lock since it last paused.
+    held: Duration,
+    /// The conflicts each apply reported, in order.
+    conflicts: Vec<Vec<Conflict>>,
+}
+
+impl<A: Apply> Steps<'_, A> {
+    /// Before a write: once a transaction of this sync has committed, pauses when the pace calls
+    /// for it, and then calls [`Apply::between`].
+    async fn turn(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        if !std::mem::take(&mut self.committed) || self.failed {
+            return Ok(());
+        }
+        if !self.pace.pause.is_zero() && self.held >= self.pace.hold {
+            pause(self.pace.pause).await;
+            self.held = Duration::ZERO;
+        }
+        let between = async {
+            self.apply.between(conn).await?;
+            check_connection(conn).await
+        };
+        let result = between.await;
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Takes a turn and begins a transaction whose first statement writes, so it waits for the
+    /// write lock at its start, in the busy handler, and never finds at a later write that another
+    /// connection wrote since it first read, which SQLite answers with an error instead of a wait.
+    /// sqlx's `begin_with("BEGIN IMMEDIATE")` would do the same, but a future dropped inside it
+    /// can leave the transaction open with nothing to end it.
+    async fn begin<'c>(
+        &mut self,
+        conn: &'c mut SqliteConnection,
+    ) -> Result<(Transaction<'c, Sqlite>, Instant), Error> {
+        self.turn(conn).await?;
+        let began = Instant::now();
+        let mut tx = conn.begin().await?;
+        sqlx::query("UPDATE fongo_client_state SET cursor = cursor WHERE library = ?")
+            .bind(&self.library.0[..])
+            .execute(&mut *tx)
+            .await?;
+        Ok((tx, began))
+    }
+
+    /// A write that began at `began` has committed.
+    fn committed(&mut self, began: Instant) {
+        self.committed = true;
+        self.held += began.elapsed();
+    }
 }
 
 /// Marks the client's transaction before the application's step, with a savepoint and a row
@@ -512,12 +793,6 @@ pub async fn check_connection(conn: &mut SqliteConnection) -> Result<(), Error> 
     Ok(())
 }
 
-/// The replica received changes are applied to, and how.
-struct Applier<'a, A> {
-    replica: &'a Replica,
-    apply: &'a mut A,
-}
-
 /// Where reading the log stands: envelopes through `read` are dealt with, and `held` has the
 /// changes among them not yet applied. `appended` lists where this database's own appends landed
 /// past `read`.
@@ -539,17 +814,17 @@ impl Pull {
     async fn commit<A: Apply>(
         &mut self,
         conn: &mut SqliteConnection,
-        applier: &mut Applier<'_, A>,
+        steps: &mut Steps<'_, A>,
         library: fongo_sync_protocol::LibraryId,
         report: &mut SyncReport,
         collect: bool,
     ) -> Result<(), Error> {
-        let replica = applier.replica;
-        let mut tx = conn.begin().await?;
+        let replica = steps.replica;
+        let (mut tx, began) = steps.begin(conn).await?;
         let written = async {
             let applied = if collect || !self.held.is_empty() {
                 begin_watch(&mut tx).await?;
-                let applied = applier.apply.apply(&mut tx, replica, &self.held).await?;
+                let applied = steps.apply.apply(&mut tx, replica, &self.held).await?;
                 end_watch(&mut tx).await?;
                 Some(applied)
             } else {
@@ -572,10 +847,12 @@ impl Pull {
             Err(error) => return Err(abandon(tx, error).await),
         };
         tx.commit().await?;
+        steps.committed(began);
         self.landed = None;
         if let Some(applied) = applied {
             self.applied = true;
             report.received += self.held.len();
+            steps.conflicts.push(applied.conflicts.clone());
             merge_applied(&mut report.applied, applied);
         }
         self.held.clear();
@@ -588,7 +865,7 @@ impl Pull {
 async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     rpc: &Rpc<'_, T, N>,
     conn: &mut SqliteConnection,
-    applier: &mut Applier<'_, A>,
+    steps: &mut Steps<'_, A>,
     keys: &mut Keys<'_>,
     limit: u32,
     pull: &mut Pull,
@@ -615,8 +892,15 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             let landed = pull
                 .sending
                 .take_if(|sending| sending.envelope == batch.envelope);
+            let opened = keys.open(rpc, batch).await?;
+            if let Opened::Changes(changes) = &opened
+                && !pull.held.is_empty()
+                && pull.held.len() + changes.len() > steps.pace.apply
+            {
+                pull.commit(conn, steps, library, report, false).await?;
+            }
             let before = pull.held.len();
-            match keys.open(rpc, batch).await? {
+            match opened {
                 Opened::Changes(changes) => pull.held.extend(changes),
                 Opened::Refused(refused) => {
                     report.refused_total += 1;
@@ -643,14 +927,14 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             // A change after this device's own envelope may have been made knowing its edits,
             // so what came before is compared with their bases, and then the bases released.
             if pull.appended.remove(&batch.seq) {
-                pull.commit(conn, applier, library, report, false).await?;
+                pull.commit(conn, steps, library, report, false).await?;
             }
         }
         if !page.more {
             return Ok(());
         }
-        if pull.held.is_empty() || pull.held.len() >= APPLY_CHUNK {
-            pull.commit(conn, applier, library, report, false).await?;
+        if pull.held.is_empty() || pull.held.len() >= steps.pace.apply {
+            pull.commit(conn, steps, library, report, false).await?;
         }
     }
     report.more = true;
@@ -847,16 +1131,17 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
 /// of its edits are released at once when the cursor is past it, which is also the case when the
 /// server answers with an earlier copy of the same envelope; otherwise by the pull that reads
 /// past it.
-async fn acknowledge(
+async fn acknowledge<A: Apply>(
     conn: &mut SqliteConnection,
-    replica: &Replica,
+    steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
     through: i64,
     seq: u64,
     cursor: &mut u64,
 ) -> Result<(), Error> {
     let follows = Some(seq) == cursor.checked_add(1);
-    let mut tx = conn.begin().await?;
+    let replica = steps.replica;
+    let (mut tx, began) = steps.begin(conn).await?;
     let written = async {
         replica.acknowledge(&mut tx, through).await?;
         state::clear_sending(&mut tx, library).await?;
@@ -875,6 +1160,7 @@ async fn acknowledge(
         return Err(abandon(tx, error).await);
     }
     tx.commit().await?;
+    steps.committed(began);
     if follows {
         *cursor = seq;
     }
@@ -917,7 +1203,13 @@ fn varint_len(mut n: usize) -> usize {
 
 /// Adds what a later apply did to what earlier ones did, as [`SyncReport::applied`] is built.
 ///
-/// - `accepted` is summed and `conflicts` appended.
+/// - `accepted` is summed.
+/// - `conflicts` are appended, after dropping each earlier one that `from` reports again: the same
+///   local edit, that is the same collection, entity, field, base and local value. A later apply
+///   reports a local edit again only for a remote change later than the one already reported,
+///   and one apply of everything would have reported only that. Each conflict in `from` replaces
+///   at most one earlier one. A different local edit of the same field, such as one written
+///   between two applies, is a different conflict, and both are kept.
 /// - `waiting` and `held` are taken from `from`: each apply reports every entity still held, so
 ///   the later report replaces the earlier.
 /// - `touched` lists keys in the order they were first touched, each key's entries together.
@@ -927,7 +1219,7 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
     into.held = from.held;
-    into.conflicts.extend(from.conflicts);
+    merge_conflicts(&mut into.conflicts, from.conflicts);
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut at: HashMap<(String, String), Vec<Touched>> = HashMap::new();
     for touched in std::mem::take(&mut into.touched)
@@ -947,10 +1239,38 @@ pub fn merge_applied(into: &mut Applied, from: Applied) {
     }
 }
 
+/// Appends `from` to `into` as [`merge_applied`] merges conflicts.
+fn merge_conflicts(into: &mut Vec<Conflict>, from: Vec<Conflict>) {
+    type Edits<'a> = Vec<(&'a Option<Value>, &'a Value)>;
+    let mut again: HashMap<(String, Gid, String), Edits> = HashMap::new();
+    for c in &from {
+        again
+            .entry((c.collection.clone(), c.gid, c.field.clone()))
+            .or_default()
+            .push((&c.base, &c.local));
+    }
+    into.retain(|c| {
+        let Some(edits) = again.get_mut(&(c.collection.clone(), c.gid, c.field.clone())) else {
+            return true;
+        };
+        match edits
+            .iter()
+            .position(|&(base, local)| *base == c.base && *local == c.local)
+        {
+            Some(at) => {
+                edits.swap_remove(at);
+                false
+            }
+            None => true,
+        }
+    });
+    into.extend(from);
+}
+
 #[cfg(test)]
 mod tests {
     use fongo_sync_protocol::{LibraryId, LibraryKeys, SigningKey};
-    use fongo_sync_sqlite::core::{Gid, Hlc, Value};
+    use fongo_sync_sqlite::core::Hlc;
 
     use super::*;
 
@@ -1034,6 +1354,73 @@ mod tests {
             assert_eq!(
                 report.touched,
                 touched(want).touched,
+                "{first:?} then {second:?}"
+            );
+        }
+    }
+
+    fn conflict(gid: u8, local: &str, remote: &str) -> Conflict {
+        Conflict {
+            collection: "notes".into(),
+            gid: Gid([gid; 16]),
+            key: None,
+            field: "body".into(),
+            base: Some(Value::Text("base".into())),
+            local: Value::Text(local.into()),
+            remote: Value::Text(remote.into()),
+            remote_won: true,
+        }
+    }
+
+    #[test]
+    fn a_conflict_reported_again_replaces_only_the_same_local_edit() {
+        let cases: [(&[_], &[_], &[_]); 6] = [
+            // The same edit, met by a later remote change.
+            (&[(1, "m1", "t1")], &[(1, "m1", "t2")], &[(1, "m1", "t2")]),
+            // Another local edit of the field, written between the two applies.
+            (
+                &[(1, "m1", "t1")],
+                &[(1, "m2", "t2")],
+                &[(1, "m1", "t1"), (1, "m2", "t2")],
+            ),
+            // Another entity's conflict stays.
+            (
+                &[(1, "m1", "t1"), (2, "m1", "t1")],
+                &[(2, "m1", "t2")],
+                &[(1, "m1", "t1"), (2, "m1", "t2")],
+            ),
+            // Two members of one group, reported under its id with different edits.
+            (
+                &[(1, "m1", "t1"), (1, "m2", "t1")],
+                &[(1, "m1", "t2")],
+                &[(1, "m2", "t1"), (1, "m1", "t2")],
+            ),
+            // Two members with the same edit: each report replaces one.
+            (
+                &[(1, "m1", "t1"), (1, "m1", "t1")],
+                &[(1, "m1", "t2")],
+                &[(1, "m1", "t1"), (1, "m1", "t2")],
+            ),
+            (
+                &[(1, "m1", "t1"), (1, "m1", "t1")],
+                &[(1, "m1", "t2"), (1, "m1", "t2")],
+                &[(1, "m1", "t2"), (1, "m1", "t2")],
+            ),
+        ];
+        let applied = |list: &[(u8, &str, &str)]| Applied {
+            conflicts: list
+                .iter()
+                .map(|&(gid, local, remote)| conflict(gid, local, remote))
+                .collect(),
+            ..Applied::default()
+        };
+        for (first, second, want) in cases {
+            let mut report = Applied::default();
+            merge_applied(&mut report, applied(first));
+            merge_applied(&mut report, applied(second));
+            assert_eq!(
+                report.conflicts,
+                applied(want).conflicts,
                 "{first:?} then {second:?}"
             );
         }

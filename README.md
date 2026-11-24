@@ -62,6 +62,11 @@ the envelope it is sending and where its recent envelopes landed, in tables of i
 `sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
 application derives from the rows an apply touched is committed with them and the cursor, and that
 is called once a pull has read the whole log, before the outbox is sent.
+A sync shares the database with other writers: each apply takes a bounded number of changes in
+whole envelopes, each envelope sent holds a bounded number, and once a sync has held SQLite's
+write lock for a while it leaves it free long enough for a writer waiting in SQLite's busy handler
+to take it. `Apply::between`, called in each gap between transactions, lets an application send
+its own writers through, and `Apply::pace` sets the bounds.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 
