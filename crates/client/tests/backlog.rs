@@ -1,0 +1,753 @@
+//! A device that wrote much since it last synced collects it in paced steps: no transaction of
+//! the sync collects more than about [`Pace::collect`] rows, other writers get their turns
+//! between them, and what the server receives is what one collect of everything would send.
+
+#[allow(dead_code)]
+mod support;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use fongo_sync_client::protocol::LibraryKeys;
+use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
+use fongo_sync_client::sqlite::{
+    Applied, COLLECT_ROWS, Collected, Collection, Registry, Replica, Resume,
+};
+use fongo_sync_client::{Apply, Error, Pace, create_library, sync_with};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteOperation};
+use sqlx::{ConnectOptions, Connection, SqliteConnection};
+use support::{Peer, Server, now, scratch};
+
+/// What each committed transaction on a connection did to the kernel's tables: rows it took off
+/// the list of rows to collect, and changes it put in the outbox.
+#[derive(Clone, Default)]
+struct Transactions(Arc<Mutex<Counted>>);
+
+/// Rows and changes of each committed transaction, then of the one open.
+type Counted = (Vec<(u64, u64)>, (u64, u64));
+
+impl Transactions {
+    async fn watch(conn: &mut SqliteConnection) -> Transactions {
+        let seen = Transactions::default();
+        conn.ping().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let open = seen.0.clone();
+        handle.set_update_hook(move |change| {
+            let mut state = open.lock().unwrap();
+            match (change.operation, change.table) {
+                (SqliteOperation::Delete, "fongo_dirty") => state.1.0 += 1,
+                (SqliteOperation::Insert, "fongo_outbox") => state.1.1 += 1,
+                _ => {}
+            }
+        });
+        let committed = seen.0.clone();
+        handle.set_commit_hook(move || {
+            let mut state = committed.lock().unwrap();
+            let done = std::mem::take(&mut state.1);
+            state.0.push(done);
+            true
+        });
+        let rolled = seen.0.clone();
+        handle.set_rollback_hook(move || {
+            rolled.lock().unwrap().1 = (0, 0);
+        });
+        seen
+    }
+
+    /// Rows collected and changes made by each transaction that collected anything.
+    fn collecting(&self) -> Vec<(u64, u64)> {
+        let state = self.0.lock().unwrap();
+        state
+            .0
+            .iter()
+            .copied()
+            .filter(|&(rows, _)| rows > 0)
+            .collect()
+    }
+}
+
+/// Paces a sync and records what it saw between transactions and before each apply.
+struct Watched {
+    pace: Pace,
+    replica: Replica,
+    /// Rows still to collect at each gap.
+    gaps: Vec<usize>,
+    /// Rows still to collect when each apply began.
+    applies: Vec<usize>,
+}
+
+impl Apply for Watched {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        self.applies
+            .push(self.replica.uncollected_rows(conn, usize::MAX).await?);
+        Ok(replica.apply(conn, changes).await?)
+    }
+
+    async fn between(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        self.gaps
+            .push(self.replica.uncollected_rows(conn, usize::MAX).await?);
+        Ok(())
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
+    }
+}
+
+/// A device of a new library over a file, with `books` books and a note on each written since
+/// it was installed, none of it sent.
+async fn backlog(dir: &Path, server: &Server, books: u64) -> (Peer, PathBuf) {
+    let made = create_library(server, now).await.unwrap();
+    let path = dir.join("a.db");
+    let mut a = Peer::new_at(&path, made).await;
+    write_books(&mut a.conn, books).await;
+    (a, path)
+}
+
+async fn write_books(conn: &mut SqliteConnection, books: u64) {
+    for sql in [
+        format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {books})
+             INSERT INTO books (id, title, year) SELECT i, 'Middlemarch ' || i, 1800 + i % 200 FROM n"
+        ),
+        format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {books})
+             INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n"
+        ),
+    ] {
+        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    }
+}
+
+/// Writes a row every 20 ms on a connection of its own with a busy timeout of `busy`, until
+/// `stop`. Returns how many writes failed and the longest any waited.
+fn writer(
+    path: PathBuf,
+    busy: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(usize, usize, Duration)> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(busy)
+                .connect()
+                .await
+                .unwrap();
+            let (mut writes, mut failed, mut worst) = (0, 0, Duration::ZERO);
+            while !stop.load(Ordering::Relaxed) {
+                let began = Instant::now();
+                let done = sqlx::query("INSERT INTO w (at) VALUES (1)")
+                    .execute(&mut conn)
+                    .await;
+                writes += 1;
+                failed += usize::from(done.is_err());
+                worst = worst.max(began.elapsed());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (writes, failed, worst)
+        })
+    })
+}
+
+/// A device with 3,000 rows to collect syncs with steps of 200 rows. No transaction of the sync
+/// collects more than a step, each apply finds fewer rows left than a step, `between` runs in
+/// the gaps between steps, and a writer on another connection with a busy timeout of 2 s never
+/// fails. Everything written is sent once.
+#[tokio::test]
+async fn a_backlog_is_collected_in_paced_steps() {
+    let dir = scratch("backlog");
+    let server = Server::new();
+    let (mut a, path) = backlog(&dir, &server, 1_500).await;
+    a.run("CREATE TABLE w (id INTEGER PRIMARY KEY, at INTEGER)")
+        .await;
+    let transactions = Transactions::watch(&mut a.conn).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let other = writer(path, Duration::from_secs(2), stop.clone());
+    let mut watched = Watched {
+        pace: Pace {
+            collect: 200,
+            hold: Duration::ZERO,
+            pause: Duration::from_millis(30),
+            ..Pace::default()
+        },
+        replica: a.replica.clone(),
+        gaps: Vec::new(),
+        applies: Vec::new(),
+    };
+    let report = sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut watched,
+    )
+    .await
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::Relaxed);
+    let (writes, failed, worst) = other.join().unwrap();
+    assert_eq!(report.sent, 6 * 1_500);
+    let collecting = transactions.collecting();
+    let at = format!("{collecting:?}; gaps {:?}", watched.gaps);
+    eprintln!("{at}; applies {:?}", watched.applies);
+    assert!(collecting.len() >= 15, "{at}");
+    assert!(collecting.iter().all(|&(rows, _)| rows <= 200), "{at}");
+    assert_eq!(
+        collecting.iter().map(|&(rows, _)| rows).sum::<u64>(),
+        3_000,
+        "{at}"
+    );
+    assert!(watched.applies.iter().all(|&left| left < 200), "{at}");
+    assert!(watched.gaps.len() >= collecting.len() - 1, "{at}");
+    assert!(watched.gaps.windows(2).all(|w| w[0] >= w[1]), "{at}");
+    assert_eq!(failed, 0, "{writes} writes, worst {worst:?}");
+    support::assert_no_change_sent_twice(&server, a.credentials.library());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Changes as the server's log holds them, with what differs between two runs of one script
+/// renamed in order of first appearance: gids, nodes and clocks, which are ranked.
+fn canonical(changes: &[Change]) -> Vec<String> {
+    let mut gids: BTreeMap<Gid, usize> = BTreeMap::new();
+    let mut nodes: BTreeMap<Gid, usize> = BTreeMap::new();
+    let mut clocks: Vec<Hlc> = changes.iter().map(|c| c.clock).collect();
+    clocks.sort();
+    clocks.dedup();
+    let name = |gid: Gid, gids: &mut BTreeMap<Gid, usize>| {
+        let next = gids.len();
+        *gids.entry(gid).or_insert(next)
+    };
+    changes
+        .iter()
+        .map(|c| {
+            let gid = name(c.gid, &mut gids);
+            let value = match &c.value {
+                Value::Ref(g) => format!("ref {}", name(*g, &mut gids)),
+                other => format!("{other:?}"),
+            };
+            let next = nodes.len();
+            let node = *nodes.entry(c.clock.node).or_insert(next);
+            let rank = clocks.binary_search(&c.clock).unwrap();
+            format!(
+                "{} {gid} {} {value} at {rank} by {node}",
+                c.collection, c.field
+            )
+        })
+        .collect()
+}
+
+/// A script of writes, each statement a millisecond or more after the last, so that runs order
+/// their clocks alike.
+async fn script(conn: &mut SqliteConnection, books: u64) {
+    write_books(conn, books).await;
+    for sql in [
+        "UPDATE books SET title = title || '!' WHERE id % 3 = 0".to_string(),
+        "DELETE FROM books WHERE id % 7 = 0".to_string(),
+        "INSERT INTO settings SELECT 'key ' || id, 'value' FROM books WHERE id % 5 = 0".to_string(),
+        "UPDATE notes SET body = 'again' WHERE id % 4 = 0".to_string(),
+        format!(
+            "INSERT INTO notes (book_id, body) SELECT id, 'second' FROM books WHERE id > {}",
+            books / 2
+        ),
+        "UPDATE books SET year = 1871 WHERE id % 11 = 0".to_string(),
+    ] {
+        std::thread::sleep(Duration::from_millis(3));
+        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    }
+}
+
+/// What a server receives from a device that ran [`script`] and synced with `pace`.
+async fn received(books: u64, pace: Pace) -> Vec<String> {
+    let dir = scratch(&format!("received-{}", pace.collect));
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let keys: LibraryKeys = made.library().clone();
+    let mut a = Peer::new_at(&dir.join("a.db"), made).await;
+    script(&mut a.conn, books).await;
+    let mut watched = Watched {
+        pace,
+        replica: a.replica.clone(),
+        gaps: Vec::new(),
+        applies: Vec::new(),
+    };
+    sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut watched,
+    )
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    canonical(&server.changes(&keys))
+}
+
+/// The same script sent by a sync that collects in steps of 40 rows and by one that collects
+/// everything in its apply, as before steps: the server receives the same changes, in the same
+/// order, with clocks in the same order.
+#[tokio::test]
+async fn a_backlog_collected_in_steps_sends_what_one_collect_sends() {
+    let pace = |collect| Pace {
+        collect,
+        hold: Duration::ZERO,
+        pause: Duration::ZERO,
+        ..Pace::default()
+    };
+    let whole = received(400, pace(usize::MAX)).await;
+    let stepped = received(400, pace(40)).await;
+    assert!(whole.len() > 2_000);
+    assert_eq!(whole, stepped);
+}
+
+/// For comparing a build of this tree with one of another: writes what the server receives
+/// from [`script`] over 16,667 books (100,000 rows and more) synced with the defaults, renamed
+/// as [`canonical`] does, to the file `BACKLOG_DUMP` names.
+///
+/// ```text
+/// BACKLOG_DUMP=/tmp/tip.txt cargo test --release -p fongo-sync-client --test backlog \
+///     -- --ignored --nocapture dump_what_a_backlog_sends
+/// ```
+#[tokio::test]
+#[ignore]
+async fn dump_what_a_backlog_sends() {
+    let Ok(out) = std::env::var("BACKLOG_DUMP") else {
+        return;
+    };
+    let dir = scratch("dump");
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let keys: LibraryKeys = made.library().clone();
+    let mut a = Peer::new_at(&dir.join("a.db"), made).await;
+    script(&mut a.conn, 16_667).await;
+    let began = Instant::now();
+    let report = a.sync(&server).await.unwrap();
+    eprintln!(
+        "sent {} in {:.2} s",
+        report.sent,
+        began.elapsed().as_secs_f64()
+    );
+    std::fs::write(out, canonical(&server.changes(&keys)).join("\n")).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+const MIXED: &[&str] = &[
+    "CREATE TABLE books (
+        id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE, year INTEGER, pages INTEGER)",
+    "CREATE TABLE notes (
+        id INTEGER PRIMARY KEY,
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        body TEXT)",
+    "CREATE INDEX notes_book ON notes (book_id)",
+    "CREATE TABLE tags (
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        tag TEXT NOT NULL,
+        note TEXT,
+        PRIMARY KEY (book_id, tag))",
+    "CREATE TABLE wide (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, f TEXT,
+        g INTEGER, h INTEGER, i INTEGER, j INTEGER, k REAL, l REAL)",
+    "CREATE TABLE w (id INTEGER PRIMARY KEY, at INTEGER)",
+];
+
+/// Books with an identity, notes they own, tags with natural keys, and wide rows.
+fn mixed() -> Registry {
+    let mut wide = Collection::minted("wide", "wide", "id");
+    for f in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"] {
+        wide = wide.field(f);
+    }
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("isbn")
+            .field("year")
+            .field("pages")
+            .identity(&["isbn"]),
+        Collection::minted("notes", "notes", "id")
+            .owner("book_id", "books")
+            .field("body"),
+        Collection::natural("tags", "tags", &["book_id", "tag"])
+            .owner("book_id", "books")
+            .field("tag")
+            .field("note"),
+        wide,
+    ])
+    .unwrap()
+}
+
+/// About `rows` rows of every shape, a quarter each: books, a note on each, a tag on each, and
+/// wide rows; the `round`th time, new rows and edits to the earlier ones alike.
+async fn mixed_writes(conn: &mut SqliteConnection, rows: u64, round: u64) {
+    let n = rows / 4;
+    let from = round * n;
+    let seq = |to: u64| {
+        format!(
+            "WITH RECURSIVE n(i) AS (SELECT {} UNION ALL SELECT i + 1 FROM n WHERE i < {to})",
+            from + 1
+        )
+    };
+    for sql in [
+        format!(
+            "{} INSERT INTO books (id, title, isbn, year, pages)
+             SELECT i, 'Middlemarch ' || i, 'isbn ' || i, 1800 + i % 200, i FROM n",
+            seq(from + n)
+        ),
+        format!(
+            "{} INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n",
+            seq(from + n)
+        ),
+        format!(
+            "{} INSERT INTO tags (book_id, tag) SELECT i, 'read' FROM n",
+            seq(from + n)
+        ),
+        format!(
+            "{} INSERT INTO wide (id, a, b, c, d, e, f, g, h, i, j, k, l)
+             SELECT i, 'a' || i, 'b' || i, 'c' || i, 'd' || i, 'e' || i, 'f' || i,
+                    i, i, i, i, i * 0.5, i * 0.25 FROM n",
+            seq(from + n)
+        ),
+    ] {
+        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    }
+}
+
+/// How long each write transaction on a connection held the write lock, from its first write
+/// to its commit.
+#[derive(Clone, Default)]
+struct Holds(Arc<Mutex<(Option<Instant>, Vec<Duration>)>>);
+
+impl Holds {
+    async fn watch(conn: &mut SqliteConnection) -> Holds {
+        let holds = Holds::default();
+        conn.ping().await.unwrap();
+        let mut handle = conn.lock_handle().await.unwrap();
+        let first = holds.0.clone();
+        handle.set_update_hook(move |_| {
+            first.lock().unwrap().0.get_or_insert_with(Instant::now);
+        });
+        let done = holds.0.clone();
+        handle.set_commit_hook(move || {
+            let mut state = done.lock().unwrap();
+            if let Some(began) = state.0.take() {
+                state.1.push(began.elapsed());
+            }
+            true
+        });
+        let rolled = holds.0.clone();
+        handle.set_rollback_hook(move || rolled.lock().unwrap().0 = None);
+        holds
+    }
+
+    fn take(&self) -> Vec<Duration> {
+        std::mem::take(&mut self.0.lock().unwrap().1)
+    }
+}
+
+/// Writes, or with `read` reads, every 20 ms on a connection of its own with a busy timeout of
+/// `busy`, until `stop`; returns its statements, how many failed, and the longest wait.
+fn every_20_ms(
+    path: PathBuf,
+    busy: Duration,
+    stop: Arc<AtomicBool>,
+    read: bool,
+) -> std::thread::JoinHandle<(usize, usize, Duration)> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(busy)
+                .connect()
+                .await
+                .unwrap();
+            let sql = if read {
+                "SELECT count(*) FROM w"
+            } else {
+                "INSERT INTO w (at) VALUES (1)"
+            };
+            let (mut n, mut failed, mut worst) = (0, 0, Duration::ZERO);
+            let mut due = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                let done = sqlx::query(sql).execute(&mut conn).await;
+                n += 1;
+                failed += usize::from(done.is_err());
+                worst = worst.max(due.elapsed());
+                due += Duration::from_millis(20);
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                } else {
+                    due = now;
+                }
+            }
+            (n, failed, worst)
+        })
+    })
+}
+
+/// The writer in a process of its own, for [`measure_backlog`]: writes every 20 ms to the
+/// database at `BACKLOG_WRITER_DB` with a busy timeout of `BACKLOG_BUSY_MS` until the file
+/// `BACKLOG_STOP` exists, then prints what it waited.
+#[test]
+#[ignore]
+fn backlog_writer_process() {
+    let Ok(db) = std::env::var("BACKLOG_WRITER_DB") else {
+        return;
+    };
+    let stop_file = PathBuf::from(std::env::var("BACKLOG_STOP").unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = Duration::from_millis(env("BACKLOG_BUSY_MS", 1_000));
+    let w = every_20_ms(db.into(), busy, stop.clone(), false);
+    while !stop_file.exists() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (n, failed, worst) = w.join().unwrap();
+    println!("WAITS {n} {failed} {}", worst.as_micros());
+}
+
+/// Others using the database while a phase runs: a writer and a reader on connections here and
+/// a writer in another process. Returns what each waited, as text.
+async fn alongside<F: std::future::Future<Output = ()>>(
+    path: &Path,
+    busy: Duration,
+    phase: F,
+) -> (Duration, String) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_file = path.with_extension("stop");
+    let _ = std::fs::remove_file(&stop_file);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "backlog_writer_process",
+            "--nocapture",
+        ])
+        .env("BACKLOG_WRITER_DB", path)
+        .env("BACKLOG_STOP", &stop_file)
+        .env("BACKLOG_BUSY_MS", busy.as_millis().to_string())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let writer = every_20_ms(path.into(), busy, stop.clone(), false);
+    let reader = every_20_ms(path.into(), busy, stop.clone(), true);
+    std::thread::sleep(Duration::from_millis(300));
+    let began = Instant::now();
+    phase.await;
+    let took = began.elapsed();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    std::fs::write(&stop_file, b"").unwrap();
+    let mut out = Vec::new();
+    for (name, thread) in [("writer", writer), ("reader", reader)] {
+        let (n, failed, worst) = thread.join().unwrap();
+        out.push(format!("{name} {:.2} s {failed}/{n}", worst.as_secs_f64()));
+    }
+    let printed = child.wait_with_output().unwrap();
+    let line = String::from_utf8_lossy(&printed.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("WAITS ").map(str::to_string))
+        .unwrap_or_default();
+    let n: Vec<u128> = line.split(' ').filter_map(|v| v.parse().ok()).collect();
+    if let [n, failed, worst] = n[..] {
+        out.push(format!("process {:.2} s {failed}/{n}", worst as f64 / 1e6));
+    }
+    (took, out.join(", "))
+}
+
+/// Begins a transaction that takes the write lock at once, waiting for it in the busy handler:
+/// the kernel's own transaction would read first, and a write after its read can fail at once.
+async fn immediate(conn: &mut SqliteConnection) {
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+}
+
+async fn commit(conn: &mut SqliteConnection) {
+    sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+}
+
+/// Collects in steps as an application would between syncs: steps of [`COLLECT_ROWS`] rows, and
+/// once they have held the write lock 250 ms, a pause of 150 ms, as [`Pace`] does by default.
+async fn in_steps(replica: &Replica, conn: &mut SqliteConnection, first: Collected) {
+    let mut held = Duration::ZERO;
+    let mut more = first.more;
+    while more {
+        if held >= Duration::from_millis(250) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            held = Duration::ZERO;
+        }
+        let began = Instant::now();
+        more = replica.collect_step(conn, COLLECT_ROWS).await.unwrap().more;
+        held += began.elapsed();
+    }
+}
+
+/// The measurement. A device writes `BACKLOG_ROWS` rows of mixed shapes (a quarter each of books
+/// with an identity, notes they own, tags with natural keys, and rows of twelve fields) and then:
+/// installs again, as an application does at each sync; writes as many more while its triggers
+/// are suspended and resumes; writes as many more and syncs. Meanwhile, every 20 ms with a busy
+/// timeout of `BACKLOG_BUSY_MS`, a connection here writes a row and another reads, and a process
+/// of its own writes one. With `BACKLOG_BOUNDED=0` each is done as before steps, in one
+/// transaction; otherwise in steps. `BACKLOG_JOURNAL` is `wal` or `delete`. Run it optimised:
+///
+/// ```text
+/// BACKLOG_ROWS=100000 BACKLOG_JOURNAL=delete cargo test --release -p fongo-sync-client \
+///     --test backlog -- --ignored --nocapture measure_backlog
+/// ```
+///
+/// On an 8 GB laptop: how long each phase took, its longest transaction, and the worst wait of
+/// the writer here, the reader and the writer in another process, with how many of their
+/// statements failed where any did. "Whole" is as before steps; resume collects whole either way.
+/// In steps the writers' worst waits are the hold, one step and the pause of 150 ms, more when
+/// they compete for one gap, so a 1 s busy timeout stays marginal for a writer in another process.
+///
+/// | journal | rows | phase | whole: took, longest, waits | steps: took, longest, waits |
+/// |---|---|---|---|---|
+/// | DELETE | 10,000 | install | 0.86 s, 0.85 s; 0.89, 0.78, 0.99 s | 1.33 s, 0.15 s; 0.37, 0.10, 0.37 s |
+/// | DELETE | 10,000 | sync | 1.87 s, 1.03 s; 1.06, 0.99, 1.07 s | 2.56 s, 0.18 s; 0.47, 0.12, 0.47 s |
+/// | WAL | 10,000 | install | 0.87 s, 0.83 s; 0.89, 0.00, 0.99 s | 1.35 s, 0.15 s; 0.47, 0.01, 0.47 s |
+/// | WAL | 10,000 | sync | 1.65 s, 1.03 s; 1.08, 0.01, 1.06 s | 2.44 s, 0.17 s; 0.37, 0.01, 0.48 s |
+/// | DELETE | 100,000 | install, 1 s | 10.9 s, 10.8 s; 10 of 35, 9 of 66, 10 of 41 failed | 22.0 s, 0.21 s; 0.52, 0.22, 1.10 s |
+/// | DELETE | 100,000 | install, 5 s | 10.8 s, 10.7 s; 5.4 s, each 1 failed | 21.8 s, 0.21 s; 0.52, 0.19, 0.95 s |
+/// | DELETE | 100,000 | sync, 1 s | 27.4 s, 18.5 s; about 16 of 460 failed each | 43.8 s, 0.26 s; 1.14, 0.53, 1.10 s |
+/// | DELETE | 100,000 | sync, 5 s | 27.0 s, 18.3 s; 5.4 s, 3 failed each | 43.5 s, 0.26 s; 1.64, 0.60, 0.81 s |
+/// | WAL | 100,000 | install, 1 s | 10.3 s, 10.0 s; 9 of 52 failed, reader 0.01 s | 23.6 s, 0.20 s; 0.72, 0.01, 0.91 s |
+/// | WAL | 100,000 | sync, 1 s | 21.5 s, 15.4 s; 14 of 337 failed, reader 0.01 s | 49.0 s, 0.53 s; 0.61, 0.04, 0.93 s |
+/// | WAL | 100,000 | sync, 5 s | 22.9 s, 16.5 s; 5.4 s, 3 failed | 48.5 s, 0.52 s; 0.58, 0.01, 0.88 s |
+///
+/// At 10,000 rows no statement failed with either timeout. Resume, whole in both, held the lock
+/// 1.0 s at 10,000 rows and 14 to 18 s at 100,000, where writers failed as above. A sync in steps
+/// takes longer mostly for its pauses. Which of its transactions held the lock about 0.5 s in
+/// WAL mode was not looked into.
+#[tokio::test]
+#[ignore]
+async fn measure_backlog() {
+    let rows = env("BACKLOG_ROWS", 10_000);
+    let busy = Duration::from_millis(env("BACKLOG_BUSY_MS", 1_000));
+    let bounded = env("BACKLOG_BOUNDED", 1) == 1;
+    let journal = std::env::var("BACKLOG_JOURNAL").unwrap_or_else(|_| "wal".into());
+    let dir = scratch("backlog-measure");
+    let path = dir.join("a.db");
+    let server = Server::new();
+    server.with(|s| {
+        s.caps.max_page_batches = None;
+        s.caps.max_batch_bytes = Some(1 << 22);
+    });
+    let made = create_library(&server, now).await.unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query(&format!("PRAGMA journal_mode = {journal}"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "PRAGMA busy_timeout = {}",
+        busy.as_millis().max(5_000)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    for sql in MIXED {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    let replica = Replica::new(mixed());
+    replica.install(&mut conn).await.unwrap();
+    let holds = Holds::watch(&mut conn).await;
+    let mut lines = Vec::new();
+    let mut report = |what: &str, took: Duration, waits: String, holds: Vec<Duration>| {
+        let longest = holds.iter().max().copied().unwrap_or_default();
+        lines.push(format!(
+            "{journal} {rows} {} {what}: {:.2} s, {} transactions, longest {:.0} ms; {waits}",
+            if bounded { "steps" } else { "whole" },
+            took.as_secs_f64(),
+            holds.len(),
+            longest.as_secs_f64() * 1e3
+        ));
+    };
+
+    mixed_writes(&mut conn, rows, 0).await;
+    holds.take();
+    let (took, waits) = alongside(&path, busy, async {
+        if bounded {
+            let first = replica.install_step(&mut conn, COLLECT_ROWS).await.unwrap();
+            in_steps(&replica, &mut conn, first).await;
+        } else {
+            immediate(&mut conn).await;
+            replica.install(&mut conn).await.unwrap();
+            commit(&mut conn).await;
+        }
+    })
+    .await;
+    report("install", took, waits, holds.take());
+
+    replica.suspend(&mut conn).await.unwrap();
+    mixed_writes(&mut conn, rows, 1).await;
+    holds.take();
+    let (took, waits) = alongside(&path, busy, async {
+        immediate(&mut conn).await;
+        replica.resume(&mut conn, Resume::Send).await.unwrap();
+        commit(&mut conn).await;
+    })
+    .await;
+    report("resume", took, waits, holds.take());
+
+    mixed_writes(&mut conn, rows, 2).await;
+    holds.take();
+    let credentials = made;
+    let (took, waits) = alongside(&path, busy, async {
+        let mut watched = Watched {
+            pace: Pace {
+                collect: if bounded { COLLECT_ROWS } else { usize::MAX },
+                ..Pace::default()
+            },
+            replica: replica.clone(),
+            gaps: Vec::new(),
+            applies: Vec::new(),
+        };
+        sync_with(
+            &mut conn,
+            &replica,
+            &server,
+            &credentials,
+            now,
+            &mut watched,
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    report("sync", took, waits, holds.take());
+    for line in lines {
+        eprintln!("RESULT {line}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

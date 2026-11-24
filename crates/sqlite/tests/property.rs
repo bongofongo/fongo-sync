@@ -1,14 +1,15 @@
 //! Replicas that use every feature at once, some holding rows before the kernel is installed,
 //! exchange changes in any order, part by part and more than once, and change their registry
 //! midway, agree with the reference model after every step and show exactly its view once
-//! everything is exchanged.
+//! everything is exchanged. Each replica collects whole or in bounded steps of a size its world
+//! picks, with the application writing between some steps.
 
 mod support;
 
 use std::collections::BTreeSet;
 
 use fongo_sync_sqlite::core::Change;
-use fongo_sync_sqlite::{Collection, LocalDefault, Made, Registry, Replica, Resume};
+use fongo_sync_sqlite::{COLLECT_ROWS, Collection, LocalDefault, Made, Registry, Replica, Resume};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use sqlx::SqliteConnection;
@@ -107,6 +108,11 @@ const MIXED: &str = "
 struct Peer {
     conn: SqliteConnection,
     replica: Replica,
+    /// Rows a bounded step of collecting takes, or `None` to collect whole.
+    step: Option<usize>,
+    /// Picks the writes made between steps.
+    seed: u64,
+    steps: usize,
     upgraded: bool,
     seen: Vec<bool>,
     sent: Option<(usize, i64)>,
@@ -120,7 +126,7 @@ struct Peer {
 
 impl Peer {
     /// A replica whose tables hold `rows` before the kernel is installed.
-    async fn new(world: &World, n: u64, schema: &[&str], rows: &[&str]) -> Peer {
+    async fn new(world: &World, n: u64, schema: &[&str], rows: &[&str], seed: u64) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
@@ -128,6 +134,11 @@ impl Peer {
         let mut peer = Peer {
             conn,
             replica: Replica::new(registry(false)),
+            step: [None, Some(1), Some(2), Some(3), Some(COLLECT_ROWS)]
+                [(mix(seed, n as usize) % 5) as usize],
+            seed: mix(seed, 1_000 + n as usize),
+
+            steps: 0,
             upgraded: false,
             seen: Vec::new(),
             sent: None,
@@ -135,15 +146,126 @@ impl Peer {
             writes: Default::default(),
             origins: None,
         };
-        let waiting = peer
-            .writes
-            .installing(&mut peer.conn, &peer.replica, &peer.taken)
-            .await;
-        peer.replica.install(&mut peer.conn).await.unwrap();
-        peer.writes
-            .installed(&mut peer.conn, &peer.replica, waiting)
-            .await;
+        peer.install().await.unwrap();
         peer
+    }
+
+    /// Installs whole, or in steps: an install that collects one step, then steps of collecting,
+    /// checking the model after each.
+    async fn install(&mut self) -> Result<(), String> {
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
+        let Some(rows) = self.step else {
+            self.replica.install(&mut self.conn).await.unwrap();
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
+            return Ok(());
+        };
+        let mut more = self
+            .replica
+            .install_step(&mut self.conn, rows)
+            .await
+            .unwrap()
+            .more;
+        if more {
+            self.writes
+                .installed_step(&mut self.conn, &self.replica, waiting)
+                .await;
+        } else {
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
+        }
+        while more {
+            self.between().await;
+            self.before_step().await;
+            more = self
+                .replica
+                .collect_step(&mut self.conn, rows)
+                .await
+                .unwrap()
+                .more;
+            if more {
+                self.writes.after_step(&mut self.conn, &self.replica).await;
+            } else {
+                self.writes.after(&mut self.conn, &self.replica).await;
+            }
+            self.collected().await?;
+        }
+        Ok(())
+    }
+
+    /// What the replica has taken in, with its outbox, which is not yet in `taken`.
+    async fn holding(&mut self) -> Vec<Change> {
+        let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+        let mut seen = self.taken.clone();
+        seen.extend(outbox.changes);
+        seen
+    }
+
+    /// Checks a replica that collected part of what was written against the model of what it
+    /// holds.
+    async fn collected(&mut self) -> Result<(), String> {
+        let seen = self.holding().await;
+        support::midway(&mut self.conn, &self.replica, &seen).await
+    }
+
+    /// Before a step of collecting that follows another.
+    async fn before_step(&mut self) {
+        let seen = self.holding().await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &seen)
+            .await;
+    }
+
+    /// Between two steps of collecting, now and then, a write of the application's.
+    async fn between(&mut self) {
+        self.steps += 1;
+        let pick = mix(self.seed, self.steps);
+        if !pick.is_multiple_of(3) {
+            return;
+        }
+        let n = (pick >> 8) % 7;
+        let row = |table: &str| {
+            format!(
+                "(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1
+                  OFFSET {n} % max(1, (SELECT count(*) FROM {table})))"
+            )
+        };
+        let sql = match (pick >> 4) % 8 {
+            0 => format!(
+                "UPDATE books SET title = 'between{n}' WHERE id = {}",
+                row("books")
+            ),
+            1 => format!(
+                "INSERT INTO notes (book_id, body) SELECT {}, 'between' WHERE EXISTS (SELECT 1 FROM books)",
+                row("books")
+            ),
+            2 => format!("DELETE FROM tags WHERE rowid = {}", row("tags")),
+            3 => format!("DELETE FROM books WHERE id = {}", row("books")),
+            4 => format!(
+                "INSERT OR IGNORE INTO shelves (name) VALUES ('shelf{}')",
+                n % 3
+            ),
+            5 => format!(
+                "INSERT OR IGNORE INTO tags (book_id, tag) SELECT {}, 'tag{}' WHERE EXISTS (SELECT 1 FROM books)",
+                row("books"),
+                n % 2
+            ),
+            6 => format!(
+                "UPDATE OR IGNORE books SET isbn = 'i{}' WHERE id = {}",
+                n % 2,
+                row("books")
+            ),
+            _ => format!(
+                "UPDATE notes SET body = 'between{n}' WHERE id = {}",
+                row("notes")
+            ),
+        };
+        self.run(&sql).await;
     }
 
     /// Checks the replica against the model, and records what it answers of who made each live
@@ -161,14 +283,7 @@ impl Peer {
         if !self.upgraded {
             self.upgraded = true;
             self.replica = Replica::new(registry(true));
-            let waiting = self
-                .writes
-                .installing(&mut self.conn, &self.replica, &self.taken)
-                .await;
-            self.replica.install(&mut self.conn).await.unwrap();
-            self.writes
-                .installed(&mut self.conn, &self.replica, waiting)
-                .await;
+            self.install().await?;
             self.midway().await?;
         }
         Ok(())
@@ -227,7 +342,29 @@ impl Peer {
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
             .await;
-        self.replica.collect(&mut self.conn).await.unwrap();
+        match self.step {
+            None => {
+                self.replica.collect(&mut self.conn).await.unwrap();
+            }
+            Some(rows) => loop {
+                let collected = self
+                    .replica
+                    .collect_step(&mut self.conn, rows)
+                    .await
+                    .unwrap();
+                if collected.more {
+                    self.writes.after_step(&mut self.conn, &self.replica).await;
+                } else {
+                    self.writes.after(&mut self.conn, &self.replica).await;
+                }
+                self.collected().await?;
+                if !collected.more {
+                    break;
+                }
+                self.between().await;
+                self.before_step().await;
+            },
+        }
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
             .replica
@@ -787,7 +924,7 @@ fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Re
         let mut peers = Vec::new();
         for n in 0..5 {
             let rows = if found { found_at_install(n) } else { &[] };
-            peers.push(Peer::new(&world, n, schema, rows).await);
+            peers.push(Peer::new(&world, n, schema, rows, seed).await);
         }
         for (step, (who, op)) in script.iter().cloned().enumerate() {
             perform(&mut peers[who], op, &mut hub)
@@ -1440,4 +1577,104 @@ fn a_tag_made_again_with_a_null_note_at_seed_271828() {
         (0, AddTag(0, 0)),
     ];
     run(0, &script).unwrap();
+}
+
+/// Found by a long run (seed 99). Peer 3 collects a row at a time while its application writes
+/// between steps: an author's favourite is set and, before a step reaches the author, set back
+/// by removing the book. Collected together, the two writes are none, as between two collects.
+#[test]
+fn a_reference_written_between_steps_and_back_sends_nothing() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (1, AddCover(0)),
+        (0, AddShelf(1)),
+        (0, AddBook(0, 1, 1)),
+        (1, Sync),
+        (0, Upgrade),
+        (0, AddAuthor(0)),
+        (0, AddCover(0)),
+        (0, SetTitle(0, 0)),
+        (0, Sync),
+        (1, AddBook(0, 0, 0)),
+        (0, DeleteAuthor(0)),
+        (1, AddTag(0, 0)),
+        (0, SetTitle(0, 0)),
+        (3, SetNote(0, 0)),
+        (0, DeleteShelf(0)),
+        (0, Deliver(0, false, false)),
+        (0, DeleteShelf(0)),
+        (0, RenameShelf(0, 0)),
+        (0, DeleteAuthor(0)),
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (1, AddAuthor(0)),
+        (2, AddShelf(0)),
+        (0, AddShelf(0)),
+        (1, Sync),
+        (0, AddAuthor(0)),
+        (0, SetFavourite(0, 0)),
+        (1, Sync),
+        (3, Sync),
+        (0, SetTitle(0, 0)),
+        (0, SetTitle(0, 0)),
+        (0, Sync),
+        (0, Upgrade),
+        (0, AddBook(2, 0, 3)),
+        (1, Sync),
+        (0, Sync),
+        (4, Log(4, true)),
+        (3, AddNote(0, 0)),
+        (4, AddTag(4, 0)),
+        (2, AddNote(3, 1)),
+        (4, Deliver(17504071961584740370, false, true)),
+        (1, SetStatus(4, 2)),
+        (3, SetStatus(5, 3)),
+        (1, Push),
+        (4, AddTag(4, 0)),
+        (3, SetTitle(3, 2)),
+        (3, Sync),
+        (2, DeleteAuthor(4)),
+        (2, AddMark(4, 1)),
+        (0, AddAuthor(2)),
+        (0, SetNote(3, 0)),
+        (1, DeleteShelf(4)),
+        (2, Sync),
+        (0, Sync),
+        (4, SetNote(2, 0)),
+        (0, SetFavourite(4, 4)),
+        (2, AddNote(4, 2)),
+        (1, Upgrade),
+        (0, AddNote(1, 0)),
+        (2, AddBook(2, 2, 3)),
+        (4, AddNote(0, 0)),
+        (0, SetSetting(0, 2)),
+        (0, AddMark(0, 1)),
+        (0, AddNote(4, 1)),
+        (0, Push),
+        (1, SetAuthor(2, 5)),
+        (4, SetNote(0, 2)),
+        (1, DeleteBook(0)),
+        (4, Deliver(16045125935950652839, false, true)),
+        (3, DeleteShelf(4)),
+        (1, AddBook(2, 1, 3)),
+        (3, AddBook(4, 2, 1)),
+        (1, SetStatus(5, 2)),
+        (4, AddNote(4, 2)),
+        (1, DeleteBook(4)),
+        (4, SetFavourite(2, 2)),
+        (0, SetFavourite(3, 5)),
+        (4, DeleteMark(3)),
+        (0, AddBook(5, 0, 3)),
+        (3, SetIsbn(2, 3)),
+        (1, AddBook(5, 2, 2)),
+        (4, Push),
+        (3, Deliver(7089252144508200401, false, true)),
+        (3, AddNote(2, 2)),
+        (3, RenameShelf(4, 1)),
+        (4, DeleteBook(2)),
+        (3, SetFavourite(5, 4)),
+        (3, AddBook(1, 0, 1)),
+    ];
+    run_found(9882191972837468972, &script).unwrap();
 }

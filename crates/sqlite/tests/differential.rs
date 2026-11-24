@@ -516,6 +516,8 @@ struct Both<'s> {
     seen: Vec<Vec<bool>>,
     last: Vec<Seen>,
     step: u64,
+    /// Rows a bounded step of collecting takes, by the seed, or `None` to collect whole.
+    collect_rows: Option<usize>,
 }
 
 impl<'s> Both<'s> {
@@ -558,6 +560,7 @@ impl<'s> Both<'s> {
             sim_log: Vec::new(),
             sql_log: Vec::new(),
             seen: vec![Vec::new(); n],
+            collect_rows: [None, Some(1), Some(2), Some(5)][(seed % 4) as usize],
             last: (0..n).map(|_| empty()).collect(),
             step: 0,
         }
@@ -853,7 +856,22 @@ impl<'s> Both<'s> {
         let sim_out = netted(&self.sims[i].outbox[start..]);
 
         let (conn, peer) = (&mut self.conns[i], &self.peers[i]);
-        peer.collect(conn).await.unwrap();
+        match self.collect_rows {
+            None => {
+                peer.collect(conn).await.unwrap();
+            }
+            Some(rows) => loop {
+                let collected = peer.collect_step(conn, rows).await.unwrap();
+                let mut seen = self.taken[i].clone();
+                seen.extend(peer.outbox(conn, 1_000_000).await.unwrap().changes);
+                support::midway(conn, peer, &seen)
+                    .await
+                    .map_err(|e| format!("replica {i}, collecting in steps of {rows}: {e}"))?;
+                if !collected.more {
+                    break;
+                }
+            },
+        }
         peer.apply(conn, &sql_in).await.unwrap();
         let outbox = peer.outbox(conn, 1_000_000).await.unwrap();
         peer.acknowledge(conn, outbox.through).await.unwrap();

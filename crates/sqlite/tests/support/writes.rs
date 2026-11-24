@@ -26,6 +26,8 @@ type Rows = BTreeMap<(String, String), BTreeMap<String, Value>>;
 pub struct Writes {
     /// The rows as the last kernel step left them.
     after: Rows,
+    /// The rows as the last kernel step found them.
+    found: Rows,
     /// Every entity each row has held, by collection and key.
     gids: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// The entity each row held when last looked at.
@@ -155,6 +157,7 @@ impl Writes {
     ) {
         witness(conn, replica).await;
         let current = now(conn, replica).await;
+        self.found = current.clone();
         let registry = replica.registry();
         let remade: BTreeSet<(String, String)> =
             rows(conn, "SELECT collection, key FROM witness_made", &[])
@@ -317,6 +320,65 @@ impl Writes {
         }
     }
 
+    /// After a bounded step of collecting that left rows to collect: a row still to collect
+    /// that the step did not write keeps what the steps before it left, so what the application
+    /// wrote to it since is still its write when a later step collects it.
+    pub async fn after_step(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+        witness(conn, replica).await;
+        let current = now(conn, replica).await;
+        let marked: BTreeSet<(String, String)> = replica
+            .inspect(conn)
+            .await
+            .unwrap()
+            .uncollected
+            .into_iter()
+            .collect();
+        let mut keys: BTreeSet<(String, String)> = current.keys().cloned().collect();
+        keys.extend(self.after.keys().cloned());
+        keys.extend(self.found.keys().cloned());
+        let mut next = Rows::new();
+        let mut kept = BTreeSet::new();
+        for key in keys {
+            if marked.contains(&key) && self.found.get(&key) == current.get(&key) {
+                if let Some(row) = self.after.get(&key) {
+                    next.insert(key.clone(), row.clone());
+                }
+                kept.insert(key);
+            } else if let Some(row) = current.get(&key) {
+                next.insert(key, row.clone());
+            }
+        }
+        for table in ["witness_made", "witness_set"] {
+            for row in rows(
+                conn,
+                &format!("SELECT rowid, collection, key FROM {table}"),
+                &[],
+            )
+            .await
+            {
+                if !kept.contains(&(text(&row[1]), text(&row[2]))) {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE rowid = ?1"))
+                        .bind(match row[0] {
+                            Value::Int(id) => id,
+                            _ => unreachable!(),
+                        })
+                        .execute(&mut *conn)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        // What is owed of a row still to collect is its change since it was last collected,
+        // which the next kernel step's look at the tables works out again.
+        let of_kept = |c: &str, k: &str| kept.contains(&(c.to_string(), k.to_string()));
+        self.owed.retain(|(c, k, _), _| !of_kept(c, k));
+        self.named.retain(|(c, k, _), _| !of_kept(c, k));
+        self.after = next;
+        for (collection, key) in current.keys() {
+            self.remember(conn, replica, collection, key).await;
+        }
+    }
+
     /// After an apply, which reports the rows it wrote and removed with their entities, among
     /// them rows the application made that the apply collected and then removed.
     pub fn touched(&mut self, touched: &[fongo_sync_sqlite::Touched]) {
@@ -412,6 +474,20 @@ impl Writes {
         self.adopted
             .extend(outbox.changes.into_iter().skip(waiting));
         self.after(conn, replica).await;
+    }
+
+    /// [`Writes::installed`] after an install that collected in a bounded step and left rows to
+    /// collect, as [`Writes::after_step`] sees them.
+    pub async fn installed_step(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        waiting: usize,
+    ) {
+        let outbox = replica.outbox(conn, u32::MAX).await.unwrap();
+        self.adopted
+            .extend(outbox.changes.into_iter().skip(waiting));
+        self.after_step(conn, replica).await;
     }
 
     /// The changes about to be sent that the application did not write, and rows it removed

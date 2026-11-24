@@ -9,6 +9,11 @@
 //! A row a merge gave up still stands for the entity it stood for, a member of the group it
 //! joined: its edits are that entity's, and a row that names it names that entity. A row that names
 //! a row the kernel has not yet given an entity is not collected: it stays marked until it has one.
+//!
+//! Marked rows are collected in the order they were last written, then by collection and key. A
+//! bounded step takes a prefix of that order, and only one whose collecting reads no marked row
+//! past it: a row it names that collecting could give another entity, or one naming a row it
+//! gives a new entity, is collected with it, or the prefix grows to reach it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +28,120 @@ use crate::registry::Key;
 use crate::replica::{Base, Ctx, Mapped, Replica, key_fields, mapping, same};
 use crate::store::Facts;
 use crate::tables::{self, local_of, minted_key, read_row};
+
+/// Where a marked row stands in the order rows are collected in: when it was last written, then
+/// its collection and key.
+pub(crate) type Place = (i64, String, String);
+
+/// Entities minted for rows by an earlier try of the same step, so that trying again mints the
+/// same ones.
+pub(crate) type Minted = BTreeMap<(usize, String), Gid>;
+
+/// What [`Replica::collect_edits`] found.
+pub(crate) enum Edits {
+    /// The edits are recorded and merged; what they affect, and how many marked rows were
+    /// collected.
+    Recorded(BTreeSet<(String, Gid)>, usize),
+    /// A row of the prefix depends on a marked row past it, the latest at this place. Nothing was
+    /// written.
+    Beyond(Place),
+    /// The prefix would collect this many rows, fewer than asked for, while more are marked.
+    /// Nothing was written.
+    Short(usize),
+}
+
+/// Answers to what local ids name, and the latest marked row past the prefix one of them read.
+struct Names {
+    cache: BTreeMap<(usize, i64), Option<Mapped>>,
+    bounded: bool,
+    beyond: Option<Place>,
+}
+
+impl Names {
+    fn past(&mut self, place: Place) {
+        if self.beyond.as_ref().is_none_or(|b| *b < place) {
+            self.beyond = Some(place);
+        }
+    }
+}
+
+/// When the row at `key` was marked, if it is, and whether a row left the key since.
+pub(crate) fn marked_at(db: &Db, collection: &str, key: &str) -> Result<Option<(i64, bool)>> {
+    let rows = db.query(
+        "SELECT at, gone FROM fongo_dirty WHERE collection = ?1 AND key = ?2",
+        &[Value::Text(collection.into()), Value::Text(key.into())],
+    )?;
+    rows.first()
+        .map(|r| Ok((as_int(&r[0])?, as_int(&r[1])? > 0)))
+        .transpose()
+}
+
+/// The place of the marked row `skip` rows after `after` in collecting order (after the start
+/// when `after` is `None`), and whether any row follows it.
+pub(crate) fn place_after(
+    db: &Db,
+    after: Option<&Place>,
+    skip: usize,
+) -> Result<Option<(Place, bool)>> {
+    let skip = Value::Int(i64::try_from(skip).unwrap_or(i64::MAX));
+    let rows = match after {
+        None => db.query(
+            "SELECT at, collection, key FROM fongo_dirty
+              ORDER BY at, collection, key LIMIT 2 OFFSET ?1",
+            &[skip],
+        )?,
+        Some((at, collection, key)) => db.query(
+            "SELECT at, collection, key FROM fongo_dirty WHERE (at, collection, key) > (?1, ?2, ?3)
+              ORDER BY at, collection, key LIMIT 2 OFFSET ?4",
+            &[
+                Value::Int(*at),
+                Value::Text(collection.clone()),
+                Value::Text(key.clone()),
+                skip,
+            ],
+        )?,
+    };
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
+    let place = (
+        as_int(&r[0])?,
+        as_text(&r[1])?.to_string(),
+        as_text(&r[2])?.to_string(),
+    );
+    Ok(Some((place, rows.len() > 1)))
+}
+
+/// How many rows are marked up to `place`, or in all with `None`.
+pub(crate) fn marked_through(db: &Db, place: &Option<Place>) -> Result<i64> {
+    let rows = match place {
+        None => db.query("SELECT count(*) FROM fongo_dirty", &[])?,
+        Some((at, collection, key)) => db.query(
+            "SELECT count(*) FROM fongo_dirty WHERE (at, collection, key) <= (?1, ?2, ?3)",
+            &[
+                Value::Int(*at),
+                Value::Text(collection.clone()),
+                Value::Text(key.clone()),
+            ],
+        )?,
+    };
+    rows.first().map_or(Ok(0), |r| as_int(&r[0]))
+}
+
+/// Whether any row is marked past `place`.
+pub(crate) fn marked_past(db: &Db, place: &Place) -> Result<bool> {
+    let (at, collection, key) = place;
+    Ok(!db
+        .query(
+            "SELECT 1 FROM fongo_dirty WHERE (at, collection, key) > (?1, ?2, ?3) LIMIT 1",
+            &[
+                Value::Int(*at),
+                Value::Text(collection.clone()),
+                Value::Text(key.clone()),
+            ],
+        )?
+        .is_empty())
+}
 
 struct Item {
     idx: usize,
@@ -58,17 +177,40 @@ enum Named {
 }
 
 impl Replica {
-    /// Records every edit the application made since the last collect and merges the changes.
-    /// Returns what they affect, for the caller to bring up to date.
-    pub(crate) fn collect_edits(&self, cx: &mut Ctx) -> Result<BTreeSet<(String, Gid)>> {
+    /// Records every edit the application made since the last collect, or with `through` those
+    /// of the rows marked up to that place, and merges the changes. With `want`, a prefix that
+    /// would collect fewer than that many rows, while more are marked, is reported short.
+    pub(crate) fn collect_edits(
+        &self,
+        cx: &mut Ctx,
+        through: Option<&Place>,
+        want: Option<usize>,
+        minted: &mut Minted,
+    ) -> Result<Edits> {
         let db = cx.db;
-        let marked = db.query(
-            "SELECT collection, key, at, gone FROM fongo_dirty ORDER BY at, collection, key",
-            &[],
-        )?;
+        let marked = match through {
+            None => db.query(
+                "SELECT collection, key, at, gone FROM fongo_dirty ORDER BY at, collection, key",
+                &[],
+            )?,
+            Some((at, collection, key)) => db.query(
+                "SELECT collection, key, at, gone FROM fongo_dirty
+                  WHERE (at, collection, key) <= (?1, ?2, ?3) ORDER BY at, collection, key",
+                &[
+                    Value::Int(*at),
+                    Value::Text(collection.clone()),
+                    Value::Text(key.clone()),
+                ],
+            )?,
+        };
         if marked.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(Edits::Recorded(BTreeSet::new(), 0));
         }
+        let mut names = Names {
+            cache: BTreeMap::new(),
+            bounded: through.is_some(),
+            beyond: None,
+        };
         let mut items: Vec<Item> = Vec::new();
         let mut index: BTreeMap<(usize, String), usize> = BTreeMap::new();
         for r in marked {
@@ -95,7 +237,7 @@ impl Replica {
                 if !matches!(self.collection(items[i].idx).key, Key::Minted { .. }) {
                     continue;
                 }
-                self.decide_minted(db, &mut items[i])?;
+                self.decide_minted(db, &mut items[i], minted)?;
                 let item = &items[i];
                 let (true, true, Some(local)) =
                     (item.old.is_some(), item.new.is_some(), local_of(&item.key))
@@ -107,6 +249,12 @@ impl Replica {
                     let c = self.collection(referrer);
                     for key in tables::rows_naming(db, c, &field, local)? {
                         if index.contains_key(&(referrer, key.clone())) {
+                            continue;
+                        }
+                        if names.bounded
+                            && let Some((at, _)) = marked_at(db, &c.name, &key)?
+                        {
+                            names.past((at, c.name.clone(), key));
                             continue;
                         }
                         let found = self.item(db, referrer, key, at, 0, true)?;
@@ -129,7 +277,6 @@ impl Replica {
                 item.waits = true;
             }
         }
-        let mut cache: BTreeMap<(usize, i64), Option<Mapped>> = BTreeMap::new();
         loop {
             let mut changed = false;
             for i in 0..items.len() {
@@ -143,7 +290,7 @@ impl Replica {
                     if let (Some(t), Some(Value::Int(k))) =
                         (self.target_of(c, &f.name), row.get(&f.name))
                         && matches!(
-                            self.will(db, &items, &index, &mut cache, t, *k)?,
+                            self.will(db, &items, &index, &mut names, t, *k)?,
                             Named::Waits
                         )
                     {
@@ -179,7 +326,7 @@ impl Replica {
                 let value = row.get(&f.name).cloned().unwrap_or(Value::Null);
                 let value = match (self.target_of(c, &f.name), &value) {
                     (Some(t), Value::Int(k)) => {
-                        match self.will(db, &items, &index, &mut cache, t, *k)? {
+                        match self.will(db, &items, &index, &mut names, t, *k)? {
                             Named::Gid(g) => Value::Ref(g),
                             Named::Nothing => Value::Null,
                             Named::Waits => {
@@ -232,6 +379,16 @@ impl Replica {
             }
         }
 
+        if let Some(place) = names.beyond.take() {
+            return Ok(Edits::Beyond(place));
+        }
+        if let (Some(want), Some(place)) = (want, through) {
+            let rows = items.iter().filter(|i| !i.waits && !i.found).count();
+            if rows < want.div_ceil(2) && marked_past(db, place)? {
+                return Ok(Edits::Short(rows));
+            }
+        }
+
         // Record, in the order the application wrote.
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_by_key(|&i| (items[i].at, i));
@@ -246,7 +403,7 @@ impl Replica {
             let name = c.name.clone();
             let after = match &items[i].row {
                 Some(row) => {
-                    Some(self.row_gids(db, &items, &index, &mut cache, items[i].idx, row)?)
+                    Some(self.row_gids(db, &items, &index, &mut names, items[i].idx, row)?)
                 }
                 None => None,
             };
@@ -326,6 +483,9 @@ impl Replica {
         }
         db.check()?;
         drop(session);
+        if let Some(place) = names.beyond.take() {
+            return Ok(Edits::Beyond(place));
+        }
 
         for i in done {
             let item = &items[i];
@@ -398,10 +558,14 @@ impl Replica {
             )?;
         }
 
-        let mut set = self.merge(cx, &changes, true)?;
+        let collected = items.iter().filter(|i| !i.waits && !i.found).count();
+        let mut set = match self.merge_unless(cx, &changes, true, through)? {
+            Ok(set) => set,
+            Err(past) => return Ok(Edits::Beyond(past)),
+        };
         set.extend(touched);
         self.remember_bases(cx)?;
-        Ok(set)
+        Ok(Edits::Recorded(set, collected))
     }
 
     fn item(
@@ -440,7 +604,7 @@ impl Replica {
         }
     }
 
-    fn decide_minted(&self, db: &Db, item: &mut Item) -> Result<()> {
+    fn decide_minted(&self, db: &Db, item: &mut Item, minted: &mut Minted) -> Result<()> {
         self.decide_common(item);
         if item.waits || item.row.is_none() {
             return Ok(());
@@ -451,8 +615,16 @@ impl Replica {
                 // A given-up row whose id was taken again has no old entity, so no rows naming it
                 // are looked for: with foreign keys enforced, its removal changed or refused them.
                 item.old = item.usable().map(|m| m.gid);
-                let fresh = db.query("SELECT randomblob(16)", &[])?;
-                item.new = Some(as_gid(&fresh[0][0])?);
+                let gid = match minted.get(&(item.idx, item.key.clone())) {
+                    Some(gid) => *gid,
+                    None => {
+                        let fresh = db.query("SELECT randomblob(16)", &[])?;
+                        let gid = as_gid(&fresh[0][0])?;
+                        minted.insert((item.idx, item.key.clone()), gid);
+                        gid
+                    }
+                };
+                item.new = Some(gid);
             }
         }
         Ok(())
@@ -464,7 +636,7 @@ impl Replica {
         db: &Db,
         items: &[Item],
         index: &BTreeMap<(usize, String), usize>,
-        cache: &mut BTreeMap<(usize, i64), Option<Mapped>>,
+        names: &mut Names,
         t: usize,
         local: i64,
     ) -> Result<Named> {
@@ -483,10 +655,19 @@ impl Replica {
             });
         }
         let c = self.collection(t);
-        if let std::collections::btree_map::Entry::Vacant(slot) = cache.entry((t, local)) {
-            slot.insert(mapping(db, &c.name, &key)?);
+        if !names.cache.contains_key(&(t, local)) {
+            let mapped = mapping(db, &c.name, &key)?;
+            // A marked row past the prefix that keeps its entity names the same one once
+            // collected; any other may not.
+            if names.bounded
+                && let Some((at, gone)) = marked_at(db, &c.name, &key)?
+                && (gone || mapped.is_none() || read_row(db, c, &key)?.is_none())
+            {
+                names.past((at, c.name.clone(), key.clone()));
+            }
+            names.cache.insert((t, local), mapped);
         }
-        Ok(match &cache[&(t, local)] {
+        Ok(match &names.cache[&(t, local)] {
             Some(m) => Named::Gid(m.gid),
             None if read_row(db, c, &key)?.is_some() => Named::Waits,
             None => Named::Nothing,
@@ -520,7 +701,7 @@ impl Replica {
         db: &Db,
         items: &[Item],
         index: &BTreeMap<(usize, String), usize>,
-        cache: &mut BTreeMap<(usize, i64), Option<Mapped>>,
+        names: &mut Names,
         idx: usize,
         row: &Row,
     ) -> Result<Row> {
@@ -528,7 +709,7 @@ impl Replica {
         let mut out = row.clone();
         for f in &c.fields {
             if let (Some(t), Some(Value::Int(k))) = (self.target_of(c, &f.name), row.get(&f.name)) {
-                let value = match self.will(db, items, index, cache, t, *k)? {
+                let value = match self.will(db, items, index, names, t, *k)? {
                     Named::Gid(g) => Value::Ref(g),
                     _ => Value::Null,
                 };

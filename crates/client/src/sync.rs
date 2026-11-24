@@ -10,7 +10,7 @@ use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
-use fongo_sync_sqlite::{Applied, Conflict, Replica, Touched};
+use fongo_sync_sqlite::{Applied, COLLECT_ROWS, Conflict, Replica, Touched};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 use crate::credentials::Credentials;
@@ -29,10 +29,10 @@ const REFUSALS_LISTED: usize = 100;
 const SMALLEST_BATCH: usize = 3 + 1 + 16 + 1 + 1 + 8 + 4 + 16;
 
 /// How a sync shares the database with other connections that write to it. SQLite lets one
-/// connection write at a time, and a sync takes that turn for each of its transactions: each
-/// apply, `caught_up`, and the record and acknowledgment of each envelope it sends. These settings
-/// keep each turn short and leave room between them. [`Apply::pace`] gives them; [`sync`] uses the
-/// defaults.
+/// connection write at a time, and a sync takes that turn for each of its transactions: each step
+/// of collecting local writes, each apply, `caught_up`, and the record and acknowledgment of each
+/// envelope it sends. These settings keep each turn short and leave room between them.
+/// [`Apply::pace`] gives them; [`sync`] uses the defaults.
 ///
 /// With the defaults, a writer on another connection that waits in SQLite's busy handler usually
 /// waits about `hold`, one apply and `pause`, and longer when several connections compete for the
@@ -56,6 +56,14 @@ pub struct Pace {
     /// about 180 ms in one of 200,000 changes, before an application's own [`Apply::apply`] work
     /// and on slower devices more.
     pub apply: usize,
+    /// About how many rows written since the last collect one transaction collects. Before each
+    /// apply, while at least this many rows wait to be collected, the sync collects them with
+    /// [`Replica::collect_step`] in transactions of their own, paced as the others, so the apply
+    /// collects fewer. A step takes more where rows written later depend on those it takes. 0
+    /// counts as 1. Default [`COLLECT_ROWS`], 1,000: on a fast laptop a step took 65 to 230 ms in
+    /// a library of tens of thousands of changes and up to 340 ms in one of a million, by how wide
+    /// the rows are.
+    pub collect: usize,
     /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
     /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
     /// Default 1,000.
@@ -80,6 +88,7 @@ impl Default for Pace {
     fn default() -> Pace {
         Pace {
             apply: 4_000,
+            collect: COLLECT_ROWS,
             seal: 1_000,
             hold: Duration::from_millis(250),
             pause: Duration::from_millis(150),
@@ -205,10 +214,11 @@ pub struct SyncReport {
 /// The cursor is stored after every page read. Received changes are held, whole envelopes at a
 /// time and across pages, until the next envelope would take them past [`Pace::apply`], and then
 /// applied together with the cursor in one transaction, so a crash at any point leaves either both
-/// or neither; re-reading changes already applied is harmless. Local writes are collected by each
-/// apply. A local edit to a field that reports conflicts is compared with every remote change to
-/// it until the pull has read past the envelope that carried it, and a remote change met before
-/// that point is reported in [`SyncReport::applied`].
+/// or neither; re-reading changes already applied is harmless. Local writes are collected before
+/// each apply, in steps of [`Pace::collect`] rows each committed on its own, and what remains by
+/// the apply itself. A local edit to a field that reports conflicts is compared with every remote
+/// change to it until the pull has read past the envelope that carried it, and a remote change
+/// met before that point is reported in [`SyncReport::applied`].
 ///
 /// Conflicts are reported on one side only. Of two concurrent edits, only the device whose
 /// envelope lands later in the log is told; the device whose envelope landed first has released
@@ -238,14 +248,15 @@ pub struct SyncReport {
 ///
 /// # Other writers
 ///
-/// SQLite lets one connection write at a time. A sync writes in transactions of its own: each
-/// apply, then [`Apply::caught_up`], then a record and an acknowledgment for each envelope it
-/// sends. Each takes the write lock with its first statement, waiting for it in the connection's
-/// busy handler, and holds it until it commits, so the longest hold is the largest apply, which
-/// [`Pace::apply`] bounds. Between them no transaction is open; once the sync has held the lock
-/// for [`Pace::hold`] in all, it leaves it free for [`Pace::pause`] before the next, long enough
-/// for a writer waiting in SQLite's busy handler on another connection to wake and write. A sync
-/// that holds the lock for less than [`Pace::hold`] never pauses. [`sync_with`] also calls
+/// SQLite lets one connection write at a time. A sync writes in transactions of its own: steps of
+/// collecting local writes and each apply, then [`Apply::caught_up`], then a record and an
+/// acknowledgment for each envelope it sends. Each takes the write lock with its first statement,
+/// waiting for it in the connection's busy handler, and holds it until it commits, so the longest
+/// hold is the largest step or apply, which [`Pace::collect`] and [`Pace::apply`] bound. Between
+/// them no transaction is open; once the sync has held the lock for [`Pace::hold`] in all, it
+/// leaves it free for [`Pace::pause`] before the next, long enough for a writer waiting in
+/// SQLite's busy handler on another connection to wake and write. A sync that holds the lock for
+/// less than [`Pace::hold`] never pauses. [`sync_with`] also calls
 /// [`Apply::between`] in each gap, where an application can let its own writers through.
 ///
 /// # The connection
@@ -381,11 +392,11 @@ pub trait Apply: Send {
     /// application whose own writes wait on a gate of its own can let them through here, or it
     /// can yield or sleep. By default it does nothing.
     ///
-    /// It is called once in each gap: before every apply but the first, before `caught_up`, and
-    /// before each record and acknowledgment of an envelope sent, whenever a transaction of this
-    /// sync committed before it; and after the client's own pause, when [`Pace`] calls for one. It
-    /// is never called inside a transaction, before the sync's first write, after its last, or
-    /// once anything in the sync has failed.
+    /// It is called once in each gap: before every step of collecting and every apply but the
+    /// sync's first transaction, before `caught_up`, and before each record and acknowledgment of
+    /// an envelope sent, whenever a transaction of this sync committed before it; and after the
+    /// client's own pause, when [`Pace`] calls for one. It is never called inside a transaction,
+    /// before the sync's first write, after its last, or once anything in the sync has failed.
     ///
     /// It may use the connection for statements and transactions of its own, provided it ends
     /// every transaction it begins; what it writes to a synced table is a local edit, collected by
@@ -721,6 +732,26 @@ impl<A: Apply> Steps<'_, A> {
         self.committed = true;
         self.held += began.elapsed();
     }
+
+    /// Collects local writes in steps of [`Pace::collect`] rows, each a transaction of its own,
+    /// while at least that many wait, so the apply that follows collects fewer.
+    async fn collect(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        let rows = self.pace.collect.max(1);
+        let replica = self.replica;
+        while replica.uncollected_rows(conn, rows).await? >= rows {
+            let (mut tx, began) = self.begin(conn).await?;
+            let collected = match replica.collect_step(&mut tx, rows).await {
+                Ok(collected) => collected,
+                Err(error) => return Err(abandon(tx, error.into()).await),
+            };
+            tx.commit().await?;
+            self.committed(began);
+            if !collected.more {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Marks the client's transaction before the application's step, with a savepoint and a row
@@ -820,6 +851,9 @@ impl Pull {
         collect: bool,
     ) -> Result<(), Error> {
         let replica = steps.replica;
+        if collect || !self.held.is_empty() {
+            steps.collect(conn).await?;
+        }
         let (mut tx, began) = steps.begin(conn).await?;
         let written = async {
             let applied = if collect || !self.held.is_empty() {

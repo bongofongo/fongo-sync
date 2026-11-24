@@ -237,6 +237,23 @@ impl Db {
         outcome
     }
 
+    /// [`Db::atomically`], taking the write lock first when no transaction is open, so that while
+    /// another connection writes it waits in the busy handler rather than fail at its first write.
+    pub(crate) fn atomically_writing<T>(&self, work: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        // SAFETY: the handle is open and used by this thread only.
+        if unsafe { ffi::sqlite3_get_autocommit(self.raw.as_ptr()) } == 0 {
+            return self.atomically(work);
+        }
+        self.exec("BEGIN IMMEDIATE", &[])?;
+        let outcome = self
+            .atomically(work)
+            .and_then(|out| self.exec("COMMIT", &[]).map(|_| out));
+        if outcome.is_err() {
+            let _ = self.exec_unchecked("ROLLBACK");
+        }
+        outcome
+    }
+
     fn exec_unchecked(&self, sql: &str) -> Result<()> {
         let stmt = self.statement(sql)?;
         // SAFETY: the statement is prepared and takes no parameters.

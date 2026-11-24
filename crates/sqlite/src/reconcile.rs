@@ -127,6 +127,7 @@ impl Replica {
                 let Ok(t) = session.target(c, *g) else {
                     continue;
                 };
+                cx.reached(c, t.members.iter().copied().chain([*g, t.canonical]));
                 if t.row.is_none() || !seen.insert((c.clone(), t.canonical)) {
                     continue;
                 }
@@ -180,6 +181,7 @@ impl Replica {
             let mut doomed: BTreeMap<(usize, String), (Gid, Gid)> = BTreeMap::new();
             for (c, g) in &set {
                 let idx = self.registry.index(c).expect("only registered collections");
+                cx.reached(c, [*g]);
                 let t = match session.target(c, *g) {
                     Ok(t) => t,
                     Err(_) => {
@@ -187,11 +189,15 @@ impl Replica {
                         continue;
                     }
                 };
+                cx.reached(c, t.members.iter().copied().chain([t.canonical]));
                 if blocked.contains(&(c.clone(), t.canonical)) {
                     held.insert((c.clone(), t.canonical));
                     continue;
                 }
                 let mine = rows_of(db, c, *g)?;
+                for (key, _) in &mine {
+                    cx.looked_at(c, key);
+                }
                 if t.members.is_empty() {
                     for (key, _) in mine {
                         doomed.insert((idx, key), (*g, *g));
@@ -204,6 +210,7 @@ impl Replica {
                     entry.1.insert(key, *g);
                 }
                 for (key, _) in rows_of(db, c, t.canonical)? {
+                    cx.looked_at(c, &key);
                     entry.1.insert(key, t.canonical);
                 }
             }
@@ -239,6 +246,7 @@ impl Replica {
                 for (referrer, field) in self.referring(*idx) {
                     let c = self.collection(referrer);
                     for k in tables::rows_naming(db, c, &field, local)? {
+                        cx.looked_at(&c.name, &k);
                         if let Some(m) = mapping(db, &c.name, &k)?
                             && !set.contains(&(c.name.clone(), m.gid))
                         {
@@ -534,6 +542,7 @@ impl Replica {
                 }
             }
         };
+        cx.looked_at(&c.name, &key);
         for (f, v) in &values {
             names.push(quoted(f));
             marks.push(format!("?{}", params.len() + 1));
