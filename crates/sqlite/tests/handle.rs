@@ -26,9 +26,11 @@ use fongo_sync_sqlite::{Collection, Registry, Replica};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 
-/// More calls than sqlx's default command queue holds.
-const CALLS: usize = 1_000;
-const LIMIT: Duration = Duration::from_secs(5);
+/// Several times what sqlx's default command queue holds, which without the fix stalls at 51.
+const CALLS: usize = 200;
+/// How long the calls may wait for a wake. They are never woken again once deadlocked, and a
+/// slow but live run is woken at every step.
+const STALL: Duration = Duration::from_secs(5);
 
 struct Slow {
     poller: ThreadId,
@@ -67,8 +69,8 @@ impl Wake for Slow {
 }
 
 /// Runs `future` on this thread, holding every other thread that wakes it until it has been
-/// polled. `None` if it has not finished within `limit`.
-fn run_slowly<F: Future>(future: F, limit: Duration) -> Option<F::Output> {
+/// polled. `None` if it waits longer than `stall` for a wake.
+fn run_slowly<F: Future>(future: F, stall: Duration) -> Option<F::Output> {
     let slow = Arc::new(Slow {
         poller: thread::current().id(),
         state: Mutex::new(State::default()),
@@ -77,7 +79,6 @@ fn run_slowly<F: Future>(future: F, limit: Duration) -> Option<F::Output> {
     let waker = Waker::from(slow.clone());
     let mut cx = Context::from_waker(&waker);
     let mut future = pin!(future);
-    let deadline = Instant::now() + limit;
     loop {
         slow.state.lock().unwrap().woken = false;
         let poll = future.as_mut().poll(&mut cx);
@@ -87,6 +88,7 @@ fn run_slowly<F: Future>(future: F, limit: Duration) -> Option<F::Output> {
         if let Poll::Ready(out) = poll {
             return Some(out);
         }
+        let deadline = Instant::now() + stall;
         while !state.woken {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -142,12 +144,12 @@ fn back_to_back_calls_finish_when_the_worker_is_slow_to_take_its_lock_back() {
             }
             found
         },
-        LIMIT,
+        STALL,
     );
     assert_eq!(
         found,
         Some(CALLS),
-        "{CALLS} lookups did not finish within {LIMIT:?}"
+        "the lookups stopped: none was woken for {STALL:?}"
     );
     eprintln!("{CALLS} lookups in {:?}", started.elapsed());
 }
