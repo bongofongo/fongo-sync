@@ -6,8 +6,8 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
@@ -887,6 +887,8 @@ struct Counting {
     fail: Option<Fail>,
     /// End the next apply's transaction once the counts are written, and then give up on it.
     abandon: Option<Abandon>,
+    /// Arm the commit hook once the counts are written, so the client's commit fails.
+    fail_commit: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -933,6 +935,9 @@ impl Apply for Counting {
             .bind(by)
             .execute(&mut *conn)
             .await?;
+        }
+        if let Some(armed) = self.fail_commit.take() {
+            armed.store(true, Ordering::SeqCst);
         }
         if let Some(abandon) = self.abandon.take() {
             end_the_transaction(conn).await?;
@@ -1411,7 +1416,7 @@ async fn on_or_after_reconnecting(peers: &mut [Peer; 2], server: &Server, at: &s
                 let at = format!("{at}, sync {n} on the same connection");
                 assert_durable(&mut peers[0], &at).await;
             }
-            Err(Error::ConnectionUnsound) => {
+            Err(Error::ConnectionUnsound { .. }) => {
                 refused = true;
                 break;
             }
@@ -1448,7 +1453,7 @@ async fn a_step_that_ends_the_transaction_and_panics_leaves_a_connection_the_nex
     assert!(panicked.is_err());
     let result = peers[0].sync(&server).await;
     assert!(
-        matches!(result, Err(Error::ConnectionUnsound)),
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
         "{result:?}"
     );
     on_or_after_reconnecting(&mut peers, &server, "panicked").await;
@@ -1468,7 +1473,7 @@ async fn a_step_that_ends_the_transaction_and_panics_leaves_a_connection_the_nex
     assert!(panicked.is_err());
     let result = a.sync(&server).await;
     assert!(
-        matches!(result, Err(Error::ConnectionUnsound)),
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
         "{result:?}"
     );
 }
@@ -1530,7 +1535,7 @@ async fn a_miscounted_connection_is_refused_and_a_fresh_one_syncs() {
     let requests = server.with(|s| s.requests.len());
     let result = peers[0].sync(&server).await;
     assert!(
-        matches!(result, Err(Error::ConnectionUnsound)),
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
         "{result:?}"
     );
     assert_eq!(server.with(|s| s.requests.len()), requests);
@@ -1555,7 +1560,7 @@ async fn a_sync_inside_a_transaction_is_refused_and_leaves_it_whole() {
             }
         };
         assert!(
-            matches!(result, Err(Error::ConnectionUnsound)),
+            matches!(result, Err(Error::ConnectionUnsound { .. })),
             "{result:?}"
         );
         assert_eq!(server.with(|s| s.requests.len()), requests);
@@ -1583,7 +1588,7 @@ async fn a_sync_inside_a_transaction_is_refused_and_leaves_it_whole() {
             .await;
         let result = a.sync(&server).await;
         assert!(
-            matches!(result, Err(Error::ConnectionUnsound)),
+            matches!(result, Err(Error::ConnectionUnsound { .. })),
             "{begin}: {result:?}"
         );
         assert_eq!(server.with(|s| s.requests.len()), requests, "{begin}");
@@ -1629,7 +1634,7 @@ async fn using_a_connection_a_panicked_sync_left_loses_writes_until_it_is_replac
     drop(other);
     let result = a.sync(&server).await;
     assert!(
-        matches!(result, Err(Error::ConnectionUnsound)),
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
         "{result:?}"
     );
     reconnect(a).await;
@@ -1697,7 +1702,7 @@ async fn a_pooled_connection_a_panicked_sync_left_is_refused_and_detached() {
     let mut conn = pool.acquire().await.unwrap();
     let result = sync(&mut conn, &replica, &server, &credentials, now).await;
     assert!(
-        matches!(result, Err(Error::ConnectionUnsound)),
+        matches!(result, Err(Error::ConnectionUnsound { .. })),
         "{result:?}"
     );
     let _ = conn.detach().close().await;
@@ -1712,6 +1717,148 @@ async fn a_pooled_connection_a_panicked_sync_left_is_refused_and_detached() {
     assert_eq!(settings, ["theme"]);
     assert_durable_on(&mut conn, "pooled").await;
     b.sync(&server).await.unwrap();
+}
+
+/// Fails the next commit on `conn` once `armed` is set, as SQLite does when a commit hook refuses:
+/// the commit becomes a rollback.
+async fn fail_commits(conn: &mut SqliteConnection, armed: Arc<AtomicBool>) {
+    conn.lock_handle()
+        .await
+        .unwrap()
+        .set_commit_hook(move || !armed.swap(false, Ordering::SeqCst));
+}
+
+/// Ways a step can leave its sync's connection unsound and still return.
+#[derive(Clone, Copy, Debug)]
+enum Leaves {
+    /// Ends the transaction inside a savepoint of its own, and returns the error its commit gives.
+    EndedInsideItsSavepoint,
+    /// Leaves a savepoint of its own behind.
+    ItsSavepoint,
+    /// Arms the commit hook, so the client's commit becomes a rollback.
+    AFailingCommit,
+}
+
+struct Leaving {
+    what: Leaves,
+    in_caught_up: bool,
+    armed: Arc<AtomicBool>,
+}
+
+impl Leaving {
+    async fn leave(&self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        match self.what {
+            Leaves::EndedInsideItsSavepoint => {
+                let mut savepoint = conn.begin().await?;
+                end_the_transaction(&mut savepoint).await?;
+                savepoint.commit().await?;
+            }
+            Leaves::ItsSavepoint => std::mem::forget(conn.begin().await?),
+            Leaves::AFailingCommit => self.armed.store(true, Ordering::SeqCst),
+        }
+        Ok(())
+    }
+}
+
+impl Apply for Leaving {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        let applied = replica.apply(conn, changes).await?;
+        if !self.in_caught_up {
+            self.leave(conn).await?;
+        }
+        Ok(applied)
+    }
+
+    async fn caught_up(
+        &mut self,
+        conn: &mut SqliteConnection,
+        _replica: &Replica,
+    ) -> Result<Option<Applied>, Error> {
+        if self.in_caught_up {
+            self.leave(conn).await?;
+        }
+        Ok(None)
+    }
+}
+
+/// Carries requests to the server, arming the commit hook as an append goes out, so the commit
+/// that acknowledges it fails.
+struct ArmsOnAppend<'a> {
+    server: &'a Server,
+    armed: Arc<AtomicBool>,
+}
+
+impl Transport for ArmsOnAppend<'_> {
+    async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        if request.method == Method::Post {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        self.server.send(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_sync_whose_failure_left_the_connection_unsound_says_so_and_keeps_the_cause() {
+    let mut cases: Vec<(String, Option<Leaving>)> = Vec::new();
+    for what in [
+        Leaves::EndedInsideItsSavepoint,
+        Leaves::ItsSavepoint,
+        Leaves::AFailingCommit,
+    ] {
+        for in_caught_up in [false, true] {
+            let leaving = Leaving {
+                what,
+                in_caught_up,
+                armed: Arc::new(AtomicBool::new(false)),
+            };
+            cases.push((
+                format!("{what:?} in_caught_up={in_caught_up}"),
+                Some(leaving),
+            ));
+        }
+    }
+    cases.push(("a failing acknowledgment".into(), None));
+    for (at, step) in cases {
+        let server = Server::new();
+        let mut peers = crash_scene(&server).await;
+        let keys = peers[0].credentials.library().clone();
+        let armed = match &step {
+            Some(leaving) => leaving.armed.clone(),
+            None => Arc::new(AtomicBool::new(false)),
+        };
+        fail_commits(&mut peers[0].conn, armed.clone()).await;
+        let a = &mut peers[0];
+        let result = match step {
+            Some(mut leaving) => sync_hooked(a, &server, &mut leaving).await,
+            None => {
+                let arming = ArmsOnAppend {
+                    server: &server,
+                    armed,
+                };
+                sync(&mut a.conn, &a.replica, &arming, &a.credentials, now).await
+            }
+        };
+        match &result {
+            Err(Error::ConnectionUnsound {
+                source: Some(cause),
+            }) => {
+                assert!(matches!(**cause, Error::Database(_)), "{at}: {cause:?}");
+            }
+            other => panic!("{at}: {other:?}"),
+        }
+        let next = a.sync(&server).await;
+        assert!(
+            matches!(next, Err(Error::ConnectionUnsound { source: None })),
+            "{at}: {next:?}"
+        );
+        on_or_after_reconnecting(&mut peers, &server, &at).await;
+        assert_no_change_sent_twice(&server, &keys);
+    }
 }
 
 #[tokio::test]
@@ -1821,11 +1968,11 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
 /// request, stores copies of envelopes already in the log, holds envelopes from signers it lists
 /// only later, sometimes holds more than one sync reads, and pages one to three envelopes at a
 /// time. Their applies fail at random before or after applying, or end the transaction and then
-/// panic or never return, after which the sync is given up on. After every sync the counts kept
+/// panic or never return, after which the sync is given up on, or make the commit after them fail. After every sync the counts kept
 /// from what each apply touched are right, and `caught_up` was called exactly when the pull read
 /// to the head, and never by a sync that failed before it appended. A sync that returned leaves the
-/// connection sound; one given up on may not, and the device then opens a fresh connection, at
-/// once or when its next sync refuses the old one. At the end every device agrees, and a second
+/// connection sound unless it says otherwise; one given up on may not, and the device then opens a
+/// fresh connection, at once or when its next sync refuses the old one. At the end every device agrees, and a second
 /// connection reads what each wrote.
 ///
 /// `FONGO_CLIENT_CASES` sets how many seeds run from `FONGO_CLIENT_SEED`. A seed fixes the steps;
@@ -1856,6 +2003,11 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             peer.run(COUNTS).await;
             peer.run(CAUGHT_UP).await;
             peer.run(ONCE).await;
+        }
+        let armed: Vec<Arc<AtomicBool>> =
+            (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        for (peer, armed) in peers.iter_mut().zip(&armed) {
+            fail_commits(&mut peer.conn, armed.clone()).await;
         }
         let mut unlisted: Vec<SigningKey> = Vec::new();
         let mut strangers = 0;
@@ -1911,12 +2063,15 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                             1 => Some(Fail::AfterApplying),
                             _ => None,
                         },
-                        abandon: match rng.below(8) {
-                            0 => Some(Abandon::Panics),
-                            1 => Some(Abandon::Hangs(hung)),
-                            _ => None,
-                        },
+                        abandon: None,
+                        fail_commit: None,
                     };
+                    match rng.below(8) {
+                        0 => hook.abandon = Some(Abandon::Panics),
+                        1 => hook.abandon = Some(Abandon::Hangs(hung)),
+                        2 => hook.fail_commit = Some(armed[who].clone()),
+                        _ => {}
+                    }
                     let noting = Noting {
                         server: &server,
                         appended: AtomicBool::new(false),
@@ -1934,7 +2089,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         () = until(hung) => None,
                     };
                     let abandoned = result.is_none();
-                    let refused = matches!(result, Some(Err(Error::ConnectionUnsound)));
+                    let refused = matches!(result, Some(Err(Error::ConnectionUnsound { .. })));
                     match result {
                         Some(Ok(report)) => {
                             let complete = report.blocked.is_none() && !report.more;
@@ -1948,6 +2103,8 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         _ => assert!(hook.caught_up <= 1, "{at}"),
                     }
                     server.behave();
+                    // A step that failed or was given up on before the commit leaves it unarmed.
+                    armed[who].store(false, Ordering::SeqCst);
                     // No request comes between `caught_up` and its commit, so a call is kept.
                     let after = peers[who]
                         .lines("SELECT CAST(count(*) AS TEXT) FROM caught_up")
@@ -1963,6 +2120,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                             .is_err()
                         {
                             reconnect(&mut peers[who]).await;
+                            fail_commits(&mut peers[who].conn, armed[who].clone()).await;
                         }
                     } else if !abandoned {
                         fongo_sync_client::check_connection(&mut peers[who].conn)
@@ -1977,12 +2135,13 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
         for stranger in unlisted.drain(..) {
             server.register(id, stranger.verifying_key());
         }
-        for peer in &mut peers {
+        for (peer, armed) in peers.iter_mut().zip(&armed) {
             if fongo_sync_client::check_connection(&mut peer.conn)
                 .await
                 .is_err()
             {
                 reconnect(peer).await;
+                fail_commits(&mut peer.conn, armed.clone()).await;
             }
         }
         for round in 0.. {

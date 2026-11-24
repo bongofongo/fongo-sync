@@ -142,14 +142,16 @@ pub struct SyncReport {
 /// [`check_connection`], and otherwise fails with [`Error::ConnectionUnsound`] before reading or
 /// writing anything.
 ///
-/// A sync that returns, even with an error, leaves the connection sound, unless a commit failed in
-/// a way that ended its transaction, as a full disk can. A sync that panicked or was dropped may
-/// not: sqlx can go on counting a transaction that SQLite has ended.
-/// A transaction then begun on the connection is a savepoint, which a commit still writes; but one
-/// rolled back or dropped leaves SQLite inside a transaction nothing will end, and every write on
-/// the connection after it, inside a transaction or not, is lost when the connection closes. The
-/// next sync reports such a connection, and the remedy is to close it and open a fresh one; a
-/// pooled one is detached rather than given back.
+/// A sync that returns `Ok`, or any error other than [`Error::ConnectionUnsound`], leaves the
+/// connection sound. [`Error::ConnectionUnsound`] means it cannot be trusted: sqlx may count a
+/// transaction SQLite has ended, or SQLite may hold one nothing will end, and what is written on
+/// it then may never reach the file. Close it, awaiting the close, before writing anything more,
+/// and open a fresh one: a connection only dropped, or left open, can keep its write transaction
+/// on the file, and the fresh one then finds the database locked. A pooled connection is detached
+/// and closed rather than given back.
+///
+/// A sync that panicked or was dropped can leave the connection unsound too, and returns nothing to
+/// say so; the next sync reports it, before reading or writing anything.
 ///
 /// # What the server is relied on for
 ///
@@ -164,7 +166,8 @@ pub async fn sync<T: Transport>(
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<SyncReport, Error> {
-    run(conn, replica, transport, credentials, now, &mut (), false).await
+    let result = run(conn, replica, transport, credentials, now, &mut (), false).await;
+    finish(conn, result).await
 }
 
 /// How [`sync_with`] applies what it receives, and what it does once a pull has read the whole
@@ -268,7 +271,29 @@ pub async fn sync_with<T: Transport, A: Apply>(
     now: impl Fn() -> u64 + Sync,
     apply: &mut A,
 ) -> Result<SyncReport, Error> {
-    run(conn, replica, transport, credentials, now, apply, true).await
+    let result = run(conn, replica, transport, credentials, now, apply, true).await;
+    finish(conn, result).await
+}
+
+/// Returns a sync's result, unless it is an error that left the connection unsound: a step that
+/// left a savepoint of its own behind, or ended the transaction inside one, or a commit that ended
+/// its own transaction. Then the connection cannot be trusted, and the error says so, carrying the
+/// original as its source.
+async fn finish(
+    conn: &mut SqliteConnection,
+    result: Result<SyncReport, Error>,
+) -> Result<SyncReport, Error> {
+    match result {
+        Err(error)
+            if !matches!(error, Error::ConnectionUnsound { .. })
+                && check_connection(conn).await.is_err() =>
+        {
+            Err(Error::ConnectionUnsound {
+                source: Some(Box::new(error)),
+            })
+        }
+        result => result,
+    }
 }
 
 /// One sync; `settles` says whether to call [`Apply::caught_up`], which `()` leaves empty.
@@ -463,9 +488,8 @@ async fn abandon(mut tx: Transaction<'_, Sqlite>, error: Error) -> Error {
     error
 }
 
-/// Whether SQLite has a transaction open on `conn`. SQLite refuses a change of safety level inside
-/// a transaction and ignores one for the temporary schema outside, and checks when it prepares
-/// the statement, so it is prepared afresh each time; any failure counts as inside. Being a
+/// Whether SQLite has a transaction open on `conn`: SQLite refuses a change of safety level inside
+/// one. The statement is prepared afresh each time, and any failure counts as inside. Being a
 /// statement, it runs after any rollback a dropped transaction queued.
 async fn in_transaction(conn: &mut SqliteConnection) -> bool {
     sqlx::query("PRAGMA temp.synchronous = OFF")
@@ -476,12 +500,14 @@ async fn in_transaction(conn: &mut SqliteConnection) -> bool {
 }
 
 /// Whether `conn` can carry a sync: SQLite has no transaction open on it and sqlx counts none.
-/// Fails with [`Error::ConnectionUnsound`] otherwise. It writes nothing and changes nothing;
-/// [`sync`] and [`sync_with`] call it first.
+/// Fails with [`Error::ConnectionUnsound`] otherwise. [`sync`] and [`sync_with`] call it first,
+/// and again before returning an error. It writes nothing to the database; its probe asks for the
+/// temporary schema's `synchronous` to be OFF, which is already so unless the application changed
+/// it.
 pub async fn check_connection(conn: &mut SqliteConnection) -> Result<(), Error> {
     // The probe first: sqlx's count is right only once a rollback it queued has run.
     if in_transaction(conn).await || conn.is_in_transaction() {
-        return Err(Error::ConnectionUnsound);
+        return Err(Error::ConnectionUnsound { source: None });
     }
     Ok(())
 }

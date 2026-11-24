@@ -54,16 +54,18 @@ pub enum Error {
     /// made before it. Nothing in that transaction was kept and the cursor did not move.
     #[error("the transaction a sync opened ended inside the application's step")]
     TransactionEnded,
-    /// The connection cannot carry a sync: SQLite has a transaction open on it, or sqlx counts one
-    /// that SQLite does not have, as a sync that panicked or was dropped can leave it. Nothing was
-    /// read or written. Finish a transaction the application opened; otherwise close the
-    /// connection and open a fresh one, detaching a pooled one rather than giving it back.
+    /// The connection cannot be trusted: SQLite has a transaction open on it, or sqlx counts one
+    /// that SQLite does not have. Either a sync found it so before reading or writing anything, or
+    /// a sync that failed left it so, and `source` is that failure. Finish a transaction the
+    /// application opened; otherwise close the connection, awaiting the close, before writing
+    /// anything more, and open a fresh one. A pooled connection is detached and closed rather
+    /// than given back.
     #[error(
-        "the connection cannot carry a sync: a transaction is open on it, or sqlx counts one SQLite \
-         does not have; finish a transaction you opened, or else close this connection and open a \
-         fresh one (from a pool, detach it rather than return it)"
+        "the connection cannot be trusted: a transaction is open on it, or sqlx counts one SQLite \
+         does not have; finish a transaction you opened, or else close this connection, awaiting \
+         the close, and open a fresh one (from a pool, detach and close it rather than return it)"
     )]
-    ConnectionUnsound,
+    ConnectionUnsound { source: Option<Box<Error>> },
 }
 
 impl From<sqlx::Error> for Error {
