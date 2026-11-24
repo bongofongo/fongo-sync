@@ -50,8 +50,8 @@ pub enum Error {
     #[error("the application's step failed: {0}")]
     Application(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// A step given through [`crate::Apply`] returned with the client's transaction ended, as a
-    /// statement SQLite answers by rolling back ends it. Nothing in that transaction was kept and
-    /// the cursor did not move.
+    /// statement SQLite answers by rolling back ends it, or rolled back to the savepoint the client
+    /// made before it. Nothing in that transaction was kept and the cursor did not move.
     #[error("the transaction a sync opened ended inside the application's step")]
     TransactionEnded,
 }

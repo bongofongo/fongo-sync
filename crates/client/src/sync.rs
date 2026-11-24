@@ -8,7 +8,7 @@ use fongo_sync_protocol::{
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED};
 use fongo_sync_sqlite::{Applied, Replica, Touched};
-use sqlx::{Connection, SqliteConnection};
+use sqlx::{Connection, Database, Sqlite, SqliteConnection, TransactionManager};
 
 use crate::credentials::Credentials;
 use crate::error::Error;
@@ -165,6 +165,11 @@ pub async fn sync<T: Transport>(
 /// fails with [`Error::TransactionEnded`] and the cursor does not move; whatever the method wrote
 /// after the transaction ended was committed on its own.
 ///
+/// The savepoint `fongo_client_watch`, made before each call, and the temporary table of that
+/// name are the client's: a method must not release the savepoint, roll back to it, or write the
+/// table. Rolling back to it fails the sync as an ended transaction does; releasing it fails the
+/// sync too, though nothing was lost.
+///
 /// Implement it with `async fn`; the futures must be `Send`.
 pub trait Apply: Send {
     /// Applies a batch of received changes and returns what that did, which is merged into
@@ -263,6 +268,7 @@ async fn run<T: Transport, A: Apply>(
     let caps = rpc.capabilities().await?;
     let library = credentials.library_id();
     let me = credentials.device_id();
+    let depth = <Sqlite as Database>::TransactionManager::get_transaction_depth(conn);
     let saved = state::load(conn, library).await?;
     let mut cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
@@ -276,6 +282,7 @@ async fn run<T: Transport, A: Apply>(
         appended: saved.appended,
         sending: saved.sending,
         landed: None,
+        depth,
     };
     let mut applier = Applier { replica, apply };
     let pulled = read_pages(
@@ -297,13 +304,19 @@ async fn run<T: Transport, A: Apply>(
     report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
 
     if settles && report.blocked.is_none() && !report.more {
-        let mut tx = conn.begin().await?;
-        begin_watch(&mut tx).await?;
-        let settled = apply.caught_up(&mut tx, replica).await?;
-        end_watch(&mut tx).await?;
-        tx.commit().await?;
-        if let Some(settled) = settled {
-            merge_applied(&mut report.applied, settled);
+        let settled = async {
+            let mut tx = conn.begin().await?;
+            begin_watch(&mut tx).await?;
+            let settled = apply.caught_up(&mut tx, replica).await?;
+            end_watch(&mut tx).await?;
+            tx.commit().await?;
+            Ok(settled)
+        }
+        .await;
+        match settled {
+            Ok(Some(settled)) => merge_applied(&mut report.applied, settled),
+            Ok(None) => {}
+            Err(error) => return Err(realign(conn, depth, error).await),
         }
     }
 
@@ -317,7 +330,16 @@ async fn run<T: Transport, A: Apply>(
             .map_or(0, |opened| opened.changes.len());
             match append(&rpc, credentials, sending.envelope).await {
                 Ok(seq) => {
-                    acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
+                    acknowledge(
+                        conn,
+                        replica,
+                        library,
+                        sending.through,
+                        seq,
+                        &mut cursor,
+                        depth,
+                    )
+                    .await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
@@ -376,29 +398,71 @@ async fn run<T: Transport, A: Apply>(
         };
         state::record_sending(conn, library, &sending).await?;
         let seq = append(&rpc, credentials, sending.envelope).await?;
-        acknowledge(conn, replica, library, sending.through, seq, &mut cursor).await?;
+        acknowledge(
+            conn,
+            replica,
+            library,
+            sending.through,
+            seq,
+            &mut cursor,
+            depth,
+        )
+        .await?;
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
     Ok(report)
 }
 
-/// Marks the client's transaction before the application's step, so [`end_watch`] can tell whether
-/// the step ended it.
+/// Marks the client's transaction before the application's step, with a savepoint and a row
+/// written inside it, so [`end_watch`] can tell whether the step ended the transaction or rolled
+/// back to the savepoint.
 async fn begin_watch(conn: &mut SqliteConnection) -> Result<(), Error> {
-    sqlx::query("SAVEPOINT fongo_client_watch")
-        .execute(conn)
-        .await?;
+    for sql in [
+        "SAVEPOINT fongo_client_watch",
+        "CREATE TEMP TABLE IF NOT EXISTS fongo_client_watch (mark INTEGER NOT NULL)",
+        "INSERT INTO temp.fongo_client_watch VALUES (1)",
+    ] {
+        sqlx::query(sql).execute(&mut *conn).await?;
+    }
     Ok(())
 }
 
-/// Fails when the transaction [`begin_watch`] marked has ended: its savepoint is gone with it.
+/// Fails when the row [`begin_watch`] wrote is gone, or its savepoint: the transaction ended, or
+/// was rolled back to the savepoint.
 async fn end_watch(conn: &mut SqliteConnection) -> Result<(), Error> {
-    sqlx::query("RELEASE fongo_client_watch")
-        .execute(conn)
-        .await
-        .map_err(|_| Error::TransactionEnded)?;
+    let marks: Result<i64, _> = sqlx::query_scalar("SELECT count(*) FROM temp.fongo_client_watch")
+        .fetch_one(&mut *conn)
+        .await;
+    if marks.ok() != Some(1) {
+        return Err(Error::TransactionEnded);
+    }
+    for sql in [
+        "DELETE FROM temp.fongo_client_watch",
+        "RELEASE fongo_client_watch",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|_| Error::TransactionEnded)?;
+    }
     Ok(())
+}
+
+/// Returns `error` once sqlx's count of open transactions is back to `depth`, where it stood when
+/// the sync began, after a transaction of the client's failed and was dropped. A statement that
+/// ended SQLite's transaction leaves the rollback sqlx queued on drop with nothing to end, and sqlx
+/// then still counts it open: every later transaction on the connection would be a savepoint, and
+/// nothing they commit would reach the file.
+async fn realign(conn: &mut SqliteConnection, depth: usize, error: Error) -> Error {
+    // The queued rollback runs before this statement does.
+    let _ = sqlx::query("SELECT 1").execute(&mut *conn).await;
+    if depth == 0 && <Sqlite as Database>::TransactionManager::get_transaction_depth(conn) > 0 {
+        // Fails, harmlessly, when SQLite is still in the transaction.
+        let _ = sqlx::query("BEGIN").execute(&mut *conn).await;
+        let _ = <Sqlite as Database>::TransactionManager::rollback(conn).await;
+    }
+    error
 }
 
 /// The replica received changes are applied to, and how.
@@ -419,6 +483,8 @@ struct Pull {
     sending: Option<Sending>,
     /// The outbox position the recorded envelope covers, once found at `read`.
     landed: Option<i64>,
+    /// sqlx's count of open transactions when the sync began.
+    depth: usize,
 }
 
 impl Pull {
@@ -434,25 +500,33 @@ impl Pull {
         collect: bool,
     ) -> Result<(), Error> {
         let replica = applier.replica;
-        let mut tx = conn.begin().await?;
-        let applied = if collect || !self.held.is_empty() {
-            begin_watch(&mut tx).await?;
-            let applied = applier.apply.apply(&mut tx, replica, &self.held).await?;
-            end_watch(&mut tx).await?;
-            Some(applied)
-        } else {
-            None
+        let written = async {
+            let mut tx = conn.begin().await?;
+            let applied = if collect || !self.held.is_empty() {
+                begin_watch(&mut tx).await?;
+                let applied = applier.apply.apply(&mut tx, replica, &self.held).await?;
+                end_watch(&mut tx).await?;
+                Some(applied)
+            } else {
+                None
+            };
+            state::advance(&mut tx, library, self.read).await?;
+            if let Some(through) = self.landed {
+                replica.acknowledge(&mut tx, through).await?;
+                state::clear_sending(&mut tx, library).await?;
+                state::record_appended(&mut tx, library, self.read, through).await?;
+            }
+            if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
+                replica.release_bases(&mut tx, through).await?;
+            }
+            tx.commit().await?;
+            Ok(applied)
+        }
+        .await;
+        let applied = match written {
+            Ok(applied) => applied,
+            Err(error) => return Err(realign(conn, self.depth, error).await),
         };
-        state::advance(&mut tx, library, self.read).await?;
-        if let Some(through) = self.landed {
-            replica.acknowledge(&mut tx, through).await?;
-            state::clear_sending(&mut tx, library).await?;
-            state::record_appended(&mut tx, library, self.read, through).await?;
-        }
-        if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
-            replica.release_bases(&mut tx, through).await?;
-        }
-        tx.commit().await?;
         self.landed = None;
         if let Some(applied) = applied {
             self.applied = true;
@@ -735,20 +809,28 @@ async fn acknowledge(
     through: i64,
     seq: u64,
     cursor: &mut u64,
+    depth: usize,
 ) -> Result<(), Error> {
-    let mut tx = conn.begin().await?;
-    replica.acknowledge(&mut tx, through).await?;
-    state::clear_sending(&mut tx, library).await?;
-    state::record_appended(&mut tx, library, seq, through).await?;
     let follows = Some(seq) == cursor.checked_add(1);
-    if follows {
-        state::advance(&mut tx, library, seq).await?;
+    let written = async {
+        let mut tx = conn.begin().await?;
+        replica.acknowledge(&mut tx, through).await?;
+        state::clear_sending(&mut tx, library).await?;
+        state::record_appended(&mut tx, library, seq, through).await?;
+        if follows {
+            state::advance(&mut tx, library, seq).await?;
+        }
+        let read = if follows { seq } else { *cursor };
+        if let Some(through) = state::read_past(&mut tx, library, read).await? {
+            replica.release_bases(&mut tx, through).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
-    let read = if follows { seq } else { *cursor };
-    if let Some(through) = state::read_past(&mut tx, library, read).await? {
-        replica.release_bases(&mut tx, through).await?;
+    .await;
+    if let Err(error) = written {
+        return Err(realign(conn, depth, error).await);
     }
-    tx.commit().await?;
     if follows {
         *cursor = seq;
     }

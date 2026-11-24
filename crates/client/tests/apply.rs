@@ -3,15 +3,20 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
-    Apply, Credentials, Error, SyncReport, Transport, create_library, join_library, sync_with,
+    Apply, Credentials, Error, Method, Request, Response, SyncReport, Transport, TransportError,
+    create_library, join_library, sync_with,
 };
-use sqlx::SqliteConnection;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{ConnectOptions, Connection, SqliteConnection};
 use support::{Library, Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch};
 
 async fn credentials(server: &Server) -> [Credentials; 2] {
@@ -22,9 +27,57 @@ async fn credentials(server: &Server) -> [Credentials; 2] {
     [made, joined]
 }
 
+/// A replica over a file of its own, so a second connection can read what reached the file.
+async fn file_peer(credentials: Credentials) -> Peer {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = DIR.get_or_init(|| scratch("apply"));
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Peer::new_at(&dir.join(format!("{n}.db")), credentials).await
+}
+
+/// The connection is out of every transaction as sqlx and SQLite both count them, and a second
+/// connection to the file reads every table as this one does.
+async fn assert_durable(peer: &mut Peer, at: &str) {
+    drop(peer.conn.begin().await.unwrap());
+    let begun = sqlx::query("BEGIN").execute(&mut peer.conn).await;
+    assert!(begun.is_ok(), "{at}: still in a transaction: {begun:?}");
+    sqlx::query("ROLLBACK")
+        .execute(&mut peer.conn)
+        .await
+        .unwrap();
+    let file: String =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_one(&mut peer.conn)
+            .await
+            .unwrap();
+    assert!(!file.is_empty(), "{at}: the database is not a file");
+    let mut other = SqliteConnectOptions::new()
+        .filename(&file)
+        .connect()
+        .await
+        .unwrap();
+    assert_eq!(
+        everything(&mut other).await,
+        everything(&mut peer.conn).await,
+        "{at}"
+    );
+}
+
+/// An envelope from `signer` setting `name`, sealed outside any peer the test syncs.
+async fn sealed_setting(keys: &LibraryKeys, signer: &SigningKey, name: &str) -> Vec<u8> {
+    let mut sealer = Peer::new(Credentials::new(keys.clone(), signer.clone(), 0)).await;
+    sealer
+        .run(&format!("INSERT INTO settings VALUES ('{name}', 'x')"))
+        .await;
+    sealer.replica.collect(&mut sealer.conn).await.unwrap();
+    let outbox = sealer.replica.outbox(&mut sealer.conn, 100).await.unwrap();
+    seal(&outbox.changes, keys, 0, signer, random_nonce().unwrap())
+}
+
 async fn pair(server: &Server) -> [Peer; 2] {
     let [made, joined] = credentials(server).await;
-    let mut peers = [Peer::new(made).await, Peer::new(joined).await];
+    let mut peers = [file_peer(made).await, file_peer(joined).await];
     for peer in &mut peers {
         peer.run(MARKS).await;
     }
@@ -400,6 +453,7 @@ async fn what_the_hook_writes_is_kept_with_the_applied_rows_and_the_cursor_or_no
             assert_eq!(applied, n >= 4, "lose={lose} n={n}");
             assert_eq!(applied, a.cursor().await >= 1, "lose={lose} n={n}");
             assert_eq!(marked, i64::from(applied), "lose={lose} n={n}");
+            assert_durable(&mut a, &format!("lose={lose} n={n}")).await;
 
             server.behave();
             for _ in 0..3 {
@@ -408,6 +462,7 @@ async fn what_the_hook_writes_is_kept_with_the_applied_rows_and_the_cursor_or_no
             }
             let signer = b.credentials.clone();
             marked_once(&mut a, &server, &signer, 1).await;
+            assert_durable(&mut a, &format!("lose={lose} n={n}, at the end")).await;
             assert_converged(&mut [a, b]).await;
         }
     }
@@ -453,6 +508,7 @@ async fn a_sync_dropped_at_any_request_keeps_the_hooks_rows_with_the_cursor() {
                 assert_eq!(applied, cursor > i, "{at}");
                 assert_eq!(marked(&mut a, &title).await, i64::from(applied), "{at}");
             }
+            assert_durable(&mut a, &format!("handled={handled} n={n}")).await;
 
             server.behave();
             for _ in 0..3 {
@@ -461,6 +517,7 @@ async fn a_sync_dropped_at_any_request_keeps_the_hooks_rows_with_the_cursor() {
             }
             let signer = b.credentials.clone();
             marked_once(&mut a, &server, &signer, 3).await;
+            assert_durable(&mut a, &format!("handled={handled} n={n}, at the end")).await;
             assert_converged(&mut [a, b]).await;
             if ended {
                 break;
@@ -528,6 +585,7 @@ async fn a_failure_in_any_of_the_clients_writes_after_the_hook_keeps_none_of_its
         assert_eq!(a.cursor().await, 1, "{write}");
         assert_eq!(a.settings().await, Vec::<String>::new(), "{write}");
         assert_eq!(marked(&mut a, "stranger").await, 0, "{write}");
+        assert_durable(&mut a, write).await;
 
         hook.after = None;
         sync_hooked(&mut a, &server, &mut hook).await.unwrap();
@@ -561,6 +619,7 @@ async fn an_apply_that_fails_keeps_nothing_and_the_next_sync_recovers() {
         assert_eq!(marked(&mut a, "dark").await, 0, "{at:?}");
         // Nothing was sent: the error came before the outbox.
         assert_eq!(server.log(id).len(), 1, "{at:?}");
+        assert_durable(&mut a, &format!("{at:?}")).await;
 
         let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
         assert_eq!(report.received, 3, "{at:?}");
@@ -568,6 +627,7 @@ async fn an_apply_that_fails_keeps_nothing_and_the_next_sync_recovers() {
         assert_eq!(a.settings().await, ["theme=dark"], "{at:?}");
         assert_eq!(marked(&mut a, "dark").await, 1, "{at:?}");
         assert_eq!(a.cursor().await, 2, "{at:?}");
+        assert_durable(&mut a, &format!("{at:?}, recovered")).await;
         b.sync(&server).await.unwrap();
         assert_converged(&mut [a, b]).await;
     }
@@ -576,36 +636,27 @@ async fn an_apply_that_fails_keeps_nothing_and_the_next_sync_recovers() {
 /// The first device has an append past its cursor that it has not read back, and an envelope
 /// from a device it has not listed yet before it, so its next pull applies at its own envelope
 /// and again at the end.
-#[tokio::test]
-async fn an_apply_that_fails_part_way_through_a_pull_is_tried_once_more_before_the_error() {
-    let server = Server::new();
-    let [mut a, mut b] = pair(&server).await;
+async fn behind_its_own_append(server: &Server) -> [Peer; 2] {
+    let [mut a, mut b] = pair(server).await;
     let keys = a.credentials.library().clone();
     b.run("INSERT INTO settings VALUES ('first', 'x')").await;
-    b.sync(&server).await.unwrap();
+    b.sync(server).await.unwrap();
     let stranger = generate_signing_key().unwrap();
-    let mut c = Peer::new(Credentials::new(keys.clone(), stranger.clone(), 0)).await;
-    c.run("INSERT INTO settings VALUES ('stranger', 'x')").await;
-    c.replica.collect(&mut c.conn).await.unwrap();
-    let outbox = c.replica.outbox(&mut c.conn, 100).await.unwrap();
-    server.inject(
-        keys.id,
-        seal(
-            &outbox.changes,
-            &keys,
-            0,
-            &stranger,
-            random_nonce().unwrap(),
-        ),
-    );
+    server.inject(keys.id, sealed_setting(&keys, &stranger, "stranger").await);
     a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
-    let blocked = a.sync(&server).await.unwrap();
+    let blocked = a.sync(server).await.unwrap();
     assert_eq!(blocked.blocked.map(|b| b.seq), Some(2));
     assert_eq!(a.cursor().await, 1);
     b.run("INSERT INTO settings VALUES ('last', 'x')").await;
-    b.sync(&server).await.unwrap();
+    b.sync(server).await.unwrap();
     server.register(keys.id, stranger.verifying_key());
+    [a, b]
+}
 
+#[tokio::test]
+async fn an_apply_that_fails_part_way_through_a_pull_is_tried_once_more_before_the_error() {
+    let server = Server::new();
+    let [mut a, mut b] = behind_its_own_append(&server).await;
     let mut hook = Marking {
         fail: Some((Fail::AfterApplying, 1)),
         ..Marking::default()
@@ -618,9 +669,11 @@ async fn an_apply_that_fails_part_way_through_a_pull_is_tried_once_more_before_t
     assert_eq!(a.cursor().await, 3);
     assert_eq!(a.settings().await, ["first=x", "mine=x", "stranger=x"]);
     assert_eq!(marked(&mut a, "stranger").await, 1);
+    assert_durable(&mut a, "after the retry").await;
 
     sync_hooked(&mut a, &server, &mut hook).await.unwrap();
     assert_eq!(hook.caught_up, 1);
+    assert_durable(&mut a, "recovered").await;
     assert_eq!(
         a.settings().await,
         ["first=x", "last=x", "mine=x", "stranger=x"]
@@ -646,6 +699,7 @@ async fn caught_up_that_fails_keeps_the_pull_and_sends_nothing_until_it_succeeds
     assert_eq!(a.cursor().await, 1);
     assert!(settled(&mut a).await.is_empty());
     assert_eq!(server.log(id).len(), 1);
+    assert_durable(&mut a, "caught_up failed").await;
 
     hook.fail_caught_up = false;
     let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
@@ -654,6 +708,7 @@ async fn caught_up_that_fails_keeps_the_pull_and_sends_nothing_until_it_succeeds
     assert!(report.sent > 0);
     assert_eq!(settled(&mut a).await, [2]);
     assert_eq!(server.log(id).len(), 2);
+    assert_durable(&mut a, "recovered").await;
     b.sync(&server).await.unwrap();
     assert_converged(&mut [a, b]).await;
 }
@@ -806,6 +861,7 @@ async fn what_caught_up_applies_is_merged_into_the_report_and_sent() {
 const PRESENT: &str = "CREATE TABLE present (
     collection TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (collection, key))";
 const COUNTS: &str = "CREATE TABLE counts (collection TEXT PRIMARY KEY, n INTEGER NOT NULL)";
+const CAUGHT_UP: &str = "CREATE TABLE caught_up (n INTEGER NOT NULL)";
 const ROWS: &str = "SELECT 'books', json_array(id) FROM books
     UNION ALL SELECT 'notes', json_array(id) FROM notes
     UNION ALL SELECT 'settings', json_array(key) FROM settings";
@@ -815,6 +871,8 @@ const ROWS: &str = "SELECT 'books', json_array(id) FROM books
 #[derive(Default)]
 struct Counting {
     caught_up: usize,
+    /// Fail the next apply, at this point.
+    fail: Option<Fail>,
 }
 
 impl Apply for Counting {
@@ -824,7 +882,14 @@ impl Apply for Counting {
         replica: &Replica,
         changes: &[Change],
     ) -> Result<Applied, Error> {
+        if self.fail.take_if(|f| *f == Fail::BeforeApplying).is_some() {
+            return Err(failed("before applying"));
+        }
         let applied = replica.apply(conn, changes).await?;
+        // Between the rows and the counts kept from them, which only one transaction keeps true.
+        if self.fail.take().is_some() {
+            return Err(failed("after applying"));
+        }
         for touched in &applied.touched {
             let sql = if touched.deleted {
                 "DELETE FROM present WHERE collection = ? AND key = ?"
@@ -852,10 +917,13 @@ impl Apply for Counting {
 
     async fn caught_up(
         &mut self,
-        _conn: &mut SqliteConnection,
+        conn: &mut SqliteConnection,
         _replica: &Replica,
     ) -> Result<Option<Applied>, Error> {
         self.caught_up += 1;
+        sqlx::query("INSERT INTO caught_up VALUES (1)")
+            .execute(&mut *conn)
+            .await?;
         Ok(None)
     }
 }
@@ -915,13 +983,14 @@ async fn three_devices_keep_counts_from_what_each_apply_touched() {
         .unwrap();
     let third = Credentials::new(made.library().clone(), key, 0);
     let mut peers = [
-        Peer::new(made).await,
-        Peer::new(joined).await,
-        Peer::new(third).await,
+        file_peer(made).await,
+        file_peer(joined).await,
+        file_peer(third).await,
     ];
     for peer in &mut peers {
         peer.run(PRESENT).await;
         peer.run(COUNTS).await;
+        peer.run(CAUGHT_UP).await;
         // A second entity with a title takes the local id of the one it replaced.
         peer.run("CREATE UNIQUE INDEX books_title ON books (title)")
             .await;
@@ -971,13 +1040,17 @@ async fn three_devices_keep_counts_from_what_each_apply_touched() {
         "{state:#?}"
     );
     for (n, peer) in peers.iter_mut().enumerate() {
-        assert_counted(peer, &format!("device {n} at the end")).await;
+        let at = format!("device {n} at the end");
+        assert_counted(peer, &at).await;
+        assert_durable(peer, &at).await;
     }
 }
 
 /// Ends the transaction it is given, as SQLite does for `INSERT OR ROLLBACK` on a conflict, and
-/// swallows the error, in its apply or once the pull is complete.
+/// swallows the error: in its next `applies` applies, and once the pull is complete when
+/// `in_caught_up`.
 struct Swallowing {
+    applies: usize,
     in_caught_up: bool,
 }
 
@@ -1000,7 +1073,8 @@ impl Apply for Swallowing {
         changes: &[Change],
     ) -> Result<Applied, Error> {
         let applied = replica.apply(conn, changes).await?;
-        if !self.in_caught_up {
+        if self.applies > 0 {
+            self.applies -= 1;
             end_the_transaction(conn).await?;
         }
         Ok(applied)
@@ -1025,6 +1099,7 @@ async fn an_apply_that_ends_the_transaction_and_hides_it_fails_the_sync_and_move
     let id = a.credentials.library_id();
     a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
     let mut hook = Swallowing {
+        applies: 1,
         in_caught_up: false,
     };
     let result = sync_hooked(&mut a, &server, &mut hook).await;
@@ -1032,14 +1107,13 @@ async fn an_apply_that_ends_the_transaction_and_hides_it_fails_the_sync_and_move
     assert_eq!(a.cursor().await, 0);
     assert!(a.settings().await.is_empty());
     assert_eq!(server.log(id).len(), 1);
-    // No transaction is left open.
-    a.run("BEGIN").await;
-    a.run("ROLLBACK").await;
+    assert_durable(&mut a, "the transaction ended").await;
 
     let report = a.sync(&server).await.unwrap();
     assert_eq!(report.received, 3);
     assert_eq!(a.settings().await, ["theme=dark"]);
     assert_eq!(a.cursor().await, 2);
+    assert_durable(&mut a, "recovered").await;
     b.sync(&server).await.unwrap();
     assert_converged(&mut [a, b]).await;
 }
@@ -1050,20 +1124,178 @@ async fn caught_up_that_ends_the_transaction_and_hides_it_fails_the_sync_and_sen
     let [mut a, mut b] = crash_scene(&server).await;
     let id = a.credentials.library_id();
     a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
-    let mut hook = Swallowing { in_caught_up: true };
+    let mut hook = Swallowing {
+        applies: 0,
+        in_caught_up: true,
+    };
     let result = sync_hooked(&mut a, &server, &mut hook).await;
     assert!(matches!(result, Err(Error::TransactionEnded)), "{result:?}");
     assert_eq!(a.cursor().await, 1);
     assert_eq!(a.settings().await, ["theme=dark"]);
     assert_eq!(server.log(id).len(), 1);
-    a.run("BEGIN").await;
-    a.run("ROLLBACK").await;
+    assert_durable(&mut a, "the transaction ended").await;
 
     let report = a.sync(&server).await.unwrap();
     assert!(report.sent > 0);
     assert_eq!(server.log(id).len(), 2);
+    assert_durable(&mut a, "recovered").await;
     b.sync(&server).await.unwrap();
     assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn an_apply_that_ends_the_transaction_part_way_through_a_pull_is_tried_once_more() {
+    for applies in [1, 2] {
+        let server = Server::new();
+        let [mut a, mut b] = behind_its_own_append(&server).await;
+        a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
+        let mut hook = Swallowing {
+            applies,
+            in_caught_up: false,
+        };
+        let result = sync_hooked(&mut a, &server, &mut hook).await;
+        assert!(
+            matches!(result, Err(Error::TransactionEnded)),
+            "{applies}: {result:?}"
+        );
+        // The apply at its own envelope ended the transaction; the client applied what it held
+        // once more, which kept it when that apply left the transaction alone.
+        let kept = applies == 1;
+        assert_eq!(a.cursor().await, if kept { 3 } else { 1 }, "{applies}");
+        let mut want = vec!["first=x", "mine=x"];
+        if kept {
+            want.push("stranger=x");
+        }
+        assert_eq!(a.settings().await, want, "{applies}");
+        assert_durable(&mut a, &format!("{applies}")).await;
+
+        a.sync(&server).await.unwrap();
+        assert_eq!(
+            a.settings().await,
+            ["first=x", "last=x", "mine=x", "stranger=x"],
+            "{applies}"
+        );
+        assert_durable(&mut a, &format!("{applies}, recovered")).await;
+        b.sync(&server).await.unwrap();
+        assert_converged(&mut [a, b]).await;
+    }
+}
+
+#[tokio::test]
+async fn after_a_transaction_ends_inside_a_step_later_syncs_reach_the_file() {
+    let server = Server::new();
+    let [mut a, mut b] = crash_scene(&server).await;
+    a.run("CREATE TABLE once (id INTEGER PRIMARY KEY)").await;
+    let mut swallowing = Swallowing {
+        applies: 1,
+        in_caught_up: false,
+    };
+    let result = sync_hooked(&mut a, &server, &mut swallowing).await;
+    assert!(matches!(result, Err(Error::TransactionEnded)), "{result:?}");
+    let mut failing = Marking {
+        fail: Some((Fail::AfterApplying, 1)),
+        ..Marking::default()
+    };
+    let result = sync_hooked(&mut a, &server, &mut failing).await;
+    assert!(matches!(result, Err(Error::Application(_))), "{result:?}");
+    assert_durable(&mut a, "after two failed syncs").await;
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.settings().await, ["theme=dark"]);
+    assert_durable(&mut a, "after a plain sync").await;
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_row_whose_write_ends_the_transaction_fails_the_sync_and_leaves_the_connection_sound() {
+    let server = Server::new();
+    let [mut a, mut b] = crash_scene(&server).await;
+    a.run(
+        "CREATE TRIGGER no_dark BEFORE INSERT ON settings WHEN NEW.value = 'dark'
+         BEGIN SELECT RAISE(ROLLBACK, 'no dark'); END",
+    )
+    .await;
+    let result = a.sync(&server).await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(a.cursor().await, 0);
+    assert!(a.settings().await.is_empty());
+    assert_durable(&mut a, "the kernel's apply ended the transaction").await;
+
+    a.run("DROP TRIGGER no_dark").await;
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.settings().await, ["theme=dark"]);
+    assert_durable(&mut a, "recovered").await;
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn an_acknowledgment_that_ends_the_transaction_fails_the_sync_and_leaves_the_connection_sound()
+ {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    a.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('theme', 'dark')").await;
+    a.run(
+        "CREATE TEMP TRIGGER ends BEFORE INSERT ON fongo_client_appended
+         BEGIN SELECT RAISE(ROLLBACK, 'ends'); END",
+    )
+    .await;
+    // The server stores the envelope; recording where it landed ends the transaction.
+    assert!(a.sync(&server).await.is_err());
+    assert_eq!(server.log(id).len(), 1);
+    assert_durable(&mut a, "the acknowledgment ended the transaction").await;
+
+    a.run("DROP TRIGGER temp.ends").await;
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(server.log(id).len(), 1);
+    assert_eq!(report.sent, 3);
+    assert_durable(&mut a, "recovered").await;
+    b.sync(&server).await.unwrap();
+    assert_converged(&mut [a, b]).await;
+}
+
+/// Rolls back to the client's savepoint, or releases it, after applying.
+struct Undoing(&'static str);
+
+impl Apply for Undoing {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        let applied = replica.apply(conn, changes).await?;
+        sqlx::query(self.0).execute(&mut *conn).await?;
+        Ok(applied)
+    }
+}
+
+#[tokio::test]
+async fn a_step_that_rolls_back_or_releases_the_clients_savepoint_fails_the_sync() {
+    for sql in [
+        "ROLLBACK TO fongo_client_watch",
+        "RELEASE fongo_client_watch",
+    ] {
+        let server = Server::new();
+        let [mut a, mut b] = pair(&server).await;
+        // A sync before, so what the client keeps for its savepoint outlasts the transaction.
+        sync_hooked(&mut a, &server, &mut ()).await.unwrap();
+        b.run("INSERT INTO settings VALUES ('theme', 'dark')").await;
+        b.sync(&server).await.unwrap();
+        let result = sync_hooked(&mut a, &server, &mut Undoing(sql)).await;
+        assert!(
+            matches!(result, Err(Error::TransactionEnded)),
+            "{sql}: {result:?}"
+        );
+        assert_eq!(a.cursor().await, 0, "{sql}");
+        assert!(a.settings().await.is_empty(), "{sql}");
+        assert_durable(&mut a, sql).await;
+        a.sync(&server).await.unwrap();
+        b.sync(&server).await.unwrap();
+        assert_converged(&mut [a, b]).await;
+    }
 }
 
 #[tokio::test]
@@ -1128,51 +1360,106 @@ fn env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Carries requests to the server and notes whether any was an append.
+struct Noting<'a> {
+    server: &'a Server,
+    appended: AtomicBool,
+}
+
+impl Transport for Noting<'_> {
+    async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        if request.method == Method::Post {
+            self.appended.store(true, Ordering::Relaxed);
+        }
+        self.server.send(request).await
+    }
+}
+
+/// sqlx and SQLite agree that the connection is in no transaction.
+async fn assert_clean(peer: &mut Peer, at: &str) {
+    drop(peer.conn.begin().await.unwrap());
+    let begun = sqlx::query("BEGIN").execute(&mut peer.conn).await;
+    assert!(begun.is_ok(), "{at}: still in a transaction: {begun:?}");
+    sqlx::query("ROLLBACK")
+        .execute(&mut peer.conn)
+        .await
+        .unwrap();
+}
+
 /// Three devices write at random and sync through a server that fails, loses or hangs a random
-/// request, stores copies of envelopes already in the log, and pages one to three envelopes at a
-/// time. After every sync the counts kept from what each apply touched are right, and `caught_up`
-/// was called exactly when the pull read to the head; at the end every device agrees.
+/// request, stores copies of envelopes already in the log, holds envelopes from signers it lists
+/// only later, sometimes holds more than one sync reads, and pages one to three envelopes at a
+/// time; their applies fail at random before or after applying. After every sync the counts kept
+/// from what each apply touched are right, the connection is in no transaction, and `caught_up`
+/// was called exactly when the pull read to the head, and never by a sync that failed before it
+/// appended. At the end every device agrees, and a second connection reads what each wrote.
 ///
 /// `FONGO_CLIENT_CASES` sets how many seeds run from `FONGO_CLIENT_SEED`. A seed fixes the steps;
 /// keys and ids are still drawn afresh, so a failure names its seed but may need a few runs.
 #[tokio::test]
 async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge() {
     let first = env("FONGO_CLIENT_SEED", 1);
-    for seed in first..first + env("FONGO_CLIENT_CASES", 25) {
+    for seed in first..first + env("FONGO_CLIENT_CASES", 15) {
         let mut rng = Rng::new(seed);
         let server = Server::new();
-        server.with(|s| s.caps.max_page_batches = Some(1 + (seed % 3) as u32));
+        let page = 1 + seed % 3;
+        server.with(|s| s.caps.max_page_batches = Some(page as u32));
         let [made, joined] = credentials(&server).await;
         let key = generate_signing_key().unwrap();
         fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
             .await
             .unwrap();
         let third = Credentials::new(made.library().clone(), key, 0);
-        let id = made.library_id();
+        let keys = made.library().clone();
+        let id = keys.id;
         let mut peers = [
-            Peer::new(made).await,
-            Peer::new(joined).await,
-            Peer::new(third).await,
+            file_peer(made).await,
+            file_peer(joined).await,
+            file_peer(third).await,
         ];
         for peer in &mut peers {
             peer.run(PRESENT).await;
             peer.run(COUNTS).await;
+            peer.run(CAUGHT_UP).await;
         }
+        let mut unlisted: Vec<SigningKey> = Vec::new();
+        let mut strangers = 0;
+        let mut long = false;
         for step in 0..40 {
             let who = rng.below(3) as usize;
             let at = format!("seed {seed} step {step} device {who}");
-            match rng.below(6) {
-                0 | 1 => {
+            match rng.below(10) {
+                0..=2 => {
                     let sql = WRITES[rng.below(WRITES.len() as u64) as usize];
                     write(&mut peers[who], sql).await;
                 }
-                2 => {
+                3 => {
                     let log = server.log(id);
                     if !log.is_empty() {
                         let copy = log[rng.below(log.len() as u64) as usize].clone();
                         server.inject(id, copy);
                     }
                 }
+                4 if rng.below(2) == 0 => {
+                    let stranger = generate_signing_key().unwrap();
+                    let name = format!("stranger{strangers}");
+                    strangers += 1;
+                    server.inject(id, sealed_setting(&keys, &stranger, &name).await);
+                    unlisted.push(stranger);
+                }
+                4 => {
+                    for stranger in unlisted.drain(..) {
+                        server.register(id, stranger.verifying_key());
+                    }
+                }
+                // More than one sync reads, once in a case at most: a thousand pages.
+                5 if page == 1 && !long && rng.below(3) == 0 => {
+                    long = true;
+                    for _ in 0..1_001 {
+                        server.inject(id, b"not an envelope".to_vec());
+                    }
+                }
+                5 => {}
                 _ => {
                     let n = 1 + rng.below(8) as usize;
                     match rng.below(4) {
@@ -1181,10 +1468,27 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         2 => server.hang_at(n, rng.below(2) == 0),
                         _ => {}
                     }
-                    let mut hook = Counting::default();
+                    let mut hook = Counting {
+                        caught_up: 0,
+                        fail: match rng.below(4) {
+                            0 => Some(Fail::BeforeApplying),
+                            1 => Some(Fail::AfterApplying),
+                            _ => None,
+                        },
+                    };
+                    let noting = Noting {
+                        server: &server,
+                        appended: AtomicBool::new(false),
+                    };
                     let peer = &mut peers[who];
+                    let before = peer
+                        .lines("SELECT CAST(count(*) AS TEXT) FROM caught_up")
+                        .await;
                     let result = tokio::select! {
-                        result = sync_hooked(peer, &server, &mut hook) => Some(result),
+                        result = sync_with(
+                            &mut peer.conn, &peer.replica, &noting, &peer.credentials, now,
+                            &mut hook,
+                        ) => Some(result),
                         () = server.hung() => None,
                     };
                     match result {
@@ -1192,12 +1496,28 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                             let complete = report.blocked.is_none() && !report.more;
                             assert_eq!(hook.caught_up, usize::from(complete), "{at}");
                         }
+                        // Appends come after `caught_up`, so a sync that failed or was dropped
+                        // before one never called it.
+                        _ if !noting.appended.load(Ordering::Relaxed) => {
+                            assert_eq!(hook.caught_up, 0, "{at}: {result:?}");
+                        }
                         _ => assert!(hook.caught_up <= 1, "{at}"),
                     }
                     server.behave();
+                    // No request comes between `caught_up` and its commit, so a call is kept.
+                    let after = peers[who]
+                        .lines("SELECT CAST(count(*) AS TEXT) FROM caught_up")
+                        .await;
+                    let kept =
+                        after[0].parse::<usize>().unwrap() - before[0].parse::<usize>().unwrap();
+                    assert_eq!(kept, hook.caught_up, "{at}");
+                    assert_clean(&mut peers[who], &at).await;
                     assert_counted(&mut peers[who], &at).await;
                 }
             }
+        }
+        for stranger in unlisted.drain(..) {
+            server.register(id, stranger.verifying_key());
         }
         for round in 0.. {
             assert!(round < 12, "seed {seed}: the devices never stopped sending");
@@ -1205,13 +1525,16 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             for (n, peer) in peers.iter_mut().enumerate() {
                 let at = format!("seed {seed} round {round} device {n}");
                 let report = counted_sync(peer, &server, &at).await;
-                moved |= report.sent > 0 || report.received > 0;
+                moved |= report.sent > 0 || report.received > 0 || report.more;
             }
             if !moved {
                 break;
             }
         }
         assert_converged(&mut peers).await;
+        for (n, peer) in peers.iter_mut().enumerate() {
+            assert_durable(peer, &format!("seed {seed} device {n} at the end")).await;
+        }
     }
 }
 
