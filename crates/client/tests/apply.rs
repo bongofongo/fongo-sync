@@ -9,14 +9,15 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
-    Apply, Credentials, Error, Method, Request, Response, SyncReport, Transport, TransportError,
-    create_library, join_library, sync, sync_with,
+    Apply, Credentials, Error, Method, Pace, Request, Response, SyncReport, Transport,
+    TransportError, create_library, join_library, sync, sync_with,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection, SqliteConnection};
@@ -302,6 +303,33 @@ struct Marking {
     settle: Option<&'static str>,
     /// Run after every apply, before the client's own writes in the same transaction.
     after: Option<String>,
+    pace: Pace,
+    /// Calls of `between`, and how many of them found a transaction open.
+    betweens: usize,
+    inside: usize,
+    /// Fail the `between` call with this number, counting from 1.
+    fail_between: Option<usize>,
+    /// Never return from the `between` call with this number, raising the signal instead.
+    hang_between: Option<(usize, Arc<Signal>)>,
+    /// Run in every `between` call.
+    in_between: Option<&'static str>,
+    /// What happened, in order: each apply's changes, each gap.
+    events: Vec<String>,
+}
+
+/// One envelope per apply, and no pause.
+fn one_envelope() -> Pace {
+    Pace {
+        apply: 0,
+        hold: Duration::ZERO,
+        pause: Duration::ZERO,
+        ..Pace::default()
+    }
+}
+
+/// The paces the sweeps run under: the default, and the smallest.
+fn paces() -> [Pace; 2] {
+    [Pace::default(), one_envelope()]
 }
 
 fn failed(what: &str) -> Error {
@@ -316,6 +344,7 @@ impl Apply for Marking {
         changes: &[Change],
     ) -> Result<Applied, Error> {
         self.applies += 1;
+        self.events.push(format!("apply {}", changes.len()));
         let fail = match &mut self.fail {
             Some((at, left)) if *left > 0 => {
                 *left -= 1;
@@ -356,6 +385,7 @@ impl Apply for Marking {
         replica: &Replica,
     ) -> Result<Option<Applied>, Error> {
         self.caught_up += 1;
+        self.events.push("caught up".into());
         sqlx::query("CREATE TABLE IF NOT EXISTS settled (n INTEGER)")
             .execute(&mut *conn)
             .await?;
@@ -371,6 +401,31 @@ impl Apply for Marking {
         };
         sqlx::query(sql).execute(&mut *conn).await?;
         Ok(Some(replica.apply(conn, &[]).await?))
+    }
+
+    async fn between(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        self.betweens += 1;
+        self.events.push("between".into());
+        if conn.is_in_transaction() || fongo_sync_client::check_connection(conn).await.is_err() {
+            self.inside += 1;
+        }
+        if self.fail_between == Some(self.betweens) {
+            return Err(failed("between"));
+        }
+        if let Some(sql) = self.in_between {
+            sqlx::query(sql).execute(&mut *conn).await?;
+        }
+        if let Some((at, hung)) = &self.hang_between
+            && *at == self.betweens
+        {
+            hung.raise();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
     }
 }
 
@@ -448,7 +503,7 @@ async fn crash_scene(server: &Server) -> [Peer; 2] {
 
 #[tokio::test]
 async fn what_the_hook_writes_is_kept_with_the_applied_rows_and_the_cursor_or_not_at_all() {
-    for lose in [false, true] {
+    for (pace, lose) in paces().into_iter().flat_map(|p| [(p, false), (p, true)]) {
         for n in 1..=5 {
             let server = Server::new();
             let [mut a, mut b] = crash_scene(&server).await;
@@ -457,7 +512,10 @@ async fn what_the_hook_writes_is_kept_with_the_applied_rows_and_the_cursor_or_no
             } else {
                 server.fail_at(n);
             }
-            let mut hook = Marking::default();
+            let mut hook = Marking {
+                pace,
+                ..Marking::default()
+            };
             let result = sync_hooked(&mut a, &server, &mut hook).await;
             assert_eq!(result.is_ok(), n == 5, "lose={lose} n={n}: {result:?}");
             let applied = a.settings().await == ["theme=dark"];
@@ -482,7 +540,7 @@ async fn what_the_hook_writes_is_kept_with_the_applied_rows_and_the_cursor_or_no
 
 #[tokio::test]
 async fn a_sync_dropped_at_any_request_keeps_the_hooks_rows_with_the_cursor() {
-    for handled in [false, true] {
+    for (pace, handled) in paces().into_iter().flat_map(|p| [(p, false), (p, true)]) {
         for n in 1.. {
             assert!(n < 100, "the sync never ended");
             let server = Server::new();
@@ -503,7 +561,10 @@ async fn a_sync_dropped_at_any_request_keeps_the_hooks_rows_with_the_cursor() {
             }
             server.with(|s| s.caps.max_batch_bytes = Some(400));
             server.hang_at(n, handled);
-            let mut hook = Marking::default();
+            let mut hook = Marking {
+                pace,
+                ..Marking::default()
+            };
             let ended = tokio::select! {
                 result = sync_hooked(&mut a, &server, &mut hook) => {
                     result.unwrap();
@@ -516,7 +577,7 @@ async fn a_sync_dropped_at_any_request_keeps_the_hooks_rows_with_the_cursor() {
             for i in 0..3u64 {
                 let title = format!("theirs {i}");
                 let applied = titles.contains(&title);
-                let at = format!("handled={handled} n={n} i={i}");
+                let at = format!("{pace:?} handled={handled} n={n} i={i}");
                 assert_eq!(applied, cursor > i, "{at}");
                 assert_eq!(marked(&mut a, &title).await, i64::from(applied), "{at}");
             }
@@ -550,7 +611,10 @@ const CLIENT_WRITES: [&str; 5] = [
 
 #[tokio::test]
 async fn a_failure_in_any_of_the_clients_writes_after_the_hook_keeps_none_of_its_rows() {
-    for write in CLIENT_WRITES {
+    for (pace, write) in paces()
+        .into_iter()
+        .flat_map(|p| CLIENT_WRITES.map(|w| (p, w)))
+    {
         let server = Server::new();
         let [mut a, mut b] = pair(&server).await;
         let keys = a.credentials.library().clone();
@@ -584,8 +648,10 @@ async fn a_failure_in_any_of_the_clients_writes_after_the_hook_keeps_none_of_its
 
         let mut hook = Marking {
             after: Some(format!(
-                "CREATE TEMP TRIGGER crash BEFORE {write} BEGIN SELECT RAISE(ABORT, 'crash'); END"
+                "CREATE TEMP TRIGGER IF NOT EXISTS crash BEFORE {write}
+                 BEGIN SELECT RAISE(ABORT, 'crash'); END"
             )),
+            pace,
             ..Marking::default()
         };
         let result = sync_hooked(&mut a, &server, &mut hook).await;
@@ -593,13 +659,22 @@ async fn a_failure_in_any_of_the_clients_writes_after_the_hook_keeps_none_of_its
             matches!(result, Err(Error::Database(_))),
             "{write}: {result:?}"
         );
-        assert_eq!((hook.applies, hook.caught_up), (2, 0), "{write}");
-        assert_eq!(a.cursor().await, 1, "{write}");
-        assert_eq!(a.settings().await, Vec::<String>::new(), "{write}");
-        assert_eq!(marked(&mut a, "stranger").await, 0, "{write}");
-        assert_durable(&mut a, write).await;
+        // One envelope per apply puts the stranger's envelope in a transaction of its own, whose
+        // only client write is the cursor's; it commits, with the trigger, unless that write fails.
+        let kept = pace == one_envelope() && write != CLIENT_WRITES[0];
+        let at = format!("{pace:?} {write}");
+        assert_eq!(
+            (hook.applies, hook.caught_up),
+            (2 + usize::from(kept), 0),
+            "{at}"
+        );
+        assert_eq!(a.cursor().await, 1 + u64::from(kept), "{at}");
+        assert_eq!(a.settings().await.len(), usize::from(kept), "{at}");
+        assert_eq!(marked(&mut a, "stranger").await, i64::from(kept), "{at}");
+        assert_durable(&mut a, &at).await;
 
         hook.after = None;
+        a.run("DROP TRIGGER IF EXISTS temp.crash").await;
         sync_hooked(&mut a, &server, &mut hook).await.unwrap();
         assert_eq!(a.settings().await, ["stranger=x"], "{write}");
         assert_eq!(marked(&mut a, "stranger").await, 1, "{write}");
@@ -612,12 +687,16 @@ async fn a_failure_in_any_of_the_clients_writes_after_the_hook_keeps_none_of_its
 
 #[tokio::test]
 async fn an_apply_that_fails_keeps_nothing_and_the_next_sync_recovers() {
-    for at in [Fail::BeforeApplying, Fail::AfterApplying] {
+    for (pace, at) in paces()
+        .into_iter()
+        .flat_map(|p| [(p, Fail::BeforeApplying), (p, Fail::AfterApplying)])
+    {
         let server = Server::new();
         let [mut a, mut b] = crash_scene(&server).await;
         let id = a.credentials.library_id();
         let mut hook = Marking {
             fail: Some((at, 1)),
+            pace,
             ..Marking::default()
         };
         let result = sync_hooked(&mut a, &server, &mut hook).await;
@@ -667,31 +746,472 @@ async fn behind_its_own_append(server: &Server) -> [Peer; 2] {
 
 #[tokio::test]
 async fn an_apply_that_fails_part_way_through_a_pull_is_tried_once_more_before_the_error() {
+    for pace in paces() {
+        let server = Server::new();
+        let [mut a, mut b] = behind_its_own_append(&server).await;
+        let mut hook = Marking {
+            fail: Some((Fail::AfterApplying, 1)),
+            pace,
+            ..Marking::default()
+        };
+        let result = sync_hooked(&mut a, &server, &mut hook).await;
+        assert!(matches!(result, Err(Error::Application(_))), "{result:?}");
+        // The apply failed and was rolled back; the sync stopped reading, applied what it held
+        // once more, and kept that. By default that apply is the one at its own envelope; with
+        // one envelope per apply, the stranger's alone, before its own envelope is read.
+        assert_eq!((hook.applies, hook.caught_up), (2, 0), "{pace:?}");
+        let read = if pace == one_envelope() { 2 } else { 3 };
+        assert_eq!(a.cursor().await, read, "{pace:?}");
+        assert_eq!(a.settings().await, ["first=x", "mine=x", "stranger=x"]);
+        assert_eq!(marked(&mut a, "stranger").await, 1, "{pace:?}");
+        assert_durable(&mut a, "after the retry").await;
+
+        sync_hooked(&mut a, &server, &mut hook).await.unwrap();
+        assert_eq!(hook.caught_up, 1, "{pace:?}");
+        assert_durable(&mut a, "recovered").await;
+        assert_eq!(
+            a.settings().await,
+            ["first=x", "last=x", "mine=x", "stranger=x"]
+        );
+        b.sync(&server).await.unwrap();
+        assert_converged(&mut [a, b]).await;
+    }
+}
+
+/// The second device sent three envelopes, a book in each, and the first has a setting to send.
+async fn three_envelopes(server: &Server) -> [Peer; 2] {
+    let [mut a, mut b] = pair(server).await;
+    for i in 0..3 {
+        b.run(&format!("INSERT INTO books (title) VALUES ('theirs {i}')"))
+            .await;
+        b.sync(server).await.unwrap();
+    }
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    [a, b]
+}
+
+/// Each of the second device's books is on the first device and marked once exactly when the
+/// cursor is past its envelope.
+async fn applied_with_the_cursor(a: &mut Peer, at: &str) -> u64 {
+    let cursor = a.cursor().await;
+    let titles = a.lines("SELECT title FROM books").await;
+    for i in 0..3u64 {
+        let title = format!("theirs {i}");
+        let applied = titles.contains(&title);
+        assert_eq!(applied, cursor > i, "{at}: {title}, cursor {cursor}");
+        assert_eq!(marked(a, &title).await, i64::from(applied), "{at}: {title}");
+    }
+    cursor
+}
+
+#[tokio::test]
+async fn between_is_called_once_in_each_gap_and_never_inside_a_transaction() {
+    for (pace, applies) in [(Pace::default(), 1), (one_envelope(), 3)] {
+        let server = Server::new();
+        let [mut a, _b] = three_envelopes(&server).await;
+        let mut hook = Marking {
+            pace,
+            ..Marking::default()
+        };
+        let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
+        assert_eq!(report.sent, 3);
+        let events: Vec<&str> = hook
+            .events
+            .iter()
+            .map(|e| if e.starts_with("apply") { "apply" } else { e })
+            .collect();
+        // Each apply, `caught_up`, and the record and acknowledgment of the one envelope sent.
+        let mut want = vec!["apply"];
+        for _ in 1..applies {
+            want.extend(["between", "apply"]);
+        }
+        want.extend(["between", "caught up", "between", "between"]);
+        assert_eq!(events, want, "{pace:?}");
+        assert_eq!(hook.inside, 0, "{pace:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_failing_between_stops_the_sync_and_keeps_each_apply_with_its_cursor() {
     let server = Server::new();
-    let [mut a, mut b] = behind_its_own_append(&server).await;
+    let [mut a, mut b] = three_envelopes(&server).await;
+    let id = a.credentials.library_id();
     let mut hook = Marking {
-        fail: Some((Fail::AfterApplying, 1)),
+        pace: one_envelope(),
+        fail_between: Some(1),
         ..Marking::default()
     };
     let result = sync_hooked(&mut a, &server, &mut hook).await;
     assert!(matches!(result, Err(Error::Application(_))), "{result:?}");
-    // The apply at its own envelope failed and was rolled back; the sync stopped reading, applied
-    // what it held once more, and kept that.
-    assert_eq!((hook.applies, hook.caught_up), (2, 0));
-    assert_eq!(a.cursor().await, 3);
-    assert_eq!(a.settings().await, ["first=x", "mine=x", "stranger=x"]);
-    assert_eq!(marked(&mut a, "stranger").await, 1);
-    assert_durable(&mut a, "after the retry").await;
+    // The first envelope was committed with the cursor past it. The gap after it failed, and the
+    // second envelope, already held, was applied once more without another call.
+    assert_eq!((hook.applies, hook.betweens, hook.caught_up), (2, 1, 0));
+    assert_eq!(applied_with_the_cursor(&mut a, "the gap failed").await, 2);
+    assert_eq!(server.log(id).len(), 3);
+    assert_durable(&mut a, "the gap failed").await;
 
+    hook.fail_between = None;
     sync_hooked(&mut a, &server, &mut hook).await.unwrap();
-    assert_eq!(hook.caught_up, 1);
-    assert_durable(&mut a, "recovered").await;
+    b.sync(&server).await.unwrap();
+    let signer = b.credentials.clone();
+    marked_once(&mut a, &server, &signer, 3).await;
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_sync_dropped_inside_between_keeps_each_apply_with_its_cursor() {
+    let server = Server::new();
+    let [mut a, mut b] = three_envelopes(&server).await;
+    let id = a.credentials.library_id();
+    let hung = Arc::new(Signal::default());
+    let mut hook = Marking {
+        pace: one_envelope(),
+        hang_between: Some((1, hung.clone())),
+        ..Marking::default()
+    };
+    tokio::select! {
+        result = sync_hooked(&mut a, &server, &mut hook) => panic!("it returned: {result:?}"),
+        () = hung.raised() => {}
+    }
     assert_eq!(
-        a.settings().await,
-        ["first=x", "last=x", "mine=x", "stranger=x"]
+        applied_with_the_cursor(&mut a, "dropped in the gap").await,
+        1
     );
+    fongo_sync_client::check_connection(&mut a.conn)
+        .await
+        .unwrap();
+    assert_durable(&mut a, "dropped in the gap").await;
+    assert_eq!(server.log(id).len(), 3);
+
+    hook.hang_between = None;
+    sync_hooked(&mut a, &server, &mut hook).await.unwrap();
+    b.sync(&server).await.unwrap();
+    let signer = b.credentials.clone();
+    marked_once(&mut a, &server, &signer, 3).await;
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_between_that_leaves_a_transaction_open_stops_the_sync_as_unsound() {
+    let server = Server::new();
+    let [mut a, mut b] = three_envelopes(&server).await;
+    let id = a.credentials.library_id();
+    let mut hook = Marking {
+        pace: one_envelope(),
+        in_between: Some("BEGIN"),
+        ..Marking::default()
+    };
+    let result = sync_hooked(&mut a, &server, &mut hook).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionUnsound { source: None })),
+        "{result:?}"
+    );
+    // Nothing was written after the gap: the second envelope, held, was not applied.
+    assert_eq!((hook.applies, hook.betweens), (1, 1));
+    a.run("ROLLBACK").await;
+    assert_eq!(applied_with_the_cursor(&mut a, "left open").await, 1);
+    assert_durable(&mut a, "left open").await;
+    assert_eq!(server.log(id).len(), 3);
+
+    hook.in_between = None;
+    sync_hooked(&mut a, &server, &mut hook).await.unwrap();
+    b.sync(&server).await.unwrap();
+    let signer = b.credentials.clone();
+    marked_once(&mut a, &server, &signer, 3).await;
+    assert_converged(&mut [a, b]).await;
+}
+
+/// Drops a sync that applies one envelope at a time at each of its suspensions in turn, from a
+/// copy of one scene each time; see `a_sync_dropped_anywhere_around_an_ended_transaction_loses_nothing`
+/// for what a busy machine does to the suspensions visited. Nothing here ends a transaction, so
+/// the connection is always left sound.
+#[tokio::test]
+async fn a_sync_of_one_envelope_per_apply_dropped_anywhere_keeps_each_apply_with_its_cursor() {
+    const LIMIT: usize = 400;
+    let server = Server::new();
+    let mut scene = three_envelopes(&server).await;
+    for k in 1.. {
+        assert!(
+            k <= LIMIT,
+            "the sync suspended {LIMIT} times and had not ended"
+        );
+        let (server, [mut a, mut b]) = copy_scene(&server, &mut scene).await;
+        let mut hook = Marking {
+            pace: one_envelope(),
+            ..Marking::default()
+        };
+        let ended = drive_to(sync_hooked(&mut a, &server, &mut hook), k).await;
+        let at = format!("dropped at suspension {k}");
+        applied_with_the_cursor(&mut a, &at).await;
+        fongo_sync_client::check_connection(&mut a.conn)
+            .await
+            .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+        assert_durable(&mut a, &at).await;
+        sync_hooked(&mut a, &server, &mut Marking::default())
+            .await
+            .unwrap();
+        b.sync(&server).await.unwrap();
+        assert_eq!(applied_with_the_cursor(&mut a, &at).await, 4, "{at}");
+        assert_converged(&mut [a, b]).await;
+        if ended {
+            break;
+        }
+    }
+}
+
+/// The number of changes in each envelope of the log, which `signer` sealed.
+fn envelope_sizes(server: &Server, signer: &Credentials) -> Vec<usize> {
+    let keys = signer.library().clone();
+    let key = signer.device().verifying_key();
+    server
+        .log(keys.id)
+        .iter()
+        .map(|envelope| open(envelope, &keys, |_| Some(key)).unwrap().changes.len())
+        .collect()
+}
+
+fn sealing(seal: u32) -> Marking {
+    Marking {
+        pace: Pace {
+            seal,
+            ..Pace::default()
+        },
+        ..Marking::default()
+    }
+}
+
+#[tokio::test]
+async fn an_apply_takes_whole_envelopes_up_to_the_bound_and_a_larger_one_alone() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = None);
+    let [a, mut b] = pair(&server).await;
+    // Three changes a setting.
+    for n in 0..5 {
+        b.run(&format!("INSERT INTO settings VALUES ('k{n}', 'v')"))
+            .await;
+    }
+    sync_hooked(&mut b, &server, &mut sealing(4)).await.unwrap();
+    let signer = b.credentials.clone();
+    assert_eq!(envelope_sizes(&server, &signer), [4, 4, 4, 3]);
+    for (apply, want) in [
+        (usize::MAX, &[15][..]),
+        (15, &[15]),
+        (9, &[8, 7]),
+        (8, &[8, 7]),
+        (7, &[4, 4, 7]),
+        (3, &[4, 4, 4, 3]),
+        (0, &[4, 4, 4, 3]),
+    ] {
+        let mut fresh = file_peer(a.credentials.clone()).await;
+        fresh.run(MARKS).await;
+        let mut hook = Marking {
+            pace: Pace {
+                apply,
+                ..Pace::default()
+            },
+            ..Marking::default()
+        };
+        let report = sync_hooked(&mut fresh, &server, &mut hook).await.unwrap();
+        assert_eq!(report.received, 15);
+        let sizes: Vec<usize> = hook
+            .events
+            .iter()
+            .filter_map(|e| e.strip_prefix("apply ")?.parse().ok())
+            .collect();
+        assert_eq!(sizes, want, "apply at most {apply}");
+        marked_once(&mut fresh, &server, &signer, 4).await;
+        assert_eq!(fresh.settings().await.len(), 5);
+    }
+}
+
+#[tokio::test]
+async fn a_hundred_thousand_pending_changes_are_sealed_in_envelopes_within_the_bound() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_batch_bytes = Some(1 << 22));
+    let [mut a, _b] = pair(&server).await;
+    a.run(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 33334)
+         INSERT INTO settings SELECT 'k' || i, 'v' FROM n",
+    )
+    .await;
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.sent, 100_002);
+    let signer = a.credentials.clone();
+    let mut want = vec![1_000; 100];
+    want.push(2);
+    assert_eq!(envelope_sizes(&server, &signer), want);
+}
+
+#[tokio::test]
+async fn an_append_whose_answer_was_lost_among_several_is_found_and_not_sent_again() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    for n in 0..4 {
+        a.run(&format!("INSERT INTO settings VALUES ('k{n}', 'v')"))
+            .await;
+    }
+    // Twelve changes in envelopes of three. Capabilities, a page, then the appends; the third's
+    // answer is lost.
+    server.lose_at(5);
+    let result = sync_hooked(&mut a, &server, &mut sealing(3)).await;
+    assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
+    server.behave();
+    assert_eq!((server.log(keys.id).len(), a.cursor().await), (3, 2));
+    let report = sync_hooked(&mut a, &server, &mut sealing(3)).await.unwrap();
+    assert_eq!(report.sent, 6);
+    let signer = a.credentials.clone();
+    assert_eq!(envelope_sizes(&server, &signer), [3, 3, 3, 3]);
+    assert_no_change_sent_twice(&server, &keys);
+    b.sync(&server).await.unwrap();
+    assert_eq!(b.settings().await.len(), 4);
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn a_server_limit_below_the_bound_still_decides_the_envelope() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_batch_bytes = Some(400));
+    let [mut a, mut b] = pair(&server).await;
+    for n in 0..20 {
+        a.run(&format!("INSERT INTO settings VALUES ('k{n}', 'v')"))
+            .await;
+    }
+    sync_hooked(&mut a, &server, &mut sealing(50))
+        .await
+        .unwrap();
+    let signer = a.credentials.clone();
+    let sizes = envelope_sizes(&server, &signer);
+    assert_eq!(sizes.iter().sum::<usize>(), 60);
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|&n| n < 50),
+        "{sizes:?}"
+    );
+    let id = signer.library_id();
+    assert!(server.log(id).iter().all(|e| e.len() <= 400));
     b.sync(&server).await.unwrap();
     assert_converged(&mut [a, b]).await;
+}
+
+/// The same exchange, from copies of the same databases and log, under a pace: every sync's
+/// conflicts, sorted, both databases whole, and every change in the log, envelope by envelope.
+async fn exchanged(
+    pace: Pace,
+    dir: &Path,
+    server: &Server,
+    [a, b]: &[Credentials; 2],
+) -> (Vec<String>, Vec<String>, Vec<Vec<String>>) {
+    let server = copy_of(server);
+    let mut a = Peer::open(&dir.join("a.db"), a.clone()).await;
+    let mut b = Peer::open(&dir.join("b.db"), b.clone()).await;
+    let mut conflicts = Vec::new();
+    let mut applies = Vec::new();
+    for n in 0..4 {
+        let peer = if n % 2 == 0 { &mut a } else { &mut b };
+        let mut hook = Marking {
+            pace,
+            ..Marking::default()
+        };
+        let report = sync_hooked(peer, &server, &mut hook).await.unwrap();
+        let mut found: Vec<String> = report
+            .applied
+            .conflicts
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect();
+        found.sort();
+        conflicts.push(found.join("; "));
+        applies.push(hook.applies);
+    }
+    if pace == one_envelope() {
+        assert_eq!(
+            applies[0], 2,
+            "the first pull applies one envelope at a time"
+        );
+    }
+    let mut tables = everything(&mut a.conn).await;
+    tables.extend(everything(&mut b.conn).await);
+    let keys = a.credentials.library().clone();
+    let log = server
+        .log(keys.id)
+        .iter()
+        .map(|envelope| {
+            let opened = open(envelope, &keys, |device| {
+                [&a.credentials, &b.credentials]
+                    .into_iter()
+                    .find(|c| c.device_id() == device)
+                    .map(|c| c.device().verifying_key())
+            })
+            .unwrap();
+            opened.changes.iter().map(|c| format!("{c:?}")).collect()
+        })
+        .collect();
+    (conflicts, tables, log)
+}
+
+#[tokio::test]
+async fn conflicts_and_bases_do_not_depend_on_how_many_envelopes_an_apply_takes() {
+    let dir = scratch("conflicts-by-pace");
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = None);
+    let creds = credentials(&server).await;
+    let mut a = Peer::new_at(&dir.join("a.db"), creds[0].clone()).await;
+    let mut b = Peer::new_at(&dir.join("b.db"), creds[1].clone()).await;
+    for peer in [&mut a, &mut b] {
+        peer.run(MARKS).await;
+    }
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    // The second device edits the note twice, in two envelopes, before the first sends its own
+    // edit of it, and then edits it again before reading that.
+    b.run("UPDATE notes SET body = 'theirs, first'").await;
+    b.sync(&server).await.unwrap();
+    later();
+    b.run("UPDATE notes SET body = 'theirs, second'").await;
+    b.run("UPDATE books SET year = 1871").await;
+    b.sync(&server).await.unwrap();
+    later();
+    a.run("UPDATE notes SET body = 'mine'").await;
+    a.run("INSERT INTO settings VALUES ('font', 'serif')").await;
+    later();
+    b.run("UPDATE notes SET body = 'theirs, third'").await;
+    // Collected now, so the clocks of these edits are the same in every run below.
+    for peer in [&mut a, &mut b] {
+        peer.replica.collect(&mut peer.conn).await.unwrap();
+    }
+
+    let mut runs = Vec::new();
+    for (n, pace) in [
+        one_envelope(),
+        Pace::default(),
+        Pace {
+            apply: usize::MAX,
+            ..Pace::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let world = dir.join(format!("world{n}"));
+        std::fs::create_dir_all(&world).unwrap();
+        a.back_up(&world.join("a.db")).await;
+        b.back_up(&world.join("b.db")).await;
+        runs.push(exchanged(pace, &world, &server, &creds).await);
+    }
+    let (conflicts, _, _) = &runs[0];
+    assert!(conflicts[0].contains("theirs, second"), "{conflicts:#?}");
+    assert!(!conflicts[0].contains("theirs, first"), "{conflicts:#?}");
+    assert!(
+        conflicts[1].contains("remote: Text(\"mine\")"),
+        "{conflicts:#?}"
+    );
+    assert_eq!(runs[1], runs[0]);
+    assert_eq!(runs[2], runs[0]);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -889,6 +1409,10 @@ struct Counting {
     abandon: Option<Abandon>,
     /// Arm the commit hook once the counts are written, so the client's commit fails.
     fail_commit: Option<Arc<AtomicBool>>,
+    pace: Pace,
+    /// Fail the `between` call with this number, counting from 1.
+    fail_between: Option<usize>,
+    betweens: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -963,6 +1487,18 @@ impl Apply for Counting {
             .await?;
         Ok(None)
     }
+
+    async fn between(&mut self, _: &mut SqliteConnection) -> Result<(), Error> {
+        self.betweens += 1;
+        if self.fail_between == Some(self.betweens) {
+            return Err(failed("between"));
+        }
+        Ok(())
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
+    }
 }
 
 /// A local write, and the application bringing its counts up to date for it.
@@ -1001,10 +1537,12 @@ async fn assert_counted(peer: &mut Peer, at: &str) {
     assert_eq!(counts, want, "{at}");
 }
 
-async fn counted_sync(peer: &mut Peer, server: &Server, at: &str) -> SyncReport {
-    let report = sync_hooked(peer, server, &mut Counting::default())
-        .await
-        .unwrap();
+async fn counted_sync(peer: &mut Peer, server: &Server, pace: Pace, at: &str) -> SyncReport {
+    let mut hook = Counting {
+        pace,
+        ..Counting::default()
+    };
+    let report = sync_hooked(peer, server, &mut hook).await.unwrap();
     assert_counted(peer, at).await;
     report
 }
@@ -1057,13 +1595,14 @@ async fn three_devices_keep_counts_from_what_each_apply_touched() {
         write(&mut peers[who], sql).await;
         for other in [(who + 1) % 3, who, (who + 2) % 3] {
             let at = format!("step {step}, device {other}");
-            counted_sync(&mut peers[other], &server, &at).await;
+            counted_sync(&mut peers[other], &server, Pace::default(), &at).await;
         }
     }
     for round in 0..10 {
         let mut moved = false;
         for (n, peer) in peers.iter_mut().enumerate() {
-            let report = counted_sync(peer, &server, &format!("round {round}, device {n}")).await;
+            let at = format!("round {round}, device {n}");
+            let report = counted_sync(peer, &server, Pace::default(), &at).await;
             moved |= report.sent > 0 || report.received > 0;
         }
         if !moved {
@@ -2051,8 +2590,10 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
 /// Three devices write at random and sync through a server that fails, loses or hangs a random
 /// request, stores copies of envelopes already in the log, holds envelopes from signers it lists
 /// only later, sometimes holds more than one sync reads, and pages one to three envelopes at a
-/// time. Their applies fail at random before or after applying, or end the transaction and then
-/// panic or never return, after which the sync is given up on, or make the commit after them fail. After every sync the counts kept
+/// time. Each case picks how many changes an apply takes and an envelope holds, and whether the
+/// sync pauses. Their applies fail at random before or after applying, or end the transaction and
+/// then panic or never return, after which the sync is given up on, or make the commit after them
+/// fail; a gap between transactions sometimes fails too. After every sync the counts kept
 /// from what each apply touched are right, and `caught_up` was called exactly when the pull read
 /// to the head, and never by a sync that failed before it appended. A sync that returned leaves the
 /// connection sound unless it says otherwise; one given up on may not, and the device then opens a
@@ -2069,6 +2610,12 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
         let server = Server::new();
         let page = 1 + seed % 3;
         server.with(|s| s.caps.max_page_batches = Some(page as u32));
+        let pace = Pace {
+            apply: [0, 1, 2, 3, 5, 4_000, usize::MAX][rng.below(7) as usize],
+            seal: [1, 2, 3, 1_000][rng.below(4) as usize],
+            hold: Duration::ZERO,
+            pause: Duration::from_millis(rng.below(2)),
+        };
         let [made, joined] = credentials(&server).await;
         let key = generate_signing_key().unwrap();
         fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
@@ -2149,6 +2696,9 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                         },
                         abandon: None,
                         fail_commit: None,
+                        pace,
+                        fail_between: (rng.below(6) == 0).then(|| 1 + rng.below(4) as usize),
+                        betweens: 0,
                     };
                     match rng.below(8) {
                         0 => hook.abandon = Some(Abandon::Panics),
@@ -2174,14 +2724,15 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                     };
                     let abandoned = result.is_none();
                     let refused = matches!(result, Some(Err(Error::ConnectionUnsound { .. })));
+                    let gap_failed = hook.fail_between.is_some_and(|n| hook.betweens >= n);
                     match result {
                         Some(Ok(report)) => {
                             let complete = report.blocked.is_none() && !report.more;
                             assert_eq!(hook.caught_up, usize::from(complete), "{at}");
                         }
                         // Appends come after `caught_up`, so a sync that failed or was dropped
-                        // before one never called it.
-                        _ if !noting.appended.load(Ordering::Relaxed) => {
+                        // before one never called it, unless the gap after it failed.
+                        _ if !noting.appended.load(Ordering::Relaxed) && !gap_failed => {
                             assert_eq!(hook.caught_up, 0, "{at}: {result:?}");
                         }
                         _ => assert!(hook.caught_up <= 1, "{at}"),
@@ -2233,7 +2784,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             let mut moved = false;
             for (n, peer) in peers.iter_mut().enumerate() {
                 let at = format!("seed {seed} round {round} device {n}");
-                let report = counted_sync(peer, &server, &at).await;
+                let report = counted_sync(peer, &server, pace, &at).await;
                 moved |= report.sent > 0 || report.received > 0 || report.more;
             }
             if !moved {
