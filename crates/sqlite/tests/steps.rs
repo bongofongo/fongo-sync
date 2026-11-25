@@ -626,7 +626,14 @@ fn same(whole: &Outcome, stepped: &Outcome) -> Result<(), String> {
             differ.push(format!("inspections:\n{a:#?}\n{b:#?}"));
         }
     } else {
-        if whole.outbox != stepped.outbox {
+        // In clock order: a first install in steps adopts in another order than a whole one, with
+        // the clocks the whole one gives.
+        let in_order = |o: &[Change]| {
+            let mut changes = o.to_vec();
+            changes.sort_by_key(|c| c.clock);
+            changes
+        };
+        if in_order(&whole.outbox) != in_order(&stepped.outbox) {
             let only = |a: &[Change], b: &[Change]| {
                 a.iter()
                     .filter(|c| !b.contains(c))

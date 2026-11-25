@@ -30,6 +30,7 @@
 //! collect; and many rows that cannot be collected yet, among others, make every step read them
 //! again.
 
+mod adopt;
 mod collect;
 mod db;
 mod error;

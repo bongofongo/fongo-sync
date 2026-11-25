@@ -640,7 +640,32 @@ impl Replica {
             return Ok(false);
         };
         let mut image = rows.slots[i].image.clone().unwrap_or_default();
-        image.extend(values.clone());
+        // Adopting, a field the application wrote since is left as it wrote it: the image takes
+        // the target, so the collect after finds the application's value as its edit.
+        let mut values = values;
+        if cx.adopting
+            && let Some(row) = tables::read_row(db, c, &key)?
+        {
+            let was = image.clone();
+            let key_field = |f: &str| matches!(&c.key, Key::Natural { fields } if fields.iter().any(|k| k == f));
+            let kept: Vec<String> = values
+                .keys()
+                .filter(|f| !key_field(f))
+                .filter(|f| {
+                    !same(
+                        row.get(*f).unwrap_or(&Value::Null),
+                        was.get(*f).unwrap_or(&Value::Null),
+                    )
+                })
+                .cloned()
+                .collect();
+            image.extend(values.clone());
+            for f in kept {
+                values.remove(&f);
+            }
+        } else {
+            image.extend(values.clone());
+        }
         let mut now = key.clone();
         if let Key::Natural { fields: key_fields } = &c.key
             && key_fields.iter().any(|f| values.contains_key(f))
@@ -666,7 +691,11 @@ impl Replica {
             sets.join(", "),
             where_key(c)
         );
-        match db.exec(&sql, &params) {
+        match if sets.is_empty() {
+            Ok(1)
+        } else {
+            db.exec(&sql, &params)
+        } {
             Ok(0) => return Ok(false),
             Ok(_) => {}
             Err(e) if refused(&e) => return Ok(false),

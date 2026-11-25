@@ -17,12 +17,13 @@ use fongo_sync_core::source::admit;
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
+use crate::adopt;
 use crate::collect::{Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through};
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
-use crate::store::{Facts, LAYOUT, TABLES, as_clock};
+use crate::store::{Facts, LAYOUT, TABLES, UPGRADES, as_clock};
 use crate::tables::{self, NOW, every_row, read_row};
 
 /// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
@@ -156,7 +157,8 @@ pub struct Inspection {
     pub held: Vec<(String, Gid)>,
     /// Rows a merge gave up that another table still holds, as (collection, key).
     pub leftover: Vec<(String, String)>,
-    /// Rows written, or removed, since the last collect, as (collection, key).
+    /// Rows written, or removed, since the last collect, and rows a first install in steps found
+    /// and has not adopted yet, as (collection, key).
     pub uncollected: Vec<(String, String)>,
     /// Fields whose value the application kept as this replica's own on resuming, as
     /// (collection, key, field).
@@ -326,6 +328,9 @@ pub(crate) struct Ctx<'d> {
     pub abandoned: usize,
     /// While a bounded step brings rows up to date, what it reached.
     pub watch: Option<Watch>,
+    /// A step adopting found rows from their records: what it writes to a row the application
+    /// has written since, it writes only to fields the application left as the image holds them.
+    pub adopting: bool,
 }
 
 /// What a bounded try must not leave a later write to: the entities whose rows a merge may
@@ -375,6 +380,7 @@ impl<'d> Ctx<'d> {
             collected: 0,
             abandoned: 0,
             watch: None,
+            adopting: false,
         })
     }
 
@@ -579,6 +585,19 @@ impl Replica {
         mut set: BTreeSet<(String, Gid)>,
         take: Option<usize>,
     ) -> Result<bool> {
+        if adopt::recorded(cx.db)? {
+            // Found rows are adopted before anything written since: a step adopts the next
+            // batches; a whole collect or an apply adopts every one first.
+            if let Some(want) = take {
+                debug_assert!(incoming.is_empty());
+                if !set.is_empty() {
+                    self.settle(cx, set)?;
+                }
+                cx.collected += self.adopt(cx, Some(want.max(1)))?;
+                return Ok(adopt::recorded(cx.db)? || marked_past_start(cx.db)?);
+            }
+            cx.collected += self.adopt(cx, None)?;
+        }
         if let Some(want) = take {
             debug_assert!(incoming.is_empty());
             return self.bounded(cx, set, want.max(1));
@@ -617,7 +636,7 @@ impl Replica {
     }
 
     /// Brings every row of `set`'s entities to its target.
-    fn settle(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>) -> Result<()> {
+    pub(crate) fn settle(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>) -> Result<()> {
         // A write a table refuses for a constraint the plan does not know of, such as a unique
         // column outside any identity, may succeed once others are written: what waits is tried
         // again while a round writes anything, up to a bound. What still waits then is tried by
@@ -800,6 +819,7 @@ impl Replica {
         if installed {
             match meta_get(db, "layout")? {
                 Some(Value::Int(LAYOUT)) => {}
+                Some(Value::Int(old)) if UPGRADES.contains(&old) => {}
                 other => {
                     return Err(Error::Corrupt(format!(
                         "the kernel's tables are of layout {other:?}, not {LAYOUT}; uninstall them first"
@@ -825,6 +845,13 @@ impl Replica {
         let mut cx = Ctx::begin(db)?;
         let mut set = BTreeSet::new();
         let mut adopted = Vec::new();
+        // An install in steps records the rows it finds, unless rows written before it are still
+        // to be collected: a whole install collects those with what it finds.
+        let record = take.is_some()
+            && db
+                .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
+                .is_empty();
+        let mut to_record = Vec::new();
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
             let fields = Value::Text(names.join(","));
@@ -837,6 +864,11 @@ impl Replica {
             let was_together = meta_get(db, &sets)?;
             meta_set(db, &known, fields)?;
             meta_set(db, &sets, together.clone())?;
+            if meta_get(db, &adoption)?.is_none() && record {
+                to_record.push(idx);
+                meta_set(db, &adoption, Value::Int(1))?;
+                continue;
+            }
             if meta_get(db, &adoption)?.is_none() {
                 db.exec(
                     &format!(
@@ -909,6 +941,7 @@ impl Replica {
         if let Some(how) = resuming {
             self.resume_in(db, how)?;
         }
+        self.record_found(db, &to_record)?;
         let more = self.step(&mut cx, &[], set, take)?;
         cx.finish()?;
         Ok(Collected {
@@ -1316,9 +1349,14 @@ impl Replica {
             if !installed {
                 return Ok(0);
             }
+            let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
+            let found = adopt::recorded_rows(db, limit)?;
             let rows = db.query(
-                "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
-                &[Value::Int(i64::try_from(at_most).unwrap_or(i64::MAX))],
+                "SELECT count(*) + ?2 FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
+                &[
+                    Value::Int(limit),
+                    Value::Int(i64::try_from(found).unwrap_or(0)),
+                ],
             )?;
             Ok(rows
                 .first()
@@ -1960,7 +1998,11 @@ impl Replica {
                 .map_or(gid, |t| t.canonical);
             out.held.push((collection, canonical));
         }
-        for r in db.query("SELECT collection, key FROM fongo_dirty", &[])? {
+        for r in db.query(
+            "SELECT collection, key FROM fongo_dirty
+             UNION SELECT collection, key FROM fongo_found WHERE batch >= 0",
+            &[],
+        )? {
             out.uncollected
                 .push((as_text(&r[0])?.to_string(), as_text(&r[1])?.to_string()));
         }
@@ -2033,4 +2075,11 @@ pub(crate) fn key_fields(c: &Collection) -> &[String] {
         Key::Natural { fields } => fields,
         Key::Minted { .. } => &[],
     }
+}
+
+/// Whether any row is marked.
+fn marked_past_start(db: &Db) -> Result<bool> {
+    Ok(!db
+        .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
+        .is_empty())
 }

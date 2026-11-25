@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::model::Row;
 use fongo_sync_core::plan::{self, FieldEdit, NewEntity};
-use fongo_sync_core::{Change, Gid, Value};
+use fongo_sync_core::{Change, Gid, Hlc, Value};
 
 use crate::db::{Db, as_gid, as_int, as_text};
 use crate::error::Result;
@@ -51,6 +51,8 @@ struct Names {
     cache: BTreeMap<(usize, i64), Option<Mapped>>,
     bounded: bool,
     beyond: Option<Place>,
+    /// Adopting: a found row names the entity it was recorded with, as when the install began.
+    adopting: bool,
 }
 
 impl Names {
@@ -146,6 +148,8 @@ struct Item {
     removed: bool,
     /// Not marked by a trigger: found through a row whose local id was taken again.
     found: bool,
+    /// A found row adopted from its record, with the counter of the adoption clock it takes.
+    recorded: Option<u32>,
     row: Option<Row>,
     mapped: Option<Mapped>,
     waits: bool,
@@ -161,6 +165,15 @@ impl Item {
     fn usable(&self) -> Option<&Mapped> {
         self.mapped.as_ref().filter(|m| !m.doomed)
     }
+}
+
+/// A found row's record, read for adoption.
+pub(crate) struct Found {
+    pub idx: usize,
+    pub key: String,
+    pub gid: Option<Gid>,
+    pub seq: u32,
+    pub row: Row,
 }
 
 /// What a local id names, as the mapping will be.
@@ -179,8 +192,25 @@ impl Replica {
         through: Option<&Place>,
         minted: &mut Minted,
     ) -> Result<Edits> {
+        self.edits(cx, through, &[], minted)
+    }
+
+    /// Adopts found rows from their records (see [`crate::store::TABLES`]), reading no marked row.
+    pub(crate) fn adopt_edits(&self, cx: &mut Ctx, records: &[Found]) -> Result<Edits> {
+        let mut minted = Minted::new();
+        self.edits(cx, None, records, &mut minted)
+    }
+
+    fn edits(
+        &self,
+        cx: &mut Ctx,
+        through: Option<&Place>,
+        records: &[Found],
+        minted: &mut Minted,
+    ) -> Result<Edits> {
         let db = cx.db;
         let marked = match through {
+            _ if !records.is_empty() => Vec::new(),
             None => db.query(
                 "SELECT collection, key, at, gone FROM fongo_dirty ORDER BY at, collection, key",
                 &[],
@@ -195,13 +225,14 @@ impl Replica {
                 ],
             )?,
         };
-        if marked.is_empty() {
+        if marked.is_empty() && records.is_empty() {
             return Ok(Edits::Recorded(BTreeSet::new(), 0));
         }
         let mut names = Names {
             cache: BTreeMap::new(),
             bounded: through.is_some(),
             beyond: None,
+            adopting: !records.is_empty(),
         };
         let mut items: Vec<Item> = Vec::new();
         let mut index: BTreeMap<(usize, String), usize> = BTreeMap::new();
@@ -217,6 +248,29 @@ impl Replica {
             };
             let item = self.item(db, idx, key, as_int(&r[2])?, as_int(&r[3])?, false)?;
             index.insert((idx, item.key.clone()), items.len());
+            items.push(item);
+        }
+        for f in records {
+            let c = self.collection(f.idx);
+            if let Some(gid) = f.gid {
+                minted.insert((f.idx, f.key.clone()), gid);
+            }
+            let item = Item {
+                idx: f.idx,
+                row: Some(f.row.clone()),
+                mapped: mapping(db, &c.name, &f.key)?,
+                key: f.key.clone(),
+                at: 0,
+                gone: false,
+                removed: false,
+                found: false,
+                recorded: Some(f.seq),
+                waits: false,
+                keeps: None,
+                old: None,
+                new: None,
+            };
+            index.insert((f.idx, item.key.clone()), items.len());
             items.push(item);
         }
 
@@ -435,7 +489,13 @@ impl Replica {
                     },
                     None => None,
                 };
-                let clock = if item.at == 0 {
+                let clock = if let Some(seq) = item.recorded {
+                    Hlc {
+                        wall_ms: 0,
+                        counter: seq,
+                        node: cx.node,
+                    }
+                } else if item.at == 0 {
                     cx.adoption_clock()?
                 } else {
                     cx.clock.tick(u64::try_from(item.at).unwrap_or(0))
@@ -536,12 +596,33 @@ impl Replica {
                     )?;
                 }
             }
-            if !item.found {
+            if item.recorded.is_some() {
+                // Kept, adopted, while others are still to adopt: rows they name name it so.
+                db.exec(
+                    "UPDATE fongo_found SET batch = -1 WHERE collection = ?1 AND key = ?2",
+                    &at,
+                )?;
+            } else if !item.found {
                 db.exec(
                     "DELETE FROM fongo_dirty WHERE collection = ?1 AND key = ?2",
                     &at,
                 )?;
             }
+        }
+        // A found row that cannot be adopted yet is left marked, as a whole install leaves it.
+        for item in items.iter().filter(|i| i.waits && i.recorded.is_some()) {
+            let at = [
+                Value::Text(self.collection(item.idx).name.clone()),
+                Value::Text(item.key.clone()),
+            ];
+            db.exec(
+                "DELETE FROM fongo_found WHERE collection = ?1 AND key = ?2",
+                &at,
+            )?;
+            db.exec(
+                "INSERT OR IGNORE INTO fongo_dirty (collection, key, at) VALUES (?1, ?2, 0)",
+                &at,
+            )?;
         }
         for item in items.iter().filter(|i| i.waits && i.found) {
             db.exec(
@@ -554,7 +635,10 @@ impl Replica {
             )?;
         }
 
-        let collected = items.iter().filter(|i| !i.waits && !i.found).count();
+        let collected = items
+            .iter()
+            .filter(|i| !i.waits && !i.found && i.recorded.is_none())
+            .count();
         let mut set = match self.merge_unless(cx, &changes, true, through)? {
             Ok(set) => set,
             Err(past) => return Ok(Edits::Beyond(past)),
@@ -697,6 +781,7 @@ impl Replica {
             gone: gone >= tables::MOVED,
             removed: gone == tables::REMOVED,
             found,
+            recorded: None,
             waits: false,
             keeps: None,
             old: None,
@@ -765,6 +850,16 @@ impl Replica {
             });
         }
         let c = self.collection(t);
+        if names.adopting
+            && let Some(r) = db
+                .query(
+                    "SELECT gid FROM fongo_found WHERE collection = ?1 AND key = ?2 AND gid IS NOT NULL",
+                    &[Value::Text(c.name.clone()), Value::Text(key.clone())],
+                )?
+                .first()
+        {
+            return Ok(Named::Gid(as_gid(&r[0])?));
+        }
         // `closed` has already grown the prefix past any marked row named here that collecting
         // could give another entity.
         if let std::collections::btree_map::Entry::Vacant(e) = names.cache.entry((t, local)) {

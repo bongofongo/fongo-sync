@@ -10,8 +10,40 @@ use fongo_sync_core::{Gid, Hlc, Value};
 use crate::db::{Db, as_gid, as_text, loaded, stored};
 use crate::error::{Error, Result};
 
-/// The kernel's own tables. Layout 3: facts as `source::admit` keeps them, a row image and the
-/// entity each local row stands for, and what waits.
+/// The kernel's own tables. Layout 4: facts as `source::admit` keeps them, a row image and the
+/// entity each local row stands for, what waits, and the rows a first install found that it has
+/// not adopted yet.
+///
+/// # Adopting found rows in steps
+///
+/// A collection's first install adopts the rows its table already holds, as the oldest writes
+/// there are. Whole, it marks them and collects them at once. In steps (`install_step`), the
+/// transaction that begins the install records each found row instead, in `fongo_found`: its
+/// values as they stand then, the gid a whole install would mint for it, and the counter of the
+/// adoption clock a whole install would give it, both in the order a whole install takes them.
+/// Later steps adopt those records, never the table, so what the application writes after the
+/// install began is an ordinary edit against the record, collected once every record is adopted,
+/// as it would be after a whole install made when the stepped one began.
+///
+/// The records are adopted in batches. A batch holds every found row that collecting could find
+/// to be one entity with another (rows with equal identities or natural keys, their references
+/// read as the batches they name), and every row on a cycle of references among found rows, and
+/// batches are taken in an order in which a row comes after the rows it names. So no step finds
+/// a row to be one with a row a later step adopts, and every reference a step records names a row
+/// already adopted or adopted with it. A step takes whole batches until it has about the rows
+/// asked for.
+///
+/// A step that adopts reads no marked row and is checked against none: in the install it stands
+/// for, every write made after the install began comes after every adoption. What it writes to
+/// a row the application has written since, it writes only to fields the application has left
+/// as the kernel last saw them; the image takes the rest, so the later collect finds the
+/// application's values as its edits, as it would have after the whole install. Until every
+/// record is adopted, a collect or an apply adopts the rest first, whole, and an install made
+/// meanwhile goes on with them. A found row that cannot be adopted yet is marked as a whole
+/// install would leave it.
+///
+/// Layout 3 is upgraded in place by the next install: it gains the empty `fongo_found` table and
+/// the index of marks in collecting order, and keeps everything else as it was.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.
@@ -87,6 +119,18 @@ pub(crate) const TABLES: &[&str] = &[
         against,
         is_ref INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (collection, key, field))",
+    // A found row a first install in steps records: its batch (-1 once adopted, kept until
+    // every one is), the gid and the counter of the adoption clock a whole install would give
+    // it, and its values when the install began.
+    "CREATE TABLE IF NOT EXISTS fongo_found (
+        collection TEXT NOT NULL,
+        key TEXT NOT NULL,
+        batch INTEGER NOT NULL,
+        gid BLOB,
+        seq INTEGER NOT NULL,
+        image BLOB NOT NULL,
+        PRIMARY KEY (collection, key))",
+    "CREATE INDEX IF NOT EXISTS fongo_found_batch ON fongo_found (batch, collection, key)",
     "CREATE TABLE IF NOT EXISTS fongo_bases (
         collection TEXT NOT NULL,
         gid BLOB NOT NULL,
@@ -103,7 +147,10 @@ pub(crate) const TABLES: &[&str] = &[
         PRIMARY KEY (collection, gid, field))",
 ];
 
-pub(crate) const LAYOUT: i64 = 3;
+pub(crate) const LAYOUT: i64 = 4;
+
+/// Earlier layouts the next install upgrades in place, adding what `TABLES` adds.
+pub(crate) const UPGRADES: &[i64] = &[3];
 
 pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {
     Hlc::decode(as_text(value)?).ok_or_else(|| Error::Corrupt("a clock does not parse".into()))
