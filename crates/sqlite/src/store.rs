@@ -40,7 +40,10 @@ use crate::error::{Error, Result};
 /// application's values as its edits, as it would have after the whole install. Until every
 /// record is adopted, a collect or an apply adopts the rest first, whole, and an install made
 /// meanwhile goes on with them. A found row that cannot be adopted yet is marked as a whole
-/// install would leave it. The registry the rows were recorded under is kept with them; a
+/// install would leave it. A collection that already holds entities from elsewhere, which its
+/// found rows may be one with, is not recorded: what is found with it is marked and adopted
+/// whole by the next step, so aliases take the clocks a whole install gives them. The registry
+/// the rows were recorded under is kept with them; a
 /// registry that differs, at an install, a resume or any call, first adopts every record under
 /// it, whole, so a change of registry meets them as it meets rows a whole install adopted.
 ///

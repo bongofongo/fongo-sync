@@ -693,3 +693,59 @@ fn a_registry_changed_while_records_wait() {
         }
     });
 }
+
+/// A collection new to the registry whose entities already arrived from elsewhere: a found
+/// scale is one with a held one, and the application edits it before any step. Its rows are
+/// adopted whole, as a whole install adopts them, so the aliases and the edit carry the same
+/// clocks and the application's value stands.
+#[test]
+fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let all = registry();
+        let first = fongo_sync_sqlite::Registry::new(
+            all.collections()
+                .iter()
+                .filter(|c| c.name != "scales")
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        let world = World::new(12);
+        world.hold(true);
+        let theirs = {
+            let replica = Replica::new(registry());
+            let mut c = database(&world, 9).await;
+            replica.install(&mut c).await.unwrap();
+            library::run(&mut c, "INSERT INTO scales (id, name, top) VALUES (1, 'stars', 7)").await;
+            replica.collect(&mut c).await.unwrap();
+            replica.outbox(&mut c, u32::MAX).await.unwrap().changes
+        };
+        let mut a = database(&world, 0).await;
+        existing(&mut a, 6).await;
+        library::run(&mut a, "DELETE FROM scales").await;
+        library::run(
+            &mut a,
+            "INSERT INTO scales (id, name, top) VALUES (1, 'tens', 10), (2, 'zeta', 3), (3, 'stars', 5)",
+        )
+        .await;
+        let (first, second) = (Replica::new(first), Replica::new(all));
+        first.install(&mut a).await.unwrap();
+        first.apply(&mut a, &theirs).await.unwrap();
+        first.collect(&mut a).await.unwrap();
+        let (twin, mut b) = world.twin(0, &mut a).await;
+        second.install_step(&mut a, 1).await.unwrap();
+        second.install(&mut b).await.unwrap();
+        for (w, conn) in [(&world, &mut a), (&twin, &mut b)] {
+            w.later(5);
+            library::run(conn, "UPDATE scales SET top = 99 WHERE id = 3").await;
+        }
+        while second.collect_step(&mut a, 1).await.unwrap().more {}
+        assert_eq!(
+            finish(&world, &second, &mut a).await,
+            finish(&twin, &second, &mut b).await
+        );
+    });
+}

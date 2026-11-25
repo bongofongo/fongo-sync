@@ -82,6 +82,33 @@ impl Replica {
     /// them: in the order it takes them, each minted row with the gid it would mint and each
     /// with the counter of the adoption clock it would give, and in batches.
     pub(crate) fn record_found(&self, db: &Db, idxs: &[usize]) -> Result<()> {
+        // A collection that already holds entities from elsewhere may find its rows to be one
+        // with them, which stamps aliases at the adopting step's time: its rows, and with them
+        // every row found with them, are marked to be adopted whole, as a whole install does.
+        for &idx in idxs {
+            let c = self.collection(idx);
+            if !db
+                .query(
+                    "SELECT 1 FROM fongo_claims WHERE collection = ?1 LIMIT 1",
+                    &[Value::Text(c.name.clone())],
+                )?
+                .is_empty()
+            {
+                for &idx in idxs {
+                    let c = self.collection(idx);
+                    db.exec(
+                        &format!(
+                            "INSERT OR IGNORE INTO fongo_dirty (collection, key, at)
+                             SELECT ?1, {}, 0 FROM {}",
+                            crate::tables::key_json(c, ""),
+                            crate::db::quoted(&c.table)
+                        ),
+                        &[Value::Text(c.name.clone())],
+                    )?;
+                }
+                return Ok(());
+            }
+        }
         let mut order: Vec<usize> = idxs.to_vec();
         order.sort_by(|a, b| self.collection(*a).name.cmp(&self.collection(*b).name));
         let mut found: Vec<(usize, String, fongo_sync_core::model::Row)> = Vec::new();
