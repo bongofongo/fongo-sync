@@ -17,7 +17,7 @@ changes from elsewhere. Its schema is left as it is; the kernel keeps its state 
 `fongo_`. `Replica::collect_step` collects in steps, each a transaction of its own that says
 whether more is left, so that many local writes are collected without holding SQLite's write lock
 for long; `Replica::install_step` installs and takes the first step. A step ends only where the
-next row is marked with a later time, so the steps end as some placing of ordinary collects
+next row is marked with a later time, and the steps end as some placing of ordinary collects
 among the same writes would; in every case the tests try, also as one collect of everything,
 but where an alias is stamped or a reference names another member of the group it joins. A
 step takes about the rows asked for, more where rows depend on later ones: a

@@ -1279,7 +1279,8 @@ impl Replica {
     ///
     /// What the steps send, hold and show is what some placing of ordinary collects among the
     /// same writes gives: a step leaves the rows past it, and all that collecting them reads, as
-    /// they were, and an alias it finds is stamped with the time of the last row it took. It is
+    /// they were, and an alias it finds is stamped with the time of the last row it took, or with
+    /// the wall clock where that has been set back below it. It is
     /// not, in general, what collects made at those times give: a row written again after a step
     /// is sent as last written, not as it stood. In every case the tests try, once the last step
     /// is done it is also what one
@@ -1309,9 +1310,10 @@ impl Replica {
     /// rows over 100,000 rows written one at a time cost 1.12 times one collect of them, and over
     /// 5,000 rows behind 999 that wait at most 1.7 times, and each step costs at most about twice
     /// what collecting its rows at once does. Two cases cost more. Every try of a step reads the
-    /// rows that wait ahead of it again, so rows that wait among many others cost each step more:
-    /// 20,000 rows with 5,000 waiting among them cost 20 times one collect in steps of 10 and 1.8
-    /// times in steps of 1,000, and 5,000 followed by 20,000 waiting 15 times in steps of 1,000.
+    /// rows that wait ahead of it again, so rows that wait among many others cost each step more,
+    /// by how they are spread: 20,000 rows with 5,000 waiting among them cost from 2.3 to 20 times
+    /// one collect in steps of 10 and 1.8 times in steps of 1,000, and 5,000 followed by 20,000
+    /// waiting 15 times in steps of 1,000.
     /// And with foreign keys off, a row of a natural collection naming a row that is gone makes
     /// the step read every marked row of its collection, which can cost 12 times one collect.
     ///
