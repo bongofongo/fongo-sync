@@ -585,6 +585,7 @@ impl Replica {
         mut set: BTreeSet<(String, Gid)>,
         take: Option<usize>,
     ) -> Result<bool> {
+        cx.collected += self.adopt_as_recorded(cx)?;
         if adopt::recorded(cx.db)? {
             // Found rows are adopted before anything written since: a step adopts the next
             // batches; a whole collect or an apply adopts every one first.
@@ -787,7 +788,8 @@ impl Replica {
     /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
     /// What it adopts of the registry for collections installed before (new fields, sets now
     /// written together), and every row that brings up to date, is done whole, as `install`
-    /// does it. The rows found in the tables of a collection installed for the first time are
+    /// does it; records an install under another registry left waiting are first adopted whole,
+    /// under the registry they were recorded with, as by that install. The rows found in the tables of a collection installed for the first time are
     /// recorded, with their values as they stand, and later steps adopt them from the records;
     /// what the application writes to them meanwhile is collected once every record is adopted,
     /// as an edit made after a whole install. Recording reads every found row in this one
@@ -851,6 +853,7 @@ impl Replica {
         let mut cx = Ctx::begin(db)?;
         let mut set = BTreeSet::new();
         let mut adopted = Vec::new();
+        cx.collected += self.adopt_as_recorded(&mut cx)?;
         // An install in steps records the rows it finds, unless rows written before it are still
         // to be collected: a whole install collects those with what it finds.
         // Nor while an earlier install's records wait: its batches are ordered among themselves.

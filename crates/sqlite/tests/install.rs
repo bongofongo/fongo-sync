@@ -609,3 +609,87 @@ async fn recording_takes_a_small_part_of_a_whole_install() {
         "recording {recording:?} against a whole install's {whole:?}"
     );
 }
+
+/// The library's registry as it was before a change, and as it is after: a field added, a
+/// collection added, a field removed, an identity added, a reference added.
+fn registries(change: &str) -> (fongo_sync_sqlite::Registry, fongo_sync_sqlite::Registry) {
+    let full = registry();
+    let mut fewer: Vec<fongo_sync_sqlite::Collection> = full.collections().to_vec();
+    let books = fewer.iter().position(|c| c.name == "books").unwrap();
+    let highlights = fewer.iter().position(|c| c.name == "highlights").unwrap();
+    match change {
+        "field" | "removed" => fewer[books].fields.retain(|f| f.name != "title"),
+        "collection" => fewer.retain(|c| c.name != "book_tags"),
+        "identity" => fewer[books]
+            .identity
+            .retain(|set| set != &["isbn_10".to_string()]),
+        "reference" => fewer[highlights].fields.retain(|f| f.name != "copy_id"),
+        _ => unreachable!(),
+    }
+    let fewer = fongo_sync_sqlite::Registry::new(fewer).unwrap();
+    if change == "removed" {
+        (full, fewer)
+    } else {
+        (fewer, full)
+    }
+}
+
+/// A registry that changes while a first install's records wait, by an install or by resuming
+/// after a migration: the records are adopted under the registry they were recorded with, and
+/// what the new one adds is adopted of the rows as they stand, as installs of the two
+/// registries one after the other would.
+#[test]
+fn a_registry_changed_while_records_wait() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for change in ["field", "collection", "removed", "identity", "reference"] {
+            for migration in [false, true] {
+                let (before, after) = registries(change);
+                let (before, after) = (Replica::new(before), Replica::new(after));
+                let world = World::new(12);
+                world.hold(true);
+                let mut a = database(&world, 0).await;
+                existing(&mut a, 12).await;
+                let (twin, mut b) = world.twin(0, &mut a).await;
+                assert!(before.install_step(&mut a, 2).await.unwrap().more);
+                before.install(&mut b).await.unwrap();
+                for (stepped, w, conn) in [(true, &world, &mut a), (false, &twin, &mut b)] {
+                    w.later(1);
+                    if migration {
+                        before.suspend(conn).await.unwrap();
+                        library::run(conn, "UPDATE books SET title = 'migrated' WHERE id = 4").await;
+                        after
+                            .resume(conn, fongo_sync_sqlite::Resume::Baseline)
+                            .await
+                            .unwrap();
+                    } else if stepped {
+                        let mut more = after.install_step(conn, 2).await.unwrap().more;
+                        while more {
+                            more = after.collect_step(conn, 2).await.unwrap().more;
+                        }
+                    } else {
+                        after.install(conn).await.unwrap();
+                    }
+                }
+                while found_left(&mut a).await > 0 {
+                    after.collect_step(&mut a, 2).await.unwrap();
+                }
+                let (x, y) = (
+                    finish(&world, &after, &mut a).await,
+                    finish(&twin, &after, &mut b).await,
+                );
+                assert!(
+                    x == y,
+                    "{change}, migration {migration}: rows {} ids {} inspection {} elsewhere {} outbox {}",
+                    x.tables == y.tables,
+                    x.ids == y.ids,
+                    x.inspection == y.inspection,
+                    x.elsewhere == y.elsewhere,
+                    x.outbox == y.outbox
+                );
+            }
+        }
+    });
+}

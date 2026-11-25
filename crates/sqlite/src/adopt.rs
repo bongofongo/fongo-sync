@@ -118,6 +118,7 @@ impl Replica {
             Value::Int(i64::from(base.saturating_add(count))),
         )?;
         let batches = self.batches(db, &found)?;
+        meta_set(db, "found_registry", Value::Text(self.registry.encode()))?;
         for (i, (idx, key, row)) in found.iter().enumerate() {
             let seq = base.saturating_add(u32::try_from(i + 1).unwrap_or(u32::MAX));
             db.exec(
@@ -279,6 +280,24 @@ impl Replica {
         Ok(roots.iter().map(|r| number[r]).collect())
     }
 
+    /// Adopts every waiting record under the registry it was recorded with, where this
+    /// replica's differs, as installs of the two registries one after the other would: what the
+    /// new registry adds is then adopted of the rows as they stand, as of any row adopted before.
+    /// Returns how many it adopted.
+    pub(crate) fn adopt_as_recorded(&self, cx: &mut Ctx) -> Result<usize> {
+        let db = cx.db;
+        if !recorded(db)? {
+            return Ok(0);
+        }
+        let Some(Value::Text(text)) = meta_get(db, "found_registry")? else {
+            return Ok(0);
+        };
+        if text == self.registry.encode() {
+            return Ok(0);
+        }
+        Replica::new(crate::registry::Registry::decode(&text)?).adopt(cx, None)
+    }
+
     /// Adopts found rows from their records: the next batches, until at least `want` rows, or
     /// every one with `None`; and brings the rows they affect up to date. Returns how many it
     /// adopted.
@@ -349,6 +368,7 @@ impl Replica {
         }
         if !recorded(db)? {
             db.exec("DELETE FROM fongo_found", &[])?;
+            db.exec("DELETE FROM fongo_meta WHERE key = 'found_registry'", &[])?;
         }
         Ok(adopted)
     }
