@@ -45,7 +45,16 @@ struct Outcome {
 async fn tables(conn: &mut SqliteConnection) -> Vec<Vec<Vec<Value>>> {
     let mut out = Vec::new();
     for t in library::TABLES {
-        out.push(support::rows(conn, &format!("SELECT * FROM {t} ORDER BY rowid"), &[]).await);
+        let there: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(t)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        if there == 1 {
+            out.push(support::rows(conn, &format!("SELECT * FROM {t} ORDER BY rowid"), &[]).await);
+        }
     }
     out
 }
@@ -85,6 +94,16 @@ async fn remote(world: &World) -> Vec<Change> {
 }
 
 async fn finish(world: &World, replica: &Replica, conn: &mut SqliteConnection) -> Outcome {
+    finish_migrated(world, replica, conn, &[]).await
+}
+
+/// [`finish`], with another replica whose tables were migrated by `migration`.
+async fn finish_migrated(
+    world: &World,
+    replica: &Replica,
+    conn: &mut SqliteConnection,
+    migration: &[&str],
+) -> Outcome {
     replica.collect(conn).await.unwrap();
     let outbox = same_changes_in_any_order(replica.outbox(conn, u32::MAX).await.unwrap().changes);
     let inspection = replica.inspect(conn).await.unwrap();
@@ -95,6 +114,9 @@ async fn finish(world: &World, replica: &Replica, conn: &mut SqliteConnection) -
     )
     .await;
     let mut other = database(world, 7).await;
+    for sql in migration {
+        sqlx::query(sql).execute(&mut other).await.unwrap();
+    }
     replica.install(&mut other).await.unwrap();
     replica.apply(&mut other, &outbox).await.unwrap();
     Outcome {
@@ -878,10 +900,104 @@ fn a_registry_changed_while_records_wait() {
     });
 }
 
+/// The library's registry with its books collection changed by `change`, or without its tags.
+fn migrated(change: &str) -> fongo_sync_sqlite::Registry {
+    let mut collections: Vec<fongo_sync_sqlite::Collection> = registry().collections().to_vec();
+    let books = collections.iter().position(|c| c.name == "books").unwrap();
+    match change {
+        "column dropped" => collections[books].fields.retain(|f| f.name != "title"),
+        "column renamed" => collections[books]
+            .fields
+            .iter_mut()
+            .filter(|f| f.name == "title")
+            .for_each(|f| f.name = "name".into()),
+        "table dropped" => collections.retain(|c| c.name != "book_tags"),
+        "column added and another dropped" => {
+            collections[books].fields.retain(|f| f.name != "title");
+            collections[books] = collections[books].clone().field("subtitle");
+        }
+        "table rebuilt" => collections[books] = collections[books].clone().field("subtitle"),
+        _ => unreachable!(),
+    }
+    fongo_sync_sqlite::Registry::new(collections).unwrap()
+}
+
+/// A migration while a first install's records wait, on the application's path: suspend, change
+/// the schema, resume with the registry that matches it. Suspending adopts the records first,
+/// under the registry they were made with, so the outcome is a whole install's followed by the
+/// same migration.
+#[test]
+fn a_migration_while_records_wait() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for (change, migration) in [
+            ("column dropped", &["ALTER TABLE books DROP COLUMN title"][..]),
+            ("column renamed", &["ALTER TABLE books RENAME COLUMN title TO name"][..]),
+            ("table dropped", &["DROP TABLE book_tags"][..]),
+            (
+                "column added and another dropped",
+                &[
+                    "ALTER TABLE books ADD COLUMN subtitle TEXT",
+                    "ALTER TABLE books DROP COLUMN title",
+                ][..],
+            ),
+            (
+                "table rebuilt",
+                &[
+                    "PRAGMA foreign_keys = OFF",
+                    "CREATE TABLE books_new (
+                        id INTEGER PRIMARY KEY,
+                        title TEXT,
+                        subtitle TEXT,
+                        isbn_13 TEXT UNIQUE,
+                        isbn_10 TEXT UNIQUE,
+                        series TEXT,
+                        series_index REAL,
+                        last_modified INTEGER)",
+                    "INSERT INTO books_new (id, title, isbn_13, isbn_10, series, series_index, last_modified)
+                     SELECT id, title, isbn_13, isbn_10, series, series_index, last_modified FROM books",
+                    "DROP TABLE books",
+                    "ALTER TABLE books_new RENAME TO books",
+                    "PRAGMA foreign_keys = ON",
+                ][..],
+            ),
+        ] {
+            let world = World::new(22);
+            world.hold(true);
+            let mut a = database(&world, 0).await;
+            existing(&mut a, 12).await;
+            let (twin, mut b) = world.twin(0, &mut a).await;
+            let before = Replica::new(registry());
+            let after = Replica::new(migrated(change));
+            assert!(before.install_step(&mut a, 2).await.unwrap().more);
+            before.install(&mut b).await.unwrap();
+            for (w, conn) in [(&world, &mut a), (&twin, &mut b)] {
+                before.suspend(conn).await.unwrap();
+                w.later(1);
+                for sql in migration {
+                    sqlx::query(sql).execute(&mut *conn).await.unwrap();
+                }
+                after
+                    .resume(conn, fongo_sync_sqlite::Resume::Baseline)
+                    .await
+                    .unwrap_or_else(|e| panic!("{change}: {e}"));
+            }
+            assert_eq!(found_left(&mut a).await, 0, "{change}");
+            assert!(
+                finish_migrated(&world, &after, &mut a, migration).await
+                    == finish_migrated(&twin, &after, &mut b, migration).await,
+                "{change}"
+            );
+        }
+    });
+}
+
 /// A collection new to the registry whose entities already arrived from elsewhere: a found
-/// scale is one with a held one, and the application edits it before any step. Its rows are
-/// adopted whole, as a whole install adopts them, so the aliases and the edit carry the same
-/// clocks and the application's value stands.
+/// scale, not the first, is one with a held one, and the application edits it after the first
+/// step, on a clock that has moved on. Its rows are adopted whole, as a whole install adopts
+/// them, so the alias and the edit carry the same clocks and the application's value stands.
 #[test]
 fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -903,18 +1019,16 @@ fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
             let replica = Replica::new(registry());
             let mut c = database(&world, 9).await;
             replica.install(&mut c).await.unwrap();
-            library::run(&mut c, "INSERT INTO scales (id, name, top) VALUES (1, 'stars', 7)").await;
+            library::run(
+                &mut c,
+                "INSERT INTO scales (id, name, top) VALUES (1, 'tens', 7)",
+            )
+            .await;
             replica.collect(&mut c).await.unwrap();
             replica.outbox(&mut c, u32::MAX).await.unwrap().changes
         };
         let mut a = database(&world, 0).await;
         existing(&mut a, 6).await;
-        library::run(&mut a, "DELETE FROM scales").await;
-        library::run(
-            &mut a,
-            "INSERT INTO scales (id, name, top) VALUES (1, 'tens', 10), (2, 'zeta', 3), (3, 'stars', 5)",
-        )
-        .await;
         let (first, second) = (Replica::new(first), Replica::new(all));
         first.install(&mut a).await.unwrap();
         first.apply(&mut a, &theirs).await.unwrap();
@@ -924,7 +1038,10 @@ fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
         second.install(&mut b).await.unwrap();
         for (w, conn) in [(&world, &mut a), (&twin, &mut b)] {
             w.later(5);
-            library::run(conn, "UPDATE scales SET top = 99 WHERE id = 3").await;
+            sqlx::query("UPDATE scales SET top = 99 WHERE name = 'tens'")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
         }
         while second.collect_step(&mut a, 1).await.unwrap().more {}
         assert_eq!(

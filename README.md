@@ -57,7 +57,8 @@ waits for it needs its own way on.
 
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
-the application asks. `uninstall` removes everything the kernel added.
+the application asks. Suspending in the middle of a first install in steps adopts the rest of what
+it found first, in one transaction. `uninstall` removes everything the kernel added.
 
 What replicas must converge to is stated twice, once to run and once to prove; see
 [Verification](#verification).

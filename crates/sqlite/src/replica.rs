@@ -1139,8 +1139,25 @@ impl Replica {
     /// Removes the triggers that notice local writes, so an application can change its schema or
     /// rewrite its rows without each write being collected. [`Replica::resume`] puts them back
     /// and says what the rows written meanwhile mean.
+    ///
+    /// Rows a first install in steps found and has not adopted yet are adopted first, whole,
+    /// under the registry they were recorded with, while the tables still match it: a schema
+    /// changed while suspended never meets them. Suspending in the middle of such an install
+    /// holds the write lock for the rest of its adoption, as long as a whole install of those
+    /// rows.
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
-        with_db(conn, |db| db.atomically(|db| drop_kernel(db, "trigger"))).await
+        with_db(conn, |db| {
+            db.atomically(|db| {
+                if adopt::recorded(db)? {
+                    let mut cx = Ctx::begin(db)?;
+                    cx.collected += self.adopt_as_recorded(&mut cx)?;
+                    cx.collected += self.adopt(&mut cx, None)?;
+                    cx.finish()?;
+                }
+                drop_kernel(db, "trigger")
+            })
+        })
+        .await
     }
 
     /// Puts the triggers back after [`Replica::suspend`], installing again so that collections

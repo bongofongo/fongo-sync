@@ -46,6 +46,8 @@ use crate::error::{Error, Result};
 /// the rows were recorded under is kept with them; a
 /// registry that differs, at an install, a resume or any call, first adopts every record under
 /// it, whole, so a change of registry meets them as it meets rows a whole install adopted.
+/// Suspending adopts every record first, whole, while the tables still match that registry, so
+/// a schema changed while suspended never meets a record.
 ///
 /// Layout 3 is upgraded in place by the next install: it gains the empty `fongo_found` table and
 /// the index of marks in collecting order, and keeps everything else as it was. The move is one
