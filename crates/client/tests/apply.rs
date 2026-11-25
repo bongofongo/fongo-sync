@@ -3004,8 +3004,8 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
 /// Three devices write at random and sync through a server that fails, loses or hangs a random
 /// request, stores copies of envelopes already in the log, holds envelopes from signers it lists
 /// only later, sometimes holds more than one sync reads, and pages one to three envelopes at a
-/// time. Each case picks how many changes an apply takes and an envelope holds, and whether the
-/// sync pauses. Their applies fail at random before or after applying, or end the transaction and
+/// time. Each case picks how many changes an apply takes and an envelope holds, how many rows a
+/// step of collecting takes, and whether the sync pauses. Their applies fail at random before or after applying, or end the transaction and
 /// then panic or never return, after which the sync is given up on, or make the commit after them
 /// fail; a gap between transactions sometimes fails too. After every sync the counts kept
 /// from what each apply touched are right, and `caught_up` was called exactly when the pull read
@@ -3026,6 +3026,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
         server.with(|s| s.caps.max_page_batches = Some(page as u32));
         let pace = Pace {
             apply: [0, 1, 2, 3, 5, 4_000, usize::MAX][rng.below(7) as usize],
+            collect: [0, 1, 2, 3, 1_000, usize::MAX][(seed % 6) as usize],
             seal: [1, 2, 3, 1_000][rng.below(4) as usize],
             hold: Duration::ZERO,
             pause: Duration::from_millis(rng.below(2)),

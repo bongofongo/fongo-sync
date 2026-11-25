@@ -26,6 +26,8 @@ type Rows = BTreeMap<(String, String), BTreeMap<String, Value>>;
 pub struct Writes {
     /// The rows as the last kernel step left them.
     after: Rows,
+    /// The rows as the last kernel step found them.
+    found: Rows,
     /// Every entity each row has held, by collection and key.
     gids: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// The entity each row held when last looked at.
@@ -44,6 +46,10 @@ pub struct Writes {
     owed: BTreeMap<(String, String, String), Value>,
     /// For a reference among them, the entity the row it names stood for when it was written.
     named: BTreeMap<(String, String, String), Gid>,
+    /// Cells owed of rows an install collected and removed, merging the entity it minted for
+    /// each into another's row, before anything here saw that entity. Their keys may be given to
+    /// other rows before the next send, so they are looked for by value, see [`Writes::unwritten`].
+    merged: BTreeMap<(String, String, String), Value>,
     /// Every write the application made, as the change that carried it: each must be in the
     /// merged state once everything is exchanged.
     pub expected: Vec<Change>,
@@ -155,6 +161,7 @@ impl Writes {
     ) {
         witness(conn, replica).await;
         let current = now(conn, replica).await;
+        self.found = current.clone();
         let registry = replica.registry();
         let remade: BTreeSet<(String, String)> =
             rows(conn, "SELECT collection, key FROM witness_made", &[])
@@ -317,6 +324,65 @@ impl Writes {
         }
     }
 
+    /// After a bounded step of collecting that left rows to collect: a row still to collect
+    /// that the step did not write keeps what the steps before it left, so what the application
+    /// wrote to it since is still its write when a later step collects it.
+    pub async fn after_step(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+        witness(conn, replica).await;
+        let current = now(conn, replica).await;
+        let marked: BTreeSet<(String, String)> = replica
+            .inspect(conn)
+            .await
+            .unwrap()
+            .uncollected
+            .into_iter()
+            .collect();
+        let mut keys: BTreeSet<(String, String)> = current.keys().cloned().collect();
+        keys.extend(self.after.keys().cloned());
+        keys.extend(self.found.keys().cloned());
+        let mut next = Rows::new();
+        let mut kept = BTreeSet::new();
+        for key in keys {
+            if marked.contains(&key) && self.found.get(&key) == current.get(&key) {
+                if let Some(row) = self.after.get(&key) {
+                    next.insert(key.clone(), row.clone());
+                }
+                kept.insert(key);
+            } else if let Some(row) = current.get(&key) {
+                next.insert(key, row.clone());
+            }
+        }
+        for table in ["witness_made", "witness_set"] {
+            for row in rows(
+                conn,
+                &format!("SELECT rowid, collection, key FROM {table}"),
+                &[],
+            )
+            .await
+            {
+                if !kept.contains(&(text(&row[1]), text(&row[2]))) {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE rowid = ?1"))
+                        .bind(match row[0] {
+                            Value::Int(id) => id,
+                            _ => unreachable!(),
+                        })
+                        .execute(&mut *conn)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        // What is owed of a row still to collect is its change since it was last collected,
+        // which the next kernel step's look at the tables works out again.
+        let of_kept = |c: &str, k: &str| kept.contains(&(c.to_string(), k.to_string()));
+        self.owed.retain(|(c, k, _), _| !of_kept(c, k));
+        self.named.retain(|(c, k, _), _| !of_kept(c, k));
+        self.after = next;
+        for (collection, key) in current.keys() {
+            self.remember(conn, replica, collection, key).await;
+        }
+    }
+
     /// After an apply, which reports the rows it wrote and removed with their entities, among
     /// them rows the application made that the apply collected and then removed.
     pub fn touched(&mut self, touched: &[fongo_sync_sqlite::Touched]) {
@@ -412,6 +478,43 @@ impl Writes {
         self.adopted
             .extend(outbox.changes.into_iter().skip(waiting));
         self.after(conn, replica).await;
+        self.gone_with_install();
+    }
+
+    /// What was owed of a row the install collected and then removed, merging its entity into
+    /// another's row, before anything here saw the entity: owed still, but by value, since the
+    /// row's key could be given to another entity before the next send.
+    fn gone_with_install(&mut self) {
+        let gone = |at: &(String, String)| {
+            !self.after.contains_key(at) && self.gids.get(at).is_none_or(BTreeSet::is_empty)
+        };
+        let cells: Vec<(String, String, String)> = self
+            .owed
+            .keys()
+            .filter(|(c, k, _)| gone(&(c.clone(), k.clone())))
+            .cloned()
+            .collect();
+        for cell in cells {
+            if let Some(value) = self.owed.remove(&cell) {
+                self.merged.insert(cell.clone(), value);
+            }
+            self.named.remove(&cell);
+        }
+    }
+
+    /// [`Writes::installed`] after an install that collected in a bounded step and left rows to
+    /// collect, as [`Writes::after_step`] sees them.
+    pub async fn installed_step(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        waiting: usize,
+    ) {
+        let outbox = replica.outbox(conn, u32::MAX).await.unwrap();
+        self.adopted
+            .extend(outbox.changes.into_iter().skip(waiting));
+        self.after_step(conn, replica).await;
+        self.gone_with_install();
     }
 
     /// The changes about to be sent that the application did not write, and rows it removed
@@ -450,6 +553,63 @@ impl Writes {
                     .entry((c.as_str(), canonical(c, *g)))
                     .or_default()
                     .insert(k.as_str());
+            }
+        }
+        // Every entity some row here has held, and the entities this send makes that none has.
+        let seen_gids: BTreeSet<Gid> = self.gids.values().flatten().copied().collect();
+        let made_unseen: BTreeSet<(&str, Gid)> = sent
+            .iter()
+            .filter(|ch| ch.field == DELETED && ch.value == Value::Int(0))
+            .filter(|ch| !seen_gids.contains(&ch.gid))
+            .map(|ch| (ch.collection.as_str(), ch.gid))
+            .collect();
+        // Whether `ch` carries `value`; a local id stands for whichever entity the row named.
+        let carries = |ch: &Change, value: &Value| match (&ch.value, value) {
+            (Value::Ref(_), Value::Int(_)) => true,
+            (a, b) => a.total_cmp(b) == std::cmp::Ordering::Equal,
+        };
+        // A row the kernel removed, merging it into another's, before anything here saw the
+        // entity it minted for the row: that entity, made by this send, carries every field the
+        // application wrote to the row.
+        let mut merged_rows: BTreeMap<(String, String), Vec<(String, Value)>> = BTreeMap::new();
+        for ((c, key, field), value) in std::mem::take(&mut self.merged) {
+            merged_rows
+                .entry((c, key))
+                .or_default()
+                .push((field, value));
+        }
+        // The entity that carried each row merged away, which references to the row name.
+        let mut carriers: BTreeMap<(String, String), Gid> = BTreeMap::new();
+        for ((c, key), cells) in merged_rows {
+            let carrier = made_unseen
+                .iter()
+                .filter(|(mc, _)| *mc == c)
+                .find(|(_, g)| {
+                    cells.iter().all(|(field, value)| {
+                        sent.iter().any(|ch| {
+                            ch.collection == c
+                                && ch.gid == *g
+                                && ch.field == *field
+                                && carries(ch, value)
+                        })
+                    })
+                });
+            match carrier {
+                Some((_, g)) => {
+                    self.expected.extend(
+                        sent.iter()
+                            .filter(|ch| {
+                                ch.collection == c
+                                    && ch.gid == *g
+                                    && cells.iter().any(|(field, _)| *field == ch.field)
+                            })
+                            .cloned(),
+                    );
+                    carriers.insert((c.clone(), key.clone()), *g);
+                }
+                None => wrong.push(format!(
+                    "the application wrote {c} row {key} as {cells:?}, the install merged the row away, and no entity it made carries it"
+                )),
             }
         }
         // The fields written to rows that are gone and were made by the application or never
@@ -609,6 +769,7 @@ impl Writes {
             if let (Some(Kind::Ref { collection: t, .. }), Value::Int(local)) = (kind, &value) {
                 names.extend(named.get(&cell).map(|g| canonical(t, *g)));
                 let held = (t.clone(), format!("[{local}]"));
+                names.extend(carriers.get(&held).map(|g| canonical(t, *g)));
                 names.extend(
                     self.gids
                         .get(&held)
@@ -628,10 +789,15 @@ impl Writes {
                 .map(|g| canonical(&c, *g))
                 .collect();
             group.extend(self.latest.get(&at).map(|g| canonical(&c, *g)));
+            // A row the application made that the step removed, merging the entity it minted
+            // into another's row, was never seen with that entity; `gids` names only the
+            // entities of earlier rows at its key. Its write is carried by that entity.
+            let unseen = self.made.contains(&at) && !self.after.contains_key(&at);
             let carried = sent.iter().find(|ch| {
                 ch.collection == c
                     && ch.field == field
-                    && group.contains(&canonical(&c, ch.gid))
+                    && (group.contains(&canonical(&c, ch.gid))
+                        || (unseen && made_unseen.contains(&(c.as_str(), ch.gid))))
                     && match (&ch.value, &value, kind) {
                         (Value::Ref(a), Value::Int(_), Some(Kind::Ref { collection: t, .. })) => {
                             names.is_empty() || names.contains(&canonical(t, *a))

@@ -14,7 +14,16 @@ The kernel knows nothing about any particular application.
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
 its database, `Replica::collect` to turn local writes into changes, and `Replica::apply` to merge
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
-`fongo_`.
+`fongo_`. `Replica::collect_step` collects in steps, each a transaction of its own that says
+whether more is left, so that many local writes are collected without holding SQLite's write lock
+for long; `Replica::install_step` installs and takes the first step. A step ends only where the
+next row is marked with a later time, so the steps end as some placing of ordinary collects
+among the same writes would; in every case the tests try, also as one collect of everything,
+but where an alias is stamped or a reference names another member of the group it joins. A
+step takes about the rows asked for, more where rows depend on later ones: a
+new row written again after the rows naming it is collected with all of them, rows written in
+one millisecond are collected together, and the rows found in a collection's tables when it is
+first installed are collected by that install whole.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are
@@ -62,11 +71,13 @@ the envelope it is sending and where its recent envelopes landed, in tables of i
 `sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
 application derives from the rows an apply touched is committed with them and the cursor, and that
 is called once a pull has read the whole log, before the outbox is sent.
-A sync shares the database with other writers: each apply takes a bounded number of changes in
-whole envelopes, each envelope sent holds a bounded number, and once a sync has held SQLite's
-write lock for a while it leaves it free long enough for a writer waiting in SQLite's busy handler
-to take it. `Apply::between`, called in each gap between transactions, lets an application send
-its own writers through, and `Apply::pace` sets the bounds.
+A sync shares the database with other writers: local writes are collected in bounded steps
+before each apply, each apply takes a bounded number of changes in whole envelopes, each envelope
+sent holds a bounded number, and once a sync has held SQLite's write lock for a while it leaves it
+free long enough for a writer waiting in SQLite's busy handler to take it. `Apply::collect` runs
+each step of collecting in the client's transaction, as `Apply::apply` runs each apply, and is told
+what the step wrote; `Apply::between`, called in each gap between transactions, lets an
+application send its own writers through, and `Apply::pace` sets the bounds.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 
@@ -150,10 +161,15 @@ One chain, each link checked against the one above it:
    implementation to the same account, and `Registry::model_schema` gives the model's schema; a
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,
    every script up to a small length in `tests/exhaustive.rs`, both repeatable from a seed;
-   `make deep` runs them longer. `tests/departures.rs` holds the ways an earlier adapter was
-   seen to depart from the model; `tests/crash.rs` stops an apply and a collect at every
-   statement and requires the database unchanged and a second run complete; `tests/bench.rs`
-   requires a small batch to run the same statements in a large library as in a small one.
+   `make deep` runs them longer; both, and `tests/differential.rs`, also collect in bounded
+   steps of sizes each case picks, checking the model after every step, some on a clock that moves
+   only now and then, so that many writes share a millisecond. `tests/steps.rs` requires
+   collecting in steps to send, hold and show what one collect does, and `tests/placings.rs`
+   what collects placed between the same writes do. `tests/departures.rs`
+   holds the ways an earlier adapter was seen to depart from the model; `tests/crash.rs` stops an
+   apply, a collect, a resume and every step of a bounded install or collect at every statement
+   and requires the database unchanged and the rest to complete; `tests/bench.rs` requires a
+   small batch to run the same statements in a large library as in a small one.
    Where the core plans no write (rows that wait on each other through columns none of which
    accepts NULL), rows wait for the application: ignored tests in `crates/core/tests/plan.rs`,
    `tests/converge.rs` and `tests/property.rs` show it.

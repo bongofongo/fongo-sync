@@ -6,7 +6,8 @@
 //!
 //! `EXHAUSTIVE_STEPS` sets the script length (default 3) and `EXHAUSTIVE_REPLICAS` the number of
 //! replicas (default 2). `EXHAUSTIVE_SEEDS` runs each script under that many worlds, which order
-//! node ids differently (default 1).
+//! node ids differently (default 1). Each script and world collects whole or in bounded steps of
+//! one or two rows, by turns, and the model is checked after every step.
 
 mod support;
 
@@ -167,6 +168,8 @@ fn scripts(replicas: usize, steps: usize) -> Vec<Vec<Op>> {
 struct Peer {
     conn: SqliteConnection,
     replica: Replica,
+    /// Rows a bounded step of collecting takes, or `None` to collect whole.
+    step: Option<usize>,
     taken: Vec<Change>,
     /// Which batches this peer has taken.
     has: Vec<bool>,
@@ -174,7 +177,7 @@ struct Peer {
 }
 
 impl Peer {
-    async fn new(world: &World, n: u64) -> Peer {
+    async fn new(world: &World, n: u64, step: Option<usize>) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in SCHEMA {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
@@ -184,6 +187,7 @@ impl Peer {
         Peer {
             conn,
             replica,
+            step,
             taken: Vec::new(),
             has: Vec::new(),
             writes: Default::default(),
@@ -194,7 +198,29 @@ impl Peer {
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
             .await;
-        self.replica.collect(&mut self.conn).await.unwrap();
+        match self.step {
+            None => {
+                self.replica.collect(&mut self.conn).await.unwrap();
+            }
+            Some(rows) => loop {
+                let collected = self
+                    .replica
+                    .collect_step(&mut self.conn, rows)
+                    .await
+                    .unwrap();
+                self.writes.after(&mut self.conn, &self.replica).await;
+                let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+                let mut seen = self.taken.clone();
+                seen.extend(outbox.changes);
+                support::midway(&mut self.conn, &self.replica, &seen).await?;
+                if !collected.more {
+                    break;
+                }
+                self.writes
+                    .before(&mut self.conn, &self.replica, &seen)
+                    .await;
+            },
+        }
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
         let unwritten = self
@@ -231,11 +257,11 @@ impl Peer {
     }
 }
 
-async fn run(seed: u64, replicas: usize, script: &[Op]) -> Result<(), String> {
+async fn run(seed: u64, replicas: usize, script: &[Op], step: Option<usize>) -> Result<(), String> {
     let world = World::new(seed);
     let mut peers = Vec::new();
     for n in 0..replicas {
-        peers.push(Peer::new(&world, n as u64).await);
+        peers.push(Peer::new(&world, n as u64, step).await);
     }
     let mut batches: Vec<Vec<Change>> = Vec::new();
     for (step, op) in script.iter().enumerate() {
@@ -318,8 +344,13 @@ fn every_short_script_agrees_with_the_model_at_every_step() {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(script) = all.get(i) else { break };
                     for seed in 0..seeds {
-                        if let Err(e) = runtime.block_on(run(seed, replicas, script)) {
-                            failures.lock().unwrap().push((script.clone(), seed, e));
+                        let step = [None, Some(1), Some(2)][(i + seed as usize) % 3];
+                        if let Err(e) = runtime.block_on(run(seed, replicas, script, step)) {
+                            failures.lock().unwrap().push((
+                                script.clone(),
+                                seed,
+                                format!("steps {step:?}: {e}"),
+                            ));
                         }
                     }
                 }

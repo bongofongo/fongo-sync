@@ -1,14 +1,18 @@
 //! Replicas that use every feature at once, some holding rows before the kernel is installed,
 //! exchange changes in any order, part by part and more than once, and change their registry
 //! midway, agree with the reference model after every step and show exactly its view once
-//! everything is exchanged.
+//! everything is exchanged. Each replica collects whole or in bounded steps of a size its world
+//! picks, with the application writing between some steps; every other time it collects in steps
+//! with no writes between, a copy of its database made at the start collects whole, and the two
+//! must send, hold and show the same. `PROPERTY_STEP` (`whole` or a number of rows) makes every
+//! replica collect one way.
 
 mod support;
 
 use std::collections::BTreeSet;
 
 use fongo_sync_sqlite::core::Change;
-use fongo_sync_sqlite::{Collection, LocalDefault, Made, Registry, Replica, Resume};
+use fongo_sync_sqlite::{COLLECT_ROWS, Collection, LocalDefault, Made, Registry, Replica, Resume};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 use sqlx::SqliteConnection;
@@ -51,6 +55,12 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE covers (
         book_id INTEGER NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
         path TEXT)",
+    // An identity no index enforces, so one replica can find two of its own rows to be one.
+    "CREATE TABLE series (id INTEGER PRIMARY KEY, code TEXT, name TEXT)",
+    "CREATE TABLE volumes (
+        id INTEGER PRIMARY KEY,
+        series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        title TEXT)",
 ];
 
 /// The registry before and after an upgrade that adds a field.
@@ -94,6 +104,13 @@ fn registry(upgraded: bool) -> Registry {
         Collection::natural("settings", "settings", &["key"])
             .field("key")
             .field("value"),
+        Collection::minted("series", "series", "id")
+            .field("code")
+            .field("name")
+            .identity(&["code"]),
+        Collection::minted("volumes", "volumes", "id")
+            .owner("series_id", "series")
+            .field("title"),
     ])
     .unwrap()
 }
@@ -107,6 +124,11 @@ const MIXED: &str = "
 struct Peer {
     conn: SqliteConnection,
     replica: Replica,
+    /// Rows a bounded step of collecting takes, or `None` to collect whole.
+    step: Option<usize>,
+    /// Picks the writes made between steps.
+    seed: u64,
+    steps: usize,
     upgraded: bool,
     seen: Vec<bool>,
     sent: Option<(usize, i64)>,
@@ -116,11 +138,23 @@ struct Peer {
     /// What this replica answered of who made each live group and wrote each field, and the
     /// changes and registry it answered from, as of its last step.
     origins: Option<(BTreeSet<String>, support::Origins)>,
+    /// The world and number of this replica's database, to collect a copy of it whole.
+    world: World,
+    n: u64,
+    pushes: usize,
 }
 
 impl Peer {
     /// A replica whose tables hold `rows` before the kernel is installed.
-    async fn new(world: &World, n: u64, schema: &[&str], rows: &[&str]) -> Peer {
+    /// `step` is the rows each step collects, `None` to collect whole; left out, the world picks.
+    async fn new(
+        world: &World,
+        n: u64,
+        schema: &[&str],
+        rows: &[&str],
+        seed: u64,
+        step: Option<Option<usize>>,
+    ) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
@@ -128,6 +162,17 @@ impl Peer {
         let mut peer = Peer {
             conn,
             replica: Replica::new(registry(false)),
+            step: step.unwrap_or(match std::env::var("PROPERTY_STEP").as_deref() {
+                Ok("whole") => None,
+                Ok(rows) => rows.parse().ok(),
+                Err(_) => [None, Some(1), Some(2), Some(3), Some(COLLECT_ROWS)]
+                    [(mix(seed, n as usize) % 5) as usize],
+            }),
+            seed: mix(seed, 1_000 + n as usize),
+            steps: 0,
+            world: world.clone(),
+            n,
+            pushes: 0,
             upgraded: false,
             seen: Vec::new(),
             sent: None,
@@ -135,15 +180,128 @@ impl Peer {
             writes: Default::default(),
             origins: None,
         };
-        let waiting = peer
-            .writes
-            .installing(&mut peer.conn, &peer.replica, &peer.taken)
-            .await;
-        peer.replica.install(&mut peer.conn).await.unwrap();
-        peer.writes
-            .installed(&mut peer.conn, &peer.replica, waiting)
-            .await;
+        peer.install().await.unwrap();
         peer
+    }
+
+    /// Installs whole, or in steps: an install that collects one step, then steps of collecting,
+    /// checking the model after each.
+    async fn install(&mut self) -> Result<(), String> {
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
+        let Some(rows) = self.step else {
+            self.replica.install(&mut self.conn).await.unwrap();
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
+            return Ok(());
+        };
+        let first = self
+            .replica
+            .install_step(&mut self.conn, rows)
+            .await
+            .unwrap();
+        self.writes.touched(&first.touched);
+        let mut more = first.more;
+        if more {
+            self.writes
+                .installed_step(&mut self.conn, &self.replica, waiting)
+                .await;
+        } else {
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
+        }
+        while more {
+            self.between().await;
+            self.before_step().await;
+            let collected = self
+                .replica
+                .collect_step(&mut self.conn, rows)
+                .await
+                .unwrap();
+            self.writes.touched(&collected.touched);
+            more = collected.more;
+            if more {
+                self.writes.after_step(&mut self.conn, &self.replica).await;
+            } else {
+                self.writes.after(&mut self.conn, &self.replica).await;
+            }
+            self.collected().await?;
+        }
+        Ok(())
+    }
+
+    /// What the replica has taken in, with its outbox, which is not yet in `taken`.
+    async fn holding(&mut self) -> Vec<Change> {
+        let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+        let mut seen = self.taken.clone();
+        seen.extend(outbox.changes);
+        seen
+    }
+
+    /// Checks a replica that collected part of what was written against the model of what it
+    /// holds.
+    async fn collected(&mut self) -> Result<(), String> {
+        let seen = self.holding().await;
+        support::midway(&mut self.conn, &self.replica, &seen).await
+    }
+
+    /// Before a step of collecting that follows another.
+    async fn before_step(&mut self) {
+        let seen = self.holding().await;
+        self.writes
+            .before(&mut self.conn, &self.replica, &seen)
+            .await;
+    }
+
+    /// Between two steps of collecting, now and then, a write of the application's.
+    async fn between(&mut self) {
+        self.steps += 1;
+        let pick = mix(self.seed, self.steps);
+        if !pick.is_multiple_of(3) {
+            return;
+        }
+        let n = (pick >> 8) % 7;
+        let row = |table: &str| {
+            format!(
+                "(SELECT rowid FROM {table} ORDER BY rowid LIMIT 1
+                  OFFSET {n} % max(1, (SELECT count(*) FROM {table})))"
+            )
+        };
+        let sql = match (pick >> 4) % 8 {
+            0 => format!(
+                "UPDATE books SET title = 'between{n}' WHERE id = {}",
+                row("books")
+            ),
+            1 => format!(
+                "INSERT INTO notes (book_id, body) SELECT {}, 'between' WHERE EXISTS (SELECT 1 FROM books)",
+                row("books")
+            ),
+            2 => format!("DELETE FROM tags WHERE rowid = {}", row("tags")),
+            3 => format!("DELETE FROM books WHERE id = {}", row("books")),
+            4 => format!(
+                "INSERT OR IGNORE INTO shelves (name) VALUES ('shelf{}')",
+                n % 3
+            ),
+            5 => format!(
+                "INSERT OR IGNORE INTO tags (book_id, tag) SELECT {}, 'tag{}' WHERE EXISTS (SELECT 1 FROM books)",
+                row("books"),
+                n % 2
+            ),
+            6 => format!(
+                "UPDATE OR IGNORE books SET isbn = 'i{}' WHERE id = {}",
+                n % 2,
+                row("books")
+            ),
+            _ => format!(
+                "UPDATE notes SET body = 'between{n}' WHERE id = {}",
+                row("notes")
+            ),
+        };
+        self.run(&sql).await;
     }
 
     /// Checks the replica against the model, and records what it answers of who made each live
@@ -161,14 +319,7 @@ impl Peer {
         if !self.upgraded {
             self.upgraded = true;
             self.replica = Replica::new(registry(true));
-            let waiting = self
-                .writes
-                .installing(&mut self.conn, &self.replica, &self.taken)
-                .await;
-            self.replica.install(&mut self.conn).await.unwrap();
-            self.writes
-                .installed(&mut self.conn, &self.replica, waiting)
-                .await;
+            self.install().await?;
             self.midway().await?;
         }
         Ok(())
@@ -227,7 +378,54 @@ impl Peer {
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
             .await;
-        self.replica.collect(&mut self.conn).await.unwrap();
+        // Every other push collects with no writes between its steps, and a copy of the database
+        // collects whole: the two must send, hold and show the same.
+        self.pushes += 1;
+        let quiet = self.step.is_some() && mix(self.seed, 10_000 + self.pushes).is_multiple_of(2);
+        let whole = if quiet {
+            let (_, mut copy) = self.world.twin(self.n, &mut self.conn).await;
+            let start = self
+                .replica
+                .outbox(&mut copy, 1_000_000)
+                .await
+                .unwrap()
+                .changes
+                .len();
+            self.replica.collect(&mut copy).await.unwrap();
+            Some((start, collected_whole(&mut copy, &self.replica).await))
+        } else {
+            None
+        };
+        match self.step {
+            None => {
+                self.replica.collect(&mut self.conn).await.unwrap();
+            }
+            Some(rows) => loop {
+                let collected = self
+                    .replica
+                    .collect_step(&mut self.conn, rows)
+                    .await
+                    .unwrap();
+                self.writes.touched(&collected.touched);
+                if collected.more {
+                    self.writes.after_step(&mut self.conn, &self.replica).await;
+                } else {
+                    self.writes.after(&mut self.conn, &self.replica).await;
+                }
+                self.collected().await?;
+                if !collected.more {
+                    break;
+                }
+                if !quiet {
+                    self.between().await;
+                }
+                self.before_step().await;
+            },
+        }
+        if let Some((start, whole)) = whole {
+            let stepped = collected_whole(&mut self.conn, &self.replica).await;
+            same_as_whole(start, &whole, &stepped)?;
+        }
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
             .replica
@@ -304,6 +502,119 @@ impl Peer {
     }
 }
 
+/// What a collect leaves: the outbox, the application's rows and the registers' values.
+struct Left {
+    outbox: Vec<Change>,
+    rows: Vec<String>,
+    values: Vec<String>,
+}
+
+async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left {
+    let mut rows = Vec::new();
+    for table in [
+        "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers", "series",
+        "volumes",
+    ] {
+        let sql = format!("SELECT * FROM {table} ORDER BY rowid");
+        for row in support::rows(conn, &sql, &[]).await {
+            rows.push(format!("{table} {row:?}"));
+        }
+    }
+    let inspection = replica.inspect(conn).await.unwrap();
+    // A reference is held as the group it names: see `same_as_whole`.
+    let canonical: std::collections::BTreeMap<fongo_sync_sqlite::core::Gid, _> = inspection
+        .aliases
+        .iter()
+        .map(|(_, g, k)| (*g, *k))
+        .collect();
+    Left {
+        outbox: replica.outbox(conn, 1_000_000).await.unwrap().changes,
+        rows,
+        values: inspection
+            .registers
+            .iter()
+            .map(|(c, g, f, v, _)| {
+                let v = match v {
+                    fongo_sync_sqlite::core::Value::Ref(r) => {
+                        fongo_sync_sqlite::core::Value::Ref(*canonical.get(r).unwrap_or(r))
+                    }
+                    v => v.clone(),
+                };
+                format!("{c} {g:?} {f} {v:?}")
+            })
+            .chain(inspection.aliases.iter().map(|a| format!("{a:?}")))
+            .collect(),
+    }
+}
+
+/// Collecting in steps sent, from `start` of the outbox, what collecting whole did: the same
+/// changes in clock order, aliases joining the same groups, and the same rows and values.
+fn same_as_whole(start: usize, whole: &Left, stepped: &Left) -> Result<(), String> {
+    use fongo_sync_sqlite::core::{ALIAS, Gid, Value};
+    // A reference may name another member of a group the steps join, as it may across two
+    // collects: references are compared by the group they name, each side's groups joined by
+    // the aliases it sent.
+    let groups = |left: &Left| {
+        let mut parent: std::collections::BTreeMap<Gid, Gid> = std::collections::BTreeMap::new();
+        fn root(parent: &std::collections::BTreeMap<Gid, Gid>, mut g: Gid) -> Gid {
+            while let Some(&p) = parent.get(&g) {
+                if p == g {
+                    break;
+                }
+                g = p;
+            }
+            g
+        }
+        for c in left.outbox[start..].iter().filter(|c| c.field == ALIAS) {
+            if let Value::Ref(b) = c.value {
+                let (ra, rb) = (root(&parent, c.gid), root(&parent, b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb));
+                }
+            }
+        }
+        move |g: Gid| root(&parent, g)
+    };
+    let plain = |left: &Left| {
+        let group = groups(left);
+        let mut changes: Vec<&Change> = left.outbox[start..]
+            .iter()
+            .filter(|c| c.field != ALIAS)
+            .collect();
+        changes.sort_by_key(|c| c.clock);
+        changes
+            .iter()
+            .map(|c| {
+                let value = match &c.value {
+                    Value::Ref(g) => Value::Ref(group(*g)),
+                    v => v.clone(),
+                };
+                format!("{} {:?} {} {:?}", c.collection, c.gid, c.field, value)
+            })
+            .collect::<Vec<_>>()
+    };
+    if plain(whole) != plain(stepped) {
+        return Err(format!(
+            "collected in steps, sent otherwise than whole:\n{:#?}\n{:#?}",
+            plain(whole),
+            plain(stepped)
+        ));
+    }
+    if whole.rows != stepped.rows {
+        return Err(format!(
+            "collected in steps, rows differ from whole:\n{:#?}\n{:#?}",
+            whole.rows, stepped.rows
+        ));
+    }
+    if whole.values != stepped.values {
+        return Err(format!(
+            "collected in steps, values or groups differ from whole:\n{:#?}\n{:#?}",
+            whole.values, stepped.values
+        ));
+    }
+    Ok(())
+}
+
 fn mix(seed: u64, i: usize) -> u64 {
     let mut x = seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 33;
@@ -341,6 +652,9 @@ enum Op {
     SetSetting(u8, u8),
     DeleteSetting(u8),
     AddCover(usize),
+    AddSeries(u8, u8),
+    SetSeriesCode(usize, u8),
+    AddVolume(usize, u8),
     /// A write with the triggers suspended, sent on resuming.
     Suspended(usize, u8),
     Upgrade,
@@ -384,6 +698,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
         2 => (0u8..2, v.clone()).prop_map(|(a, b)| Op::SetSetting(a, b)),
         1 => (0u8..2).prop_map(Op::DeleteSetting),
         2 => n.clone().prop_map(Op::AddCover),
+        3 => (0u8..2, v.clone()).prop_map(|(a, b)| Op::AddSeries(a, b)),
+        2 => (n.clone(), 0u8..2).prop_map(|(a, b)| Op::SetSeriesCode(a, b)),
+        2 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddVolume(a, b)),
         1 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::Suspended(a, b)),
         1 => Just(Op::Upgrade),
         4 => Just(Op::Sync),
@@ -625,6 +942,17 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
             Some(b) => format!("INSERT OR IGNORE INTO covers (book_id, path) VALUES ({b}, 'c')"),
             None => return Ok(()),
         },
+        Op::AddSeries(c, v) => {
+            format!("INSERT INTO series (code, name) VALUES ('c{c}', 'name{v}')")
+        }
+        Op::SetSeriesCode(n, c) => match peer.pick("series", n).await {
+            Some(id) => format!("UPDATE series SET code = 'c{c}' WHERE id = {id}"),
+            None => return Ok(()),
+        },
+        Op::AddVolume(n, v) => match peer.pick("series", n).await {
+            Some(id) => format!("INSERT INTO volumes (series_id, title) VALUES ({id}, 'v{v}')"),
+            None => return Ok(()),
+        },
     };
     peer.run(&sql).await;
     Ok(())
@@ -769,25 +1097,48 @@ fn found_at_install(n: u64) -> &'static [&'static str] {
 /// Runs a script on five peers of a world made from `seed`. The same seed and script always do
 /// the same thing.
 fn run(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, false, seed, script)
+    run_on(SCHEMA, false, seed, 0, script, None)
 }
 
 /// [`run`] on replicas that hold [`found_at_install`] before they install.
 fn run_found(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, true, seed, script)
+    run_on(SCHEMA, true, seed, 0, script, None)
 }
 
-fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
+/// [`run`] or [`run_found`] in a world whose clock moves on one reading in `every` (see
+/// [`World::clustered`]), and with every peer collecting in steps of `step` rows (`Some(None)`
+/// for whole) where given.
+fn run_on(
+    schema: &[&str],
+    found: bool,
+    seed: u64,
+    every: u64,
+    script: &[(usize, Op)],
+    step: Option<Option<usize>>,
+) -> Result<(), String> {
+    run_back(schema, found, seed, every, 0, script, step)
+}
+
+/// [`run_on`] on a clock that also steps back `back` milliseconds now and then.
+fn run_back(
+    schema: &[&str],
+    found: bool,
+    seed: u64,
+    every: u64,
+    back: u64,
+    script: &[(usize, Op)],
+    step: Option<Option<usize>>,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let outcome = runtime.block_on(async {
-        let world = World::new(seed);
+        let world = World::stepping_back(seed, every, back);
         let mut hub = Vec::new();
         let mut peers = Vec::new();
         for n in 0..5 {
             let rows = if found { found_at_install(n) } else { &[] };
-            peers.push(Peer::new(&world, n, schema, rows).await);
+            peers.push(Peer::new(&world, n, schema, rows, seed, step).await);
         }
         for (step, (who, op)) in script.iter().cloned().enumerate() {
             perform(&mut peers[who], op, &mut hub)
@@ -800,18 +1151,25 @@ fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Re
             .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers).await
     });
-    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, script)))
+    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
 }
 
 /// A failing case as a test to paste below.
-fn reproduction(found: bool, seed: u64, script: &[(usize, Op)]) -> String {
-    let run = if found { "run_found" } else { "run" };
+fn reproduction(found: bool, seed: u64, every: u64, back: u64, script: &[(usize, Op)]) -> String {
+    let run = match (found, every, back) {
+        (false, 0, 0) => format!("run({seed}, &script)"),
+        (true, 0, 0) => format!("run_found({seed}, &script)"),
+        (found, every, 0) => format!("run_on(SCHEMA, {found}, {seed}, {every}, &script, None)"),
+        (found, every, back) => {
+            format!("run_back(SCHEMA, {found}, {seed}, {every}, {back}, &script, None)")
+        }
+    };
     let steps: Vec<String> = script
         .iter()
         .map(|(who, op)| format!("        ({who}, {op:?}),"))
         .collect();
     format!(
-        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    {run}({seed}, &script).unwrap();\n}}",
+        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    {run}.unwrap();\n}}",
         steps.join("\n")
     )
 }
@@ -844,9 +1202,11 @@ proptest! {
     fn replicas_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
         seed in any::<u64>(),
         found in any::<bool>(),
+        every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
+        back in prop_oneof![Just(0u64), Just(1), Just(2), Just(40)],
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
-        let outcome = if found { run_found(seed, &script) } else { run(seed, &script) };
+        let outcome = run_back(SCHEMA, found, seed, every, back, &script, None);
         if let Err(error) = outcome {
             prop_assert!(false, "{}", error);
         }
@@ -953,7 +1313,7 @@ fn a_shelf_renamed_onto_one_its_book_moved_to() {
         (4, MoveBookDeleteShelf(0, 0)),
         (1, RenameShelf(0, 2)),
     ];
-    run_on(&schema, false, 0, &script).unwrap();
+    run_on(&schema, false, 0, 0, &script, None).unwrap();
 }
 
 /// A title written while suspended is sent on resuming, so writing it back afterwards is an edit
@@ -1440,4 +1800,383 @@ fn a_tag_made_again_with_a_null_note_at_seed_271828() {
         (0, AddTag(0, 0)),
     ];
     run(0, &script).unwrap();
+}
+
+/// Found by a long run (seed 99). Peer 3 collects a row at a time while its application writes
+/// between steps: an author's favourite is set and, before a step reaches the author, set back
+/// by removing the book. Collected together, the two writes are none, as between two collects.
+#[test]
+fn a_reference_written_between_steps_and_back_sends_nothing() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (1, AddCover(0)),
+        (0, AddShelf(1)),
+        (0, AddBook(0, 1, 1)),
+        (1, Sync),
+        (0, Upgrade),
+        (0, AddAuthor(0)),
+        (0, AddCover(0)),
+        (0, SetTitle(0, 0)),
+        (0, Sync),
+        (1, AddBook(0, 0, 0)),
+        (0, DeleteAuthor(0)),
+        (1, AddTag(0, 0)),
+        (0, SetTitle(0, 0)),
+        (3, SetNote(0, 0)),
+        (0, DeleteShelf(0)),
+        (0, Deliver(0, false, false)),
+        (0, DeleteShelf(0)),
+        (0, RenameShelf(0, 0)),
+        (0, DeleteAuthor(0)),
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (1, AddAuthor(0)),
+        (2, AddShelf(0)),
+        (0, AddShelf(0)),
+        (1, Sync),
+        (0, AddAuthor(0)),
+        (0, SetFavourite(0, 0)),
+        (1, Sync),
+        (3, Sync),
+        (0, SetTitle(0, 0)),
+        (0, SetTitle(0, 0)),
+        (0, Sync),
+        (0, Upgrade),
+        (0, AddBook(2, 0, 3)),
+        (1, Sync),
+        (0, Sync),
+        (4, Log(4, true)),
+        (3, AddNote(0, 0)),
+        (4, AddTag(4, 0)),
+        (2, AddNote(3, 1)),
+        (4, Deliver(17504071961584740370, false, true)),
+        (1, SetStatus(4, 2)),
+        (3, SetStatus(5, 3)),
+        (1, Push),
+        (4, AddTag(4, 0)),
+        (3, SetTitle(3, 2)),
+        (3, Sync),
+        (2, DeleteAuthor(4)),
+        (2, AddMark(4, 1)),
+        (0, AddAuthor(2)),
+        (0, SetNote(3, 0)),
+        (1, DeleteShelf(4)),
+        (2, Sync),
+        (0, Sync),
+        (4, SetNote(2, 0)),
+        (0, SetFavourite(4, 4)),
+        (2, AddNote(4, 2)),
+        (1, Upgrade),
+        (0, AddNote(1, 0)),
+        (2, AddBook(2, 2, 3)),
+        (4, AddNote(0, 0)),
+        (0, SetSetting(0, 2)),
+        (0, AddMark(0, 1)),
+        (0, AddNote(4, 1)),
+        (0, Push),
+        (1, SetAuthor(2, 5)),
+        (4, SetNote(0, 2)),
+        (1, DeleteBook(0)),
+        (4, Deliver(16045125935950652839, false, true)),
+        (3, DeleteShelf(4)),
+        (1, AddBook(2, 1, 3)),
+        (3, AddBook(4, 2, 1)),
+        (1, SetStatus(5, 2)),
+        (4, AddNote(4, 2)),
+        (1, DeleteBook(4)),
+        (4, SetFavourite(2, 2)),
+        (0, SetFavourite(3, 5)),
+        (4, DeleteMark(3)),
+        (0, AddBook(5, 0, 3)),
+        (3, SetIsbn(2, 3)),
+        (1, AddBook(5, 2, 2)),
+        (4, Push),
+        (3, Deliver(7089252144508200401, false, true)),
+        (3, AddNote(2, 2)),
+        (3, RenameShelf(4, 1)),
+        (4, DeleteBook(2)),
+        (3, SetFavourite(5, 4)),
+        (3, AddBook(1, 0, 1)),
+    ];
+    run_found(9882191972837468972, &script).unwrap();
+}
+
+/// The case behind the next test, by itself: a replica makes two series with one code, and an
+/// upgrade's install or a collect finds them to be one and removes a row; another replica's series
+/// then arrives, before or after the next collect, and may take the removed row's key. Both
+/// replicas end with one series of each code, holding what was written.
+#[tokio::test]
+async fn two_series_made_with_one_code_reach_another_replica_as_one() {
+    for upgrade in [true, false] {
+        for deliver_first in [true, false] {
+            let world = World::new(1);
+            let mut a = world.connect(2).await;
+            let mut c = world.connect(0).await;
+            for sql in SCHEMA {
+                sqlx::query(sql).execute(&mut a).await.unwrap();
+                sqlx::query(sql).execute(&mut c).await.unwrap();
+            }
+            let (before, after) = (Replica::new(registry(false)), Replica::new(registry(true)));
+            before.install(&mut a).await.unwrap();
+            before.install(&mut c).await.unwrap();
+            for _ in 0..2 {
+                world.later(10);
+                sqlx::query("INSERT INTO series (code, name) VALUES ('c1', 'name1')")
+                    .execute(&mut a)
+                    .await
+                    .unwrap();
+            }
+            world.later(10);
+            let on_a = if upgrade {
+                after.install(&mut a).await.unwrap();
+                &after
+            } else {
+                before.collect(&mut a).await.unwrap();
+                &before
+            };
+            world.later(10);
+            sqlx::query("INSERT INTO series (code, name) VALUES ('c0', 'name1')")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            before.collect(&mut c).await.unwrap();
+            let from_c = before.outbox(&mut c, u32::MAX).await.unwrap().changes;
+            if deliver_first {
+                on_a.apply(&mut a, &from_c).await.unwrap();
+            }
+            on_a.collect(&mut a).await.unwrap();
+            let from_a = on_a.outbox(&mut a, u32::MAX).await.unwrap().changes;
+            if !deliver_first {
+                on_a.apply(&mut a, &from_c).await.unwrap();
+            }
+            before.apply(&mut c, &from_a).await.unwrap();
+            for conn in [&mut a, &mut c] {
+                let held =
+                    support::rows(conn, "SELECT code, name FROM series ORDER BY code", &[]).await;
+                assert_eq!(
+                    format!("{held:?}"),
+                    r#"[[Text("c0"), Text("name1")], [Text("c1"), Text("name1")]]"#,
+                    "upgrade {upgrade}, delivered first {deliver_first}"
+                );
+            }
+        }
+    }
+}
+
+/// Found by a long run once series, an identity no index enforces, joined the test. An upgrade
+/// install collects two series a replica made with one code and merges them, removing one row;
+/// a delivery then gives that row's key to another series. What the install sent carries the
+/// application's writes; this checks the test's own account of them, with the replicas
+/// collecting in the steps the world picks and with every replica collecting whole.
+#[test]
+fn series_found_to_be_one_on_one_replica_keep_its_writes() {
+    use Op::*;
+    let script = vec![
+        (2, AddShelf(2)),
+        (4, AddBook(3, 1, 1)),
+        (3, Log(3, true)),
+        (4, SetSeriesCode(5, 0)),
+        (3, AddShelf(1)),
+        (1, AddCover(4)),
+        (1, SetIsbn(1, 3)),
+        (4, SetTitle(4, 2)),
+        (4, SetIsbn(4, 0)),
+        (4, Log(3, true)),
+        (0, DeleteShelf(4)),
+        (0, AddNote(5, 2)),
+        (1, AddBook(1, 2, 2)),
+        (1, AddCover(3)),
+        (0, SetFavourite(4, 5)),
+        (2, AddSeries(1, 1)),
+        (4, Deliver(12070878064311819280, false, true)),
+        (2, AddMark(1, 2)),
+        (2, AddTag(1, 0)),
+        (3, SetNote(1, 0)),
+        (2, AddSeries(1, 1)),
+        (3, SetTagNote(4, 2)),
+        (4, AddTag(1, 0)),
+        (4, AddBook(1, 0, 1)),
+        (1, RenameShelf(1, 2)),
+        (4, SetSeriesCode(1, 1)),
+        (4, AddBook(5, 0, 3)),
+        (0, Deliver(18220861876318342081, true, false)),
+        (3, Upgrade),
+        (1, AddAuthor(1)),
+        (0, Upgrade),
+        (2, Upgrade),
+        (1, Sync),
+        (4, AddBook(4, 0, 3)),
+        (3, AddCover(0)),
+        (2, Deliver(14353264754466172533, false, false)),
+        (4, Upgrade),
+        (0, SetAuthor(0, 5)),
+        (3, AddShelf(1)),
+        (4, AddNote(2, 2)),
+        (0, AddSeries(0, 1)),
+        (2, SetIsbn(3, 0)),
+        (1, AddCover(3)),
+        (2, Deliver(14648138576390885823, false, false)),
+        (3, Push),
+        (4, AddMark(5, 0)),
+        (3, DeleteShelf(3)),
+        (3, SetNote(0, 2)),
+        (2, SetStatus(5, 3)),
+        (1, SetStatus(5, 2)),
+        (3, DeleteNote(0)),
+        (0, AddBook(4, 1, 1)),
+        (4, RenameShelf(3, 2)),
+        (1, AddBook(2, 1, 3)),
+        (4, MoveBookDeleteShelf(1, 3)),
+        (3, Sync),
+        (0, Suspended(3, 2)),
+        (0, DeleteTag(3)),
+        (1, AddCover(1)),
+        (2, AddTag(2, 0)),
+        (2, Log(4, true)),
+        (1, AddBook(0, 0, 2)),
+        (2, AddShelf(1)),
+        (2, AddBook(0, 1, 1)),
+        (0, AddNote(4, 1)),
+        (2, AddBook(2, 1, 3)),
+        (4, SetFavourite(0, 3)),
+        (4, AddTag(2, 0)),
+        (2, AddMark(2, 1)),
+        (1, AddSeries(1, 2)),
+        (4, MoveMarkDeleteBook(2, 4)),
+        (2, Log(0, true)),
+        (3, Deliver(17844019385685927557, true, true)),
+        (0, Push),
+        (3, Deliver(9135296489156821608, false, false)),
+        (1, DeleteAuthor(0)),
+        (2, Deliver(14972710878109861610, false, true)),
+        (3, SetExtra(0, 1)),
+        (0, AddMark(1, 1)),
+        (3, SetIsbn(5, 1)),
+        (2, AddMark(1, 1)),
+        (1, Sync),
+        (0, AddSeries(1, 1)),
+        (1, AddShelf(1)),
+        (3, AddVolume(2, 2)),
+        (1, DeleteMark(4)),
+        (0, AddAuthor(1)),
+        (2, MoveMarkDeleteBook(1, 2)),
+        (3, MoveBookDeleteShelf(2, 0)),
+        (1, SetTitle(3, 1)),
+        (0, SetExtra(5, 0)),
+        (0, AddNote(1, 0)),
+        (1, SetAuthor(3, 5)),
+        (4, AddCover(1)),
+        (0, AddSeries(0, 2)),
+        (4, AddShelf(1)),
+        (2, RenameShelf(4, 0)),
+        (4, AddSeries(0, 2)),
+        (1, Log(2, false)),
+        (2, MoveNoteDeleteShelf(2, 2)),
+        (4, SetSetting(0, 2)),
+        (4, AddNote(4, 1)),
+        (2, DeleteAuthor(3)),
+        (4, AddBook(4, 1, 1)),
+        (1, RenameShelf(4, 2)),
+        (1, AddMark(1, 2)),
+        (2, AddCover(1)),
+        (0, AddSeries(0, 1)),
+        (3, AddMark(1, 2)),
+        (1, AddTag(1, 1)),
+        (4, AddTag(0, 1)),
+        (0, Log(4, true)),
+        (1, AddSeries(1, 1)),
+        (2, AddBook(3, 0, 0)),
+        (3, SetNote(3, 0)),
+        (4, Deliver(15985184485851326179, true, true)),
+        (3, AddBook(4, 0, 0)),
+        (3, MoveNoteDeleteShelf(0, 1)),
+        (3, AddCover(0)),
+        (1, DeleteBook(0)),
+        (1, AddBook(0, 1, 1)),
+        (2, AddVolume(1, 0)),
+    ];
+    run(5694626446472720197, &script).unwrap();
+    run_on(SCHEMA, false, 5694626446472720197, 0, &script, Some(None)).unwrap();
+}
+/// Found at 500 cases once series joined the test. A series the replica received is found to be
+/// one with another of its own and its row is removed; two new series then share one code, the
+/// first at the removed row's key, and the push's collect merges that one away too. What it wrote
+/// is carried under the entity minted for it, which the test never saw at that key.
+#[test]
+fn a_series_made_at_a_key_a_merge_freed_and_merged_away_again_is_sent() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, AddSeries(1, 0)),
+        (0, Sync),
+        (0, RenameShelf(0, 0)),
+        (0, AddSeries(0, 0)),
+        (0, AddShelf(0)),
+        (2, AddAuthor(0)),
+        (0, DeleteShelf(0)),
+        (0, AddShelf(0)),
+        (0, Sync),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (2, Deliver(99234427557325516, false, false)),
+        (2, SetSeriesCode(2, 0)),
+        (2, AddVolume(0, 0)),
+        (2, AddShelf(1)),
+        (2, AddVolume(0, 0)),
+        (2, Suspended(0, 0)),
+        (0, AddShelf(0)),
+        (2, AddSeries(1, 0)),
+        (2, AddSeries(1, 0)),
+    ];
+    run(6847074269335888592, &script).unwrap();
+    run_on(SCHEMA, false, 6847074269335888592, 0, &script, Some(None)).unwrap();
+}
+/// Found at 400 cases with seed 424242. Two series with one code and a volume on the second;
+/// resuming collects them whole and merges the second away, and a new series then takes its id.
+/// The volume's reference is carried as the entity minted for the merged row, which the test
+/// never saw at that id.
+#[test]
+fn a_volume_naming_a_series_merged_away_at_a_resume_is_sent() {
+    use Op::*;
+    let script = vec![
+        (1, AddSeries(1, 0)),
+        (1, AddShelf(2)),
+        (1, AddShelf(0)),
+        (1, AddSeries(1, 0)),
+        (0, Deliver(0, false, true)),
+        (1, AddVolume(5, 0)),
+        (1, Suspended(0, 0)),
+        (1, AddSeries(0, 0)),
+    ];
+    run(1416172913542871530, &script).unwrap();
+    run_on(SCHEMA, false, 1416172913542871530, 0, &script, Some(None)).unwrap();
+}
+/// Found at 400 cases with seed 99. A book found to be one with a delivered book, and a note on
+/// it, collected in steps: the note names the book's own entity, where one collect names the
+/// entity it joins. Both name one group; the test compares references by the group they name.
+#[test]
+fn a_note_on_a_book_found_to_be_one_names_its_group_in_steps() {
+    use Op::*;
+    let script = vec![
+        (1, AddShelf(1)),
+        (1, Sync),
+        (0, AddShelf(0)),
+        (3, Deliver(0, false, false)),
+        (0, AddShelf(0)),
+        (0, Sync),
+        (2, AddBook(0, 0, 1)),
+        (2, Deliver(11898942371205919333, false, false)),
+        (2, AddBook(0, 0, 0)),
+        (2, MoveBookDeleteShelf(1, 0)),
+        (2, AddNote(2, 0)),
+        (2, Sync),
+    ];
+    run_found(3778721728584034636, &script).unwrap();
 }

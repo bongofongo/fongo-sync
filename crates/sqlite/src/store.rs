@@ -63,6 +63,9 @@ pub(crate) const TABLES: &[&str] = &[
         at INTEGER NOT NULL,
         gone INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (collection, key))",
+    // The order rows are collected in, so a bounded step reads only the rows it takes. A
+    // database made without it gains it at its next install; one with it works as before.
+    "CREATE INDEX IF NOT EXISTS fongo_dirty_order ON fongo_dirty (at, collection, key)",
     "CREATE TABLE IF NOT EXISTS fongo_outbox (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         collection TEXT NOT NULL,

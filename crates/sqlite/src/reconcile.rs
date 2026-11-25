@@ -180,6 +180,10 @@ impl Replica {
             let mut doomed: BTreeMap<(usize, String), (Gid, Gid)> = BTreeMap::new();
             for (c, g) in &set {
                 let idx = self.registry.index(c).expect("only registered collections");
+                let mine = rows_of(db, c, *g)?;
+                for (key, _) in &mine {
+                    cx.looked_at(c, key);
+                }
                 let t = match session.target(c, *g) {
                     Ok(t) => t,
                     Err(_) => {
@@ -191,7 +195,6 @@ impl Replica {
                     held.insert((c.clone(), t.canonical));
                     continue;
                 }
-                let mine = rows_of(db, c, *g)?;
                 if t.members.is_empty() {
                     for (key, _) in mine {
                         doomed.insert((idx, key), (*g, *g));
@@ -204,6 +207,7 @@ impl Replica {
                     entry.1.insert(key, *g);
                 }
                 for (key, _) in rows_of(db, c, t.canonical)? {
+                    cx.looked_at(c, &key);
                     entry.1.insert(key, t.canonical);
                 }
             }
@@ -239,6 +243,7 @@ impl Replica {
                 for (referrer, field) in self.referring(*idx) {
                     let c = self.collection(referrer);
                     for k in tables::rows_naming(db, c, &field, local)? {
+                        cx.looked_at(&c.name, &k);
                         if let Some(m) = mapping(db, &c.name, &k)?
                             && !set.contains(&(c.name.clone(), m.gid))
                         {
@@ -384,6 +389,23 @@ impl Replica {
         Ok(wrote)
     }
 
+    /// Notes, for a bounded step, the rows a row it writes or removes named: one collected later
+    /// may make one of them again and find the row naming it.
+    fn named_by(&self, cx: &mut Ctx, rows: &Rows, i: usize) {
+        let s = &rows.slots[i];
+        let (Some(image), true) = (&s.image, cx.watch.is_some()) else {
+            return;
+        };
+        let c = self.collection(s.idx);
+        for f in &c.fields {
+            if let (Some(t), Some(Value::Int(local))) =
+                (self.target_of(c, &f.name), image.get(&f.name))
+            {
+                cx.looked_at(&self.collection(t).name, &minted_key(*local));
+            }
+        }
+    }
+
     fn refused(
         &self,
         db: &Db,
@@ -505,6 +527,23 @@ impl Replica {
         let mut params = Vec::new();
         let (key, local) = match &c.key {
             Key::Minted { column } => {
+                // The id depends on the highest mapped one, which collecting a removal lowers:
+                // a step takes every removal above the table's highest id with it.
+                if cx.watch.is_some() {
+                    for r in db.query(
+                        &format!(
+                            "SELECT d.key FROM fongo_dirty AS d
+                               JOIN fongo_ids AS i ON i.collection = d.collection AND i.key = d.key
+                              WHERE d.collection = ?1 AND d.gone > 0
+                                AND i.local > COALESCE((SELECT max({col}) FROM {table}), 0)",
+                            col = quoted(column),
+                            table = quoted(&c.table)
+                        ),
+                        &[Value::Text(c.name.clone())],
+                    )? {
+                        cx.looked_at(&c.name, as_text(&r[0])?);
+                    }
+                }
                 let next = db.query(
                     &format!(
                         "SELECT max(COALESCE((SELECT max({col}) FROM {table}), 0),
@@ -534,6 +573,7 @@ impl Replica {
                 }
             }
         };
+        cx.looked_at(&c.name, &key);
         for (f, v) in &values {
             names.push(quoted(f));
             marks.push(format!("?{}", params.len() + 1));
@@ -590,6 +630,7 @@ impl Replica {
     }
 
     fn update(&self, cx: &mut Ctx, rows: &mut Rows, i: usize, fields: &Row) -> Result<bool> {
+        self.named_by(cx, rows, i);
         let db = cx.db;
         let idx = rows.slots[i].idx;
         let c = self.collection(idx);
@@ -664,6 +705,7 @@ impl Replica {
         row_for: &BTreeMap<(usize, Gid), usize>,
         i: usize,
     ) -> Result<bool> {
+        self.named_by(cx, rows, i);
         let db = cx.db;
         let idx = rows.slots[i].idx;
         let c = self.collection(idx);

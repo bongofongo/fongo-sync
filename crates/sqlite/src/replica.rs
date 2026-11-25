@@ -17,6 +17,7 @@ use fongo_sync_core::source::admit;
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
+use crate::collect::{Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through};
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
@@ -32,6 +33,37 @@ pub enum Resume {
     /// They are this replica's own baseline: not sent, and kept in the row until this replica or
     /// another next writes the field.
     Baseline,
+}
+
+/// About how many rows written since the last collect one bounded step collects. On a fast laptop
+/// a step of 1,000 rows that depend on no later ones took 65 to 230 ms in a library of tens of
+/// thousands of changes, and up to 340 ms in rollback-journal mode and 0.6 s in WAL mode in one of
+/// a million, by how wide the rows are; a step takes more rows where they depend on later ones,
+/// share a millisecond, or follow rows that cannot be collected yet.
+pub const COLLECT_ROWS: usize = 1_000;
+
+/// What one bounded step of collecting did; see [`Replica::collect_step`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Collected {
+    /// Changes the step produced.
+    pub produced: usize,
+    /// Marked rows the step collected.
+    pub rows: usize,
+    /// Marked rows taken by tries the step gave up and took again, larger, because rows they
+    /// took depended on rows past them. Fewer than the marked rows the step took, those it
+    /// collected ([`Collected::rows`]) and those among them that wait, so the tries given up cost
+    /// no more than the try kept; see [`Replica::collect_step`] for what else a step costs.
+    pub abandoned: usize,
+    /// Rows written later than those the step took are still to be collected: call
+    /// [`Replica::collect_step`] again. False once every row left marked is one the step found
+    /// cannot be collected yet, so a caller looping while this holds stops.
+    pub more: bool,
+    /// The rows the step wrote or removed in bringing rows up to date, as [`Applied::touched`]
+    /// lists them: a merge of entities its rows were found to share, a row held back before
+    /// that it could write at last, and the like. A row it collected is among them when bringing
+    /// rows up to date wrote or removed it, as one a merge gives up; one only collected is not.
+    pub touched: Vec<Touched>,
 }
 
 /// Local changes waiting to be sent, oldest first.
@@ -288,6 +320,31 @@ pub(crate) struct Ctx<'d> {
     pub touched: BTreeMap<(usize, String, Gid), (usize, bool)>,
     /// What local edits to fields that report conflicts replaced.
     pub bases: Vec<Base>,
+    /// Marked rows collected.
+    pub collected: usize,
+    /// Marked rows taken by tries of a bounded step that were given up.
+    pub abandoned: usize,
+    /// While a bounded step brings rows up to date, what it reached.
+    pub watch: Option<Watch>,
+}
+
+/// What a bounded try must not leave a later write to: the entities whose rows a merge may
+/// change (only `merge_unless` names these), and every row settle looked at, some of which may
+/// stand for no entity yet.
+#[derive(Default)]
+pub(crate) struct Watch {
+    pub entities: BTreeSet<(String, Gid)>,
+    pub keys: BTreeSet<(String, String)>,
+}
+
+/// What a try of a bounded step changed in its [`Ctx`], to put back when the try is undone.
+struct Saved {
+    clock: Clock,
+    produced: usize,
+    collected: usize,
+    accepted: usize,
+    touched: BTreeMap<(usize, String, Gid), (usize, bool)>,
+    bases: usize,
 }
 
 pub(crate) struct Base {
@@ -315,7 +372,38 @@ impl<'d> Ctx<'d> {
             accepted: 0,
             touched: BTreeMap::new(),
             bases: Vec::new(),
+            collected: 0,
+            abandoned: 0,
+            watch: None,
         })
+    }
+
+    fn save(&self) -> Saved {
+        Saved {
+            clock: self.clock.clone(),
+            produced: self.produced,
+            collected: self.collected,
+            accepted: self.accepted,
+            touched: self.touched.clone(),
+            bases: self.bases.len(),
+        }
+    }
+
+    fn restore(&mut self, saved: Saved) {
+        self.clock = saved.clock;
+        self.produced = saved.produced;
+        self.collected = saved.collected;
+        self.accepted = saved.accepted;
+        self.touched = saved.touched;
+        self.bases.truncate(saved.bases);
+        self.watch = None;
+    }
+
+    /// Notes a row a bounded step looked at.
+    pub(crate) fn looked_at(&mut self, collection: &str, key: &str) {
+        if let Some(watch) = &mut self.watch {
+            watch.keys.insert((collection.to_string(), key.to_string()));
+        }
     }
 
     fn finish(&self) -> Result<()> {
@@ -418,6 +506,20 @@ impl Replica {
         changes: &[Change],
         local: bool,
     ) -> Result<BTreeSet<(String, Gid)>> {
+        Ok(self
+            .merge_unless(cx, changes, local, None)?
+            .unwrap_or_default())
+    }
+
+    /// [`Replica::merge`], unless an entity the changes affect has a row marked past `place`:
+    /// then nothing is merged, and the latest such row's place is returned.
+    pub(crate) fn merge_unless(
+        &self,
+        cx: &mut Ctx,
+        changes: &[Change],
+        local: bool,
+        place: Option<&Place>,
+    ) -> Result<std::result::Result<BTreeSet<(String, Gid)>, Place>> {
         let limit = cx.db.length_limit();
         let fits = |c: &&Change| storable(c, limit);
         let kept: Vec<Change>;
@@ -428,12 +530,24 @@ impl Replica {
             &kept
         };
         if changes.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(Ok(BTreeSet::new()));
         }
         let ev = self.evaluator();
         let facts = Facts { db: cx.db };
         let affected = ev.affected(&facts, changes);
         cx.db.check()?;
+        if let Some(place) = place {
+            let named = Watch {
+                entities: match &affected {
+                    Ok(set) => set.clone(),
+                    Err(_) => ev.everything(&facts),
+                },
+                keys: BTreeSet::new(),
+            };
+            if let Some(past) = self.marked_beyond(cx.db, &named, place)? {
+                return Ok(Err(past));
+            }
+        }
         for change in changes {
             if let Some(fact) = admit(&self.schema, change)
                 && facts.keep(&fact)?
@@ -452,18 +566,27 @@ impl Replica {
             Err(_) => ev.everything(&facts),
         };
         cx.db.check()?;
-        Ok(set)
+        Ok(Ok(set))
     }
 
     /// Collects local edits, merges `incoming`, and brings every row the core names to its
-    /// target.
+    /// target. With `take`, collects only about that many of the rows marked, the earliest
+    /// written, and returns whether later ones are still marked; see [`Replica::bounded`].
     fn step(
         &self,
         cx: &mut Ctx,
         incoming: &[Change],
         mut set: BTreeSet<(String, Gid)>,
-    ) -> Result<()> {
-        set.extend(self.collect_edits(cx)?);
+        take: Option<usize>,
+    ) -> Result<bool> {
+        if let Some(want) = take {
+            debug_assert!(incoming.is_empty());
+            return self.bounded(cx, set, want.max(1));
+        }
+        if let Edits::Recorded(more, rows) = self.collect_edits(cx, None, &mut Minted::new())? {
+            set.extend(more);
+            cx.collected += rows;
+        }
         let limit = cx.db.length_limit();
         for change in incoming {
             if self.registry.index(&change.collection).is_none()
@@ -489,6 +612,12 @@ impl Replica {
             }
         }
         set.extend(self.merge(cx, incoming, false)?);
+        self.settle(cx, set)?;
+        Ok(false)
+    }
+
+    /// Brings every row of `set`'s entities to its target.
+    fn settle(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>) -> Result<()> {
         // A write a table refuses for a constraint the plan does not know of, such as a unique
         // column outside any identity, may succeed once others are written: what waits is tried
         // again while a round writes anything, up to a bound. What still waits then is tried by
@@ -508,18 +637,160 @@ impl Replica {
         Ok(())
     }
 
+    /// A step that collects a prefix of the marked rows, in the order they were last written,
+    /// of about `want` rows, as a collect made just after the prefix's last write would.
+    /// Collecting the rest later must record what collecting everything at once would have, so
+    /// the step leaves the rows marked past its prefix, and all that collecting them reads, as
+    /// they were. That holds when no row marked past the prefix is one collecting the prefix
+    /// reads and could find changed (a row it names, or one naming a row it gives a new entity),
+    /// one standing for an entity the prefix's changes affect, or one standing for a member of a
+    /// group the step evaluated, or that it looked at, in bringing rows up to date. A prefix that
+    /// breaks this is undone and grown until it holds, at worst to every marked row; one always
+    /// takes every row found at a first install. Returns whether rows are still marked past it.
+    fn bounded(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>, want: usize) -> Result<bool> {
+        let db = cx.db;
+        // Rows found when their collection was first installed are collected together: a write
+        // to one before it is collected would make it the application's edit.
+        let mut through = self.closed(db, last_adopted(db)?, want)?;
+        let wall = cx.wall;
+        let start = cx.collected;
+        let mut minted = Minted::new();
+        loop {
+            let Some(place) = through.clone() else {
+                cx.wall = wall;
+                if let Edits::Recorded(more, rows) = self.collect_edits(cx, None, &mut minted)? {
+                    cx.collected += rows;
+                    let mut set = set;
+                    set.extend(more);
+                    self.settle(cx, set)?;
+                }
+                return Ok(false);
+            };
+            let saved = cx.save();
+            // As a collect made just after the prefix's last write: rows written later that it
+            // leaves are stamped after anything it records, as they would be after that collect.
+            cx.wall = wall.min(u64::try_from(place.0).unwrap_or(0));
+            db.exec("SAVEPOINT fongo_step", &[])?;
+            let need = match self.collect_edits(cx, Some(&place), &mut minted)? {
+                Edits::Beyond(past) => Some(past),
+                Edits::Recorded(more, rows) => {
+                    cx.collected += rows;
+                    let mut set = set.clone();
+                    set.extend(more);
+                    cx.watch = Some(Watch::default());
+                    self.settle(cx, set)?;
+                    let watch = cx.watch.take().unwrap_or_default();
+                    self.marked_beyond(db, &watch, &place)?
+                }
+            };
+            let Some(need) = need else {
+                db.exec("RELEASE fongo_step", &[])?;
+                cx.wall = wall;
+                let taken = cx.collected - start;
+                let past = marked_past(db, &place)?;
+                // What the prefix left marked waits, as it would after a collect. The step goes
+                // on, as a collect after this one would, until it has taken what was asked and at
+                // least as many rows as wait ahead of them, so that reading those again costs no
+                // more than the rows it takes.
+                let waiting = usize::try_from(marked_through(db, &Some(place.clone()))?)
+                    .unwrap_or(usize::MAX);
+                let enough = want.max(waiting);
+                if taken >= enough || !past {
+                    return Ok(past);
+                }
+                through = self.closed(db, Some(place), waiting.saturating_add(enough - taken))?;
+                continue;
+            };
+            db.exec("ROLLBACK TO fongo_step", &[])?;
+            db.exec("RELEASE fongo_step", &[])?;
+            cx.restore(saved);
+            // At least twice as many rows each time, and every row once that is more than half
+            // of them, so the rows of the tries given up come to fewer than the step takes.
+            let rows = marked_through(db, &Some(place.clone()))?;
+            cx.abandoned += usize::try_from(rows).unwrap_or(0);
+            through = self.closed(
+                db,
+                Some(need.max(place)),
+                usize::try_from(rows.saturating_mul(2)).unwrap_or(usize::MAX),
+            )?;
+            if through.is_some()
+                && marked_through(db, &through)?.saturating_mul(2) > marked_through(db, &None)?
+            {
+                through = None;
+            }
+        }
+    }
+
+    /// The latest place past `place` of a marked row that `watch` names, or that stands for an
+    /// entity it names.
+    fn marked_beyond(&self, db: &Db, watch: &Watch, place: &Place) -> Result<Option<Place>> {
+        let mut beyond: Option<Place> = None;
+        let mut see = |found: Place| {
+            if found > *place && beyond.as_ref().is_none_or(|b| *b < found) {
+                beyond = Some(found);
+            }
+        };
+        for (collection, gid) in &watch.entities {
+            for r in db.query(
+                "SELECT d.at, d.key FROM fongo_ids AS i INDEXED BY fongo_ids_gid
+                   JOIN fongo_dirty AS d ON d.collection = i.collection AND d.key = i.key
+                  WHERE i.collection = ?1 AND i.gid = ?2",
+                &[Value::Text(collection.clone()), Value::Ref(*gid)],
+            )? {
+                see((
+                    as_int(&r[0])?,
+                    collection.clone(),
+                    as_text(&r[1])?.to_string(),
+                ));
+            }
+        }
+        for (collection, key) in &watch.keys {
+            if let Some((at, _)) = marked_at(db, collection, key)? {
+                see((at, collection.clone(), key.clone()));
+            }
+        }
+        Ok(beyond)
+    }
+
     /// Creates the sync tables and the triggers that notice local writes. Safe to run at every
     /// open. Rows that existed before a collection was first installed are queued as the oldest
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
     /// and kernel tables of an earlier layout, which [`Replica::uninstall`] removes.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
-        with_db(conn, |db| db.atomically(|db| self.install_in(db, None))).await
+        with_db(conn, |db| {
+            db.atomically(|db| self.install_in(db, None, None).map(|_| ()))
+        })
+        .await
+    }
+
+    /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
+    /// What it adopts of the registry, every row that adoption brings up to date, and every row
+    /// found in the tables of a collection installed for the first time are done whole, as
+    /// `install` does them: a write to a found row before it was collected would make it an
+    /// edit of the application's rather than what was found. So a first install over a large
+    /// library holds the write lock as long as `install` does; only rows written since the last
+    /// collect are left to later steps, and are in the meantime as any row written since then.
+    pub async fn install_step(
+        &self,
+        conn: &mut SqliteConnection,
+        rows: usize,
+    ) -> Result<Collected> {
+        with_db(conn, |db| {
+            db.atomically_writing(|db| self.install_in(db, None, Some(rows)))
+        })
+        .await
     }
 
     /// With `resuming`, marks the rows written while suspended before the step that brings rows
-    /// to their targets, which would otherwise overwrite those writes unrecorded.
-    fn install_in(&self, db: &Db, resuming: Option<Resume>) -> Result<()> {
+    /// to their targets, which would otherwise overwrite those writes unrecorded. With `take`,
+    /// the step is bounded.
+    fn install_in(
+        &self,
+        db: &Db,
+        resuming: Option<Resume>,
+        take: Option<usize>,
+    ) -> Result<Collected> {
         let installed = !db
             .query(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
@@ -638,8 +909,15 @@ impl Replica {
         if let Some(how) = resuming {
             self.resume_in(db, how)?;
         }
-        self.step(&mut cx, &[], set)?;
-        cx.finish()
+        let more = self.step(&mut cx, &[], set, take)?;
+        cx.finish()?;
+        Ok(Collected {
+            produced: cx.produced,
+            rows: cx.collected,
+            abandoned: cx.abandoned,
+            more,
+            touched: self.touched_rows(cx.touched),
+        })
     }
 
     /// Records the values rows hold for fields new to an adopted collection, as the oldest
@@ -820,11 +1098,14 @@ impl Replica {
     /// rows' images. A row added meanwhile is a new entity and a row removed is deleted,
     /// whichever `how`; a row whose local id was reused meanwhile is the old entity changed. A
     /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline.
+    ///
+    /// Unlike [`Replica::install_step`], it collects every marked row before it returns, in the
+    /// transaction that puts the triggers back: a row written back to its image before a later
+    /// collect would otherwise lose both writes. It is as long as the rows changed meanwhile are
+    /// many; collecting with [`Replica::collect_step`] before suspending leaves it only those.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
-        // Collected at once: a row written back to its image before a later collect would
-        // otherwise lose both writes.
         with_db(conn, |db| {
-            db.atomically(|db| self.install_in(db, Some(how)))
+            db.atomically(|db| self.install_in(db, Some(how), None).map(|_| ()))
         })
         .await
     }
@@ -934,10 +1215,115 @@ impl Replica {
         with_db(conn, |db| {
             db.atomically(|db| {
                 let mut cx = Ctx::begin(db)?;
-                self.step(&mut cx, &[], BTreeSet::new())?;
+                self.step(&mut cx, &[], BTreeSet::new(), None)?;
                 cx.finish()?;
                 Ok(cx.produced)
             })
+        })
+        .await
+    }
+
+    /// [`Replica::collect`] in bounded steps: one transaction collects about `rows` of the rows
+    /// written since the last collect, the earliest written, and says whether more are left. A
+    /// caller that loops until none are, leaving the database free between calls, holds SQLite's
+    /// write lock for one step at a time; see [`COLLECT_ROWS`] for how long one takes.
+    ///
+    /// A step ends only between two times: the next row marked after it was marked with a later
+    /// time. Within one millisecond the order of writing is not known, so rows marked with one
+    /// time are taken together: one statement that writes 50,000 rows is one step of 50,000 rows,
+    /// as long as one collect of them, whatever `rows` asks.
+    ///
+    /// What the steps send, hold and show is what some placing of ordinary collects among the
+    /// same writes gives: a step leaves the rows past it, and all that collecting them reads, as
+    /// they were, and an alias it finds is stamped with the time of the last row it took. It is
+    /// not, in general, what collects made at those times give: a row written again after a step
+    /// is sent as last written, not as it stood. In every case the tests try, once the last step
+    /// is done it is also what one
+    /// collect of the same rows gives, the same changes in the same order, entities, conflict
+    /// bases, rows and images, but for aliases: entities found to be one across two steps are
+    /// joined by other pairs of aliases, stamped by their steps, and a reference to one of them
+    /// may name another member of the group they join.
+    ///
+    /// A step takes more than `rows` where rows it takes depend on later ones: a row naming
+    /// one made since, made again, or removed, and written again later; rows naming a row the
+    /// step makes again; what a removed owner owned, written later; rows found to be one; and a
+    /// row made again later at an id named by a row the step writes or removes. Most of these are
+    /// found by reading the rows before anything is collected, so a chain of rows each needing a
+    /// later one, such as rows each naming the next, is taken as one step as long as the chain.
+    /// The rest are found only once the step's changes are merged; the step then gives up what it
+    /// did and tries again with at least twice the rows, or with every row once that would be
+    /// more than half of them, so the rows of the tries it gives up come to fewer than those it
+    /// takes ([`Collected::abandoned`]). At worst a step takes every row. Rows found in a
+    /// collection's tables when it is first installed are collected by that install.
+    ///
+    /// A row that cannot be collected yet, such as one naming a row that has no entity, stays
+    /// marked, as it does after a collect, and every later step reads it again. So a step goes on
+    /// past such rows until it has collected `rows` rows and at least as many as wait ahead of
+    /// them; a step that finds only rows that wait says none are left. The rows marked are
+    /// indexed in the order they are collected, so a step reads only the rows it takes. In the
+    /// supported shape (see the crate's documentation), in SQLite's work, steps of 100 or 1,000
+    /// rows over 100,000 rows written one at a time cost 1.12 times one collect of them, and over
+    /// 5,000 rows behind 999 that wait at most 1.7 times, and each step costs at most about twice
+    /// what collecting its rows at once does. Two cases cost more. Every try of a step reads the
+    /// rows that wait ahead of it again, so rows that wait among many others cost each step more:
+    /// 20,000 rows with 5,000 waiting among them cost 20 times one collect in steps of 10 and 1.8
+    /// times in steps of 1,000, and 5,000 followed by 20,000 waiting 15 times in steps of 1,000.
+    /// And with foreign keys off, a row of a natural collection naming a row that is gone makes
+    /// the step read every marked row of its collection, which can cost 12 times one collect.
+    ///
+    /// Each step is a transaction of its own, committed whole or not at all: after a crash or a
+    /// failure between steps, the rows not yet collected are still marked, and the next step or
+    /// collect takes them; nothing collected is collected again. Rows written between steps join
+    /// those left, as rows written between two collects do. Called with no transaction open, a
+    /// step takes the write lock with its first statement, so while another connection writes it
+    /// waits in the busy handler; called inside a transaction, it is a savepoint of it.
+    pub async fn collect_step(
+        &self,
+        conn: &mut SqliteConnection,
+        rows: usize,
+    ) -> Result<Collected> {
+        with_db(conn, |db| {
+            db.atomically_writing(|db| {
+                let mut cx = Ctx::begin(db)?;
+                let more = self.step(&mut cx, &[], BTreeSet::new(), Some(rows))?;
+                cx.finish()?;
+                Ok(Collected {
+                    produced: cx.produced,
+                    rows: cx.collected,
+                    abandoned: cx.abandoned,
+                    more,
+                    touched: self.touched_rows(cx.touched),
+                })
+            })
+        })
+        .await
+    }
+
+    /// How many rows are marked as written since the last collect, counting at most `at_most`.
+    /// Rows that cannot be collected yet count. A read that writes nothing.
+    pub async fn uncollected_rows(
+        &self,
+        conn: &mut SqliteConnection,
+        at_most: usize,
+    ) -> Result<usize> {
+        with_db(conn, |db| {
+            let installed = !db
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_dirty'",
+                    &[],
+                )?
+                .is_empty();
+            if !installed {
+                return Ok(0);
+            }
+            let rows = db.query(
+                "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
+                &[Value::Int(i64::try_from(at_most).unwrap_or(i64::MAX))],
+            )?;
+            Ok(rows
+                .first()
+                .and_then(|r| as_int(&r[0]).ok())
+                .map_or(0, |n| usize::try_from(n).unwrap_or(0)))
         })
         .await
     }
@@ -984,7 +1370,7 @@ impl Replica {
 
     fn apply_in(&self, db: &Db, changes: &[Change]) -> Result<Applied> {
         let mut cx = Ctx::begin(db)?;
-        self.step(&mut cx, changes, BTreeSet::new())?;
+        self.step(&mut cx, changes, BTreeSet::new(), None)?;
         let conflicts = self.conflicts(&mut cx, changes)?;
         cx.finish()?;
         let ev = self.evaluator();
@@ -1020,24 +1406,28 @@ impl Replica {
             }
         }
         db.check()?;
-        let collections = self.registry.collections();
-        let mut rows: Vec<_> = cx.touched.into_iter().collect();
-        rows.sort_by(|((a, k, _), (s, _)), ((b, l, _), (t, _))| (a, k, s).cmp(&(b, l, t)));
         Ok(Applied {
             accepted: cx.accepted,
             waiting: held.len(),
-            touched: rows
-                .into_iter()
-                .map(|((idx, key, gid), (_, deleted))| Touched {
-                    collection: collections[idx].name.clone(),
-                    key,
-                    gid,
-                    deleted,
-                })
-                .collect(),
+            touched: self.touched_rows(cx.touched),
             conflicts,
             held,
         })
+    }
+
+    /// Rows written or removed, by collection in registry order, then by key.
+    fn touched_rows(&self, touched: BTreeMap<(usize, String, Gid), (usize, bool)>) -> Vec<Touched> {
+        let collections = self.registry.collections();
+        let mut rows: Vec<_> = touched.into_iter().collect();
+        rows.sort_by(|((a, k, _), (s, _)), ((b, l, _), (t, _))| (a, k, s).cmp(&(b, l, t)));
+        rows.into_iter()
+            .map(|((idx, key, gid), (_, deleted))| Touched {
+                collection: collections[idx].name.clone(),
+                key,
+                gid,
+                deleted,
+            })
+            .collect()
     }
 
     /// Remembers what this collect's edits to fields that report conflicts replaced, until
