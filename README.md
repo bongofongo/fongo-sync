@@ -16,11 +16,13 @@ its database, `Replica::collect` to turn local writes into changes, and `Replica
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
 `fongo_`. `Replica::collect_step` collects in steps, each a transaction of its own that says
 whether more is left, so that many local writes are collected without holding SQLite's write lock
-for long; `Replica::install_step` installs and takes the first step. The steps end as ordinary
-collects made one after another would, and the same as one collect of everything but where an
-alias is stamped. A step takes about the rows asked for, more where rows depend on later ones: a
-new row written again after the rows naming it is collected with all of them, and the rows found
-in a collection's tables when it is first installed are collected by that install whole.
+for long; `Replica::install_step` installs and takes the first step. A step ends only between two
+milliseconds, so the steps end as ordinary collects made one after another, each between two
+milliseconds, would; in every case the tests try, also as one collect of everything, but where an
+alias is stamped or a reference names another member of the group it joins. A step takes about the rows asked for, more where rows depend on later ones: a
+new row written again after the rows naming it is collected with all of them, rows written in
+one millisecond are collected together, and the rows found in a collection's tables when it is
+first installed are collected by that install whole.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are
@@ -159,8 +161,10 @@ One chain, each link checked against the one above it:
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,
    every script up to a small length in `tests/exhaustive.rs`, both repeatable from a seed;
    `make deep` runs them longer; both, and `tests/differential.rs`, also collect in bounded
-   steps of sizes each case picks, checking the model after every step. `tests/steps.rs` requires
-   collecting in steps to send, hold and show exactly what one collect does. `tests/departures.rs`
+   steps of sizes each case picks, checking the model after every step, some on a clock that moves
+   only now and then, so that many writes share a millisecond. `tests/steps.rs` requires
+   collecting in steps to send, hold and show what one collect does, and `tests/placings.rs`
+   what collects placed between the same writes do. `tests/departures.rs`
    holds the ways an earlier adapter was seen to depart from the model; `tests/crash.rs` stops an
    apply, a collect, a resume and every step of a bounded install or collect at every statement
    and requires the database unchanged and the rest to complete; `tests/bench.rs` requires a

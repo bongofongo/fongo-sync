@@ -23,6 +23,10 @@ fn splitmix(state: &mut u64) -> u64 {
 struct Wall {
     ms: u64,
     rng: u64,
+    /// The clock moves on one reading in this many, on average; 0 for three in four.
+    every: u64,
+    /// The clock does not move by itself.
+    still: bool,
 }
 
 struct Source {
@@ -42,11 +46,19 @@ pub struct World {
 
 impl World {
     pub fn new(seed: u64) -> World {
+        World::clustered(seed, 0)
+    }
+
+    /// A world whose clock moves on, on average, one reading in `every`, so that many writes
+    /// share a millisecond; 0 moves it three readings in four, as [`World::new`] does.
+    pub fn clustered(seed: u64, every: u64) -> World {
         World {
             seed,
             wall: Arc::new(Mutex::new(Wall {
                 ms: 1_700_000_000_000,
-                rng: seed ^ 0x5555,
+                rng: if every == 0 { seed ^ 0x5555 } else { seed | 1 },
+                every,
+                still: false,
             })),
             streams: Streams::default(),
         }
@@ -61,6 +73,8 @@ impl World {
             Wall {
                 ms: wall.ms,
                 rng: wall.rng,
+                every: wall.every,
+                still: wall.still,
             }
         };
         let states: Vec<u64> = self.streams.lock().unwrap()[&n]
@@ -86,6 +100,12 @@ impl World {
         }
         drop((from, to));
         (world, copy)
+    }
+
+    /// Stops the clock moving by itself, so that every write until it starts again shares one
+    /// millisecond, or starts it again.
+    pub fn hold(&self, still: bool) {
+        self.wall.lock().unwrap().still = still;
     }
 
     /// Moves the shared clock on by `ms`.
@@ -209,7 +229,18 @@ unsafe extern "C" fn unixepoch(
 ) {
     let source = unsafe { source(ctx) };
     let mut wall = source.wall.lock().unwrap();
-    if !splitmix(&mut wall.rng).is_multiple_of(4) {
+    let moves = match wall.every {
+        0 => !splitmix(&mut wall.rng).is_multiple_of(4),
+        every => {
+            let mut x = wall.rng;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            wall.rng = x;
+            x.is_multiple_of(every)
+        }
+    };
+    if moves && !wall.still {
         wall.ms += 1;
     }
     // Half a millisecond on, so `CAST(x * 1000 AS INTEGER)` reads back the same millisecond.

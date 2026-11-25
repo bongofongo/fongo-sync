@@ -180,7 +180,10 @@ impl Replica {
             let mut doomed: BTreeMap<(usize, String), (Gid, Gid)> = BTreeMap::new();
             for (c, g) in &set {
                 let idx = self.registry.index(c).expect("only registered collections");
-                cx.reached(c, [*g]);
+                let mine = rows_of(db, c, *g)?;
+                for (key, _) in &mine {
+                    cx.looked_at(c, key);
+                }
                 let t = match session.target(c, *g) {
                     Ok(t) => t,
                     Err(_) => {
@@ -191,10 +194,6 @@ impl Replica {
                 if blocked.contains(&(c.clone(), t.canonical)) {
                     held.insert((c.clone(), t.canonical));
                     continue;
-                }
-                let mine = rows_of(db, c, *g)?;
-                for (key, _) in &mine {
-                    cx.looked_at(c, key);
                 }
                 if t.members.is_empty() {
                     for (key, _) in mine {

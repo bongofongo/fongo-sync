@@ -1,8 +1,10 @@
-//! Collecting in bounded steps records what one collect of the same rows records. The same world
-//! is built again for each step size, from one seed, so every run reaches the collect under test
-//! in the same state; that collect is then made whole, or in steps of a few rows until none are
-//! left, and the outcomes are compared: the changes sent, what the replica holds, its rows and
-//! images, and what another replica shows once it applies them.
+//! Collecting in bounded steps records what one collect of the same rows records, in every case
+//! tried here. The same world is built again for each step size, from one seed, so every run
+//! reaches the collect under test in the same state; that collect is then made whole, or in steps
+//! of a few rows until none are left, and the outcomes are compared: the changes sent, what the
+//! replica holds, its rows and images, and what another replica shows once it applies them.
+//! Worlds are run on clocks that move on most readings or only now and then, and with the writes
+//! under test in one millisecond or spread out.
 //!
 //! Gids and clocks are compared exactly, but where a step aliases entities found to be one: an
 //! alias takes the clock of the step that found it, so later clocks move on. Then the changes are
@@ -364,6 +366,11 @@ struct Case {
     history: Vec<Option<(bool, u8, u8, u8)>>,
     /// Writes on replica 0 not yet collected when the operation under test runs.
     burst: Vec<(u8, u8, u8)>,
+    /// The clock moves on one reading in this many, so many writes share a millisecond; 0 for
+    /// three in four.
+    every: u64,
+    /// Whether the burst is written in one millisecond.
+    still: bool,
 }
 
 async fn run(conn: &mut SqliteConnection, statements: &[String]) {
@@ -402,7 +409,7 @@ async fn tables(conn: &mut SqliteConnection) -> Vec<Vec<Vec<Value>>> {
 /// Builds the case's world and runs the operation under test whole (`step` of `None`) or in
 /// steps of `step` rows.
 async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
-    let world = World::new(case.seed);
+    let world = World::clustered(case.seed, case.every);
     let mut a = world.connect(0).await;
     let mut b = world.connect(1).await;
     for sql in SCHEMA {
@@ -436,7 +443,12 @@ async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
             &LIBRARY.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
         .await;
+        if case.still {
+            world.later(7);
+            world.hold(true);
+        }
         run(&mut a, &burst).await;
+        world.hold(false);
         plain.install(&mut b).await.unwrap();
         match step {
             None => plain.install(&mut a).await.unwrap(),
@@ -470,7 +482,12 @@ async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
         }
         send(&plain, &mut a, &mut b).await;
         send(&plain, &mut b, &mut a).await;
+        if case.still {
+            world.later(7);
+            world.hold(true);
+        }
         run(&mut a, &burst).await;
+        world.hold(false);
         let replica = if case.mode == Mode::Upgrade {
             &upgraded
         } else {
@@ -696,13 +713,17 @@ fn arb_case() -> impl Strategy<Value = Case> {
             0..40,
         ),
         proptest::collection::vec(arb_write(), 0..40),
+        prop_oneof![Just(0), Just(1), Just(3), Just(8), Just(40)],
+        any::<bool>(),
     )
-        .prop_map(|(seed, mode, fk, history, burst)| Case {
+        .prop_map(|(seed, mode, fk, history, burst, every, still)| Case {
             seed,
             mode,
             fk,
             history,
             burst,
+            every,
+            still,
         })
 }
 
@@ -737,6 +758,8 @@ fn every_kind_of_write_collects_alike_in_steps() {
         for kind in 0..36u8 {
             let burst = vec![(kind, 1, 2), (kind, 2, 5), (kind, 0, 7)];
             check(&Case {
+                every: 0,
+                still: false,
                 seed: u64::from(kind),
                 mode,
                 fk,
@@ -747,6 +770,8 @@ fn every_kind_of_write_collects_alike_in_steps() {
         }
         let burst: Vec<_> = (0..108u8).map(|i| (i % 36, i / 36, i)).collect();
         check(&Case {
+            every: 0,
+            still: false,
             seed: 7,
             mode,
             fk,
@@ -757,8 +782,9 @@ fn every_kind_of_write_collects_alike_in_steps() {
     }
 }
 
-/// Rows that do not depend on one another are collected `rows` at a time, the earliest written
-/// first, and the last step says no more are left.
+/// Rows that do not depend on one another, each written in a millisecond of its own, are
+/// collected `rows` at a time, the earliest written first, and the last step says no more are
+/// left.
 #[tokio::test]
 async fn a_step_takes_as_many_independent_rows_as_asked() {
     let world = World::new(3);
@@ -768,13 +794,13 @@ async fn a_step_takes_as_many_independent_rows_as_asked() {
     }
     let replica = Replica::new(registry(false));
     replica.install(&mut conn).await.unwrap();
-    sqlx::query(
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 95)
-         INSERT INTO settings SELECT 'key ' || i, 'value' FROM n",
-    )
-    .execute(&mut conn)
-    .await
-    .unwrap();
+    for i in 1..=95 {
+        world.later(1);
+        sqlx::query(&format!("INSERT INTO settings VALUES ('key {i}', 'value')"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
     let mut left = Vec::new();
     loop {
         let collected = replica.collect_step(&mut conn, 10).await.unwrap();
@@ -795,6 +821,37 @@ async fn a_step_takes_as_many_independent_rows_as_asked() {
         })
         .collect();
     assert_eq!(left, want);
+}
+
+/// Rows written in one millisecond, as one statement writes many, are taken by one step: a step
+/// never ends inside a millisecond, however few rows it was asked for.
+#[tokio::test]
+async fn rows_written_in_one_millisecond_are_one_step() {
+    let world = World::new(3);
+    let mut conn = world.connect(0).await;
+    for sql in SCHEMA {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    let replica = Replica::new(registry(false));
+    replica.install(&mut conn).await.unwrap();
+    world.hold(true);
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 95)
+         INSERT INTO settings SELECT 'key ' || i, 'value' FROM n",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    world.hold(false);
+    world.later(1);
+    sqlx::query("INSERT INTO settings VALUES ('later', 'value')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let first = replica.collect_step(&mut conn, 10).await.unwrap();
+    assert_eq!((first.rows, first.more), (95, true));
+    let second = replica.collect_step(&mut conn, 10).await.unwrap();
+    assert_eq!((second.rows, second.more), (1, false));
 }
 
 /// Hard shapes, each collected a row at a time: a book removed and made again at its id with
@@ -823,6 +880,8 @@ fn hard_shapes_collect_alike_in_steps() {
     for (i, burst) in shapes.iter().enumerate() {
         for mode in [Mode::First, Mode::Collect, Mode::Upgrade] {
             check(&Case {
+                every: 0,
+                still: false,
                 seed: i as u64,
                 mode,
                 fk: true,
@@ -833,6 +892,8 @@ fn hard_shapes_collect_alike_in_steps() {
         }
     }
     check(&Case {
+        every: 0,
+        still: false,
         seed: 2143016055923739986,
         mode: Mode::Collect,
         fk: true,
@@ -933,6 +994,8 @@ fn rows_naming_a_row_a_step_gives_up_are_collected_with_it() {
     for seed in 0..8 {
         for fk in [true, false] {
             check(&Case {
+                every: 0,
+                still: false,
                 seed,
                 mode: Mode::Collect,
                 fk,
@@ -1325,6 +1388,8 @@ async fn a_row_written_back_between_steps_sends_what_two_collects_would() {
 #[test]
 fn tags_whose_books_are_gone_collect_alike_in_steps() {
     check(&Case {
+        every: 0,
+        still: false,
         seed: 1882020332708727243,
         mode: Mode::Collect,
         fk: false,
@@ -1354,6 +1419,8 @@ fn tags_whose_books_are_gone_collect_alike_in_steps() {
 #[test]
 fn a_row_a_later_step_would_find_is_not_written_first() {
     check(&Case {
+        every: 0,
+        still: false,
         seed: 2121431186798033,
         mode: Mode::Collect,
         fk: false,
@@ -1680,4 +1747,304 @@ async fn steps_go_on_past_a_row_that_waits() {
     }
     let left = replica.inspect(&mut a).await.unwrap().uncollected;
     assert_eq!(left, [("books".to_string(), "[1]".to_string())]);
+}
+
+/// A book on a shelf a merge gave up, and another shelf, removed in one millisecond, the shelf
+/// first. Removing the book lets the given-up row go and gives its entity a new row, at the next
+/// id SQLite picks; a step that took the book's removal without the shelf's, which sorts after it
+/// though written before, saw the shelf's id still taken and wrote the row at another id than any
+/// collect made between the writes would.
+#[test]
+fn a_shelf_and_a_book_removed_in_one_millisecond_are_one_step() {
+    check(&Case {
+        seed: 4788079860073119813,
+        mode: Mode::Collect,
+        fk: false,
+        history: vec![
+            Some((false, 80, 4, 0)),
+            None,
+            Some((false, 8, 0, 0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((true, 110, 7, 0)),
+            Some((true, 4, 4, 0)),
+            None,
+            None,
+            None,
+            None,
+            Some((true, 180, 0, 70)),
+            None,
+            Some((false, 80, 2, 0)),
+            None,
+            None,
+            None,
+        ],
+        burst: vec![(218, 2, 0), (116, 6, 0)],
+        every: 40,
+        still: true,
+    })
+    .unwrap();
+}
+
+/// With foreign keys off, an author removed while a book still names its id; then, in one
+/// millisecond, a new author at that id, the book pointed at it and the author renamed. A step
+/// that took the authors first compared the book with its image through the new author's
+/// mapping and never sent its reference.
+#[test]
+fn an_author_made_again_with_its_book_in_one_millisecond_is_one_step() {
+    for still in [true, false] {
+        check(&Case {
+            seed: 1382359649355028263,
+            mode: Mode::Collect,
+            fk: false,
+            history: vec![
+                None,
+                Some((false, 43, 1, 5)),
+                Some((false, 227, 1, 0)),
+                Some((false, 26, 0, 43)),
+            ],
+            burst: vec![(13, 7, 0)],
+            every: 3,
+            still,
+        })
+        .unwrap();
+    }
+}
+
+/// Books each written alone, `n` of them, and `wait` books naming authors the kernel has not
+/// given an entity, which cannot be collected yet, written before them (`head`), among them
+/// (`middle`) or after them (`tail`).
+async fn waiting_and_new(
+    world: &World,
+    n: usize,
+    wait: usize,
+    place: &str,
+) -> (SqliteConnection, Replica) {
+    let mut a = world.connect(0).await;
+    for sql in SCHEMA {
+        sqlx::query(sql).execute(&mut a).await.unwrap();
+    }
+    let replica = Replica::new(registry(false));
+    replica.install(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["INSERT INTO shelves (id, name) VALUES (1, 's1')".into()],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    // As the kernel's own writes are, so the authors are neither marked nor mapped.
+    run(
+        &mut a,
+        &[
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 1)".into(),
+            format!(
+                "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {})
+                 INSERT INTO authors (id, name) SELECT i, 'unknown' FROM k",
+                wait.max(1)
+            ),
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 0)".into(),
+        ],
+    )
+    .await;
+    let at = match place {
+        "head" => 0,
+        "middle" => n / 2,
+        _ => n,
+    };
+    sqlx::query("BEGIN").execute(&mut a).await.unwrap();
+    for i in 0..=n {
+        if i == at {
+            for w in 1..=wait {
+                world.later(1);
+                run(
+                    &mut a,
+                    &[format!(
+                        "INSERT INTO books (id, shelf_id, title, author_id, seen)
+                         VALUES ({w}, 1, 'waits', {w}, 0)"
+                    )],
+                )
+                .await;
+            }
+        }
+        if i < n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!(
+                    "INSERT INTO books (id, shelf_id, title, seen) VALUES ({}, 1, 'new', 0)",
+                    1_000_000 + i
+                )],
+            )
+            .await;
+        }
+    }
+    sqlx::query("COMMIT").execute(&mut a).await.unwrap();
+    (a, replica)
+}
+
+/// Steps of 100 and 1,000 rows over many rows each written alone, and over rows behind, among or
+/// after many that wait, cost in SQLite's work at most twice one collect of them all: the marks
+/// are read in order through their index, and a step goes on past rows that wait until it has
+/// collected at least as many. Every step but the last collects at least what was asked, and the
+/// last says none are left once only rows that wait remain.
+#[tokio::test]
+async fn steps_over_many_rows_and_rows_that_wait_cost_at_most_twice_one_collect() {
+    for (n, wait, place) in [
+        (20_000, 0, "head"),
+        (5_000, 999, "head"),
+        (5_000, 999, "middle"),
+        (5_000, 999, "tail"),
+        (2_000, 2_047, "head"),
+    ] {
+        let whole = {
+            let world = World::new(3);
+            let (mut a, replica) = waiting_and_new(&world, n, wait, place).await;
+            let work = count_work(&mut a).await;
+            replica.collect(&mut a).await.unwrap();
+            work.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for rows in [100, 1_000] {
+            let world = World::new(3);
+            let (mut a, replica) = waiting_and_new(&world, n, wait, place).await;
+            let work = count_work(&mut a).await;
+            let mut taken = 0;
+            loop {
+                let step = replica.collect_step(&mut a, rows).await.unwrap();
+                taken += step.rows;
+                if !step.more {
+                    break;
+                }
+                assert!(
+                    step.rows >= rows,
+                    "{n} rows, {wait} waiting at the {place}, steps of {rows}: a step took {}",
+                    step.rows
+                );
+            }
+            let work = work.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "{n} rows, {wait} waiting at the {place}, steps of {rows}: work {work} against {whole}"
+            );
+            assert_eq!(
+                taken, n,
+                "{n} rows, {wait} waiting at the {place}, steps of {rows}"
+            );
+            assert_eq!(
+                replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+                wait
+            );
+            assert!(
+                work <= 2 * whole,
+                "{n} rows, {wait} waiting at the {place}, steps of {rows}: work {work} against {whole}"
+            );
+        }
+    }
+}
+
+/// A new series found to be one with a series edited a hundred rows later: the step finds that
+/// only once it merges, and its next try reaches the edited series at once, giving up one row.
+#[tokio::test]
+async fn a_try_given_up_is_followed_by_one_reaching_the_row_it_needed() {
+    let world = World::new(3);
+    let mut a = world.connect(0).await;
+    for sql in SCHEMA {
+        sqlx::query(sql).execute(&mut a).await.unwrap();
+    }
+    let replica = Replica::new(registry(false));
+    replica.install(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["INSERT INTO series (id, code, name) VALUES (1, 'c1', 'first')".into()],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    world.later(1);
+    run(
+        &mut a,
+        &["INSERT INTO series (id, code, name) VALUES (2, 'c1', 'again')".into()],
+    )
+    .await;
+    for i in 0..100 {
+        world.later(1);
+        run(
+            &mut a,
+            &[format!("INSERT INTO settings VALUES ('key {i}', 'value')")],
+        )
+        .await;
+    }
+    world.later(1);
+    run(
+        &mut a,
+        &["UPDATE series SET name = 'edited' WHERE id = 1".into()],
+    )
+    .await;
+    let step = replica.collect_step(&mut a, 1).await.unwrap();
+    assert_eq!((step.abandoned, step.rows), (1, 102));
+}
+
+/// A series whose code is changed to another's, so its entity joins that one's group, and the
+/// other series edited later: the step that merges them keeps the other's row and writes it, so
+/// it takes the later edit with it rather than write over it.
+#[tokio::test]
+async fn a_row_a_merge_keeps_takes_its_later_edit_with_the_step() {
+    for rows in [None, Some(1)] {
+        let world = World::new(3);
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &["INSERT INTO series (id, code, name) VALUES (1, 'c1', 'first'), (2, 'c2', 'second')".into()],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        world.later(1);
+        run(
+            &mut a,
+            &["UPDATE series SET code = 'c1' WHERE id = 2".into()],
+        )
+        .await;
+        for i in 0..5 {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!("INSERT INTO settings VALUES ('key {i}', 'value')")],
+            )
+            .await;
+        }
+        world.later(1);
+        run(
+            &mut a,
+            &["UPDATE series SET name = 'edited' WHERE id = 1".into()],
+        )
+        .await;
+        match rows {
+            None => {
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => while replica.collect_step(&mut a, rows).await.unwrap().more {},
+        }
+        let names = support::rows(&mut a, "SELECT id, name FROM series ORDER BY id", &[]).await;
+        let sent: Vec<_> = replica
+            .outbox(&mut a, u32::MAX)
+            .await
+            .unwrap()
+            .changes
+            .into_iter()
+            .filter(|c| c.collection == "series" && c.field == "name")
+            .map(|c| c.value)
+            .collect();
+        eprintln!("ZZM {rows:?}: {names:?} sent {sent:?}");
+        assert!(
+            sent.contains(&fongo_sync_sqlite::core::Value::Text("edited".into())),
+            "{rows:?}: {names:?} {sent:?}"
+        );
+    }
 }

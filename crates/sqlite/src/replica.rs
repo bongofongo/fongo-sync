@@ -38,7 +38,8 @@ pub enum Resume {
 /// About how many rows written since the last collect one bounded step collects. On a fast laptop
 /// a step of 1,000 rows that depend on no later ones took 65 to 230 ms in a library of tens of
 /// thousands of changes, and up to 340 ms in rollback-journal mode and 0.6 s in WAL mode in one of
-/// a million, by how wide the rows are; a step takes more rows where they depend on later ones.
+/// a million, by how wide the rows are; a step takes more rows where they depend on later ones,
+/// share a millisecond, or follow rows that cannot be collected yet.
 pub const COLLECT_ROWS: usize = 1_000;
 
 /// What one bounded step of collecting did; see [`Replica::collect_step`].
@@ -55,7 +56,8 @@ pub struct Collected {
     /// twice what collecting its rows at once costs.
     pub abandoned: usize,
     /// Rows written later than those the step took are still to be collected: call
-    /// [`Replica::collect_step`] again.
+    /// [`Replica::collect_step`] again. False once every row left marked is one the step found
+    /// cannot be collected yet, so a caller looping while this holds stops.
     pub more: bool,
     /// The rows the step wrote or removed in bringing rows up to date, as [`Applied::touched`]
     /// lists them: a merge of entities its rows were found to share, a row held back before
@@ -396,15 +398,6 @@ impl<'d> Ctx<'d> {
         self.watch = None;
     }
 
-    /// Notes members of a group a bounded step evaluated.
-    pub(crate) fn reached(&mut self, collection: &str, gids: impl IntoIterator<Item = Gid>) {
-        if let Some(watch) = &mut self.watch {
-            for gid in gids {
-                watch.entities.insert((collection.to_string(), gid));
-            }
-        }
-    }
-
     /// Notes a row a bounded step looked at.
     pub(crate) fn looked_at(&mut self, collection: &str, key: &str) {
         if let Some(watch) = &mut self.watch {
@@ -659,6 +652,7 @@ impl Replica {
         // to one before it is collected would make it the application's edit.
         let mut through = self.closed(db, last_adopted(db)?, want)?;
         let wall = cx.wall;
+        let start = cx.collected;
         let mut minted = Minted::new();
         loop {
             let Some(place) = through.clone() else {
@@ -677,7 +671,7 @@ impl Replica {
             cx.wall = wall.min(u64::try_from(place.0).unwrap_or(0));
             db.exec("SAVEPOINT fongo_step", &[])?;
             let need = match self.collect_edits(cx, Some(&place), &mut minted)? {
-                Edits::Beyond(past) => Some(Some(past)),
+                Edits::Beyond(past) => Some(past),
                 Edits::Recorded(more, rows) => {
                     cx.collected += rows;
                     let mut set = set.clone();
@@ -685,20 +679,26 @@ impl Replica {
                     cx.watch = Some(Watch::default());
                     self.settle(cx, set)?;
                     let watch = cx.watch.take().unwrap_or_default();
-                    match self.marked_beyond(db, &watch, &place)? {
-                        Some(past) => Some(Some(past)),
-                        // A prefix of rows that all wait collects nothing: it grows, or the
-                        // steps would never end.
-                        None if rows == 0 && marked_past(db, &place)? => Some(None),
-                        None => None,
-                    }
+                    self.marked_beyond(db, &watch, &place)?
                 }
             };
             let Some(need) = need else {
                 db.exec("RELEASE fongo_step", &[])?;
                 cx.wall = wall;
-                // `closed` gave a place only with rows marked past it, which the step left.
-                return Ok(true);
+                let taken = cx.collected - start;
+                let past = marked_past(db, &place)?;
+                // What the prefix left marked waits, as it would after a collect. The step goes
+                // on, as a collect after this one would, until it has taken what was asked and at
+                // least as many rows as wait ahead of them, so that reading those again costs no
+                // more than the rows it takes.
+                let waiting = usize::try_from(marked_through(db, &Some(place.clone()))?)
+                    .unwrap_or(usize::MAX);
+                let enough = want.max(waiting);
+                if taken >= enough || !past {
+                    return Ok(past);
+                }
+                through = self.closed(db, Some(place), waiting.saturating_add(enough - taken))?;
+                continue;
             };
             db.exec("ROLLBACK TO fongo_step", &[])?;
             db.exec("RELEASE fongo_step", &[])?;
@@ -709,7 +709,7 @@ impl Replica {
             cx.abandoned += usize::try_from(rows).unwrap_or(0);
             through = self.closed(
                 db,
-                need.map(|need| need.max(place)),
+                Some(need.max(place)),
                 usize::try_from(rows.saturating_mul(2)).unwrap_or(usize::MAX),
             )?;
             if through.is_some()
@@ -1227,35 +1227,41 @@ impl Replica {
     /// caller that loops until none are, leaving the database free between calls, holds SQLite's
     /// write lock for one step at a time; see [`COLLECT_ROWS`] for how long one takes.
     ///
+    /// A step ends only between two milliseconds: the next row marked after it was written in a
+    /// later one. Inside a millisecond the order of writing is not known, so rows written in one
+    /// are taken together: one statement that writes 50,000 rows is one step of 50,000 rows, as
+    /// long as one collect of them, whatever `rows` asks.
+    ///
     /// What the steps send, hold and show is what ordinary collects would, each made just after
-    /// the last row a step took was written: a step leaves the rows past it, and all that
+    /// the millisecond of the last row a step took: a step leaves the rows past it, and all that
     /// collecting them reads, as they were, and an alias it finds is stamped with that last
-    /// row's time. Once the last step is done it is also what one collect of the same rows
-    /// gives, the same changes in the same order, entities, conflict bases, rows and images,
-    /// but for aliases: entities found to be one across two steps are joined by other pairs of
-    /// aliases, stamped by their steps, and a row written in the same millisecond as a step's
-    /// last row then ticks one count later.
+    /// row's time. In every case the tests try, once the last step is done it is also what one
+    /// collect of the same rows gives, the same changes in the same order, entities, conflict
+    /// bases, rows and images, but for aliases: entities found to be one across two steps are
+    /// joined by other pairs of aliases, stamped by their steps, and a reference to one of them
+    /// may name another member of the group they join.
     ///
     /// A step takes more than `rows` where rows it takes depend on later ones: a row naming
     /// one made since, made again, or removed, and written again later; rows naming a row the
-    /// step makes again; what a removed owner owned, written later; rows found to be one; a row
-    /// made again later at an id named by a row the step writes or removes; and a row found
-    /// through one the step makes again takes every row of that millisecond. Most of these are
+    /// step makes again; what a removed owner owned, written later; rows found to be one; and a
+    /// row made again later at an id named by a row the step writes or removes. Most of these are
     /// found by reading the rows before anything is collected, so a chain of rows each needing a
     /// later one, such as rows each naming the next, is taken as one step as long as the chain.
     /// The rest are found only once the step's changes are merged; the step then gives up what it
     /// did and tries again with at least twice the rows, or with every row once that would be
     /// more than half of them, so the rows of the tries it gives up come to fewer than those it
-    /// takes ([`Collected::abandoned`]), and a step costs at most about twice what collecting its
-    /// rows at once does. At worst a step takes every row. Rows found in
-    /// a collection's tables when it is first installed are collected by that install. A row that
-    /// cannot be collected yet stays marked, as it does after a collect, and does not count as
-    /// more.
+    /// takes ([`Collected::abandoned`]). At worst a step takes every row. Rows found in a
+    /// collection's tables when it is first installed are collected by that install.
     ///
-    /// Each step also reads the places of the rows marked ahead of it, since nothing indexes them
-    /// in the order they are collected: steps of very few rows over many marked rows cost more in
-    /// all than one collect. On a test backlog of 900 rows, steps of ten cost 1.4 times one
-    /// collect in SQLite's work, and steps of one 4.3 times.
+    /// A row that cannot be collected yet, such as one naming a row that has no entity, stays
+    /// marked, as it does after a collect, and every later step reads it again. So a step goes on
+    /// past such rows until it has collected `rows` rows and at least as many as wait ahead of
+    /// them, and reading them again costs no more than the rows it collects; a step that finds
+    /// only rows that wait says none are left. The rows marked are indexed in the order they are
+    /// collected, so a step reads only the rows it takes. In SQLite's work, steps of 100 or 1,000
+    /// rows over 100,000 rows written one at a time cost 1.12 times one collect of them, and over
+    /// 5,000 rows behind 999 that wait at most 1.7 times; each step costs at most about twice what
+    /// collecting its rows at once does.
     ///
     /// Each step is a transaction of its own, committed whole or not at all: after a crash or a
     /// failure between steps, the rows not yet collected are still marked, and the next step or

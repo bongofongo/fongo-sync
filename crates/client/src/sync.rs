@@ -59,10 +59,12 @@ pub struct Pace {
     /// About how many rows written since the last collect one transaction collects. Before each
     /// apply, while at least this many rows wait to be collected, the sync collects them through
     /// [`Apply::collect`] in transactions of their own, paced as the others, until those steps
-    /// have taken, in all, as many rows as waited when the first of them began; the apply then
-    /// collects what is left, which is what was written during the steps and fewer than this many
-    /// besides. A step takes more where rows it takes depend on later ones; see
-    /// [`Replica::collect_step`]. 0 counts as 1. Default [`COLLECT_ROWS`].
+    /// have collected, in all, as many rows as waited when the first of them began, or one finds
+    /// that only rows that cannot be collected yet are left; the apply then collects what is
+    /// left, which is what was written during the steps, those rows, and fewer than this many
+    /// besides. A step takes more where rows it takes depend on later ones, share a millisecond,
+    /// or follow rows that wait; see [`Replica::collect_step`]. 0 counts as 1. Default
+    /// [`COLLECT_ROWS`].
     ///
     /// This field is new: code that builds a `Pace` naming every field must name it too, or
     /// start from `..Pace::default()`.
@@ -256,7 +258,8 @@ pub struct SyncReport {
 /// acknowledgment for each envelope it sends. Each takes the write lock with its first statement,
 /// waiting for it in the connection's busy handler, and holds it until it commits, so the longest
 /// hold is the largest of them. What bounds each: a step of collecting takes about
-/// [`Pace::collect`] rows, more where rows depend on later ones, at worst every row waiting; an
+/// [`Pace::collect`] rows, more where rows depend on later ones, share a millisecond or follow
+/// rows that cannot be collected yet, at worst every row waiting; an
 /// apply takes at most [`Pace::apply`] received changes unless one envelope holds more, and
 /// collects the rows written while the steps before it ran, which nothing bounds, with fewer
 /// than [`Pace::collect`] left over besides; [`Apply::caught_up`] holds what the application
@@ -388,9 +391,9 @@ pub trait Apply: Send {
     /// touched does the same with these, here, in the step's transaction.
     ///
     /// Before each apply it is called while at least [`Pace::collect`] rows wait to be
-    /// collected, until its steps have taken, in all, as many rows as waited when the first of
-    /// them began, whichever rows those are; the apply collects what is left. It is not called
-    /// when fewer wait.
+    /// collected, until its steps have collected, in all, as many rows as waited when the first
+    /// of them began, whichever rows those are, or one reports that no more are left
+    /// ([`Collected::more`]); the apply collects what is left. It is not called when fewer wait.
     fn collect(
         &mut self,
         conn: &mut SqliteConnection,

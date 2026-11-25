@@ -105,23 +105,6 @@ fn last_of(db: &Db, collection: &str) -> Result<Option<Place>> {
     )))
 }
 
-/// The place of the last row marked at `at`.
-fn last_at(db: &Db, at: i64) -> Result<Option<Place>> {
-    let rows = db.query(
-        "SELECT at, collection, key FROM fongo_dirty WHERE at = ?1
-          ORDER BY collection DESC, key DESC LIMIT 1",
-        &[Value::Int(at)],
-    )?;
-    let Some(r) = rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some((
-        as_int(&r[0])?,
-        as_text(&r[1])?.to_string(),
-        as_text(&r[2])?.to_string(),
-    )))
-}
-
 /// The place of the last row marked as found when its collection was first installed.
 pub(crate) fn last_adopted(db: &Db) -> Result<Option<Place>> {
     let rows = db.query(
@@ -401,15 +384,6 @@ impl Replica {
             }
         }
 
-        // A row found through another is stamped with that row's time, after every marked row
-        // of the same time, so a prefix that finds one takes all of them.
-        if let Some(edge) = through
-            && items.iter().any(|i| i.found && i.at == edge.0)
-            && let Some(last) = last_at(db, edge.0)?
-            && last > *edge
-        {
-            names.past(last);
-        }
         if let Some(place) = names.beyond.take() {
             return Ok(Edits::Beyond(place));
         }
@@ -635,10 +609,12 @@ impl Replica {
                 let Some(edge) = to.clone() else {
                     continue;
                 };
-                if place > edge {
+                // A prefix ends between two milliseconds: inside one, rows are in no order of
+                // writing, so a step there could take a row without one written before it.
+                if place.0 > edge.0 {
                     return Ok(Some(edge));
                 }
-                let mut to_now = edge;
+                let mut to_now = edge.max(place.clone());
                 after = Some(place);
                 'row: {
                     let Some(idx) = self.registry.index(&name) else {

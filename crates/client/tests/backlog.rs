@@ -112,18 +112,27 @@ async fn backlog(dir: &Path, server: &Server, books: u64) -> (Peer, PathBuf) {
     (a, path)
 }
 
+/// `books` books and a note on each, fifty rows to a statement, each statement in a millisecond
+/// of its own: a step never ends inside a millisecond, so rows written in one statement are
+/// collected together.
 async fn write_books(conn: &mut SqliteConnection, books: u64) {
-    for sql in [
-        format!(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {books})
-             INSERT INTO books (id, title, year) SELECT i, 'Middlemarch ' || i, 1800 + i % 200 FROM n"
-        ),
-        format!(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {books})
-             INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n"
-        ),
-    ] {
-        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    for table in ["books", "notes"] {
+        for from in (1..=books).step_by(50) {
+            let to = (from + 49).min(books);
+            let sql = if table == "books" {
+                format!(
+                    "WITH RECURSIVE n(i) AS (SELECT {from} UNION ALL SELECT i + 1 FROM n WHERE i < {to})
+                     INSERT INTO books (id, title, year) SELECT i, 'Middlemarch ' || i, 1800 + i % 200 FROM n"
+                )
+            } else {
+                format!(
+                    "WITH RECURSIVE n(i) AS (SELECT {from} UNION ALL SELECT i + 1 FROM n WHERE i < {to})
+                     INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n"
+                )
+            };
+            sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -458,38 +467,33 @@ async fn chained_writes(conn: &mut SqliteConnection, rows: u64, shape: &str) {
 }
 
 /// About `rows` rows of every shape, a quarter each: books, a note on each, a tag on each, and
-/// wide rows; the `round`th time, new rows and edits to the earlier ones alike.
+/// wide rows, the `round`th time new ones. A hundred of each shape to a statement, and each
+/// statement in a millisecond of its own, since a step takes every row written in one.
 async fn mixed_writes(conn: &mut SqliteConnection, rows: u64, round: u64) {
     let n = rows / 4;
-    let from = round * n;
-    let seq = |to: u64| {
-        format!(
-            "WITH RECURSIVE n(i) AS (SELECT {} UNION ALL SELECT i + 1 FROM n WHERE i < {to})",
-            from + 1
-        )
-    };
-    for sql in [
-        format!(
-            "{} INSERT INTO books (id, title, isbn, year, pages)
-             SELECT i, 'Middlemarch ' || i, 'isbn ' || i, 1800 + i % 200, i FROM n",
-            seq(from + n)
-        ),
-        format!(
-            "{} INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n",
-            seq(from + n)
-        ),
-        format!(
-            "{} INSERT INTO tags (book_id, tag) SELECT i, 'read' FROM n",
-            seq(from + n)
-        ),
-        format!(
-            "{} INSERT INTO wide (id, a, b, c, d, e, f, g, h, i, j, k, l)
-             SELECT i, 'a' || i, 'b' || i, 'c' || i, 'd' || i, 'e' || i, 'f' || i,
-                    i, i, i, i, i * 0.5, i * 0.25 FROM n",
-            seq(from + n)
-        ),
-    ] {
-        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    for lo in (round * n + 1..=round * n + n).step_by(100) {
+        let hi = (lo + 99).min(round * n + n);
+        let seq = format!(
+            "WITH RECURSIVE n(i) AS (SELECT {lo} UNION ALL SELECT i + 1 FROM n WHERE i < {hi})"
+        );
+        for sql in [
+            format!(
+                "{seq} INSERT INTO books (id, title, isbn, year, pages)
+                 SELECT i, 'Middlemarch ' || i, 'isbn ' || i, 1800 + i % 200, i FROM n"
+            ),
+            format!(
+                "{seq} INSERT INTO notes (id, book_id, body) SELECT i, i, 'a note on book ' || i FROM n"
+            ),
+            format!("{seq} INSERT INTO tags (book_id, tag) SELECT i, 'read' FROM n"),
+            format!(
+                "{seq} INSERT INTO wide (id, a, b, c, d, e, f, g, h, i, j, k, l)
+                 SELECT i, 'a' || i, 'b' || i, 'c' || i, 'd' || i, 'e' || i, 'f' || i,
+                        i, i, i, i, i * 0.5, i * 0.25 FROM n"
+            ),
+        ] {
+            sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -706,34 +710,33 @@ async fn in_steps(replica: &Replica, conn: &mut SqliteConnection, first: Collect
 ///     --test backlog -- --ignored --nocapture measure_backlog
 /// ```
 ///
-/// On an 8 GB laptop: how long each phase took, its longest transaction, and the worst wait of
-/// the writer here, the reader and the writer in another process, with how many of their
-/// statements failed where any did. "Whole" is as before steps; resume collects whole either way.
-/// In steps the writers' worst waits are the hold, one step and the pause of 150 ms, more when
-/// they compete for one gap, so a 1 s busy timeout stays marginal for a writer in another process.
+/// On an 8 GB laptop, with a busy timeout of 1 s and another test running: how long each phase
+/// took, its longest transaction, and the worst wait of the writer here, the reader and the
+/// writer in another process, with how many of their statements failed where any did. "Whole" is
+/// as before steps; resume collects whole either way. In steps the writers' worst waits are the
+/// hold, one step and the pause of 150 ms, more when they compete for one gap, so a 1 s busy
+/// timeout stays marginal for a writer in another process.
 ///
 /// | journal | rows | phase | whole: took, longest, waits | steps: took, longest, waits |
 /// |---|---|---|---|---|
-/// | DELETE | 10,000 | install | 0.86 s, 0.85 s; 0.89, 0.78, 0.99 s | 1.33 s, 0.15 s; 0.37, 0.10, 0.37 s |
-/// | DELETE | 10,000 | sync | 1.87 s, 1.03 s; 1.06, 0.99, 1.07 s | 2.56 s, 0.18 s; 0.47, 0.12, 0.47 s |
-/// | WAL | 10,000 | install | 0.87 s, 0.83 s; 0.89, 0.00, 0.99 s | 1.35 s, 0.15 s; 0.47, 0.01, 0.47 s |
-/// | WAL | 10,000 | sync | 1.65 s, 1.03 s; 1.08, 0.01, 1.06 s | 2.44 s, 0.17 s; 0.37, 0.01, 0.48 s |
-/// | DELETE | 100,000 | install, 1 s | 10.9 s, 10.8 s; 10 of 35, 9 of 66, 10 of 41 failed | 22.0 s, 0.21 s; 0.52, 0.22, 1.10 s |
-/// | DELETE | 100,000 | install, 5 s | 10.8 s, 10.7 s; 5.4 s, each 1 failed | 21.8 s, 0.21 s; 0.52, 0.19, 0.95 s |
-/// | DELETE | 100,000 | sync, 1 s | 27.4 s, 18.5 s; about 16 of 460 failed each | 43.8 s, 0.26 s; 1.14, 0.53, 1.10 s |
-/// | DELETE | 100,000 | sync, 5 s | 27.0 s, 18.3 s; 5.4 s, 3 failed each | 43.5 s, 0.26 s; 1.64, 0.60, 0.81 s |
-/// | WAL | 100,000 | install, 1 s | 10.3 s, 10.0 s; 9 of 52 failed, reader 0.01 s | 23.6 s, 0.20 s; 0.72, 0.01, 0.91 s |
-/// | WAL | 100,000 | sync, 1 s | 21.5 s, 15.4 s; 14 of 337 failed, reader 0.01 s | 49.0 s, 0.53 s; 0.61, 0.04, 0.93 s |
-/// | WAL | 100,000 | sync, 5 s | 22.9 s, 16.5 s; 5.4 s, 3 failed | 48.5 s, 0.52 s; 0.58, 0.01, 0.88 s |
+/// | DELETE | 10,000 | install | 0.89 s, 0.88 s; 0.94, 0.81, 0.93 s | 1.39 s, 0.11 s; 0.42, 0.09, 0.90 s |
+/// | DELETE | 10,000 | sync | 1.89 s, 1.11 s; 1.11, 1.09, 1.12 s | 2.90 s, 0.16 s; 0.82, 0.14, 0.82 s |
+/// | WAL | 10,000 | install | 0.94 s, 0.89 s; 0.92, 0.01, 0.93 s | 1.61 s, 0.11 s; 0.50, 0.01, 0.40 s |
+/// | WAL | 10,000 | sync | 1.73 s, 1.11 s; 1.14, 0.01, 1.11 s | 2.85 s, 0.15 s; 0.38, 0.01, 0.23 s |
+/// | DELETE | 100,000 | install | 12.0 s, 12.0 s; 10 of 37, 10 of 70, 10 of 40 failed | 24.5 s, 0.20 s; 1.03, 0.52, 1.04 s |
+/// | DELETE | 100,000 | sync | 31.6 s, 22.5 s; about 20 of 480 failed each | 62.8 s, 0.54 s; 1.11, 0.60, 1.11 s, 1 failed each |
+/// | WAL | 100,000 | install | 11.6 s, 11.2 s; 10 of 49 failed, reader 0.01 s | 28.0 s, 0.24 s; 0.83, 0.01, 0.51 s |
+/// | WAL | 100,000 | sync | 24.2 s, 17.7 s; 16 of 340 failed, reader 0.02 s | 65.0 s, 0.81 s; 0.83, 0.01, 0.92 s |
 ///
 /// Rows that each name one written after them, a chain of works and authors or a list of
-/// highlights, cannot be collected in part: at 10,000 rows in WAL mode one step takes them all,
-/// holding the lock 0.77 to 0.79 s against 0.72 to 0.76 s for one collect.
+/// highlights, cannot be collected in part: one step takes them all, holding the lock as long as
+/// one collect or longer. At 10,000 rows that is 0.75 to 0.77 s against 0.71 to 0.76 s; at
+/// 100,000, 10.6 to 19.5 s against 10.3 to 11.8 s, and writers fail as they do for one collect.
 ///
-/// At 10,000 rows no statement failed with either timeout. Resume, whole in both, held the lock
-/// 1.0 s at 10,000 rows and 14 to 18 s at 100,000, where writers failed as above. A sync in steps
-/// takes longer mostly for its pauses. Which of its transactions held the lock about 0.5 s in
-/// WAL mode was not looked into.
+/// At 10,000 rows no statement failed but one of a whole sync's. Resume, whole in both, held the
+/// lock 1.0 s at 10,000 rows and 15 s at 100,000, where writers failed as above. A sync in steps
+/// takes longer mostly for its pauses. Its longest transaction at 100,000 rows, 0.5 to 0.8 s, is
+/// a step of 1,000 rows of mixed shapes in a library of about half a million changes.
 #[tokio::test]
 #[ignore]
 async fn measure_backlog() {

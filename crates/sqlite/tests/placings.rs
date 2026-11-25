@@ -1,8 +1,9 @@
 //! Collecting in steps lands where ordinary collects could. For histories drawn from a seed, a
 //! replica writes a few rows and collects them in steps of one, two and three rows, by a collect,
-//! by an install that adds collections, or around an apply; with every write at a fixed time, the
-//! outcome, once both replicas have exchanged everything, must be one that collecting after some
-//! of the same writes gives, or failing that after some of their statements.
+//! by an install that adds collections, or around an apply; with each of those writes at a fixed
+//! time, often the same millisecond, the outcome, once both replicas have exchanged everything,
+//! must be one that collecting after some of the same writes gives, or failing that after some of
+//! their statements. The history before them runs on a clock that may move only now and then.
 //! `PLACINGS_CASES` sets how many histories (24 by default), `PLACINGS_SEED` the first seed.
 
 mod support;
@@ -396,6 +397,13 @@ fn splitmix(state: &mut u64) -> u64 {
 struct Source {
     rng: Mutex<u64>,
     wall: Arc<AtomicI64>,
+    drift: Arc<Mutex<Drift>>,
+}
+
+/// How the clock moves by itself: on one reading in `every`, on average, or never for 0.
+struct Drift {
+    state: u64,
+    every: u64,
 }
 
 type Call = unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
@@ -441,14 +449,30 @@ unsafe extern "C" fn unixepoch(
     _: *mut *mut ffi::sqlite3_value,
 ) {
     let source = unsafe { source(ctx) };
+    let mut drift = source.drift.lock().unwrap();
+    if drift.every > 0 {
+        let mut x = drift.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        drift.state = x;
+        if x.is_multiple_of(drift.every) {
+            source.wall.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     let ms = source.wall.load(Ordering::SeqCst);
     let seconds = (ms as f64 + 0.5) / 1000.0;
     unsafe { ffi::sqlite3_result_double(ctx, seconds) };
 }
 
-/// A database whose randomness comes from `seed` and whose wall clock is `wall`, which moves only
-/// when the test moves it.
-async fn connect(seed: u64, n: u64, wall: Arc<AtomicI64>) -> SqliteConnection {
+/// A database whose randomness comes from `seed` and whose wall clock is `wall`, which moves when
+/// the test moves it and as `drift` says.
+async fn connect(
+    seed: u64,
+    n: u64,
+    wall: Arc<AtomicI64>,
+    drift: Arc<Mutex<Drift>>,
+) -> SqliteConnection {
     let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
         .foreign_keys(true)
@@ -468,6 +492,7 @@ async fn connect(seed: u64, n: u64, wall: Arc<AtomicI64>) -> SqliteConnection {
         let source = Box::new(Source {
             rng: Mutex::new(splitmix(&mut start)),
             wall: wall.clone(),
+            drift: drift.clone(),
         });
         let cname = CString::new(name).unwrap();
         let status = unsafe {
@@ -525,6 +550,9 @@ struct Case {
     a: Vec<(i64, u8, u8, u8)>,
     /// B's writes, each after A's write of that number.
     b: Vec<(usize, u8, u8, u8)>,
+    /// Before A's writes, the clock moves by itself on one reading in this many, or never for
+    /// 0, so many writes of the history share a millisecond.
+    every: u64,
 }
 
 /// How A collects its writes: after each write whose bit is set, after each statement whose bit
@@ -549,8 +577,12 @@ fn a_write(i: usize, k: u8, x: u8, y: u8) -> Vec<String> {
 /// Both replicas' rows once A has collected its writes as `how` says and everything is exchanged.
 async fn outcome(case: &Case, how: How) -> String {
     let wall = Arc::new(AtomicI64::new(1_700_000_000_000));
-    let mut a = connect(case.seed, 0, wall.clone()).await;
-    let mut b = connect(case.seed, 1, wall.clone()).await;
+    let drift = Arc::new(Mutex::new(Drift {
+        state: case.seed | 1,
+        every: case.every,
+    }));
+    let mut a = connect(case.seed, 0, wall.clone(), drift.clone()).await;
+    let mut b = connect(case.seed, 1, wall.clone(), drift.clone()).await;
     for sql in SCHEMA {
         sqlx::query(sql).execute(&mut a).await.unwrap();
         sqlx::query(sql).execute(&mut b).await.unwrap();
@@ -595,6 +627,8 @@ async fn outcome(case: &Case, how: How) -> String {
     send(ra, &mut a, &mut b).await;
     send(&full, &mut b, &mut a).await;
     tick(&wall, 1000);
+    // From here every write is at the time the case gives it, however A collects.
+    drift.lock().unwrap().every = 0;
     let mut si = 0usize;
     for (i, &(gap, k, x, y)) in case.a.iter().enumerate() {
         tick(&wall, gap);
@@ -707,6 +741,7 @@ fn make_case(seed: u64) -> Case {
             )
         })
         .collect();
+    let every = [0, 1, 3, 8, 40][r(5) as usize];
     Case {
         seed,
         fk,
@@ -714,6 +749,7 @@ fn make_case(seed: u64) -> Case {
         history,
         a,
         b,
+        every,
     }
 }
 

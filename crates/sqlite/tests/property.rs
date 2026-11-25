@@ -521,13 +521,27 @@ async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left
         }
     }
     let inspection = replica.inspect(conn).await.unwrap();
+    // A reference is held as the group it names: see `same_as_whole`.
+    let canonical: std::collections::BTreeMap<fongo_sync_sqlite::core::Gid, _> = inspection
+        .aliases
+        .iter()
+        .map(|(_, g, k)| (*g, *k))
+        .collect();
     Left {
         outbox: replica.outbox(conn, 1_000_000).await.unwrap().changes,
         rows,
         values: inspection
             .registers
             .iter()
-            .map(|(c, g, f, v, _)| format!("{c} {g:?} {f} {v:?}"))
+            .map(|(c, g, f, v, _)| {
+                let v = match v {
+                    fongo_sync_sqlite::core::Value::Ref(r) => {
+                        fongo_sync_sqlite::core::Value::Ref(*canonical.get(r).unwrap_or(r))
+                    }
+                    v => v.clone(),
+                };
+                format!("{c} {g:?} {f} {v:?}")
+            })
             .chain(inspection.aliases.iter().map(|a| format!("{a:?}")))
             .collect(),
     }
@@ -536,15 +550,47 @@ async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left
 /// Collecting in steps sent, from `start` of the outbox, what collecting whole did: the same
 /// changes in clock order, aliases joining the same groups, and the same rows and values.
 fn same_as_whole(start: usize, whole: &Left, stepped: &Left) -> Result<(), String> {
+    use fongo_sync_sqlite::core::{ALIAS, Gid, Value};
+    // A reference may name another member of a group the steps join, as it may across two
+    // collects: references are compared by the group they name, each side's groups joined by
+    // the aliases it sent.
+    let groups = |left: &Left| {
+        let mut parent: std::collections::BTreeMap<Gid, Gid> = std::collections::BTreeMap::new();
+        fn root(parent: &std::collections::BTreeMap<Gid, Gid>, mut g: Gid) -> Gid {
+            while let Some(&p) = parent.get(&g) {
+                if p == g {
+                    break;
+                }
+                g = p;
+            }
+            g
+        }
+        for c in left.outbox[start..].iter().filter(|c| c.field == ALIAS) {
+            if let Value::Ref(b) = c.value {
+                let (ra, rb) = (root(&parent, c.gid), root(&parent, b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb));
+                }
+            }
+        }
+        move |g: Gid| root(&parent, g)
+    };
     let plain = |left: &Left| {
+        let group = groups(left);
         let mut changes: Vec<&Change> = left.outbox[start..]
             .iter()
-            .filter(|c| c.field != fongo_sync_sqlite::core::ALIAS)
+            .filter(|c| c.field != ALIAS)
             .collect();
         changes.sort_by_key(|c| c.clock);
         changes
             .iter()
-            .map(|c| format!("{} {:?} {} {:?}", c.collection, c.gid, c.field, c.value))
+            .map(|c| {
+                let value = match &c.value {
+                    Value::Ref(g) => Value::Ref(group(*g)),
+                    v => v.clone(),
+                };
+                format!("{} {:?} {} {:?}", c.collection, c.gid, c.field, value)
+            })
             .collect::<Vec<_>>()
     };
     if plain(whole) != plain(stepped) {
@@ -1051,18 +1097,22 @@ fn found_at_install(n: u64) -> &'static [&'static str] {
 /// Runs a script on five peers of a world made from `seed`. The same seed and script always do
 /// the same thing.
 fn run(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, false, seed, script, None)
+    run_on(SCHEMA, false, seed, 0, script, None)
 }
 
 /// [`run`] on replicas that hold [`found_at_install`] before they install.
 fn run_found(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, true, seed, script, None)
+    run_on(SCHEMA, true, seed, 0, script, None)
 }
 
+/// [`run`] or [`run_found`] in a world whose clock moves on one reading in `every` (see
+/// [`World::clustered`]), and with every peer collecting in steps of `step` rows (`Some(None)`
+/// for whole) where given.
 fn run_on(
     schema: &[&str],
     found: bool,
     seed: u64,
+    every: u64,
     script: &[(usize, Op)],
     step: Option<Option<usize>>,
 ) -> Result<(), String> {
@@ -1070,7 +1120,7 @@ fn run_on(
         .build()
         .unwrap();
     let outcome = runtime.block_on(async {
-        let world = World::new(seed);
+        let world = World::clustered(seed, every);
         let mut hub = Vec::new();
         let mut peers = Vec::new();
         for n in 0..5 {
@@ -1088,18 +1138,22 @@ fn run_on(
             .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers).await
     });
-    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, script)))
+    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, script)))
 }
 
 /// A failing case as a test to paste below.
-fn reproduction(found: bool, seed: u64, script: &[(usize, Op)]) -> String {
-    let run = if found { "run_found" } else { "run" };
+fn reproduction(found: bool, seed: u64, every: u64, script: &[(usize, Op)]) -> String {
+    let run = match (found, every) {
+        (false, 0) => format!("run({seed}, &script)"),
+        (true, 0) => format!("run_found({seed}, &script)"),
+        (found, every) => format!("run_on(SCHEMA, {found}, {seed}, {every}, &script, None)"),
+    };
     let steps: Vec<String> = script
         .iter()
         .map(|(who, op)| format!("        ({who}, {op:?}),"))
         .collect();
     format!(
-        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    {run}({seed}, &script).unwrap();\n}}",
+        "#[test]\nfn found() {{\n    use Op::*;\n    let script = vec![\n{}\n    ];\n    {run}.unwrap();\n}}",
         steps.join("\n")
     )
 }
@@ -1132,9 +1186,10 @@ proptest! {
     fn replicas_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
         seed in any::<u64>(),
         found in any::<bool>(),
+        every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
-        let outcome = if found { run_found(seed, &script) } else { run(seed, &script) };
+        let outcome = run_on(SCHEMA, found, seed, every, &script, None);
         if let Err(error) = outcome {
             prop_assert!(false, "{}", error);
         }
@@ -1241,7 +1296,7 @@ fn a_shelf_renamed_onto_one_its_book_moved_to() {
         (4, MoveBookDeleteShelf(0, 0)),
         (1, RenameShelf(0, 2)),
     ];
-    run_on(&schema, false, 0, &script, None).unwrap();
+    run_on(&schema, false, 0, 0, &script, None).unwrap();
 }
 
 /// A title written while suspended is sent on resuming, so writing it back afterwards is an edit
@@ -2025,7 +2080,7 @@ fn series_found_to_be_one_on_one_replica_keep_its_writes() {
         (2, AddVolume(1, 0)),
     ];
     run(5694626446472720197, &script).unwrap();
-    run_on(SCHEMA, false, 5694626446472720197, &script, Some(None)).unwrap();
+    run_on(SCHEMA, false, 5694626446472720197, 0, &script, Some(None)).unwrap();
 }
 /// Found at 500 cases once series joined the test. A series the replica received is found to be
 /// one with another of its own and its row is removed; two new series then share one code, the
@@ -2064,5 +2119,47 @@ fn a_series_made_at_a_key_a_merge_freed_and_merged_away_again_is_sent() {
         (2, AddSeries(1, 0)),
     ];
     run(6847074269335888592, &script).unwrap();
-    run_on(SCHEMA, false, 6847074269335888592, &script, Some(None)).unwrap();
+    run_on(SCHEMA, false, 6847074269335888592, 0, &script, Some(None)).unwrap();
+}
+/// Found at 400 cases with seed 424242. Two series with one code and a volume on the second;
+/// resuming collects them whole and merges the second away, and a new series then takes its id.
+/// The volume's reference is carried as the entity minted for the merged row, which the test
+/// never saw at that id.
+#[test]
+fn a_volume_naming_a_series_merged_away_at_a_resume_is_sent() {
+    use Op::*;
+    let script = vec![
+        (1, AddSeries(1, 0)),
+        (1, AddShelf(2)),
+        (1, AddShelf(0)),
+        (1, AddSeries(1, 0)),
+        (0, Deliver(0, false, true)),
+        (1, AddVolume(5, 0)),
+        (1, Suspended(0, 0)),
+        (1, AddSeries(0, 0)),
+    ];
+    run(1416172913542871530, &script).unwrap();
+    run_on(SCHEMA, false, 1416172913542871530, 0, &script, Some(None)).unwrap();
+}
+/// Found at 400 cases with seed 99. A book found to be one with a delivered book, and a note on
+/// it, collected in steps: the note names the book's own entity, where one collect names the
+/// entity it joins. Both name one group; the test compares references by the group they name.
+#[test]
+fn a_note_on_a_book_found_to_be_one_names_its_group_in_steps() {
+    use Op::*;
+    let script = vec![
+        (1, AddShelf(1)),
+        (1, Sync),
+        (0, AddShelf(0)),
+        (3, Deliver(0, false, false)),
+        (0, AddShelf(0)),
+        (0, Sync),
+        (2, AddBook(0, 0, 1)),
+        (2, Deliver(11898942371205919333, false, false)),
+        (2, AddBook(0, 0, 0)),
+        (2, MoveBookDeleteShelf(1, 0)),
+        (2, AddNote(2, 0)),
+        (2, Sync),
+    ];
+    run_found(3778721728584034636, &script).unwrap();
 }
