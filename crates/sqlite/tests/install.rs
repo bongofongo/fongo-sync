@@ -372,13 +372,26 @@ fn a_second_registry_installed_while_records_wait() {
     });
 }
 
+type Sent = (Vec<Change>, Vec<Vec<Value>>, Inspection);
+
+fn without_clocks((mut changes, rows, mut inspection): Sent) -> Sent {
+    let none = |h: &mut fongo_sync_sqlite::core::Hlc| {
+        h.wall_ms = 0;
+        h.counter = 0;
+    };
+    changes.iter_mut().for_each(|c| none(&mut c.clock));
+    changes.sort_by(|a, b| (&a.collection, a.gid, &a.field).cmp(&(&b.collection, b.gid, &b.field)));
+    inspection.registers.iter_mut().for_each(|r| none(&mut r.4));
+    (changes, rows, inspection)
+}
+
 /// Outside the library's shape: series whose code is an identity no index enforces, two found
-/// with one code, so adopting them gives one row up. Before their batch is adopted the given-up
-/// row is removed and another made at its id; adopting leaves the new row to the collect of its
-/// mark, as after a whole install.
-#[test]
-#[ignore = "outside the supported shape: an identity no unique index enforces; rows agree, the changes sent do not"]
-fn a_found_row_given_up_after_its_id_was_taken_again() {
+/// with one code, so adopting them gives one row up and keeps the larger `seen` of the two,
+/// after albums that come first. Between the
+/// first step and the series' batch, and after a whole install on the twin, the application
+/// runs `writes`. Returns what each side sends after, its series and its inspection, without
+/// clocks: an alias is stamped when its batch is adopted, so the clocks after it differ.
+fn series_found_twice(writes: &[&str]) -> [Sent; 2] {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -389,6 +402,7 @@ fn a_found_row_given_up_after_its_id_was_taken_again() {
                 fongo_sync_sqlite::Collection::minted("series", "series", "id")
                     .field("code")
                     .field("name")
+                    .field_with("seen", fongo_sync_sqlite::core::Strategy::Max)
                     .identity(&["code"]),
             ])
             .unwrap()
@@ -398,10 +412,10 @@ fn a_found_row_given_up_after_its_id_was_taken_again() {
         let mut a = world.connect(0).await;
         for sql in [
             "CREATE TABLE albums (id INTEGER PRIMARY KEY, name TEXT)",
-            "CREATE TABLE series (id INTEGER PRIMARY KEY, code TEXT, name TEXT)",
+            "CREATE TABLE series (id INTEGER PRIMARY KEY, code TEXT, name TEXT, seen INTEGER)",
             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6)
              INSERT INTO albums (id, name) SELECT i, 'album ' || i FROM n",
-            "INSERT INTO series (id, code, name) VALUES (1, 'c1', 'first'), (2, 'c1', 'second')",
+            "INSERT INTO series (id, code, name, seen) VALUES (1, 'c1', 'first', 1), (2, 'c1', 'second', 5)",
         ] {
             library::run(&mut a, sql).await;
         }
@@ -411,10 +425,7 @@ fn a_found_row_given_up_after_its_id_was_taken_again() {
         replica.install(&mut b).await.unwrap();
         for (w, conn) in [(&world, &mut a), (&twin, &mut b)] {
             w.later(1);
-            for sql in [
-                "DELETE FROM series WHERE id = 2",
-                "INSERT INTO series (id, code, name) VALUES (2, 'c9', 'made again')",
-            ] {
+            for sql in writes {
                 library::run(conn, sql).await;
             }
         }
@@ -430,10 +441,155 @@ fn a_found_row_given_up_after_its_id_was_taken_again() {
                 replica.inspect(conn).await.unwrap(),
             ));
         }
-        let (stepped, whole) = (&out[0], &out[1]);
-        assert_eq!(stepped.1, whole.1, "rows");
-        assert_eq!(stepped.0, whole.0, "changes");
-        assert_eq!(stepped.2, whole.2, "inspections");
+        let [stepped, whole]: [Sent; 2] = out.try_into().unwrap();
+        [without_clocks(stepped), without_clocks(whole)]
+    })
+}
+
+/// The row adopting gives up is removed and another made at its id before its batch: adopting
+/// leaves the new row standing, for the collect of its mark, as after a whole install.
+#[test]
+fn a_row_made_again_at_a_given_up_id_is_left_standing() {
+    let [stepped, whole] = series_found_twice(&[
+        "DELETE FROM series WHERE id = 2",
+        "INSERT INTO series (id, code, name) VALUES (2, 'c9', 'made again')",
+    ]);
+    assert_eq!(stepped.1, whole.1, "rows");
+    assert_eq!(stepped.0, whole.0, "changes");
+    assert_eq!(stepped.2, whole.2, "inspections");
+}
+
+/// The row adopting keeps is written before its batch, on a field adopting it takes from the row
+/// given up: the application's value stands, and is sent, as after a whole install.
+#[test]
+fn a_kept_row_written_before_its_batch_keeps_the_write() {
+    for id in [1, 2] {
+        let [stepped, whole] = series_found_twice(&[&format!(
+            "UPDATE series SET name = 'written' WHERE id = {id}"
+        )]);
+        assert_eq!(stepped.1, whole.1, "rows, {id} written");
+        assert_eq!(stepped.0, whole.0, "changes, {id} written");
+        assert_eq!(stepped.2, whole.2, "inspections, {id} written");
+    }
+}
+
+/// The row adopting keeps is removed and made again at its id before its batch, with the value
+/// it was found with where adopting takes the larger value of the row given up: adopting writes
+/// nothing over the new row.
+#[test]
+fn a_kept_row_made_again_is_not_written_over() {
+    for (id, seen) in [(1, 1), (2, 5)] {
+        let [stepped, whole] = series_found_twice(&[
+            &format!("DELETE FROM series WHERE id = {id}"),
+            &format!(
+                "INSERT INTO series (id, code, name, seen) VALUES ({id}, 'c9', 'made again', {seen})"
+            ),
+        ]);
+        assert_eq!(stepped.1, whole.1, "rows, {id} made again");
+        assert_eq!(stepped.0, whole.0, "changes, {id} made again");
+        assert_eq!(stepped.2, whole.2, "inspections, {id} made again");
+    }
+}
+
+/// Outside the library's shape: a found note names a book id no row holds, and the application
+/// makes that book before the note's batch. The note cannot be adopted naming nothing then, so it
+/// is left marked, and the collect after the book's names the book.
+#[test]
+fn a_found_row_naming_an_id_made_since_is_collected_after_it() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let world = World::new(9);
+        world.hold(true);
+        let mut a = world.connect(0).await;
+        for sql in [
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, book_id INTEGER, text TEXT)",
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6)
+             INSERT INTO books (id, title) SELECT i, 'book ' || i FROM n",
+            "INSERT INTO notes (id, book_id, text) VALUES (1, 99, 'on a book not here')",
+        ] {
+            library::run(&mut a, sql).await;
+        }
+        let replica = Replica::new(
+            fongo_sync_sqlite::Registry::new(vec![
+                fongo_sync_sqlite::Collection::minted("books", "books", "id").field("title"),
+                fongo_sync_sqlite::Collection::minted("notes", "notes", "id")
+                    .field("text")
+                    .reference("book_id", "books"),
+            ])
+            .unwrap(),
+        );
+        assert!(replica.install_step(&mut a, 1).await.unwrap().more);
+        let note_waits: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fongo_found WHERE collection = 'notes' AND batch >= 0",
+        )
+        .fetch_one(&mut a)
+        .await
+        .unwrap();
+        assert_eq!(note_waits, 1);
+        world.later(1);
+        library::run(
+            &mut a,
+            "INSERT INTO books (id, title) VALUES (99, 'made since')",
+        )
+        .await;
+        let mut steps = 0;
+        while replica.collect_step(&mut a, 1).await.unwrap().more {
+            steps += 1;
+            assert!(steps < 20, "the steps do not end");
+        }
+        assert_eq!(found_left(&mut a).await, 0);
+        let seen = replica.inspect(&mut a).await.unwrap();
+        let gid = |collection: &str, key: &str| {
+            seen.ids
+                .iter()
+                .find(|(c, k, _)| c == collection && k == key)
+                .map(|(_, _, g)| *g)
+                .unwrap()
+        };
+        let named = seen
+            .registers
+            .iter()
+            .find(|(c, g, f, _, _)| c == "notes" && *g == gid("notes", "[1]") && f == "book_id")
+            .map(|r| r.3.clone());
+        assert_eq!(named, Some(Value::Ref(gid("books", "[99]"))));
+    });
+}
+
+/// Rows a first install in steps found and has not adopted yet count as rows to collect, with
+/// the rows marked since, up to the limit asked for.
+#[test]
+fn found_rows_not_adopted_yet_count_as_uncollected() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let world = World::new(10);
+        world.hold(true);
+        let mut a = database(&world, 0).await;
+        existing(&mut a, 12).await;
+        let replica = Replica::new(registry());
+        assert!(replica.install_step(&mut a, 2).await.unwrap().more);
+        let found = usize::try_from(found_left(&mut a).await).unwrap();
+        assert!(found > 4);
+        assert_eq!(
+            replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+            found
+        );
+        world.later(1);
+        library::run(&mut a, "UPDATE books SET title = 'quiet' WHERE id = 1").await;
+        assert_eq!(
+            replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+            found + 1
+        );
+        for at_most in [0, 1, 3, found, found + 1, found + 2] {
+            assert_eq!(
+                replica.uncollected_rows(&mut a, at_most).await.unwrap(),
+                at_most.min(found + 1)
+            );
+        }
     });
 }
 
