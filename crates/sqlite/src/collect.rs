@@ -765,17 +765,10 @@ impl Replica {
             });
         }
         let c = self.collection(t);
-        if !names.cache.contains_key(&(t, local)) {
-            let mapped = mapping(db, &c.name, &key)?;
-            // A marked row past the prefix that keeps its entity names the same one once
-            // collected; any other may not.
-            if names.bounded
-                && let Some((at, gone)) = marked_at(db, &c.name, &key)?
-                && (gone || mapped.is_none() || read_row(db, c, &key)?.is_none())
-            {
-                names.past((at, c.name.clone(), key.clone()));
-            }
-            names.cache.insert((t, local), mapped);
+        // `closed` has already grown the prefix past any marked row named here that collecting
+        // could give another entity.
+        if let std::collections::btree_map::Entry::Vacant(e) = names.cache.entry((t, local)) {
+            e.insert(mapping(db, &c.name, &key)?);
         }
         Ok(match &names.cache[&(t, local)] {
             Some(m) => Named::Gid(m.gid),

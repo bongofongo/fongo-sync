@@ -27,6 +27,9 @@ struct Wall {
     every: u64,
     /// The clock does not move by itself.
     still: bool,
+    /// On one reading in sixteen, the clock steps back this many milliseconds; 0 never.
+    back: u64,
+    back_rng: u64,
 }
 
 struct Source {
@@ -52,6 +55,12 @@ impl World {
     /// A world whose clock moves on, on average, one reading in `every`, so that many writes
     /// share a millisecond; 0 moves it three readings in four, as [`World::new`] does.
     pub fn clustered(seed: u64, every: u64) -> World {
+        World::stepping_back(seed, every, 0)
+    }
+
+    /// [`World::clustered`] whose clock also steps back `back` milliseconds on one reading in
+    /// sixteen, as a wall clock set back does; 0 never.
+    pub fn stepping_back(seed: u64, every: u64, back: u64) -> World {
         World {
             seed,
             wall: Arc::new(Mutex::new(Wall {
@@ -59,6 +68,8 @@ impl World {
                 rng: if every == 0 { seed ^ 0x5555 } else { seed | 1 },
                 every,
                 still: false,
+                back,
+                back_rng: seed ^ 0xB4CC,
             })),
             streams: Streams::default(),
         }
@@ -75,6 +86,8 @@ impl World {
                 rng: wall.rng,
                 every: wall.every,
                 still: wall.still,
+                back: wall.back,
+                back_rng: wall.back_rng,
             }
         };
         let states: Vec<u64> = self.streams.lock().unwrap()[&n]
@@ -111,6 +124,11 @@ impl World {
     /// Moves the shared clock on by `ms`.
     pub fn later(&self, ms: u64) {
         self.wall.lock().unwrap().ms += ms;
+    }
+
+    /// Moves the shared clock back by `ms`, as a clock set back does.
+    pub fn earlier(&self, ms: u64) {
+        self.wall.lock().unwrap().ms -= ms;
     }
 
     /// An empty database, numbered `n` within this world, with foreign keys enforced.
@@ -242,6 +260,9 @@ unsafe extern "C" fn unixepoch(
     };
     if moves && !wall.still {
         wall.ms += 1;
+    }
+    if wall.back > 0 && !wall.still && splitmix(&mut wall.back_rng).is_multiple_of(16) {
+        wall.ms -= wall.back;
     }
     // Half a millisecond on, so `CAST(x * 1000 AS INTEGER)` reads back the same millisecond.
     let seconds = (wall.ms as f64 + 0.5) / 1000.0;

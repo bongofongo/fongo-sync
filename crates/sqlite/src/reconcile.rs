@@ -527,6 +527,23 @@ impl Replica {
         let mut params = Vec::new();
         let (key, local) = match &c.key {
             Key::Minted { column } => {
+                // The id depends on the highest mapped one, which collecting a removal lowers:
+                // a step takes every removal above the table's highest id with it.
+                if cx.watch.is_some() {
+                    for r in db.query(
+                        &format!(
+                            "SELECT d.key FROM fongo_dirty AS d
+                               JOIN fongo_ids AS i ON i.collection = d.collection AND i.key = d.key
+                              WHERE d.collection = ?1 AND d.gone > 0
+                                AND i.local > COALESCE((SELECT max({col}) FROM {table}), 0)",
+                            col = quoted(column),
+                            table = quoted(&c.table)
+                        ),
+                        &[Value::Text(c.name.clone())],
+                    )? {
+                        cx.looked_at(&c.name, as_text(&r[0])?);
+                    }
+                }
                 let next = db.query(
                     &format!(
                         "SELECT max(COALESCE((SELECT max({col}) FROM {table}), 0),

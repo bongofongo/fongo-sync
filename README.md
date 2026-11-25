@@ -16,10 +16,11 @@ its database, `Replica::collect` to turn local writes into changes, and `Replica
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
 `fongo_`. `Replica::collect_step` collects in steps, each a transaction of its own that says
 whether more is left, so that many local writes are collected without holding SQLite's write lock
-for long; `Replica::install_step` installs and takes the first step. A step ends only between two
-milliseconds, so the steps end as ordinary collects made one after another, each between two
-milliseconds, would; in every case the tests try, also as one collect of everything, but where an
-alias is stamped or a reference names another member of the group it joins. A step takes about the rows asked for, more where rows depend on later ones: a
+for long; `Replica::install_step` installs and takes the first step. A step ends only where the
+next row is marked with a later time, so the steps end as some placing of ordinary collects
+among the same writes would; in every case the tests try, also as one collect of everything,
+but where an alias is stamped or a reference names another member of the group it joins. A
+step takes about the rows asked for, more where rows depend on later ones: a
 new row written again after the rows naming it is collected with all of them, rows written in
 one millisecond are collected together, and the rows found in a collection's tables when it is
 first installed are collected by that install whole.

@@ -371,6 +371,8 @@ struct Case {
     every: u64,
     /// Whether the burst is written in one millisecond.
     still: bool,
+    /// How far the clock steps back now and then, in milliseconds; 0 never.
+    back: u64,
 }
 
 async fn run(conn: &mut SqliteConnection, statements: &[String]) {
@@ -409,7 +411,7 @@ async fn tables(conn: &mut SqliteConnection) -> Vec<Vec<Vec<Value>>> {
 /// Builds the case's world and runs the operation under test whole (`step` of `None`) or in
 /// steps of `step` rows.
 async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
-    let world = World::clustered(case.seed, case.every);
+    let world = World::stepping_back(case.seed, case.every, case.back);
     let mut a = world.connect(0).await;
     let mut b = world.connect(1).await;
     for sql in SCHEMA {
@@ -715,16 +717,20 @@ fn arb_case() -> impl Strategy<Value = Case> {
         proptest::collection::vec(arb_write(), 0..40),
         prop_oneof![Just(0), Just(1), Just(3), Just(8), Just(40)],
         any::<bool>(),
+        prop_oneof![Just(0), Just(1), Just(2), Just(40)],
     )
-        .prop_map(|(seed, mode, fk, history, burst, every, still)| Case {
-            seed,
-            mode,
-            fk,
-            history,
-            burst,
-            every,
-            still,
-        })
+        .prop_map(
+            |(seed, mode, fk, history, burst, every, still, back)| Case {
+                seed,
+                mode,
+                fk,
+                history,
+                burst,
+                every,
+                still,
+                back,
+            },
+        )
 }
 
 proptest! {
@@ -760,6 +766,7 @@ fn every_kind_of_write_collects_alike_in_steps() {
             check(&Case {
                 every: 0,
                 still: false,
+                back: 0,
                 seed: u64::from(kind),
                 mode,
                 fk,
@@ -772,6 +779,7 @@ fn every_kind_of_write_collects_alike_in_steps() {
         check(&Case {
             every: 0,
             still: false,
+            back: 0,
             seed: 7,
             mode,
             fk,
@@ -882,6 +890,7 @@ fn hard_shapes_collect_alike_in_steps() {
             check(&Case {
                 every: 0,
                 still: false,
+                back: 0,
                 seed: i as u64,
                 mode,
                 fk: true,
@@ -894,6 +903,7 @@ fn hard_shapes_collect_alike_in_steps() {
     check(&Case {
         every: 0,
         still: false,
+        back: 0,
         seed: 2143016055923739986,
         mode: Mode::Collect,
         fk: true,
@@ -996,6 +1006,7 @@ fn rows_naming_a_row_a_step_gives_up_are_collected_with_it() {
             check(&Case {
                 every: 0,
                 still: false,
+                back: 0,
                 seed,
                 mode: Mode::Collect,
                 fk,
@@ -1390,6 +1401,7 @@ fn tags_whose_books_are_gone_collect_alike_in_steps() {
     check(&Case {
         every: 0,
         still: false,
+        back: 0,
         seed: 1882020332708727243,
         mode: Mode::Collect,
         fk: false,
@@ -1421,6 +1433,7 @@ fn a_row_a_later_step_would_find_is_not_written_first() {
     check(&Case {
         every: 0,
         still: false,
+        back: 0,
         seed: 2121431186798033,
         mode: Mode::Collect,
         fk: false,
@@ -1787,6 +1800,7 @@ fn a_shelf_and_a_book_removed_in_one_millisecond_are_one_step() {
         burst: vec![(218, 2, 0), (116, 6, 0)],
         every: 40,
         still: true,
+        back: 0,
     })
     .unwrap();
 }
@@ -1811,6 +1825,7 @@ fn an_author_made_again_with_its_book_in_one_millisecond_is_one_step() {
             burst: vec![(13, 7, 0)],
             every: 3,
             still,
+            back: 0,
         })
         .unwrap();
     }
@@ -1857,6 +1872,35 @@ async fn waiting_and_new(
         _ => n,
     };
     sqlx::query("BEGIN").execute(&mut a).await.unwrap();
+    if place == "among" {
+        // One that waits after every few others.
+        let every = (n / wait.max(1)).max(1);
+        for i in 0..n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!(
+                    "INSERT INTO books (id, shelf_id, title, seen) VALUES ({}, 1, 'new', 0)",
+                    1_000_000 + i
+                )],
+            )
+            .await;
+            let w = i / every + 1;
+            if i % every == 0 && w <= wait {
+                world.later(1);
+                run(
+                    &mut a,
+                    &[format!(
+                        "INSERT INTO books (id, shelf_id, title, author_id, seen)
+                         VALUES ({w}, 1, 'waits', {w}, 0)"
+                    )],
+                )
+                .await;
+            }
+        }
+        sqlx::query("COMMIT").execute(&mut a).await.unwrap();
+        return (a, replica);
+    }
     for i in 0..=n {
         if i == at {
             for w in 1..=wait {
@@ -2041,10 +2085,226 @@ async fn a_row_a_merge_keeps_takes_its_later_edit_with_the_step() {
             .filter(|c| c.collection == "series" && c.field == "name")
             .map(|c| c.value)
             .collect();
-        eprintln!("ZZM {rows:?}: {names:?} sent {sent:?}");
         assert!(
             sent.contains(&fongo_sync_sqlite::core::Value::Text("edited".into())),
             "{rows:?}: {names:?} {sent:?}"
         );
     }
+}
+
+/// Foreign keys on: a remote author held here for a name another holds, released by removing
+/// that one, just after the author with the highest id was removed, the clock having stepped
+/// back a millisecond between the two. The step that takes the second removal, marked earlier,
+/// writes the released author at a fresh id: it takes the first removal with it, so the id is
+/// the one any collect after both removals gives.
+#[tokio::test]
+async fn a_row_released_after_a_removal_marked_later_takes_the_id_one_collect_gives() {
+    let mut ids = Vec::new();
+    for rows in [None, Some(1)] {
+        let world = World::new(11);
+        world.hold(true);
+        let mut a = world.connect(0).await;
+        let mut b = world.connect(1).await;
+        for conn in [&mut a, &mut b] {
+            run(
+                conn,
+                &[
+                    "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT UNIQUE)".into(),
+                    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT,
+                        author_id INTEGER REFERENCES authors(id) ON DELETE SET NULL)"
+                        .into(),
+                ],
+            )
+            .await;
+        }
+        let replica = Replica::new(
+            Registry::new(vec![
+                Collection::minted("authors", "authors", "id").field("name"),
+                Collection::minted("books", "books", "id")
+                    .field("title")
+                    .reference("author_id", "authors"),
+            ])
+            .unwrap(),
+        );
+        replica.install(&mut a).await.unwrap();
+        replica.install(&mut b).await.unwrap();
+        world.later(1_000);
+        run(
+            &mut a,
+            &["INSERT INTO authors (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')".into()],
+        )
+        .await;
+        send(&replica, &mut a, &mut b).await;
+        world.later(1_000);
+        run(
+            &mut a,
+            &["UPDATE authors SET name = 'Z' WHERE id = 3".into()],
+        )
+        .await;
+        run(&mut b, &["INSERT INTO authors (name) VALUES ('Z')".into()]).await;
+        send(&replica, &mut b, &mut a).await;
+        send(&replica, &mut a, &mut b).await;
+        assert_eq!(replica.inspect(&mut a).await.unwrap().held.len(), 1);
+        world.later(1_000);
+        run(&mut a, &["DELETE FROM authors WHERE id = 5".into()]).await;
+        world.earlier(1);
+        run(&mut a, &["DELETE FROM authors WHERE id = 3".into()]).await;
+        world.later(1_000);
+        match rows {
+            None => {
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => while replica.collect_step(&mut a, rows).await.unwrap().more {},
+        }
+        ids.push(support::rows(&mut a, "SELECT id, name FROM authors ORDER BY id", &[]).await);
+    }
+    assert_eq!(ids[0], ids[1]);
+}
+
+/// Outside the supported shape's bound: rows that wait among many others are read again by every
+/// try of every step, so steps of 10 over 20,000 rows with 5,000 waiting among them cost far more
+/// than one collect.
+#[tokio::test]
+#[ignore = "rows that wait among others cost each step a read of every one before it"]
+async fn steps_over_rows_that_wait_among_others_cost_at_most_twice_one_collect() {
+    let (n, wait) = (20_000, 5_000);
+    let whole = {
+        let world = World::new(3);
+        let (mut a, replica) = waiting_and_new(&world, n, wait, "among").await;
+        let work = count_work(&mut a).await;
+        replica.collect(&mut a).await.unwrap();
+        work.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for rows in [10, 1_000] {
+        let world = World::new(3);
+        let (mut a, replica) = waiting_and_new(&world, n, wait, "among").await;
+        let work = count_work(&mut a).await;
+        while replica.collect_step(&mut a, rows).await.unwrap().more {}
+        let work = work.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            work <= 2 * whole,
+            "steps of {rows}: work {work} against {whole}"
+        );
+    }
+}
+
+/// Outside the supported shape: with foreign keys off, tags naming a book that is gone, one a
+/// millisecond, each make the step read every marked tag, so steps cost many times one collect.
+#[tokio::test]
+#[ignore = "with foreign keys off, natural rows naming a gone row cost each step every mark of their collection"]
+async fn tags_naming_a_gone_book_cost_at_most_twice_one_collect() {
+    async fn tags(world: &World) -> (SqliteConnection, Replica) {
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        run(&mut a, &["PRAGMA foreign_keys = OFF".into()]).await;
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &[
+                "INSERT INTO shelves (id, name) VALUES (1, 's1')".into(),
+                "INSERT INTO books (id, shelf_id, title, seen) VALUES (1, 1, 't', 0)".into(),
+            ],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        run(&mut a, &["DELETE FROM books WHERE id = 1".into()]).await;
+        for i in 0..3_000 {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!(
+                    "INSERT INTO tags (book_id, tag) VALUES (1, 'tag {i}')"
+                )],
+            )
+            .await;
+        }
+        (a, replica)
+    }
+    let whole = {
+        let world = World::new(3);
+        let (mut a, replica) = tags(&world).await;
+        let work = count_work(&mut a).await;
+        replica.collect(&mut a).await.unwrap();
+        work.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let world = World::new(3);
+    let (mut a, replica) = tags(&world).await;
+    let work = count_work(&mut a).await;
+    while replica.collect_step(&mut a, 1_000).await.unwrap().more {}
+    let work = work.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(work <= 2 * whole, "work {work} against {whole}");
+}
+
+/// Outside the supported shape, and so on main as well: with foreign keys off, a book pointed at
+/// an author that is then removed and collected, an author made again at that id and collected,
+/// and the book pointed at it again. The last write compares equal to the image read through the
+/// new mapping and is never sent: here the book names the new author, elsewhere none.
+#[tokio::test]
+#[ignore = "with foreign keys off, a reference to an id taken again after its row was collected gone is lost"]
+async fn a_reference_to_an_id_taken_again_is_sent() {
+    let world = World::new(3);
+    let mut a = world.connect(0).await;
+    let mut b = world.connect(1).await;
+    let replica = Replica::new(
+        Registry::new(vec![
+            Collection::minted("authors", "authors", "id").field("name"),
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .reference("author_id", "authors"),
+        ])
+        .unwrap(),
+    );
+    for conn in [&mut a, &mut b] {
+        run(
+            conn,
+            &[
+                "PRAGMA foreign_keys = OFF".into(),
+                "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)".into(),
+                "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT,
+                    author_id INTEGER REFERENCES authors(id) ON DELETE SET NULL)"
+                    .into(),
+            ],
+        )
+        .await;
+        replica.install(conn).await.unwrap();
+    }
+    run(
+        &mut a,
+        &[
+            "INSERT INTO authors (id, name) VALUES (1, 'Eliot'), (2, 'Lewes')".into(),
+            "INSERT INTO books (id, title, author_id) VALUES (1, 'Middlemarch', NULL)".into(),
+        ],
+    )
+    .await;
+    send(&replica, &mut a, &mut b).await;
+    run(
+        &mut a,
+        &[
+            "UPDATE books SET author_id = 2 WHERE id = 1".into(),
+            "DELETE FROM authors WHERE id = 2".into(),
+        ],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["INSERT INTO authors (id, name) VALUES (2, 'Evans')".into()],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["UPDATE books SET author_id = 2 WHERE id = 1".into()],
+    )
+    .await;
+    send(&replica, &mut a, &mut b).await;
+    send(&replica, &mut b, &mut a).await;
+    let q = "SELECT b.id, a.name FROM books b LEFT JOIN authors a ON a.id = b.author_id";
+    assert_eq!(
+        support::rows(&mut a, q, &[]).await,
+        support::rows(&mut b, q, &[]).await
+    );
 }

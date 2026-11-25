@@ -52,8 +52,8 @@ pub struct Collected {
     pub rows: usize,
     /// Marked rows taken by tries the step gave up and took again, larger, because rows they
     /// took depended on rows past them. Fewer than the marked rows the step took, those it
-    /// collected ([`Collected::rows`]) and those among them that wait: a step costs at most about
-    /// twice what collecting its rows at once costs.
+    /// collected ([`Collected::rows`]) and those among them that wait, so the tries given up cost
+    /// no more than the try kept; see [`Replica::collect_step`] for what else a step costs.
     pub abandoned: usize,
     /// Rows written later than those the step took are still to be collected: call
     /// [`Replica::collect_step`] again. False once every row left marked is one the step found
@@ -328,8 +328,9 @@ pub(crate) struct Ctx<'d> {
     pub watch: Option<Watch>,
 }
 
-/// What a bounded step brought up to date: every member of each group it evaluated, and every
-/// row it looked at, some of which may stand for no entity yet.
+/// What a bounded try must not leave a later write to: the entities whose rows a merge may
+/// change (only `merge_unless` names these), and every row settle looked at, some of which may
+/// stand for no entity yet.
 #[derive(Default)]
 pub(crate) struct Watch {
     pub entities: BTreeSet<(String, Gid)>,
@@ -1227,15 +1228,17 @@ impl Replica {
     /// caller that loops until none are, leaving the database free between calls, holds SQLite's
     /// write lock for one step at a time; see [`COLLECT_ROWS`] for how long one takes.
     ///
-    /// A step ends only between two milliseconds: the next row marked after it was written in a
-    /// later one. Inside a millisecond the order of writing is not known, so rows written in one
-    /// are taken together: one statement that writes 50,000 rows is one step of 50,000 rows, as
-    /// long as one collect of them, whatever `rows` asks.
+    /// A step ends only between two times: the next row marked after it was marked with a later
+    /// time. Within one millisecond the order of writing is not known, so rows marked with one
+    /// time are taken together: one statement that writes 50,000 rows is one step of 50,000 rows,
+    /// as long as one collect of them, whatever `rows` asks.
     ///
-    /// What the steps send, hold and show is what ordinary collects would, each made just after
-    /// the millisecond of the last row a step took: a step leaves the rows past it, and all that
-    /// collecting them reads, as they were, and an alias it finds is stamped with that last
-    /// row's time. In every case the tests try, once the last step is done it is also what one
+    /// What the steps send, hold and show is what some placing of ordinary collects among the
+    /// same writes gives: a step leaves the rows past it, and all that collecting them reads, as
+    /// they were, and an alias it finds is stamped with the time of the last row it took. It is
+    /// not, in general, what collects made at those times give: a row written again after a step
+    /// is sent as last written, not as it stood. In every case the tests try, once the last step
+    /// is done it is also what one
     /// collect of the same rows gives, the same changes in the same order, entities, conflict
     /// bases, rows and images, but for aliases: entities found to be one across two steps are
     /// joined by other pairs of aliases, stamped by their steps, and a reference to one of them
@@ -1256,12 +1259,17 @@ impl Replica {
     /// A row that cannot be collected yet, such as one naming a row that has no entity, stays
     /// marked, as it does after a collect, and every later step reads it again. So a step goes on
     /// past such rows until it has collected `rows` rows and at least as many as wait ahead of
-    /// them, and reading them again costs no more than the rows it collects; a step that finds
-    /// only rows that wait says none are left. The rows marked are indexed in the order they are
-    /// collected, so a step reads only the rows it takes. In SQLite's work, steps of 100 or 1,000
+    /// them; a step that finds only rows that wait says none are left. The rows marked are
+    /// indexed in the order they are collected, so a step reads only the rows it takes. In the
+    /// supported shape (see the crate's documentation), in SQLite's work, steps of 100 or 1,000
     /// rows over 100,000 rows written one at a time cost 1.12 times one collect of them, and over
-    /// 5,000 rows behind 999 that wait at most 1.7 times; each step costs at most about twice what
-    /// collecting its rows at once does.
+    /// 5,000 rows behind 999 that wait at most 1.7 times, and each step costs at most about twice
+    /// what collecting its rows at once does. Two cases cost more. Every try of a step reads the
+    /// rows that wait ahead of it again, so rows that wait among many others cost each step more:
+    /// 20,000 rows with 5,000 waiting among them cost 20 times one collect in steps of 10 and 1.8
+    /// times in steps of 1,000, and 5,000 followed by 20,000 waiting 15 times in steps of 1,000.
+    /// And with foreign keys off, a row of a natural collection naming a row that is gone makes
+    /// the step read every marked row of its collection, which can cost 12 times one collect.
     ///
     /// Each step is a transaction of its own, committed whole or not at all: after a crash or a
     /// failure between steps, the rows not yet collected are still marked, and the next step or

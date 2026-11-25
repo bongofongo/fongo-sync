@@ -1116,11 +1116,24 @@ fn run_on(
     script: &[(usize, Op)],
     step: Option<Option<usize>>,
 ) -> Result<(), String> {
+    run_back(schema, found, seed, every, 0, script, step)
+}
+
+/// [`run_on`] on a clock that also steps back `back` milliseconds now and then.
+fn run_back(
+    schema: &[&str],
+    found: bool,
+    seed: u64,
+    every: u64,
+    back: u64,
+    script: &[(usize, Op)],
+    step: Option<Option<usize>>,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let outcome = runtime.block_on(async {
-        let world = World::clustered(seed, every);
+        let world = World::stepping_back(seed, every, back);
         let mut hub = Vec::new();
         let mut peers = Vec::new();
         for n in 0..5 {
@@ -1138,15 +1151,18 @@ fn run_on(
             .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers).await
     });
-    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, script)))
+    outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
 }
 
 /// A failing case as a test to paste below.
-fn reproduction(found: bool, seed: u64, every: u64, script: &[(usize, Op)]) -> String {
-    let run = match (found, every) {
-        (false, 0) => format!("run({seed}, &script)"),
-        (true, 0) => format!("run_found({seed}, &script)"),
-        (found, every) => format!("run_on(SCHEMA, {found}, {seed}, {every}, &script, None)"),
+fn reproduction(found: bool, seed: u64, every: u64, back: u64, script: &[(usize, Op)]) -> String {
+    let run = match (found, every, back) {
+        (false, 0, 0) => format!("run({seed}, &script)"),
+        (true, 0, 0) => format!("run_found({seed}, &script)"),
+        (found, every, 0) => format!("run_on(SCHEMA, {found}, {seed}, {every}, &script, None)"),
+        (found, every, back) => {
+            format!("run_back(SCHEMA, {found}, {seed}, {every}, {back}, &script, None)")
+        }
     };
     let steps: Vec<String> = script
         .iter()
@@ -1187,9 +1203,10 @@ proptest! {
         seed in any::<u64>(),
         found in any::<bool>(),
         every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
+        back in prop_oneof![Just(0u64), Just(1), Just(2), Just(40)],
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
-        let outcome = run_on(SCHEMA, found, seed, every, &script, None);
+        let outcome = run_back(SCHEMA, found, seed, every, back, &script, None);
         if let Err(error) = outcome {
             prop_assert!(false, "{}", error);
         }

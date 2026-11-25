@@ -404,6 +404,8 @@ struct Source {
 struct Drift {
     state: u64,
     every: u64,
+    /// On one move in sixteen, the clock goes back this many milliseconds instead.
+    back: u64,
 }
 
 type Call = unsafe extern "C" fn(*mut ffi::sqlite3_context, c_int, *mut *mut ffi::sqlite3_value);
@@ -457,7 +459,12 @@ unsafe extern "C" fn unixepoch(
         x ^= x << 17;
         drift.state = x;
         if x.is_multiple_of(drift.every) {
-            source.wall.fetch_add(1, Ordering::SeqCst);
+            let step = if drift.back > 0 && (x >> 8).is_multiple_of(16) {
+                -i64::try_from(drift.back).unwrap_or(0)
+            } else {
+                1
+            };
+            source.wall.fetch_add(step, Ordering::SeqCst);
         }
     }
     let ms = source.wall.load(Ordering::SeqCst);
@@ -553,6 +560,8 @@ struct Case {
     /// Before A's writes, the clock moves by itself on one reading in this many, or never for
     /// 0, so many writes of the history share a millisecond.
     every: u64,
+    /// How far the clock steps back now and then during the history, in milliseconds.
+    back: u64,
 }
 
 /// How A collects its writes: after each write whose bit is set, after each statement whose bit
@@ -580,6 +589,7 @@ async fn outcome(case: &Case, how: How) -> String {
     let drift = Arc::new(Mutex::new(Drift {
         state: case.seed | 1,
         every: case.every,
+        back: case.back,
     }));
     let mut a = connect(case.seed, 0, wall.clone(), drift.clone()).await;
     let mut b = connect(case.seed, 1, wall.clone(), drift.clone()).await;
@@ -742,6 +752,7 @@ fn make_case(seed: u64) -> Case {
         })
         .collect();
     let every = [0, 1, 3, 8, 40][r(5) as usize];
+    let back = [0, 1, 2, 40][r(4) as usize];
     Case {
         seed,
         fk,
@@ -750,6 +761,7 @@ fn make_case(seed: u64) -> Case {
         a,
         b,
         every,
+        back,
     }
 }
 

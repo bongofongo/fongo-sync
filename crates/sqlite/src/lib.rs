@@ -17,6 +17,18 @@
 //! connection. The ping makes every earlier command run first. An application that also takes
 //! the handle itself, on a connection it passes to the kernel, should do the same: send any
 //! command it waits on, such as `ping` or a query, before each `lock_handle`.
+//!
+//! # What is supported and tested
+//!
+//! Collecting in bounded steps is held to its documented bar and bounds in the shape of
+//! registry and schema tested most: foreign keys enforced, minted collections with owners,
+//! references, sets written together, `Max` and last-writer-wins fields and local dependents,
+//! natural collections owned by minted ones, and identities each enforced by a unique index.
+//! Outside it, ignored tests record what is known not to hold: with foreign keys off, a
+//! reference to an id taken again after its row was collected gone can be lost (as with
+//! ordinary collects), and natural rows naming a row that is gone make steps cost many times one
+//! collect; and many rows that cannot be collected yet, among others, make every step read them
+//! again.
 
 mod collect;
 mod db;
