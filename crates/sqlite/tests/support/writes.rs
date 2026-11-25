@@ -627,7 +627,9 @@ impl Writes {
             }
         }
         for change in sent {
-            if change.field == ALIAS || self.adopted.contains(change) {
+            // An adoption, by an install or by a later step adopting what one recorded, takes the
+            // adoption clock, which no write of the application's does.
+            if change.field == ALIAS || self.adopted.contains(change) || change.clock.wall_ms == 0 {
                 continue;
             }
             let target = canonical(&change.collection, change.gid);

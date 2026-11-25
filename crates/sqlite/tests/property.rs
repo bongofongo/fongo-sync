@@ -2180,3 +2180,11 @@ fn a_note_on_a_book_found_to_be_one_names_its_group_in_steps() {
     ];
     run_found(3778721728584034636, &script).unwrap();
 }
+
+/// Found at 128 cases: rows found at a first install made in steps are adopted by the steps
+/// after it, whose adoptions carry the adoption clock; the test's account took only what the
+/// install call itself sent for adoptions.
+#[test]
+fn rows_a_first_install_in_steps_adopts_after_it_are_its_adoptions() {
+    run_found(8319302663633078794, &[]).unwrap();
+}
