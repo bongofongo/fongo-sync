@@ -127,7 +127,6 @@ impl Replica {
                 let Ok(t) = session.target(c, *g) else {
                     continue;
                 };
-                cx.reached(c, t.members.iter().copied().chain([*g, t.canonical]));
                 if t.row.is_none() || !seen.insert((c.clone(), t.canonical)) {
                     continue;
                 }
@@ -392,6 +391,23 @@ impl Replica {
         Ok(wrote)
     }
 
+    /// Notes, for a bounded step, the rows a row it writes or removes named: one collected later
+    /// may make one of them again and find the row naming it.
+    fn named_by(&self, cx: &mut Ctx, rows: &Rows, i: usize) {
+        let s = &rows.slots[i];
+        let (Some(image), true) = (&s.image, cx.watch.is_some()) else {
+            return;
+        };
+        let c = self.collection(s.idx);
+        for f in &c.fields {
+            if let (Some(t), Some(Value::Int(local))) =
+                (self.target_of(c, &f.name), image.get(&f.name))
+            {
+                cx.looked_at(&self.collection(t).name, &minted_key(*local));
+            }
+        }
+    }
+
     fn refused(
         &self,
         db: &Db,
@@ -599,6 +615,7 @@ impl Replica {
     }
 
     fn update(&self, cx: &mut Ctx, rows: &mut Rows, i: usize, fields: &Row) -> Result<bool> {
+        self.named_by(cx, rows, i);
         let db = cx.db;
         let idx = rows.slots[i].idx;
         let c = self.collection(idx);
@@ -673,6 +690,7 @@ impl Replica {
         row_for: &BTreeMap<(usize, Gid), usize>,
         i: usize,
     ) -> Result<bool> {
+        self.named_by(cx, rows, i);
         let db = cx.db;
         let idx = rows.slots[i].idx;
         let c = self.collection(idx);

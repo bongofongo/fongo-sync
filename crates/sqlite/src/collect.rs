@@ -128,6 +128,57 @@ pub(crate) fn marked_through(db: &Db, place: &Option<Place>) -> Result<i64> {
     rows.first().map_or(Ok(0), |r| as_int(&r[0]))
 }
 
+/// The place of the last row of `collection` marked.
+fn last_of(db: &Db, collection: &str) -> Result<Option<Place>> {
+    let rows = db.query(
+        "SELECT at, collection, key FROM fongo_dirty WHERE collection = ?1
+          ORDER BY at DESC, key DESC LIMIT 1",
+        &[Value::Text(collection.into())],
+    )?;
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        as_int(&r[0])?,
+        as_text(&r[1])?.to_string(),
+        as_text(&r[2])?.to_string(),
+    )))
+}
+
+/// The place of the last row marked at `at`.
+fn last_at(db: &Db, at: i64) -> Result<Option<Place>> {
+    let rows = db.query(
+        "SELECT at, collection, key FROM fongo_dirty WHERE at = ?1
+          ORDER BY collection DESC, key DESC LIMIT 1",
+        &[Value::Int(at)],
+    )?;
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        as_int(&r[0])?,
+        as_text(&r[1])?.to_string(),
+        as_text(&r[2])?.to_string(),
+    )))
+}
+
+/// The place of the last row marked as found when its collection was first installed.
+pub(crate) fn last_adopted(db: &Db) -> Result<Option<Place>> {
+    let rows = db.query(
+        "SELECT at, collection, key FROM fongo_dirty WHERE at <= 0
+          ORDER BY at DESC, collection DESC, key DESC LIMIT 1",
+        &[],
+    )?;
+    let Some(r) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        as_int(&r[0])?,
+        as_text(&r[1])?.to_string(),
+        as_text(&r[2])?.to_string(),
+    )))
+}
+
 /// Whether any row is marked past `place`.
 pub(crate) fn marked_past(db: &Db, place: &Place) -> Result<bool> {
     let (at, collection, key) = place;
@@ -347,6 +398,19 @@ impl Replica {
                 .iter()
                 .map(|f| now.get(f).cloned().unwrap_or(Value::Null))
                 .collect();
+            // A key naming a row that is gone derives what other rows' keys may derive too, so
+            // whether its entity is known depends on which of them is collected first.
+            if let Some(edge) = through
+                && fields.iter().any(|f| {
+                    self.target_of(c, f).is_some()
+                        && matches!(row.get(f), Some(Value::Int(_)))
+                        && now.get(f) == Some(&Value::Null)
+                })
+                && let Some(last) = last_of(db, &c.name)?
+                && last > *edge
+            {
+                names.past(last);
+            }
             let item = &mut items[i];
             let mapped = if item.gone {
                 item.usable()
@@ -379,6 +443,15 @@ impl Replica {
             }
         }
 
+        // A row found through another is stamped with that row's time, after every marked row
+        // of the same time, so a prefix that finds one takes all of them.
+        if let Some(edge) = through
+            && items.iter().any(|i| i.found && i.at == edge.0)
+            && let Some(last) = last_at(db, edge.0)?
+            && last > *edge
+        {
+            names.past(last);
+        }
         if let Some(place) = names.beyond.take() {
             return Ok(Edits::Beyond(place));
         }
@@ -483,9 +556,6 @@ impl Replica {
         }
         db.check()?;
         drop(session);
-        if let Some(place) = names.beyond.take() {
-            return Ok(Edits::Beyond(place));
-        }
 
         for i in done {
             let item = &items[i];

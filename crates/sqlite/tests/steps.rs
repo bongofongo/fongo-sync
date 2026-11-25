@@ -10,9 +10,9 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use fongo_sync_sqlite::core::{ALIAS, Change, Value};
+use fongo_sync_sqlite::core::{ALIAS, Change, Gid, Value};
 use fongo_sync_sqlite::{COLLECT_ROWS, Collection, Inspection, LocalDefault, Registry, Replica};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -53,10 +53,17 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE covers (
         book_id INTEGER NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
         path TEXT)",
+    // An identity no index enforces, so a collect can find two of its own rows to be one.
+    "CREATE TABLE series (id INTEGER PRIMARY KEY, code TEXT, name TEXT)",
+    "CREATE TABLE volumes (
+        id INTEGER PRIMARY KEY,
+        series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        title TEXT)",
 ];
 
 const TABLES: &[&str] = &[
-    "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers",
+    "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers", "series",
+    "volumes",
 ];
 
 fn registry(upgraded: bool) -> Registry {
@@ -99,6 +106,13 @@ fn registry(upgraded: bool) -> Registry {
         Collection::natural("settings", "settings", &["key"])
             .field("key")
             .field("value"),
+        Collection::minted("series", "series", "id")
+            .field("code")
+            .field("name")
+            .identity(&["code"]),
+        Collection::minted("volumes", "volumes", "id")
+            .owner("series_id", "series")
+            .field("title"),
     ])
     .unwrap()
 }
@@ -119,7 +133,7 @@ fn write(kind: u8, a: u8, b: u8) -> Vec<String> {
         v => format!("'i{}'", v % 2),
     };
     let one = |s: String| vec![s];
-    match kind % 30 {
+    match kind % 36 {
         0 => one(format!(
             "INSERT OR IGNORE INTO shelves (name) VALUES ('shelf{}')",
             b % 3
@@ -275,10 +289,39 @@ fn write(kind: u8, a: u8, b: u8) -> Vec<String> {
             "INSERT OR IGNORE INTO covers (book_id, path) SELECT {book}, 'c'
               WHERE EXISTS (SELECT 1 FROM books)"
         )),
-        _ => one(format!(
+        29 => one(format!(
             "UPDATE books SET extra = 'x{}' WHERE id = {book}",
             b % 3
         )),
+        30 => one(format!(
+            "INSERT INTO series (code, name) VALUES ('c{}', 'series{}')",
+            b % 2,
+            b % 3
+        )),
+        31 => one(format!(
+            "UPDATE series SET code = 'c{}' WHERE id = {}",
+            b % 2,
+            pick("series", a)
+        )),
+        32 => one(format!(
+            "UPDATE series SET name = 'name{}' WHERE id = {}",
+            b % 3,
+            pick("series", a)
+        )),
+        33 => one(format!(
+            "INSERT INTO volumes (series_id, title) SELECT {}, 'v{}'
+              WHERE EXISTS (SELECT 1 FROM series)",
+            pick("series", a),
+            b % 3
+        )),
+        34 => one(format!("DELETE FROM series WHERE id = {}", pick("series", a))),
+        // Two series found to be one, and a volume on the later.
+        _ => vec![
+            format!("INSERT INTO series (code, name) VALUES ('dup', 'first{}')", b % 2),
+            format!("INSERT INTO series (code, name) VALUES ('dup', 'second{}')", b % 2),
+            "INSERT INTO volumes (series_id, title) SELECT max(id), 'on the second' FROM series"
+                .into(),
+        ],
     }
 }
 
@@ -297,6 +340,8 @@ const LIBRARY: &[&str] = &[
     "INSERT INTO tags (book_id, tag, note) VALUES (1, 'tag0', NULL), (3, 'tag1', 'n'), (3, 'tag0', NULL)",
     "INSERT INTO settings VALUES ('key0', 'value0'), ('key1', 'value1')",
     "INSERT INTO covers (book_id, path) VALUES (1, 'c')",
+    "INSERT INTO series (id, code, name) VALUES (1, 'c0', 'one'), (2, 'c1', 'two')",
+    "INSERT INTO volumes (id, series_id, title) VALUES (1, 1, 'v'), (2, 2, 'w')",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -313,6 +358,8 @@ enum Mode {
 struct Case {
     seed: u64,
     mode: Mode,
+    /// Whether the databases enforce foreign keys. Without, removing a row leaves rows naming it.
+    fk: bool,
     /// Writes on replica 0 or 1 (by the flag), or with `None` an exchange between the two.
     history: Vec<Option<(bool, u8, u8, u8)>>,
     /// Writes on replica 0 not yet collected when the operation under test runs.
@@ -361,6 +408,14 @@ async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
     for sql in SCHEMA {
         sqlx::query(sql).execute(&mut a).await.unwrap();
         sqlx::query(sql).execute(&mut b).await.unwrap();
+    }
+    if !case.fk {
+        for conn in [&mut a, &mut b] {
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
     }
     let plain = Replica::new(registry(false));
     let upgraded = Replica::new(registry(true));
@@ -484,11 +539,41 @@ fn same(whole: &Outcome, stepped: &Outcome) -> Result<(), String> {
                 })
                 .collect::<Vec<_>>()
         };
+        // By the groups they join: entities found to be one in two steps take other pairs than
+        // when found at once, as they would in two collects.
         let aliases = |o: &Outcome| {
-            o.outbox
+            let mut group: BTreeMap<(String, Gid), (String, Gid)> = BTreeMap::new();
+            fn root(
+                group: &BTreeMap<(String, Gid), (String, Gid)>,
+                mut at: (String, Gid),
+            ) -> (String, Gid) {
+                while let Some(up) = group.get(&at) {
+                    at = up.clone();
+                }
+                at
+            }
+            for c in o.outbox.iter().filter(|c| c.field == ALIAS) {
+                let Value::Ref(to) = c.value else { continue };
+                let a = root(&group, (c.collection.clone(), c.gid));
+                let b = root(&group, (c.collection.clone(), to));
+                if a != b {
+                    group.insert(a.clone().max(b.clone()), a.min(b));
+                }
+            }
+            let mut parts: BTreeMap<(String, Gid), BTreeSet<Gid>> = BTreeMap::new();
+            let all: Vec<(String, Gid)> = group
                 .iter()
-                .filter(|c| c.field == ALIAS)
-                .map(|c| format!("{} {:?} {:?}", c.collection, c.gid, c.value))
+                .flat_map(|(a, b)| [a.clone(), b.clone()])
+                .collect();
+            for at in all {
+                parts
+                    .entry(root(&group, at.clone()))
+                    .or_default()
+                    .insert(at.1);
+            }
+            parts
+                .into_iter()
+                .map(|((c, _), members)| format!("{c} {members:?}"))
                 .collect::<BTreeSet<_>>()
         };
         if plain(whole) != plain(stepped) {
@@ -601,6 +686,7 @@ fn arb_case() -> impl Strategy<Value = Case> {
     (
         any::<u64>(),
         prop_oneof![Just(Mode::First), Just(Mode::Collect), Just(Mode::Upgrade)],
+        any::<bool>(),
         proptest::collection::vec(
             prop_oneof![
                 1 => Just(None),
@@ -611,9 +697,10 @@ fn arb_case() -> impl Strategy<Value = Case> {
         ),
         proptest::collection::vec(arb_write(), 0..40),
     )
-        .prop_map(|(seed, mode, history, burst)| Case {
+        .prop_map(|(seed, mode, fk, history, burst)| Case {
             seed,
             mode,
+            fk,
             history,
             burst,
         })
@@ -637,25 +724,32 @@ proptest! {
 /// Every kind of write, each alone and all together, in each mode.
 #[test]
 fn every_kind_of_write_collects_alike_in_steps() {
-    for mode in [Mode::First, Mode::Collect, Mode::Upgrade] {
-        let history: Vec<_> = (0..30u8)
+    for (mode, fk) in [
+        (Mode::First, true),
+        (Mode::Collect, true),
+        (Mode::Upgrade, true),
+        (Mode::Collect, false),
+    ] {
+        let history: Vec<_> = (0..36u8)
             .flat_map(|k| [Some((k % 3 == 0, k, k, k + 1)), Some((false, 3, k, k))])
             .chain([None])
             .collect();
-        for kind in 0..30u8 {
+        for kind in 0..36u8 {
             let burst = vec![(kind, 1, 2), (kind, 2, 5), (kind, 0, 7)];
             check(&Case {
                 seed: u64::from(kind),
                 mode,
+                fk,
                 history: history.clone(),
                 burst,
             })
             .unwrap();
         }
-        let burst: Vec<_> = (0..90u8).map(|i| (i % 30, i / 30, i)).collect();
+        let burst: Vec<_> = (0..108u8).map(|i| (i % 36, i / 36, i)).collect();
         check(&Case {
             seed: 7,
             mode,
+            fk,
             history,
             burst,
         })
@@ -731,6 +825,7 @@ fn hard_shapes_collect_alike_in_steps() {
             check(&Case {
                 seed: i as u64,
                 mode,
+                fk: true,
                 history: vec![None],
                 burst: burst.to_vec(),
             })
@@ -740,6 +835,7 @@ fn hard_shapes_collect_alike_in_steps() {
     check(&Case {
         seed: 2143016055923739986,
         mode: Mode::Collect,
+        fk: true,
         history: vec![Some((false, 38, 5, 0))],
         burst: vec![
             (2, 1, 0),
@@ -747,6 +843,531 @@ fn hard_shapes_collect_alike_in_steps() {
             (181, 0, 0),
             (70, 0, 0),
             (146, 0, 38),
+        ],
+    })
+    .unwrap();
+}
+
+/// An alias found by an early step is stamped as by a collect made just after the rows that step
+/// took, not when the step runs: a write collected by a later step keeps its own time, so it
+/// still loses to another replica's later write, as it would after any collects. Two series are
+/// found to be one while, later, this replica renames another series and the other replica then
+/// renames it too.
+#[tokio::test]
+async fn an_alias_found_by_an_early_step_leaves_later_writes_their_times() {
+    async fn names(step: Option<usize>) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, bool) {
+        let world = World::new(1);
+        let mut a = world.connect(0).await;
+        let mut b = world.connect(1).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+            sqlx::query(sql).execute(&mut b).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        replica.install(&mut b).await.unwrap();
+        run(
+            &mut a,
+            &["INSERT INTO series (id, code, name) VALUES (1, NULL, 'Middlemarch')".into()],
+        )
+        .await;
+        send(&replica, &mut a, &mut b).await;
+        world.later(10_000);
+        run(
+            &mut a,
+            &[
+                "INSERT INTO series (id, code, name) VALUES (2, 'dup', 'one')".into(),
+                "INSERT INTO series (id, code, name) VALUES (3, 'dup', 'two')".into(),
+            ],
+        )
+        .await;
+        world.later(10_000);
+        run(
+            &mut a,
+            &["UPDATE series SET name = 'from a' WHERE id = 1".into()],
+        )
+        .await;
+        world.later(10_000);
+        run(
+            &mut b,
+            &["UPDATE series SET name = 'from b' WHERE id = 1".into()],
+        )
+        .await;
+        replica.collect(&mut b).await.unwrap();
+        world.later(10_000);
+        match step {
+            None => {
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => while replica.collect_step(&mut a, rows).await.unwrap().more {},
+        }
+        let aliased = replica
+            .outbox(&mut a, u32::MAX)
+            .await
+            .unwrap()
+            .changes
+            .iter()
+            .any(|c| c.field == ALIAS);
+        send(&replica, &mut a, &mut b).await;
+        send(&replica, &mut b, &mut a).await;
+        let sql = "SELECT code, name FROM series ORDER BY code, name";
+        (
+            support::rows(&mut a, sql, &[]).await,
+            support::rows(&mut b, sql, &[]).await,
+            aliased,
+        )
+    }
+    let whole = names(None).await;
+    assert!(whole.2, "no alias was found");
+    assert_eq!(whole.0, whole.1);
+    assert!(format!("{:?}", whole.0).contains("from b"));
+    for rows in [1, 2, 3] {
+        assert_eq!(names(Some(rows)).await, whole, "steps of {rows}");
+    }
+}
+
+/// Entities found to be one while rows that name the one given up wait past the prefix: the
+/// rows are collected with the step, before the merge points them at the row kept.
+#[test]
+fn rows_naming_a_row_a_step_gives_up_are_collected_with_it() {
+    for seed in 0..8 {
+        for fk in [true, false] {
+            check(&Case {
+                seed,
+                mode: Mode::Collect,
+                fk,
+                history: vec![None],
+                burst: vec![
+                    (35, 0, seed as u8),
+                    (24, 0, 1),
+                    (24, 1, 2),
+                    (33, 3, 0),
+                    (35, 1, 1),
+                ],
+            })
+            .unwrap();
+        }
+    }
+}
+
+/// A prefix that must grow because what its changes affect has rows past it is given up before
+/// any change is kept: with foreign keys off, a book removed and then a note it owned edited,
+/// collected a row at a time, store each fact once, as collecting at once does.
+#[tokio::test]
+async fn a_prefix_that_must_grow_keeps_nothing_before_it_does() {
+    async fn kept(step: Option<usize>) -> (u64, usize) {
+        let world = World::new(2);
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &LIBRARY.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &[
+                "PRAGMA foreign_keys = OFF".into(),
+                "DELETE FROM books WHERE id = 3".into(),
+                "UPDATE notes SET body = 'still' WHERE id = 2".into(),
+                "INSERT INTO settings VALUES ('key2', 'v'), ('key3', 'v'), ('key4', 'v'),
+                    ('key5', 'v'), ('key6', 'v'), ('key7', 'v')"
+                    .into(),
+            ],
+        )
+        .await;
+        let statements = support::statements::Statements::watch(&mut a).await;
+        let mut steps = 1;
+        match step {
+            None => {
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => {
+                while replica.collect_step(&mut a, rows).await.unwrap().more {
+                    steps += 1;
+                }
+            }
+        }
+        (statements.started("INSERT INTO fongo_shadow"), steps)
+    }
+    let (whole, _) = kept(None).await;
+    let (stepped, steps) = kept(Some(1)).await;
+    assert!(whole > 0);
+    assert!(steps > 1, "one step");
+    assert_eq!(stepped, whole);
+}
+
+/// A row found through a book made again at its id is stamped with the book's time, so it ticks
+/// after every row marked in that millisecond, whole or in steps. With foreign keys off, the
+/// author naming the book is not marked, and settings share the book's millisecond.
+#[tokio::test]
+async fn a_found_row_ticks_after_the_rows_of_its_millisecond() {
+    async fn sent(step: Option<usize>, fk: bool) -> Vec<Change> {
+        let world = World::new(5);
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        if !fk {
+            run(&mut a, &["PRAGMA foreign_keys = OFF".into()]).await;
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &LIBRARY.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        let o = replica.outbox(&mut a, u32::MAX).await.unwrap();
+        replica.acknowledge(&mut a, o.through).await.unwrap();
+        world.later(1000);
+        run(
+            &mut a,
+            &[
+                "DELETE FROM books WHERE id = 3".into(),
+                "INSERT INTO books (id, shelf_id, title, seen) VALUES (3, 1, 'again', 0)".into(),
+                "INSERT INTO settings VALUES ('k1', 'v'), ('k2', 'v'), ('k3', 'v')".into(),
+                "UPDATE fongo_dirty SET at = (SELECT max(at) FROM fongo_dirty)".into(),
+            ],
+        )
+        .await;
+        match step {
+            None => {
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => while replica.collect_step(&mut a, rows).await.unwrap().more {},
+        }
+        replica.outbox(&mut a, u32::MAX).await.unwrap().changes
+    }
+    for fk in [false, true] {
+        let whole = sent(None, fk).await;
+        for rows in 1..=4 {
+            assert_eq!(
+                sent(Some(rows), fk).await,
+                whole,
+                "steps of {rows}, foreign keys {fk}"
+            );
+        }
+    }
+}
+
+/// The application writes rows found at a first install between that install's steps: they were
+/// adopted by the install, and the writes are edits after them, as after one install.
+#[tokio::test]
+async fn rows_found_at_a_first_install_are_adopted_before_its_next_step() {
+    async fn shown(step: Option<usize>) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        let world = World::new(11);
+        let mut a = world.connect(0).await;
+        let mut b = world.connect(1).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+            sqlx::query(sql).execute(&mut b).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut b).await.unwrap();
+        run(
+            &mut b,
+            &[
+                "INSERT INTO settings VALUES ('theme', 'light')".into(),
+                "INSERT INTO series (code, name) VALUES ('mm', 'Middlemarch, from b')".into(),
+            ],
+        )
+        .await;
+        replica.collect(&mut b).await.unwrap();
+        world.later(1000);
+        run(
+            &mut a,
+            &[
+                "INSERT INTO settings VALUES ('font', 'serif'), ('size', '12'), ('theme', 'dark')"
+                    .into(),
+                "INSERT INTO series (code, name) VALUES ('mm', 'Middlemarch, from a')".into(),
+                "INSERT INTO series (code, name) VALUES ('x', 'Romola')".into(),
+            ],
+        )
+        .await;
+        let between = [
+            "UPDATE settings SET value = value WHERE key = 'theme'".to_string(),
+            "UPDATE series SET name = name".into(),
+            "UPDATE settings SET value = '14' WHERE key = 'size'".into(),
+        ];
+        match step {
+            None => {
+                replica.install(&mut a).await.unwrap();
+                run(&mut a, &between).await;
+                replica.collect(&mut a).await.unwrap();
+            }
+            Some(rows) => {
+                let mut more = replica.install_step(&mut a, rows).await.unwrap().more;
+                run(&mut a, &between).await;
+                while more {
+                    more = replica.collect_step(&mut a, rows).await.unwrap().more;
+                }
+                while replica.collect_step(&mut a, rows).await.unwrap().more {}
+            }
+        }
+        send(&replica, &mut a, &mut b).await;
+        send(&replica, &mut b, &mut a).await;
+        let sql =
+            "SELECT key, value FROM settings UNION ALL SELECT code, name FROM series ORDER BY 1, 2";
+        (
+            support::rows(&mut a, sql, &[]).await,
+            support::rows(&mut b, sql, &[]).await,
+        )
+    }
+    let whole = shown(None).await;
+    assert!(format!("{whole:?}").contains("light"));
+    for rows in [1, 2] {
+        assert_eq!(shown(Some(rows)).await, whole, "steps of {rows}");
+    }
+}
+
+/// How far steps grow past what is asked over shapes of writes that depend on each other: books
+/// removed and made again at their ids with a new note on each, as an import that replaces its
+/// records does; every book edited, then every note; half the books moved to a new shelf, and the
+/// shelf they left renamed. No step takes more than twice what is asked. (A new row written again
+/// after the rows naming it is collected with all of them: until then it has no entity they can
+/// name.)
+#[tokio::test]
+async fn steps_over_rows_that_depend_on_each_other_stay_near_their_size() {
+    async fn largest(writes: &[String], rows: usize) -> (usize, usize) {
+        let world = World::new(21);
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &[
+                "INSERT INTO shelves (id, name) VALUES (1, 's1'), (2, 's2')".into(),
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+                 INSERT INTO books (id, shelf_id, title, seen) SELECT i, 1, 't' || i, 0 FROM n"
+                    .into(),
+                "INSERT INTO notes (book_id, body) SELECT id, 'b' FROM books".into(),
+            ],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        run(&mut a, writes).await;
+        let (mut largest, mut total) = (0, 0);
+        loop {
+            let before = replica.uncollected_rows(&mut a, usize::MAX).await.unwrap();
+            let more = replica.collect_step(&mut a, rows).await.unwrap().more;
+            let taken = before - replica.uncollected_rows(&mut a, usize::MAX).await.unwrap();
+            largest = largest.max(taken);
+            total += taken;
+            if !more {
+                return (largest, total);
+            }
+        }
+    }
+    let replaced: Vec<String> = (1..=300)
+        .flat_map(|i| {
+            [
+                format!("DELETE FROM books WHERE id = {i}"),
+                format!(
+                    "INSERT INTO books (id, shelf_id, title, seen) VALUES ({i}, 1, 'again', 0)"
+                ),
+                format!("INSERT INTO notes (book_id, body) VALUES ({i}, 'new')"),
+            ]
+        })
+        .collect();
+    let edited = vec![
+        "UPDATE books SET title = title || '!'".to_string(),
+        "UPDATE notes SET body = body || '!'".into(),
+    ];
+    let moved = vec![
+        "INSERT INTO shelves (id, name) VALUES (3, 's3')".to_string(),
+        "UPDATE books SET shelf_id = 3 WHERE id % 2 = 0".into(),
+        "UPDATE shelves SET name = 's1!' WHERE id = 1".into(),
+    ];
+    for (what, writes) in [("replaced", replaced), ("edited", edited), ("moved", moved)] {
+        for rows in [10, 100] {
+            let (largest, total) = largest(&writes, rows).await;
+            assert!(total > rows, "{what}: {total} rows");
+            assert!(
+                largest <= 2 * rows,
+                "{what}, steps of {rows}: a step of {largest}"
+            );
+        }
+    }
+}
+
+/// What one replica's collects, made wherever between its writes, send for an alias found and
+/// then an earlier edit of a field another replica edits later: the later edit wins in every
+/// placement, as it does when the same writes are collected in steps.
+#[tokio::test]
+async fn no_placing_of_collects_lets_an_earlier_edit_win() {
+    for placing in 0u32..8 {
+        let world = World::new(1);
+        let mut a = world.connect(0).await;
+        let mut b = world.connect(1).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+            sqlx::query(sql).execute(&mut b).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        replica.install(&mut b).await.unwrap();
+        run(
+            &mut a,
+            &["INSERT INTO series (id, code, name) VALUES (1, NULL, 'Middlemarch')".into()],
+        )
+        .await;
+        send(&replica, &mut a, &mut b).await;
+        world.later(10_000);
+        let writes = [
+            "INSERT INTO series (id, code, name) VALUES (2, 'dup', 'one')",
+            "INSERT INTO series (id, code, name) VALUES (3, 'dup', 'two')",
+            "UPDATE series SET name = 'from a' WHERE id = 1",
+        ];
+        for (i, write) in writes.iter().enumerate() {
+            if i == 2 {
+                world.later(10_000);
+            }
+            run(&mut a, &[write.to_string()]).await;
+            if placing & (1 << i) != 0 {
+                replica.collect(&mut a).await.unwrap();
+            }
+        }
+        world.later(10_000);
+        run(
+            &mut b,
+            &["UPDATE series SET name = 'from b' WHERE id = 1".into()],
+        )
+        .await;
+        replica.collect(&mut b).await.unwrap();
+        send(&replica, &mut a, &mut b).await;
+        send(&replica, &mut b, &mut a).await;
+        let names = support::rows(&mut a, "SELECT name FROM series WHERE code IS NULL", &[]).await;
+        assert_eq!(
+            names,
+            vec![vec![Value::Text("from b".into())]],
+            "placing {placing:03b}"
+        );
+    }
+}
+
+/// A row written back to what it held between two steps, while another written before the first
+/// step is collected by it: the steps send what a collect made just after the first step's rows,
+/// and another at the end, send.
+#[tokio::test]
+async fn a_row_written_back_between_steps_sends_what_two_collects_would() {
+    async fn sent(first_by_step: bool) -> Vec<String> {
+        let world = World::new(3);
+        let mut a = world.connect(0).await;
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut a).await.unwrap();
+        }
+        let replica = Replica::new(registry(false));
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            &["INSERT INTO settings VALUES ('q', 'q0'), ('r', 'r0')".into()],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        let outbox = replica.outbox(&mut a, u32::MAX).await.unwrap();
+        replica.acknowledge(&mut a, outbox.through).await.unwrap();
+        world.later(100);
+        run(
+            &mut a,
+            &["UPDATE settings SET value = 'q1' WHERE key = 'q'".into()],
+        )
+        .await;
+        if !first_by_step {
+            replica.collect(&mut a).await.unwrap();
+        }
+        world.later(100);
+        run(
+            &mut a,
+            &["UPDATE settings SET value = 'r1' WHERE key = 'r'".into()],
+        )
+        .await;
+        if first_by_step {
+            assert!(replica.collect_step(&mut a, 1).await.unwrap().more);
+        }
+        world.later(100);
+        run(
+            &mut a,
+            &[
+                "UPDATE settings SET value = 'r0' WHERE key = 'r'".into(),
+                "UPDATE settings SET value = 'q0' WHERE key = 'q'".into(),
+            ],
+        )
+        .await;
+        if first_by_step {
+            while replica.collect_step(&mut a, 1).await.unwrap().more {}
+        } else {
+            replica.collect(&mut a).await.unwrap();
+        }
+        replica
+            .outbox(&mut a, u32::MAX)
+            .await
+            .unwrap()
+            .changes
+            .iter()
+            .map(|c| format!("{:?} {} {:?}", c.gid, c.field, c.value))
+            .collect()
+    }
+    assert_eq!(sent(true).await, sent(false).await);
+}
+
+/// Found by a long run (seed 41). With foreign keys off, tags whose books are removed derive one
+/// key; the first of them makes its entity and the next finds it known.
+#[test]
+fn tags_whose_books_are_gone_collect_alike_in_steps() {
+    check(&Case {
+        seed: 1882020332708727243,
+        mode: Mode::Collect,
+        fk: false,
+        history: vec![
+            Some((false, 80, 4, 0)),
+            None,
+            Some((false, 16, 0, 0)),
+            Some((false, 86, 0, 0)),
+            Some((false, 232, 0, 0)),
+        ],
+        burst: vec![
+            (17, 1, 130),
+            (57, 3, 0),
+            (98, 0, 42),
+            (152, 1, 0),
+            (20, 3, 2),
+            (8, 3, 0),
+        ],
+    })
+    .unwrap();
+}
+
+/// Found by a long run (seed 42). With foreign keys off, a shelf is removed while a book on it
+/// stays, and an author the book names is removed and made again at its id later: one collect
+/// finds the book through the author and clears its shelf before the merge, so the book lives;
+/// a step that removes the shelf first must take the author too, or it removes the book.
+#[test]
+fn a_row_a_later_step_would_find_is_not_written_first() {
+    check(&Case {
+        seed: 2121431186798033,
+        mode: Mode::Collect,
+        fk: false,
+        history: vec![Some((false, 254, 2, 0)), Some((true, 191, 5, 0))],
+        burst: vec![
+            (17, 6, 1),
+            (63, 4, 0),
+            (38, 2, 0),
+            (28, 0, 0),
+            (83, 0, 0),
+            (88, 1, 0),
+            (118, 0, 0),
+            (89, 7, 0),
+            (46, 0, 0),
         ],
     })
     .unwrap();

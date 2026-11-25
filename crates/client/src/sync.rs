@@ -10,7 +10,7 @@ use fongo_sync_protocol::{
     DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
-use fongo_sync_sqlite::{Applied, COLLECT_ROWS, Conflict, Replica, Touched};
+use fongo_sync_sqlite::{Applied, COLLECT_ROWS, Collected, Conflict, Replica, Touched};
 use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 use crate::credentials::Credentials;
@@ -57,12 +57,16 @@ pub struct Pace {
     /// and on slower devices more.
     pub apply: usize,
     /// About how many rows written since the last collect one transaction collects. Before each
-    /// apply, while at least this many rows wait to be collected, the sync collects them with
-    /// [`Replica::collect_step`] in transactions of their own, paced as the others, so the apply
-    /// collects fewer. A step takes more where rows written later depend on those it takes. 0
-    /// counts as 1. Default [`COLLECT_ROWS`], 1,000: on a fast laptop a step took 65 to 230 ms in
-    /// a library of tens of thousands of changes and up to 340 ms in one of a million, by how wide
-    /// the rows are.
+    /// apply, while at least this many rows wait to be collected, the sync collects them through
+    /// [`Apply::collect`] in transactions of their own, paced as the others, so the apply
+    /// collects fewer; it takes no more rows in all than waited when its first step began, and
+    /// the apply collects what was written since. A step takes more where rows written later
+    /// depend on those it takes; see [`Replica::collect_step`]. 0 counts as 1. Default
+    /// [`COLLECT_ROWS`], 1,000: on a fast laptop a step took 65 to 230 ms in a library of tens of
+    /// thousands of changes and up to 340 ms in one of a million, by how wide the rows are.
+    ///
+    /// This field is new: code that builds a `Pace` naming every field must name it too, or
+    /// start from `..Pace::default()`.
     pub collect: usize,
     /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
     /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
@@ -334,7 +338,8 @@ pub trait Apply: Send {
     ///
     /// It is called for every apply the client makes, including the apply with no changes a sync
     /// makes when it receives nothing: that apply collects local writes and may write rows held
-    /// back before, so what it touched need not be empty.
+    /// back before, so what it touched need not be empty. Rows written by the steps of collecting
+    /// before an apply are reported by [`Apply::collect`] instead, in each step's transaction.
     ///
     /// `changes` holds whole envelopes, at most [`Pace::apply`] changes unless one envelope holds
     /// more. A pull can thus make many applies, and a field changed remotely more than once before
@@ -361,6 +366,29 @@ pub trait Apply: Send {
         changes: &[Change],
     ) -> impl Future<Output = Result<Applied, Error>> + Send {
         async move { Ok(replica.apply(conn, changes).await?) }
+    }
+
+    /// Collects a step of about `rows` local writes, before an apply, in a transaction the client
+    /// opened, as [`Apply::apply`] applies: it must neither commit nor roll it back, and what it
+    /// writes is committed with the step. By default, `replica.collect_step(conn, rows)`. An
+    /// implementation calls [`Replica::collect_step`] once and returns what it did.
+    ///
+    /// A step can write rows besides collecting them: a merge of entities its rows were found to
+    /// share, or a row held back before that it can now write. It lists them in
+    /// [`Collected::touched`], which is merged into [`SyncReport::applied`]; one apply of
+    /// everything would have reported them itself. An application that works from what an apply
+    /// touched does the same with these, here, in the step's transaction.
+    ///
+    /// It is called while at least [`Pace::collect`] rows wait to be collected, up to as many as
+    /// waited when the sync's first step began: what is written after that is collected by the
+    /// apply that follows. It is not called when fewer wait.
+    fn collect(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        rows: usize,
+    ) -> impl Future<Output = Result<Collected, Error>> + Send {
+        async move { Ok(replica.collect_step(conn, rows).await?) }
     }
 
     /// Called once in a sync whose pull read to the head of the log, after its last apply and
@@ -519,6 +547,7 @@ async fn run<T: Transport, A: Apply>(
         failed: false,
         held,
         conflicts: Vec::new(),
+        backlog: None,
     };
     let pulled = read_pages(
         &rpc,
@@ -686,6 +715,8 @@ struct Steps<'a, A> {
     held: Duration,
     /// The conflicts each apply reported, in order.
     conflicts: Vec<Vec<Conflict>>,
+    /// Rows the steps of collecting may still take, counted when the first began.
+    backlog: Option<usize>,
 }
 
 impl<A: Apply> Steps<'_, A> {
@@ -734,18 +765,51 @@ impl<A: Apply> Steps<'_, A> {
     }
 
     /// Collects local writes in steps of [`Pace::collect`] rows, each a transaction of its own,
-    /// while at least that many wait, so the apply that follows collects fewer.
-    async fn collect(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+    /// while at least that many wait, so the apply that follows collects fewer; but no more rows
+    /// than waited when the first step began, so that writes made meanwhile cannot keep the sync
+    /// from its apply.
+    async fn collect(
+        &mut self,
+        conn: &mut SqliteConnection,
+        report: &mut SyncReport,
+    ) -> Result<(), Error> {
         let rows = self.pace.collect.max(1);
         let replica = self.replica;
-        while replica.uncollected_rows(conn, rows).await? >= rows {
+        let backlog = match self.backlog {
+            Some(left) => left,
+            None => {
+                let waiting = replica.uncollected_rows(conn, usize::MAX).await?;
+                self.backlog = Some(waiting);
+                waiting
+            }
+        };
+        let mut left = backlog;
+        while left >= rows && replica.uncollected_rows(conn, rows).await? >= rows {
             let (mut tx, began) = self.begin(conn).await?;
-            let collected = match replica.collect_step(&mut tx, rows).await {
+            let collected = async {
+                begin_watch(&mut tx).await?;
+                let collected = self.apply.collect(&mut tx, replica, rows).await?;
+                end_watch(&mut tx).await?;
+                Ok(collected)
+            }
+            .await;
+            let collected = match collected {
                 Ok(collected) => collected,
-                Err(error) => return Err(abandon(tx, error.into()).await),
+                Err(error) => return Err(abandon(tx, error).await),
             };
             tx.commit().await?;
             self.committed(began);
+            left = left.saturating_sub(collected.rows.max(1));
+            self.backlog = Some(left);
+            if !collected.touched.is_empty() {
+                let applied = Applied {
+                    touched: collected.touched,
+                    waiting: report.applied.waiting,
+                    held: report.applied.held.clone(),
+                    ..Applied::default()
+                };
+                merge_applied(&mut report.applied, applied);
+            }
             if !collected.more {
                 break;
             }
@@ -852,7 +916,7 @@ impl Pull {
     ) -> Result<(), Error> {
         let replica = steps.replica;
         if collect || !self.held.is_empty() {
-            steps.collect(conn).await?;
+            steps.collect(conn, report).await?;
         }
         let (mut tx, began) = steps.begin(conn).await?;
         let written = async {

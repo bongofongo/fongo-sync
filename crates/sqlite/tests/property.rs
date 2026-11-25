@@ -2,7 +2,10 @@
 //! exchange changes in any order, part by part and more than once, and change their registry
 //! midway, agree with the reference model after every step and show exactly its view once
 //! everything is exchanged. Each replica collects whole or in bounded steps of a size its world
-//! picks, with the application writing between some steps.
+//! picks, with the application writing between some steps; every other time it collects in steps
+//! with no writes between, a copy of its database made at the start collects whole, and the two
+//! must send, hold and show the same. `PROPERTY_STEP` (`whole` or a number of rows) makes every
+//! replica collect one way.
 
 mod support;
 
@@ -122,6 +125,10 @@ struct Peer {
     /// What this replica answered of who made each live group and wrote each field, and the
     /// changes and registry it answered from, as of its last step.
     origins: Option<(BTreeSet<String>, support::Origins)>,
+    /// The world and number of this replica's database, to collect a copy of it whole.
+    world: World,
+    n: u64,
+    pushes: usize,
 }
 
 impl Peer {
@@ -134,11 +141,17 @@ impl Peer {
         let mut peer = Peer {
             conn,
             replica: Replica::new(registry(false)),
-            step: [None, Some(1), Some(2), Some(3), Some(COLLECT_ROWS)]
-                [(mix(seed, n as usize) % 5) as usize],
+            step: match std::env::var("PROPERTY_STEP").as_deref() {
+                Ok("whole") => None,
+                Ok(rows) => rows.parse().ok(),
+                Err(_) => [None, Some(1), Some(2), Some(3), Some(COLLECT_ROWS)]
+                    [(mix(seed, n as usize) % 5) as usize],
+            },
             seed: mix(seed, 1_000 + n as usize),
-
             steps: 0,
+            world: world.clone(),
+            n,
+            pushes: 0,
             upgraded: false,
             seen: Vec::new(),
             sent: None,
@@ -342,6 +355,24 @@ impl Peer {
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
             .await;
+        // Every other push collects with no writes between its steps, and a copy of the database
+        // collects whole: the two must send, hold and show the same.
+        self.pushes += 1;
+        let quiet = self.step.is_some() && mix(self.seed, 10_000 + self.pushes).is_multiple_of(2);
+        let whole = if quiet {
+            let (_, mut copy) = self.world.twin(self.n, &mut self.conn).await;
+            let start = self
+                .replica
+                .outbox(&mut copy, 1_000_000)
+                .await
+                .unwrap()
+                .changes
+                .len();
+            self.replica.collect(&mut copy).await.unwrap();
+            Some((start, collected_whole(&mut copy, &self.replica).await))
+        } else {
+            None
+        };
         match self.step {
             None => {
                 self.replica.collect(&mut self.conn).await.unwrap();
@@ -361,9 +392,15 @@ impl Peer {
                 if !collected.more {
                     break;
                 }
-                self.between().await;
+                if !quiet {
+                    self.between().await;
+                }
                 self.before_step().await;
             },
+        }
+        if let Some((start, whole)) = whole {
+            let stepped = collected_whole(&mut self.conn, &self.replica).await;
+            same_as_whole(start, &whole, &stepped)?;
         }
         self.writes.after(&mut self.conn, &self.replica).await;
         let outbox = self
@@ -439,6 +476,72 @@ impl Peer {
         }
         Ok(())
     }
+}
+
+/// What a collect leaves: the outbox, the application's rows and the registers' values.
+struct Left {
+    outbox: Vec<Change>,
+    rows: Vec<String>,
+    values: Vec<String>,
+}
+
+async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left {
+    let mut rows = Vec::new();
+    for table in [
+        "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers",
+    ] {
+        let sql = format!("SELECT * FROM {table} ORDER BY rowid");
+        for row in support::rows(conn, &sql, &[]).await {
+            rows.push(format!("{table} {row:?}"));
+        }
+    }
+    let inspection = replica.inspect(conn).await.unwrap();
+    Left {
+        outbox: replica.outbox(conn, 1_000_000).await.unwrap().changes,
+        rows,
+        values: inspection
+            .registers
+            .iter()
+            .map(|(c, g, f, v, _)| format!("{c} {g:?} {f} {v:?}"))
+            .chain(inspection.aliases.iter().map(|a| format!("{a:?}")))
+            .collect(),
+    }
+}
+
+/// Collecting in steps sent, from `start` of the outbox, what collecting whole did: the same
+/// changes in clock order, aliases joining the same groups, and the same rows and values.
+fn same_as_whole(start: usize, whole: &Left, stepped: &Left) -> Result<(), String> {
+    let plain = |left: &Left| {
+        let mut changes: Vec<&Change> = left.outbox[start..]
+            .iter()
+            .filter(|c| c.field != fongo_sync_sqlite::core::ALIAS)
+            .collect();
+        changes.sort_by_key(|c| c.clock);
+        changes
+            .iter()
+            .map(|c| format!("{} {:?} {} {:?}", c.collection, c.gid, c.field, c.value))
+            .collect::<Vec<_>>()
+    };
+    if plain(whole) != plain(stepped) {
+        return Err(format!(
+            "collected in steps, sent otherwise than whole:\n{:#?}\n{:#?}",
+            plain(whole),
+            plain(stepped)
+        ));
+    }
+    if whole.rows != stepped.rows {
+        return Err(format!(
+            "collected in steps, rows differ from whole:\n{:#?}\n{:#?}",
+            whole.rows, stepped.rows
+        ));
+    }
+    if whole.values != stepped.values {
+        return Err(format!(
+            "collected in steps, values or groups differ from whole:\n{:#?}\n{:#?}",
+            whole.values, stepped.values
+        ));
+    }
+    Ok(())
 }
 
 fn mix(seed: u64, i: usize) -> u64 {

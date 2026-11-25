@@ -87,6 +87,19 @@ impl Statements {
         self.state.texts.lock().unwrap().keys().cloned().collect()
     }
 
+    /// How many times statements starting with `prefix` started since counting began, or since
+    /// the last reset.
+    pub fn started(&self, prefix: &str) -> u64 {
+        self.state
+            .texts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(text, _)| text.trim_start().starts_with(prefix))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// The statements started since counting began, or since the last reset, the most frequent
     /// first: a cost test's message, saying where the statements went.
     pub fn busiest(&self, n: usize) -> String {

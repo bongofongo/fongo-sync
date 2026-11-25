@@ -432,9 +432,17 @@ async fn mixed_writes(conn: &mut SqliteConnection, rows: u64, round: u64) {
 }
 
 /// How long each write transaction on a connection held the write lock, from its first write
-/// to its commit.
+/// to its commit, and for the longest, how many rows of each table it wrote.
 #[derive(Clone, Default)]
-struct Holds(Arc<Mutex<(Option<Instant>, Vec<Duration>)>>);
+struct Holds(Arc<Mutex<Held>>);
+
+#[derive(Default)]
+struct Held {
+    began: Option<Instant>,
+    tables: BTreeMap<String, u64>,
+    holds: Vec<Duration>,
+    longest: (Duration, String),
+}
 
 impl Holds {
     async fn watch(conn: &mut SqliteConnection) -> Holds {
@@ -442,24 +450,40 @@ impl Holds {
         conn.ping().await.unwrap();
         let mut handle = conn.lock_handle().await.unwrap();
         let first = holds.0.clone();
-        handle.set_update_hook(move |_| {
-            first.lock().unwrap().0.get_or_insert_with(Instant::now);
+        handle.set_update_hook(move |change| {
+            let mut state = first.lock().unwrap();
+            state.began.get_or_insert_with(Instant::now);
+            *state.tables.entry(change.table.to_string()).or_default() += 1;
         });
         let done = holds.0.clone();
         handle.set_commit_hook(move || {
             let mut state = done.lock().unwrap();
-            if let Some(began) = state.0.take() {
-                state.1.push(began.elapsed());
+            let tables = std::mem::take(&mut state.tables);
+            if let Some(began) = state.began.take() {
+                let held = began.elapsed();
+                state.holds.push(held);
+                if held > state.longest.0 {
+                    state.longest = (held, format!("{tables:?}"));
+                }
             }
             true
         });
         let rolled = holds.0.clone();
-        handle.set_rollback_hook(move || rolled.lock().unwrap().0 = None);
+        handle.set_rollback_hook(move || {
+            let mut state = rolled.lock().unwrap();
+            state.began = None;
+            state.tables.clear();
+        });
         holds
     }
 
     fn take(&self) -> Vec<Duration> {
-        std::mem::take(&mut self.0.lock().unwrap().1)
+        std::mem::take(&mut self.0.lock().unwrap().holds)
+    }
+
+    /// The longest transaction since the last call, and the rows it wrote by table.
+    fn longest(&self) -> (Duration, String) {
+        std::mem::take(&mut self.0.lock().unwrap().longest)
     }
 }
 
@@ -722,6 +746,7 @@ async fn measure_backlog() {
 
     mixed_writes(&mut conn, rows, 2).await;
     holds.take();
+    holds.longest();
     let credentials = made;
     let (took, waits) = alongside(&path, busy, async {
         let mut watched = Watched {
@@ -746,8 +771,306 @@ async fn measure_backlog() {
     })
     .await;
     report("sync", took, waits, holds.take());
+    let (held, tables) = holds.longest();
+    lines.push(format!(
+        "{journal} {rows} sync's longest transaction {:.0} ms wrote {tables}",
+        held.as_secs_f64() * 1e3
+    ));
     for line in lines {
         eprintln!("RESULT {line}");
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Records what each apply and each step of collecting reported touching.
+#[derive(Default)]
+struct Touching {
+    pace: Pace,
+    touched: Vec<(String, String, bool)>,
+}
+
+impl Apply for Touching {
+    async fn apply(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        changes: &[Change],
+    ) -> Result<Applied, Error> {
+        let applied = replica.apply(conn, changes).await?;
+        for t in &applied.touched {
+            self.touched
+                .push((t.collection.clone(), t.key.clone(), t.deleted));
+        }
+        Ok(applied)
+    }
+
+    async fn collect(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        rows: usize,
+    ) -> Result<Collected, Error> {
+        let collected = replica.collect_step(conn, rows).await?;
+        for t in &collected.touched {
+            self.touched
+                .push((t.collection.clone(), t.key.clone(), t.deleted));
+        }
+        Ok(collected)
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
+    }
+}
+
+/// A row held back by a unique index here is written once this device frees the title, by the
+/// first step of collecting that follows: the step reports it to the application, in its own
+/// transaction, as one apply of everything would have, and the sync's report lists it.
+#[tokio::test]
+async fn a_row_a_step_of_collecting_writes_is_reported_as_an_apply_would() {
+    async fn freed(collect: usize) -> (Vec<(String, String, bool)>, Vec<String>, Vec<String>) {
+        let server = Server::new();
+        let made = create_library(&server, now).await.unwrap();
+        let joined = fongo_sync_client::join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap();
+        let mut a = Peer::new(made).await;
+        let mut b = Peer::new(joined).await;
+        a.run("CREATE UNIQUE INDEX books_title ON books (title)")
+            .await;
+        a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        b.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+            .await;
+        b.sync(&server).await.unwrap();
+        a.sync(&server).await.unwrap();
+        a.run("UPDATE books SET title = 'Middlemarch (mine)' WHERE title = 'Middlemarch'")
+            .await;
+        a.run("INSERT INTO settings VALUES ('k1', 'v'), ('k2', 'v'), ('k3', 'v')")
+            .await;
+        let mut touching = Touching {
+            pace: Pace {
+                collect,
+                ..Pace::default()
+            },
+            ..Touching::default()
+        };
+        let report = sync_with(
+            &mut a.conn,
+            &a.replica,
+            &server,
+            &a.credentials,
+            now,
+            &mut touching,
+        )
+        .await
+        .unwrap();
+        let reported = report
+            .applied
+            .touched
+            .iter()
+            .map(|t| format!("{} {} {}", t.collection, t.key, t.deleted))
+            .collect();
+        let rows = a
+            .lines("SELECT id || ' ' || title FROM books ORDER BY id")
+            .await;
+        (touching.touched, reported, rows)
+    }
+    let whole = freed(usize::MAX).await;
+    let stepped = freed(2).await;
+    assert!(!whole.0.is_empty());
+    assert_eq!(stepped, whole);
+}
+
+const LIBRARY: &[&str] = &[
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, isbn TEXT, year INTEGER)",
+    "CREATE TABLE highlights (
+        id INTEGER PRIMARY KEY,
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        text TEXT, pos INTEGER)",
+    "CREATE INDEX highlights_book ON highlights (book_id)",
+    "CREATE TABLE notes (
+        id INTEGER PRIMARY KEY,
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        body TEXT)",
+    "CREATE INDEX notes_book ON notes (book_id)",
+    "CREATE TABLE w (id INTEGER PRIMARY KEY, at INTEGER)",
+];
+
+fn library_registry() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("isbn")
+            .field("year")
+            .identity(&["isbn"]),
+        Collection::minted("highlights", "highlights", "id")
+            .owner("book_id", "books")
+            .field("text")
+            .field("pos"),
+        Collection::minted("notes", "notes", "id")
+            .owner("book_id", "books")
+            .field("body"),
+    ])
+    .unwrap()
+}
+
+/// The first install over an existing library: `FIRST_BOOKS` books, each with a highlight and a
+/// note referring to it, written before the kernel was installed, in `FIRST_JOURNAL` mode, while
+/// a connection here writes and another reads every 20 ms, and a process of its own writes, with
+/// a busy timeout of `FIRST_BUSY_MS`. It reports how long the install held the write lock, what
+/// the others waited, and, for comparison, how long a copy of every row the install adopts
+/// takes, done in SQL in one statement per table: the least an install could hold the lock for
+/// that made its own record of what it found.
+///
+/// ```text
+/// FIRST_BOOKS=50000 FIRST_JOURNAL=delete cargo test --release -p fongo-sync-client \\
+///     --test backlog -- --ignored --nocapture measure_first_install
+/// ```
+///
+/// On an 8 GB laptop, with a 1 s busy timeout: 10,000 books (30,000 rows) held the lock 2.0 s
+/// in either journal mode, and one statement of each other connection failed; 50,000 books held
+/// it 13.3 to 14.1 s, and about 12 of 40 statements of each writer failed (in WAL mode the
+/// reader never waited). A copy of every row took 0.01 s and 0.03 s.
+#[tokio::test]
+#[ignore]
+async fn measure_first_install() {
+    let books = env("FIRST_BOOKS", 10_000);
+    let busy = Duration::from_millis(env("FIRST_BUSY_MS", 1_000));
+    let journal = std::env::var("FIRST_JOURNAL").unwrap_or_else(|_| "wal".into());
+    let dir = scratch("first-install");
+    let path = dir.join("a.db");
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query(&format!("PRAGMA journal_mode = {journal}"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for sql in LIBRARY {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    let seq = format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {books})"
+    );
+    for sql in [
+        format!(
+            "{seq} INSERT INTO books SELECT i, 'Middlemarch ' || i, 'isbn ' || i, 1800 + i % 200 FROM n"
+        ),
+        format!("{seq} INSERT INTO highlights SELECT i, i, 'a passage of book ' || i, i FROM n"),
+        format!("{seq} INSERT INTO notes SELECT i, i, 'a note on book ' || i FROM n"),
+    ] {
+        sqlx::query(&sql).execute(&mut conn).await.unwrap();
+    }
+    let began = Instant::now();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for (table, columns) in [
+        ("books", "title, isbn, year"),
+        ("highlights", "book_id, text, pos"),
+        ("notes", "book_id, body"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE copy_{table} AS
+             SELECT json_array(id) AS key, json_array({columns}) AS image FROM {table}"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    let copy = began.elapsed();
+    let replica = Replica::new(library_registry());
+    let holds = Holds::watch(&mut conn).await;
+    let (took, waits) = alongside(&path, busy, async {
+        immediate(&mut conn).await;
+        replica.install(&mut conn).await.unwrap();
+        commit(&mut conn).await;
+    })
+    .await;
+    let longest = holds.take().into_iter().max().unwrap_or_default();
+    eprintln!(
+        "RESULT {journal} {books} books, {} rows: first install {:.2} s, held {:.2} s; {waits}; a copy of every row {:.2} s",
+        books * 3,
+        took.as_secs_f64(),
+        longest.as_secs_f64(),
+        copy.as_secs_f64()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Writes rows between the sync's transactions, as fast as it collects them.
+struct Busy {
+    pace: Pace,
+    next: u64,
+    steps: usize,
+}
+
+impl Apply for Busy {
+    async fn collect(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        rows: usize,
+    ) -> Result<Collected, Error> {
+        self.steps += 1;
+        Ok(replica.collect_step(conn, rows).await?)
+    }
+
+    async fn between(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
+        let from = self.next;
+        self.next += 150;
+        sqlx::query(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT {from} UNION ALL SELECT i + 1 FROM n WHERE i < {})
+             INSERT INTO settings SELECT 'key ' || i, 'v' FROM n",
+            from + 149
+        ))
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    fn pace(&self) -> Pace {
+        self.pace
+    }
+}
+
+/// An application that writes more rows in each gap than a step collects does not keep the sync
+/// from its apply: the steps take no more rows than waited when the first began, and the apply
+/// collects the rest.
+#[tokio::test]
+async fn writes_between_steps_do_not_keep_a_sync_collecting() {
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let mut a = Peer::new(made).await;
+    write_books(&mut a.conn, 200).await;
+    let mut busy = Busy {
+        pace: Pace {
+            collect: 100,
+            hold: Duration::ZERO,
+            pause: Duration::ZERO,
+            ..Pace::default()
+        },
+        next: 1,
+        steps: 0,
+    };
+    let report = sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut busy,
+    )
+    .await
+    .unwrap();
+    assert!(busy.steps >= 3 && busy.steps <= 4, "{} steps", busy.steps);
+    assert!(report.sent > 6 * 200, "{}", report.sent);
 }

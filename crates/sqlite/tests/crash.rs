@@ -374,7 +374,7 @@ async fn every_statement_of_every_step(op: Steps) -> u64 {
     }
     eprintln!("{op:?}: {calls} calls, {total} statements");
     assert!(
-        calls > 1 || matches!(op, Steps::Resume),
+        calls > 1 || matches!(op, Steps::Resume | Steps::First),
         "{op:?} took one step"
     );
     total
@@ -452,4 +452,124 @@ async fn a_step_dropped_where_it_waits_is_whole_or_not_done_and_the_steps_finish
     for op in [Steps::Collect, Steps::Install, Steps::First, Steps::Resume] {
         every_suspension_of_every_step(op).await;
     }
+}
+
+/// No transaction or savepoint of a step is left open, whether it ran with no transaction open
+/// or inside the caller's, and stopped at any statement or not.
+async fn no_transaction_left(conn: &mut SqliteConnection) -> Result<(), String> {
+    use sqlx::Connection;
+    if conn.is_in_transaction() {
+        return Err("sqlx counts a transaction".into());
+    }
+    sqlx::query("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("BEGIN: {e}"))?;
+    for savepoint in ["fongo", "fongo_step"] {
+        if sqlx::query(&format!("RELEASE {savepoint}"))
+            .execute(&mut *conn)
+            .await
+            .is_ok()
+        {
+            return Err(format!("savepoint {savepoint} left"));
+        }
+    }
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("ROLLBACK: {e}"))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_step_stopped_at_any_statement_leaves_no_transaction_open() {
+    let (mut conn, replica) = begin(Steps::Collect).await;
+    let statements = Statements::watch(&mut conn).await;
+    replica.collect_step(&mut conn, 1).await.unwrap();
+    let count = statements.count();
+    for n in 1..=count {
+        let (mut conn, replica) = begin(Steps::Collect).await;
+        let statements = Statements::watch(&mut conn).await;
+        statements.stop_at(n);
+        let step = replica.collect_step(&mut conn, 1).await;
+        statements.stop_at(0);
+        no_transaction_left(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("statement {n}: {e}; {step:?}"));
+        let (mut conn, replica) = begin(Steps::Collect).await;
+        let statements = Statements::watch(&mut conn).await;
+        sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+        statements.stop_at(n + 1);
+        let step = replica.collect_step(&mut conn, 1).await;
+        statements.stop_at(0);
+        for savepoint in ["fongo", "fongo_step"] {
+            assert!(
+                sqlx::query(&format!("RELEASE {savepoint}"))
+                    .execute(&mut conn)
+                    .await
+                    .is_err(),
+                "in a transaction, statement {n}: savepoint {savepoint} left; {step:?}"
+            );
+        }
+        let _ = sqlx::query("ROLLBACK").execute(&mut conn).await;
+    }
+}
+
+/// A step that cannot take the write lock, or cannot commit while another connection reads,
+/// fails with nothing collected and the connection sound, in either journal mode; the steps
+/// then finish.
+#[tokio::test]
+async fn a_step_kept_from_the_lock_leaves_the_connection_sound() {
+    use sqlx::ConnectOptions;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("crash-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for journal in ["delete", "wal"] {
+        let path = dir.join(format!("{journal}.db"));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_millis(100));
+        let mut a = options.connect().await.unwrap();
+        run(&mut a, &format!("PRAGMA journal_mode = {journal}")).await;
+        for sql in SCHEMA {
+            run(&mut a, sql).await;
+        }
+        let replica = Replica::new(registry());
+        replica.install(&mut a).await.unwrap();
+        run(
+            &mut a,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+             INSERT INTO books (title) SELECT 'Middlemarch ' || i FROM n",
+        )
+        .await;
+        let before = replica.uncollected_rows(&mut a, usize::MAX).await.unwrap();
+        let mut other = options.connect().await.unwrap();
+        run(&mut other, "BEGIN IMMEDIATE").await;
+        assert!(replica.collect_step(&mut a, 100).await.is_err());
+        no_transaction_left(&mut a).await.unwrap();
+        run(&mut other, "ROLLBACK").await;
+        assert_eq!(
+            replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+            before
+        );
+        run(&mut other, "BEGIN").await;
+        run(&mut other, "SELECT count(*) FROM books").await;
+        let step = replica.collect_step(&mut a, 100).await;
+        no_transaction_left(&mut a).await.unwrap();
+        run(&mut other, "COMMIT").await;
+        if step.is_err() {
+            assert_eq!(
+                replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+                before
+            );
+        }
+        while replica.collect_step(&mut a, 100).await.unwrap().more {}
+        assert_eq!(
+            replica.uncollected_rows(&mut a, usize::MAX).await.unwrap(),
+            0
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }

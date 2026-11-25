@@ -26,14 +26,18 @@ struct Wall {
 }
 
 struct Source {
-    rng: Mutex<u64>,
+    rng: Arc<Mutex<u64>>,
     wall: Arc<Mutex<Wall>>,
 }
+
+/// The state of each function's stream on a connection, by connection number.
+type Streams = Arc<Mutex<std::collections::BTreeMap<u64, Vec<Arc<Mutex<u64>>>>>>;
 
 #[derive(Clone)]
 pub struct World {
     seed: u64,
     wall: Arc<Mutex<Wall>>,
+    streams: Streams,
 }
 
 impl World {
@@ -44,7 +48,44 @@ impl World {
                 ms: 1_700_000_000_000,
                 rng: seed ^ 0x5555,
             })),
+            streams: Streams::default(),
         }
+    }
+
+    /// A copy of database `n`, on a connection whose randomness and wall clock go on from where
+    /// `n`'s stand, in a world of its own: what is done to the copy is what would have been done
+    /// to `n`, and touches neither `n` nor this world's clock.
+    pub async fn twin(&self, n: u64, conn: &mut SqliteConnection) -> (World, SqliteConnection) {
+        let wall = {
+            let wall = self.wall.lock().unwrap();
+            Wall {
+                ms: wall.ms,
+                rng: wall.rng,
+            }
+        };
+        let states: Vec<u64> = self.streams.lock().unwrap()[&n]
+            .iter()
+            .map(|s| *s.lock().unwrap())
+            .collect();
+        let world = World {
+            seed: self.seed,
+            wall: Arc::new(Mutex::new(wall)),
+            streams: Streams::default(),
+        };
+        let mut copy = world.open(n, Some(states)).await;
+        let mut from = super::lock(conn).await;
+        let mut to = super::lock(&mut copy).await;
+        let (src, dest) = (from.as_raw_handle().as_ptr(), to.as_raw_handle().as_ptr());
+        let main = CString::new("main").unwrap();
+        // SAFETY: both handles are open and locked for the copy.
+        unsafe {
+            let backup = ffi::sqlite3_backup_init(dest, main.as_ptr(), src, main.as_ptr());
+            assert!(!backup.is_null());
+            assert_eq!(ffi::sqlite3_backup_step(backup, -1), ffi::SQLITE_DONE);
+            assert_eq!(ffi::sqlite3_backup_finish(backup), ffi::SQLITE_OK);
+        }
+        drop((from, to));
+        (world, copy)
     }
 
     /// Moves the shared clock on by `ms`.
@@ -54,6 +95,10 @@ impl World {
 
     /// An empty database, numbered `n` within this world, with foreign keys enforced.
     pub async fn connect(&self, n: u64) -> SqliteConnection {
+        self.open(n, None).await
+    }
+
+    async fn open(&self, n: u64, states: Option<Vec<u64>>) -> SqliteConnection {
         let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .foreign_keys(true)
@@ -65,14 +110,24 @@ impl World {
         let rng = splitmix(&mut rng);
         let mut handle = super::lock(&mut conn).await;
         let db = handle.as_raw_handle().as_ptr();
-        for (name, args, call) in [
+        let mut streams = Vec::new();
+        for (i, (name, args, call)) in [
             ("randomblob", 1, randomblob as Call),
             ("random", 0, random as Call),
             ("unixepoch", 1, unixepoch as Call),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut start = rng ^ (name.len() as u64).wrapping_mul(0x8CB9_2BA7_2F3D_8DD7);
+            let state = match &states {
+                Some(states) => states[i],
+                None => splitmix(&mut start),
+            };
+            let stream = Arc::new(Mutex::new(state));
+            streams.push(stream.clone());
             let source = Box::new(Source {
-                rng: Mutex::new(splitmix(&mut start)),
+                rng: stream,
                 wall: self.wall.clone(),
             });
             let name = CString::new(name).unwrap();
@@ -94,6 +149,7 @@ impl World {
             assert_eq!(status, ffi::SQLITE_OK);
         }
         drop(handle);
+        self.streams.lock().unwrap().insert(n, streams);
         conn
     }
 }

@@ -14,9 +14,13 @@ The kernel knows nothing about any particular application.
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
 its database, `Replica::collect` to turn local writes into changes, and `Replica::apply` to merge
 changes from elsewhere. Its schema is left as it is; the kernel keeps its state in tables prefixed
-`fongo_`. `Replica::install_step` and `Replica::collect_step` do the same work in bounded steps,
-each a transaction of its own that says whether more is left, so that many local writes are
-collected without holding SQLite's write lock for long; the steps record what one collect would.
+`fongo_`. `Replica::collect_step` collects in steps, each a transaction of its own that says
+whether more is left, so that many local writes are collected without holding SQLite's write lock
+for long; `Replica::install_step` installs and takes the first step. The steps end as ordinary
+collects made one after another would, and the same as one collect of everything but where an
+alias is stamped. A step takes about the rows asked for, more where rows depend on later ones: a
+new row written again after the rows naming it is collected with all of them, and the rows found
+in a collection's tables when it is first installed are collected by that install whole.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are
@@ -67,9 +71,10 @@ is called once a pull has read the whole log, before the outbox is sent.
 A sync shares the database with other writers: local writes are collected in bounded steps
 before each apply, each apply takes a bounded number of changes in whole envelopes, each envelope
 sent holds a bounded number, and once a sync has held SQLite's write lock for a while it leaves it
-free long enough for a writer waiting in SQLite's busy handler to take it. `Apply::between`,
-called in each gap between transactions, lets an application send its own writers through, and
-`Apply::pace` sets the bounds.
+free long enough for a writer waiting in SQLite's busy handler to take it. `Apply::collect` runs
+each step of collecting in the client's transaction, as `Apply::apply` runs each apply, and is told
+what the step wrote; `Apply::between`, called in each gap between transactions, lets an
+application send its own writers through, and `Apply::pace` sets the bounds.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 
