@@ -569,3 +569,43 @@ async fn an_install_in_steps_costs_at_most_twice_a_whole_one() {
         assert!(w <= 2 * whole, "steps of {rows}: work {w} against {whole}");
     }
 }
+
+/// The step that records what a first install finds is short beside a whole install of the same
+/// library, references among the rows and cycles of them included: recording reads each row
+/// once and walks each reference once.
+#[tokio::test]
+async fn recording_takes_a_small_part_of_a_whole_install() {
+    let books = std::env::var("INSTALL_BOOKS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(3_000);
+    let whole = {
+        let world = World::new(3);
+        let mut a = database(&world, 0).await;
+        existing(&mut a, books).await;
+        let began = std::time::Instant::now();
+        Replica::new(registry()).install(&mut a).await.unwrap();
+        began.elapsed()
+    };
+    let world = World::new(3);
+    let mut a = database(&world, 0).await;
+    existing(&mut a, books).await;
+    let replica = Replica::new(registry());
+    let began = std::time::Instant::now();
+    replica.install_step(&mut a, 1).await.unwrap();
+    let recording = began.elapsed();
+    let largest: i64 = sqlx::query_scalar(
+        "SELECT max(n) FROM (SELECT count(*) AS n FROM fongo_found GROUP BY batch)",
+    )
+    .fetch_one(&mut a)
+    .await
+    .unwrap();
+    eprintln!(
+        "{books} books: recording {recording:?}, whole install {whole:?}, largest batch {largest}"
+    );
+    assert!(largest <= 3, "a batch of {largest} rows");
+    assert!(
+        recording * 2 <= whole,
+        "recording {recording:?} against a whole install's {whole:?}"
+    );
+}

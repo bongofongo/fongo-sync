@@ -225,51 +225,58 @@ impl Replica {
                 break;
             }
         }
-        // Sets on a cycle of references are joined, so the sets' graph has none.
-        loop {
-            let roots: Vec<usize> = (0..found.len()).map(|i| sets.find(i)).collect();
-            let mut after: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-            for (i, named) in names.iter().enumerate() {
-                for &n in named {
-                    if roots[n] != roots[i] {
-                        after.entry(roots[i]).or_default().insert(roots[n]);
-                    }
+        // Sets on a cycle of references are joined, so the sets' graph has none: each strongly
+        // connected component of it becomes one set.
+        let roots: Vec<usize> = (0..found.len()).map(|i| sets.find(i)).collect();
+        let mut after: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (i, named) in names.iter().enumerate() {
+            for &n in named {
+                if roots[n] != roots[i] {
+                    after.entry(roots[i]).or_default().insert(roots[n]);
                 }
             }
-            let cycle = cycle(&after);
-            if cycle.is_empty() {
-                // Sets in an order where each comes after those it names, earliest place first.
-                let mut waiting: BTreeMap<usize, usize> = BTreeMap::new();
-                let mut before: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-                for (&set, named) in &after {
-                    waiting.insert(set, named.len());
-                    for &n in named {
-                        before.entry(n).or_default().push(set);
-                    }
-                }
-                let all: BTreeSet<usize> = roots.iter().copied().collect();
-                let mut ready: BinaryHeap<Reverse<usize>> = all
-                    .iter()
-                    .filter(|s| !waiting.contains_key(s))
-                    .map(|&s| Reverse(s))
-                    .collect();
-                let mut number: BTreeMap<usize, usize> = BTreeMap::new();
-                while let Some(Reverse(set)) = ready.pop() {
-                    number.insert(set, number.len());
-                    for &next in before.get(&set).map(Vec::as_slice).unwrap_or(&[]) {
-                        let left = waiting.get_mut(&next).expect("counted");
-                        *left -= 1;
-                        if *left == 0 {
-                            ready.push(Reverse(next));
-                        }
-                    }
-                }
-                return Ok(roots.iter().map(|r| number[r]).collect());
-            }
-            for pair in cycle.windows(2) {
+        }
+        for component in components(&after) {
+            for pair in component.windows(2) {
                 sets.join(pair[0], pair[1]);
             }
         }
+        let roots: Vec<usize> = (0..found.len()).map(|i| sets.find(i)).collect();
+        let mut after: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (i, named) in names.iter().enumerate() {
+            for &n in named {
+                if roots[n] != roots[i] {
+                    after.entry(roots[i]).or_default().insert(roots[n]);
+                }
+            }
+        }
+        // Sets in an order where each comes after those it names, earliest place first.
+        let mut waiting: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut before: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (&set, named) in &after {
+            waiting.insert(set, named.len());
+            for &n in named {
+                before.entry(n).or_default().push(set);
+            }
+        }
+        let all: BTreeSet<usize> = roots.iter().copied().collect();
+        let mut ready: BinaryHeap<Reverse<usize>> = all
+            .iter()
+            .filter(|s| !waiting.contains_key(s))
+            .map(|&s| Reverse(s))
+            .collect();
+        let mut number: BTreeMap<usize, usize> = BTreeMap::new();
+        while let Some(Reverse(set)) = ready.pop() {
+            number.insert(set, number.len());
+            for &next in before.get(&set).map(Vec::as_slice).unwrap_or(&[]) {
+                let left = waiting.get_mut(&next).expect("counted");
+                *left -= 1;
+                if *left == 0 {
+                    ready.push(Reverse(next));
+                }
+            }
+        }
+        Ok(roots.iter().map(|r| number[r]).collect())
     }
 
     /// Adopts found rows from their records: the next batches, until at least `want` rows, or
@@ -347,41 +354,62 @@ impl Replica {
     }
 }
 
-/// A cycle in `after`, as the sets on it, or none.
-fn cycle(after: &BTreeMap<usize, BTreeSet<usize>>) -> Vec<usize> {
-    // Depth first, with an explicit stack: 0 unseen, 1 on the path, 2 done.
-    let mut state: BTreeMap<usize, u8> = BTreeMap::new();
+/// The strongly connected components of `after` with more than one set, found once by
+/// Tarjan's method without recursion: each set is visited once and each edge walked once.
+fn components(after: &BTreeMap<usize, BTreeSet<usize>>) -> Vec<Vec<usize>> {
+    let mut index: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut low: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut on_stack: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    let empty = BTreeSet::new();
     for &start in after.keys() {
-        if state.get(&start).copied().unwrap_or(0) != 0 {
+        if index.contains_key(&start) {
             continue;
         }
-        let mut path: Vec<(usize, Vec<usize>)> = Vec::new();
-        state.insert(start, 1);
-        path.push((start, after[&start].iter().copied().collect()));
-        while let Some((node, next)) = path.last_mut() {
+        // Each frame: a set and the sets it names still to walk.
+        let mut frames: Vec<(usize, std::collections::btree_set::Iter<'_, usize>)> = Vec::new();
+        let n = index.len();
+        index.insert(start, n);
+        low.insert(start, n);
+        stack.push(start);
+        on_stack.insert(start);
+        frames.push((start, after.get(&start).unwrap_or(&empty).iter()));
+        while let Some((node, next)) = frames.last_mut() {
             let node = *node;
-            match next.pop() {
-                Some(n) => match state.get(&n).copied().unwrap_or(0) {
-                    0 => {
-                        state.insert(n, 1);
-                        let more = after
-                            .get(&n)
-                            .map(|s| s.iter().copied().collect())
-                            .unwrap_or_default();
-                        path.push((n, more));
+            if let Some(&n) = next.next() {
+                if !index.contains_key(&n) {
+                    let i = index.len();
+                    index.insert(n, i);
+                    low.insert(n, i);
+                    stack.push(n);
+                    on_stack.insert(n);
+                    frames.push((n, after.get(&n).unwrap_or(&empty).iter()));
+                } else if on_stack.contains(&n) {
+                    let l = low[&node].min(index[&n]);
+                    low.insert(node, l);
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some((parent, _)) = frames.last() {
+                let l = low[parent].min(low[&node]);
+                low.insert(*parent, l);
+            }
+            if low[&node] == index[&node] {
+                let mut component = Vec::new();
+                while let Some(top) = stack.pop() {
+                    on_stack.remove(&top);
+                    component.push(top);
+                    if top == node {
+                        break;
                     }
-                    1 => {
-                        let from = path.iter().position(|(p, _)| *p == n).expect("on the path");
-                        return path[from..].iter().map(|(p, _)| *p).collect();
-                    }
-                    _ => {}
-                },
-                None => {
-                    state.insert(node, 2);
-                    path.pop();
+                }
+                if component.len() > 1 {
+                    out.push(component);
                 }
             }
         }
     }
-    Vec::new()
+    out
 }
