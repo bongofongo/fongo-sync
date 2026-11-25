@@ -975,8 +975,14 @@ const LIBRARY: &[&str] = &[
     "CREATE TABLE highlights (
         id INTEGER PRIMARY KEY,
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-        text TEXT, pos INTEGER)",
+        text TEXT, pos INTEGER,
+        reading_id INTEGER REFERENCES readings(id) ON DELETE SET NULL)",
     "CREATE INDEX highlights_book ON highlights (book_id)",
+    "CREATE TABLE readings (
+        id INTEGER PRIMARY KEY,
+        book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        status TEXT,
+        card_id INTEGER REFERENCES highlights(id) ON DELETE SET NULL)",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
@@ -995,7 +1001,12 @@ fn library_registry() -> Registry {
         Collection::minted("highlights", "highlights", "id")
             .owner("book_id", "books")
             .field("text")
-            .field("pos"),
+            .field("pos")
+            .reference("reading_id", "readings"),
+        Collection::minted("readings", "readings", "id")
+            .owner("book_id", "books")
+            .field("status")
+            .reference("card_id", "highlights"),
         Collection::minted("notes", "notes", "id")
             .owner("book_id", "books")
             .field("body"),
@@ -1004,7 +1015,8 @@ fn library_registry() -> Registry {
 }
 
 /// The first install over an existing library: `FIRST_BOOKS` books, each with a highlight and a
-/// note referring to it, written before the kernel was installed, in `FIRST_JOURNAL` mode, while
+/// note referring to it, and every third with a reading naming its highlight, which names it
+/// back, written before the kernel was installed, in `FIRST_JOURNAL` mode, while
 /// a connection here writes and another reads every 20 ms, and a process of its own writes, with
 /// a busy timeout of `FIRST_BUSY_MS`. It reports how long the install held the write lock, what
 /// the others waited, and, for comparison, how long a copy of every row the install adopts
@@ -1016,10 +1028,18 @@ fn library_registry() -> Registry {
 ///     --test backlog -- --ignored --nocapture measure_first_install
 /// ```
 ///
-/// On an 8 GB laptop, with a 1 s busy timeout: 10,000 books (30,000 rows) held the lock 2.0 s
-/// in either journal mode, and one statement of each other connection failed; 50,000 books held
-/// it 13.3 to 14.1 s, and about 12 of 40 statements of each writer failed (in WAL mode the
-/// reader never waited). A copy of every row took 0.01 s and 0.03 s.
+/// With `FIRST_STEPPED=1` the install is made in steps of [`COLLECT_ROWS`], paced as a sync
+/// paces them; its first transaction records every found row, and the most rows recorded to be
+/// adopted together is reported.
+///
+/// On an 8 GB laptop, with a 1 s busy timeout, in WAL and rollback journal modes alike: whole,
+/// 10,000 books (33,333 rows) held the lock 2.3 s and two statements of each other connection
+/// failed; 50,000 books (166,666 rows) held it 14.6 s and about 13 of 45 statements of each
+/// writer failed (in WAL mode the reader never waited). In steps, 10,000 books held it at most
+/// 0.19 s and 50,000 books at most 0.67 s, both in the recording step, and one statement in
+/// either failed in all. The batches are a reading and its highlight, which name each other, or
+/// one row. In steps the install took 5 s and 38 to 41 s in all, mostly for its pauses. A copy
+/// of every row took 0.01 to 0.03 s.
 #[tokio::test]
 #[ignore]
 async fn measure_first_install() {
@@ -1050,8 +1070,15 @@ async fn measure_first_install() {
         format!(
             "{seq} INSERT INTO books SELECT i, 'Middlemarch ' || i, 'isbn ' || i, 1800 + i % 200 FROM n"
         ),
-        format!("{seq} INSERT INTO highlights SELECT i, i, 'a passage of book ' || i, i FROM n"),
+        format!(
+            "{seq} INSERT INTO highlights (id, book_id, text, pos) SELECT i, i, 'a passage of book ' || i, i FROM n"
+        ),
         format!("{seq} INSERT INTO notes SELECT i, i, 'a note on book ' || i FROM n"),
+        // A reading of every third book, naming a highlight that names it back.
+        format!(
+            "{seq} INSERT INTO readings (id, book_id, status, card_id) SELECT i, i, 'done', i FROM n WHERE i % 3 = 0"
+        ),
+        "UPDATE highlights SET reading_id = id WHERE id % 3 = 0".into(),
     ] {
         sqlx::query(&sql).execute(&mut conn).await.unwrap();
     }
@@ -1077,17 +1104,34 @@ async fn measure_first_install() {
     let copy = began.elapsed();
     let replica = Replica::new(library_registry());
     let holds = Holds::watch(&mut conn).await;
+    let stepped = env("FIRST_STEPPED", 0) == 1;
+    let mut largest = 0i64;
     let (took, waits) = alongside(&path, busy, async {
-        immediate(&mut conn).await;
-        replica.install(&mut conn).await.unwrap();
-        commit(&mut conn).await;
+        if stepped {
+            let first = replica.install_step(&mut conn, COLLECT_ROWS).await.unwrap();
+            largest = sqlx::query_scalar(
+                "SELECT coalesce(max(n), 0) FROM (SELECT count(*) AS n FROM fongo_found WHERE batch >= 0 GROUP BY batch)",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            in_steps(&replica, &mut conn, first).await;
+        } else {
+            immediate(&mut conn).await;
+            replica.install(&mut conn).await.unwrap();
+            commit(&mut conn).await;
+        }
     })
     .await;
-    let longest = holds.take().into_iter().max().unwrap_or_default();
+    let held = holds.take();
+    let longest = held.iter().max().copied().unwrap_or_default();
     eprintln!(
-        "RESULT {journal} {books} books, {} rows: first install {:.2} s, held {:.2} s; {waits}; a copy of every row {:.2} s",
-        books * 3,
+        "RESULT {journal} {books} books, {} rows, {}: first install {:.2} s, {} transactions, first {:.2} s, longest {:.2} s, largest batch {largest}; {waits}; a copy of every row {:.2} s",
+        books * 3 + books / 3,
+        if stepped { "steps" } else { "whole" },
         took.as_secs_f64(),
+        held.len(),
+        held.first().copied().unwrap_or_default().as_secs_f64(),
         longest.as_secs_f64(),
         copy.as_secs_f64()
     );

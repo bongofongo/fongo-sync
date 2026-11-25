@@ -17,12 +17,13 @@ use fongo_sync_core::source::admit;
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
+use crate::adopt;
 use crate::collect::{Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through};
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
-use crate::store::{Facts, LAYOUT, TABLES, as_clock};
+use crate::store::{Facts, LAYOUT, TABLES, UPGRADES, as_clock};
 use crate::tables::{self, NOW, every_row, read_row};
 
 /// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
@@ -156,7 +157,8 @@ pub struct Inspection {
     pub held: Vec<(String, Gid)>,
     /// Rows a merge gave up that another table still holds, as (collection, key).
     pub leftover: Vec<(String, String)>,
-    /// Rows written, or removed, since the last collect, as (collection, key).
+    /// Rows written, or removed, since the last collect, and rows a first install in steps found
+    /// and has not adopted yet, as (collection, key).
     pub uncollected: Vec<(String, String)>,
     /// Fields whose value the application kept as this replica's own on resuming, as
     /// (collection, key, field).
@@ -326,6 +328,9 @@ pub(crate) struct Ctx<'d> {
     pub abandoned: usize,
     /// While a bounded step brings rows up to date, what it reached.
     pub watch: Option<Watch>,
+    /// A step adopting found rows from their records: what it writes to a row the application
+    /// has written since, it writes only to fields the application left as the image holds them.
+    pub adopting: bool,
 }
 
 /// What a bounded try must not leave a later write to: the entities whose rows a merge may
@@ -375,6 +380,7 @@ impl<'d> Ctx<'d> {
             collected: 0,
             abandoned: 0,
             watch: None,
+            adopting: false,
         })
     }
 
@@ -579,6 +585,20 @@ impl Replica {
         mut set: BTreeSet<(String, Gid)>,
         take: Option<usize>,
     ) -> Result<bool> {
+        cx.collected += self.adopt_as_recorded(cx)?;
+        if adopt::recorded(cx.db)? {
+            // Found rows are adopted before anything written since: a step adopts the next
+            // batches; a whole collect or an apply adopts every one first.
+            if let Some(want) = take {
+                debug_assert!(incoming.is_empty());
+                if !set.is_empty() {
+                    self.settle(cx, set)?;
+                }
+                cx.collected += self.adopt(cx, Some(want.max(1)))?;
+                return Ok(adopt::recorded(cx.db)? || marked_past_start(cx.db)?);
+            }
+            cx.collected += self.adopt(cx, None)?;
+        }
         if let Some(want) = take {
             debug_assert!(incoming.is_empty());
             return self.bounded(cx, set, want.max(1));
@@ -617,7 +637,7 @@ impl Replica {
     }
 
     /// Brings every row of `set`'s entities to its target.
-    fn settle(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>) -> Result<()> {
+    pub(crate) fn settle(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>) -> Result<()> {
         // A write a table refuses for a constraint the plan does not know of, such as a unique
         // column outside any identity, may succeed once others are written: what waits is tried
         // again while a round writes anything, up to a bound. What still waits then is tried by
@@ -756,7 +776,8 @@ impl Replica {
     /// open. Rows that existed before a collection was first installed are queued as the oldest
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
-    /// and kernel tables of an earlier layout, which [`Replica::uninstall`] removes.
+    /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
+    /// layout 3 is upgraded in place.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
             db.atomically(|db| self.install_in(db, None, None).map(|_| ()))
@@ -765,12 +786,21 @@ impl Replica {
     }
 
     /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
-    /// What it adopts of the registry, every row that adoption brings up to date, and every row
-    /// found in the tables of a collection installed for the first time are done whole, as
-    /// `install` does them: a write to a found row before it was collected would make it an
-    /// edit of the application's rather than what was found. So a first install over a large
-    /// library holds the write lock as long as `install` does; only rows written since the last
-    /// collect are left to later steps, and are in the meantime as any row written since then.
+    /// What it adopts of the registry for collections installed before (new fields, sets now
+    /// written together), and every row that brings up to date, is done whole, as `install`
+    /// does it; records an install under another registry left waiting are first adopted whole,
+    /// under the registry they were recorded with, as by that install. The rows found in the tables of a collection installed for the first time are
+    /// recorded, with their values as they stand, and later steps adopt them from the records;
+    /// what the application writes to them meanwhile is collected once every record is adopted,
+    /// as an edit made after a whole install. Recording reads every found row in this one
+    /// transaction. Where rows written before this install are still to be collected, or an
+    /// earlier install's records still wait, the found rows are instead adopted whole by the
+    /// next step. A collect or an apply made while records wait adopts the rest first, whole:
+    /// a caller that wants the lock held briefly takes steps until [`Collected::more`] is false
+    /// before it applies anything. The adoptions are the changes a whole install would send,
+    /// with the same gids and clocks, but in the outbox in the order of their batches rather than
+    /// of their collections and keys. The design is set out with the kernel's tables, in
+    /// `store.rs`.
     pub async fn install_step(
         &self,
         conn: &mut SqliteConnection,
@@ -800,6 +830,7 @@ impl Replica {
         if installed {
             match meta_get(db, "layout")? {
                 Some(Value::Int(LAYOUT)) => {}
+                Some(Value::Int(old)) if UPGRADES.contains(&old) => {}
                 other => {
                     return Err(Error::Corrupt(format!(
                         "the kernel's tables are of layout {other:?}, not {LAYOUT}; uninstall them first"
@@ -825,6 +856,16 @@ impl Replica {
         let mut cx = Ctx::begin(db)?;
         let mut set = BTreeSet::new();
         let mut adopted = Vec::new();
+        cx.collected += self.adopt_as_recorded(&mut cx)?;
+        // An install in steps records the rows it finds, unless rows written before it are still
+        // to be collected: a whole install collects those with what it finds.
+        // Nor while an earlier install's records wait: its batches are ordered among themselves.
+        let record = take.is_some()
+            && db
+                .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
+                .is_empty()
+            && !adopt::recorded(db)?;
+        let mut to_record = Vec::new();
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
             let fields = Value::Text(names.join(","));
@@ -837,6 +878,11 @@ impl Replica {
             let was_together = meta_get(db, &sets)?;
             meta_set(db, &known, fields)?;
             meta_set(db, &sets, together.clone())?;
+            if meta_get(db, &adoption)?.is_none() && record {
+                to_record.push(idx);
+                meta_set(db, &adoption, Value::Int(1))?;
+                continue;
+            }
             if meta_get(db, &adoption)?.is_none() {
                 db.exec(
                     &format!(
@@ -907,8 +953,12 @@ impl Replica {
         }
         set.extend(self.merge(&mut cx, &foreign, false)?);
         if let Some(how) = resuming {
+            // What was written while suspended is told apart from images, so every found row
+            // gets one first.
+            cx.collected += self.adopt(&mut cx, None)?;
             self.resume_in(db, how)?;
         }
+        self.record_found(db, &to_record)?;
         let more = self.step(&mut cx, &[], set, take)?;
         cx.finish()?;
         Ok(Collected {
@@ -1089,8 +1139,25 @@ impl Replica {
     /// Removes the triggers that notice local writes, so an application can change its schema or
     /// rewrite its rows without each write being collected. [`Replica::resume`] puts them back
     /// and says what the rows written meanwhile mean.
+    ///
+    /// Rows a first install in steps found and has not adopted yet are adopted first, whole,
+    /// under the registry they were recorded with, while the tables still match it: a schema
+    /// changed while suspended never meets them. Suspending in the middle of such an install
+    /// holds the write lock for the rest of its adoption, as long as a whole install of those
+    /// rows.
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
-        with_db(conn, |db| db.atomically(|db| drop_kernel(db, "trigger"))).await
+        with_db(conn, |db| {
+            db.atomically(|db| {
+                if adopt::recorded(db)? {
+                    let mut cx = Ctx::begin(db)?;
+                    cx.collected += self.adopt_as_recorded(&mut cx)?;
+                    cx.collected += self.adopt(&mut cx, None)?;
+                    cx.finish()?;
+                }
+                drop_kernel(db, "trigger")
+            })
+        })
+        .await
     }
 
     /// Puts the triggers back after [`Replica::suspend`], installing again so that collections
@@ -1235,7 +1302,8 @@ impl Replica {
     ///
     /// What the steps send, hold and show is what some placing of ordinary collects among the
     /// same writes gives: a step leaves the rows past it, and all that collecting them reads, as
-    /// they were, and an alias it finds is stamped with the time of the last row it took. It is
+    /// they were, and an alias it finds is stamped with the time of the last row it took, or with
+    /// the wall clock where that has been set back below it. It is
     /// not, in general, what collects made at those times give: a row written again after a step
     /// is sent as last written, not as it stood. In every case the tests try, once the last step
     /// is done it is also what one
@@ -1265,9 +1333,10 @@ impl Replica {
     /// rows over 100,000 rows written one at a time cost 1.12 times one collect of them, and over
     /// 5,000 rows behind 999 that wait at most 1.7 times, and each step costs at most about twice
     /// what collecting its rows at once does. Two cases cost more. Every try of a step reads the
-    /// rows that wait ahead of it again, so rows that wait among many others cost each step more:
-    /// 20,000 rows with 5,000 waiting among them cost 20 times one collect in steps of 10 and 1.8
-    /// times in steps of 1,000, and 5,000 followed by 20,000 waiting 15 times in steps of 1,000.
+    /// rows that wait ahead of it again, so rows that wait among many others cost each step more,
+    /// by how they are spread: 20,000 rows with 5,000 waiting among them cost from 2.3 to 20 times
+    /// one collect in steps of 10 and 1.8 times in steps of 1,000, and 5,000 followed by 20,000
+    /// waiting 15 times in steps of 1,000.
     /// And with foreign keys off, a row of a natural collection naming a row that is gone makes
     /// the step read every marked row of its collection, which can cost 12 times one collect.
     ///
@@ -1299,8 +1368,9 @@ impl Replica {
         .await
     }
 
-    /// How many rows are marked as written since the last collect, counting at most `at_most`.
-    /// Rows that cannot be collected yet count. A read that writes nothing.
+    /// How many rows are still to be collected, counting at most `at_most`: those marked as
+    /// written since the last collect, rows that cannot be collected yet among them, and rows a
+    /// first install in steps found and has not adopted yet. A read that writes nothing.
     pub async fn uncollected_rows(
         &self,
         conn: &mut SqliteConnection,
@@ -1316,14 +1386,17 @@ impl Replica {
             if !installed {
                 return Ok(0);
             }
+            let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
             let rows = db.query(
                 "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
-                &[Value::Int(i64::try_from(at_most).unwrap_or(i64::MAX))],
+                &[Value::Int(limit)],
             )?;
-            Ok(rows
+            let marked = rows
                 .first()
                 .and_then(|r| as_int(&r[0]).ok())
-                .map_or(0, |n| usize::try_from(n).unwrap_or(0)))
+                .map_or(0, |n| usize::try_from(n).unwrap_or(0));
+            let left = i64::try_from(at_most.saturating_sub(marked)).unwrap_or(i64::MAX);
+            Ok(marked + adopt::recorded_rows(db, left)?)
         })
         .await
     }
@@ -1960,7 +2033,15 @@ impl Replica {
                 .map_or(gid, |t| t.canonical);
             out.held.push((collection, canonical));
         }
-        for r in db.query("SELECT collection, key FROM fongo_dirty", &[])? {
+        let found = if adopt::laid(db)? {
+            " UNION SELECT collection, key FROM fongo_found WHERE batch >= 0"
+        } else {
+            ""
+        };
+        for r in db.query(
+            &format!("SELECT collection, key FROM fongo_dirty{found}"),
+            &[],
+        )? {
             out.uncollected
                 .push((as_text(&r[0])?.to_string(), as_text(&r[1])?.to_string()));
         }
@@ -2033,4 +2114,11 @@ pub(crate) fn key_fields(c: &Collection) -> &[String] {
         Key::Natural { fields } => fields,
         Key::Minted { .. } => &[],
     }
+}
+
+/// Whether any row is marked.
+fn marked_past_start(db: &Db) -> Result<bool> {
+    Ok(!db
+        .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
+        .is_empty())
 }

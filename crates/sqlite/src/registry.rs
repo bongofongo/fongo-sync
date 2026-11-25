@@ -422,6 +422,120 @@ impl Registry {
     }
 }
 
+impl Registry {
+    /// A text [`Registry::decode`] rebuilds this registry from, kept with the rows a first
+    /// install in steps records, so they are adopted under the registry they were recorded
+    /// with.
+    pub(crate) fn encode(&self) -> String {
+        let mut lines = Vec::new();
+        for c in &self.collections {
+            lines.push(match &c.key {
+                Key::Minted { column } => format!("C\t{}\t{}\tM\t{column}", c.name, c.table),
+                Key::Natural { fields } => {
+                    format!("C\t{}\t{}\tN\t{}", c.name, c.table, fields.join(","))
+                }
+            });
+            for f in &c.fields {
+                let (kind, target, owned) = match &f.kind {
+                    Kind::Plain => ("P", "", false),
+                    Kind::Ref { collection, owned } => ("R", collection.as_str(), *owned),
+                };
+                let strategy = match f.strategy {
+                    Strategy::Lww => "Lww",
+                    Strategy::Max => "Max",
+                };
+                lines.push(format!(
+                    "F\t{}\t{kind}\t{target}\t{}\t{strategy}\t{}",
+                    f.name,
+                    u8::from(owned),
+                    u8::from(f.reports_conflicts)
+                ));
+            }
+            for set in &c.identity {
+                lines.push(format!("I\t{}", set.join(",")));
+            }
+            for set in &c.together {
+                lines.push(format!("T\t{}", set.join(",")));
+            }
+            for (table, column) in &c.local_dependents {
+                lines.push(format!("D\t{table}\t{column}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The registry [`Registry::encode`] wrote, with the local defaults `current` gives its
+    /// collections: no SQL is read back from the database. Its names are checked as any
+    /// registry's are.
+    pub(crate) fn decode(text: &str, current: &Registry) -> Result<Registry> {
+        let bad = || Error::Corrupt("a recorded registry does not parse".into());
+        let list = |s: &str| -> Vec<String> {
+            s.split(',')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut collections: Vec<Collection> = Vec::new();
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts[0] == "C" {
+                let key = match (parts.get(3), parts.get(4)) {
+                    (Some(&"M"), Some(column)) => Key::Minted {
+                        column: (*column).to_string(),
+                    },
+                    (Some(&"N"), Some(fields)) => Key::Natural {
+                        fields: list(fields),
+                    },
+                    _ => return Err(bad()),
+                };
+                collections.push(Collection {
+                    name: parts.get(1).ok_or_else(bad)?.to_string(),
+                    table: parts.get(2).ok_or_else(bad)?.to_string(),
+                    key,
+                    fields: Vec::new(),
+                    identity: Vec::new(),
+                    local_dependents: Vec::new(),
+                    local_defaults: Vec::new(),
+                    together: Vec::new(),
+                });
+                continue;
+            }
+            let c = collections.last_mut().ok_or_else(bad)?;
+            match parts.as_slice() {
+                ["F", name, kind, target, owned, strategy, reports] => c.fields.push(Field {
+                    name: (*name).to_string(),
+                    kind: match *kind {
+                        "P" => Kind::Plain,
+                        "R" => Kind::Ref {
+                            collection: (*target).to_string(),
+                            owned: *owned == "1",
+                        },
+                        _ => return Err(bad()),
+                    },
+                    strategy: match *strategy {
+                        "Lww" => Strategy::Lww,
+                        "Max" => Strategy::Max,
+                        _ => return Err(bad()),
+                    },
+                    reports_conflicts: *reports == "1",
+                }),
+                ["I", set] => c.identity.push(list(set)),
+                ["T", set] => c.together.push(list(set)),
+                ["D", table, column] => c
+                    .local_dependents
+                    .push(((*table).to_string(), (*column).to_string())),
+                _ => return Err(bad()),
+            }
+        }
+        for c in &mut collections {
+            if let Some(now) = current.collections.iter().find(|n| n.name == c.name) {
+                c.local_defaults.clone_from(&now.local_defaults);
+            }
+        }
+        Registry::new(collections)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

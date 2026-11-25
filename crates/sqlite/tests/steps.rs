@@ -538,6 +538,16 @@ async fn outcome(case: &Case, step: Option<usize>) -> Outcome {
     }
 }
 
+/// The changes sent, each with its clock, as a set: a first install in steps puts its
+/// adoptions in the outbox in batch order, a whole one by collection and key.
+fn same_changes_in_any_order(changes: &[Change]) -> Vec<Change> {
+    let mut changes = changes.to_vec();
+    changes.sort_by(|a, b| {
+        (a.clock, &a.collection, a.gid, &a.field).cmp(&(b.clock, &b.collection, b.gid, &b.field))
+    });
+    changes
+}
+
 /// Fails unless `stepped` records what `whole` does, as the module documentation says.
 fn same(whole: &Outcome, stepped: &Outcome) -> Result<(), String> {
     let aliased = whole.outbox.iter().any(|c| c.field == ALIAS);
@@ -626,7 +636,7 @@ fn same(whole: &Outcome, stepped: &Outcome) -> Result<(), String> {
             differ.push(format!("inspections:\n{a:#?}\n{b:#?}"));
         }
     } else {
-        if whole.outbox != stepped.outbox {
+        if same_changes_in_any_order(&whole.outbox) != same_changes_in_any_order(&stepped.outbox) {
             let only = |a: &[Change], b: &[Change]| {
                 a.iter()
                     .filter(|c| !b.contains(c))

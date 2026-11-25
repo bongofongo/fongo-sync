@@ -266,7 +266,9 @@ pub struct SyncReport {
 /// makes it hold; a record or an acknowledgment is small. Nothing here bounds what the
 /// application does outside a sync: [`Replica::resume`], a first [`Replica::install`] over rows
 /// already in its tables, and a plain [`Replica::install`] or [`Replica::collect`] each hold the
-/// lock for everything they do.
+/// lock for everything they do. A first [`Replica::install_step`] records the rows it finds in
+/// one transaction and leaves adopting them to steps, which a sync takes as steps of collecting
+/// before its first apply; an apply adopts whatever is left first, whole.
 ///
 /// Between transactions no transaction is open; once the sync has held the lock for
 /// [`Pace::hold`] in all, it leaves it free for [`Pace::pause`] before the next, long enough for a

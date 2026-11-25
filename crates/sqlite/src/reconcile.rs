@@ -9,6 +9,7 @@ use fongo_sync_core::model::Row;
 use fongo_sync_core::plan::{self, Planned, RowAction};
 use fongo_sync_core::{ALIAS, Change, Gid, Value};
 
+use crate::collect::marked_at;
 use crate::db::{Db, as_gid, as_text, loaded, quoted, refused};
 use crate::error::Result;
 use crate::image;
@@ -640,7 +641,38 @@ impl Replica {
             return Ok(false);
         };
         let mut image = rows.slots[i].image.clone().unwrap_or_default();
-        image.extend(values.clone());
+        // Adopting, a field the application wrote since is left as it wrote it: the image takes
+        // the target, so the collect after finds the application's value as its edit.
+        let mut values = values;
+        // A row removed or made again since stands for no recorded entity: it is left to the
+        // collect of its mark.
+        let remade = cx.adopting && marked_at(db, &c.name, &key)?.is_some_and(|(_, gone)| gone);
+        if remade {
+            image.extend(values.clone());
+            values.clear();
+        } else if cx.adopting
+            && let Some(row) = tables::read_row(db, c, &key)?
+        {
+            let was = image.clone();
+            let key_field = |f: &str| matches!(&c.key, Key::Natural { fields } if fields.iter().any(|k| k == f));
+            let kept: Vec<String> = values
+                .keys()
+                .filter(|f| !key_field(f))
+                .filter(|f| {
+                    !same(
+                        row.get(*f).unwrap_or(&Value::Null),
+                        was.get(*f).unwrap_or(&Value::Null),
+                    )
+                })
+                .cloned()
+                .collect();
+            image.extend(values.clone());
+            for f in kept {
+                values.remove(&f);
+            }
+        } else {
+            image.extend(values.clone());
+        }
         let mut now = key.clone();
         if let Key::Natural { fields: key_fields } = &c.key
             && key_fields.iter().any(|f| values.contains_key(f))
@@ -666,7 +698,11 @@ impl Replica {
             sets.join(", "),
             where_key(c)
         );
-        match db.exec(&sql, &params) {
+        match if sets.is_empty() {
+            Ok(1)
+        } else {
+            db.exec(&sql, &params)
+        } {
             Ok(0) => return Ok(false),
             Ok(_) => {}
             Err(e) if refused(&e) => return Ok(false),
@@ -731,10 +767,13 @@ impl Replica {
             }
         }
         let sql = format!("DELETE FROM {} WHERE {}", quoted(&c.table), where_key(c));
-        match db.exec(&sql, &[tables::key_param(c, &key)?]) {
-            Ok(_) => {}
-            Err(e) if refused(&e) => return Ok(false),
-            Err(e) => return Err(e),
+        let remade = cx.adopting && marked_at(db, &c.name, &key)?.is_some_and(|(_, gone)| gone);
+        if !remade {
+            match db.exec(&sql, &[tables::key_param(c, &key)?]) {
+                Ok(_) => {}
+                Err(e) if refused(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            }
         }
         let at = [Value::Text(c.name.clone()), Value::Text(key.clone())];
         db.exec(
