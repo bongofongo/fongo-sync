@@ -29,6 +29,8 @@ struct Case {
     writes: Vec<(i8, u64, u64, u64)>,
     /// After which write a remote replica's changes arrive, if at all.
     remote: Option<usize>,
+    /// After which write both sides collect whole, if at all.
+    collect: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -63,9 +65,18 @@ async fn remote(world: &World) -> Vec<Change> {
     let mut c = database(world, 9).await;
     replica.install(&mut c).await.unwrap();
     for sql in [
-        "INSERT INTO books (id, title, isbn_13) VALUES (1, 'theirs', '9781'), (2, 'other', '555')",
-        "INSERT INTO highlights (book_id, text, hash) VALUES (1, 'their passage', 'h1')",
-        "INSERT INTO book_tags (book_id, tag, source) VALUES (2, 'read', 'shelf')",
+        "INSERT INTO books (id, title, isbn_13, isbn_10) VALUES
+            (1, 'theirs', '9781', 'T1'), (2, 'other', '555', NULL), (3, 'third', '9783', NULL)",
+        "INSERT INTO highlights (id, book_id, text, hash) VALUES
+            (1, 1, 'their passage', 'h1'), (2, 3, 'p3', 'h3'), (3, 2, 'p', 'zz')",
+        "INSERT INTO readings (id, book_id, status, finished_at, card_id, last_modified)
+            VALUES (1, 3, 'done', 5, 2, 99)",
+        "INSERT INTO notes (id, book_id, highlight_id, path, title) VALUES
+            (1, 1, 1, 'notes/1.md', 'theirs'), (2, 2, 3, 'notes/remote.md', 'r')",
+        "INSERT INTO note_bodies (note_id, body) VALUES (1, 'their body')",
+        "INSERT INTO book_tags (book_id, tag, source) VALUES (2, 'read', 'shelf'), (1, 'read', 'shelf')",
+        "INSERT INTO cards (book_id, highlight_id, word, exported) VALUES (1, 1, 'word3', 4)",
+        "INSERT INTO scales (name, top) VALUES ('stars', 7)",
     ] {
         library::run(&mut c, sql).await;
     }
@@ -138,6 +149,10 @@ async fn both(case: &Case) -> (Outcome, Outcome, usize) {
             replica.apply(&mut a, &changes).await.unwrap();
             replica.apply(&mut b, &changes).await.unwrap();
         }
+        if case.collect == Some(i) {
+            replica.collect(&mut a).await.unwrap();
+            replica.collect(&mut b).await.unwrap();
+        }
         // Steps adopt between the writes; collecting what they wrote is left to the end.
         if more && found_left(&mut a).await > 0 {
             more = replica.collect_step(&mut a, case.step).await.unwrap().more;
@@ -197,7 +212,13 @@ fn check(case: &Case) -> Result<(), String> {
         ));
     }
     if stepped.elsewhere != whole.elsewhere {
-        differ.push("rows elsewhere".into());
+        let tables: Vec<String> = library::TABLES
+            .iter()
+            .zip(stepped.elsewhere.iter().zip(&whole.elsewhere))
+            .filter(|(_, (a, b))| a != b)
+            .map(|(t, (a, b))| format!("{t}:\n{a:?}\n{b:?}"))
+            .collect();
+        differ.push(format!("rows elsewhere: {}", tables.join("\n")));
     }
     if differ.is_empty() {
         Ok(())
@@ -237,8 +258,9 @@ proptest! {
             0..30,
         ),
         remote in proptest::option::of(0usize..30),
+        collect in proptest::option::of(0usize..30),
     ) {
-        let case = Case { seed, books, step, writes, remote };
+        let case = Case { seed, books, step, writes, remote, collect };
         if let Err(error) = check(&case) {
             prop_assert!(false, "{}", error);
         }
@@ -714,7 +736,7 @@ fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
         let first = fongo_sync_sqlite::Registry::new(
             all.collections()
                 .iter()
-                .filter(|c| c.name != "scales")
+                .filter(|c| c.name != "scales" && c.name != "reviews")
                 .cloned()
                 .collect(),
         )
