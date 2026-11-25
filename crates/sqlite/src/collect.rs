@@ -42,12 +42,8 @@ pub(crate) enum Edits {
     /// The edits are recorded and merged; what they affect, and how many marked rows were
     /// collected.
     Recorded(BTreeSet<(String, Gid)>, usize),
-    /// A row of the prefix depends on a marked row past it, the latest at this place. Nothing was
-    /// written.
+    /// A row of the prefix depends on a marked row past it, the latest at this place.
     Beyond(Place),
-    /// The prefix would collect this many rows, fewer than asked for, while more are marked.
-    /// Nothing was written.
-    Short(usize),
 }
 
 /// Answers to what local ids name, and the latest marked row past the prefix one of them read.
@@ -74,42 +70,6 @@ pub(crate) fn marked_at(db: &Db, collection: &str, key: &str) -> Result<Option<(
     rows.first()
         .map(|r| Ok((as_int(&r[0])?, as_int(&r[1])? > 0)))
         .transpose()
-}
-
-/// The place of the marked row `skip` rows after `after` in collecting order (after the start
-/// when `after` is `None`), and whether any row follows it.
-pub(crate) fn place_after(
-    db: &Db,
-    after: Option<&Place>,
-    skip: usize,
-) -> Result<Option<(Place, bool)>> {
-    let skip = Value::Int(i64::try_from(skip).unwrap_or(i64::MAX));
-    let rows = match after {
-        None => db.query(
-            "SELECT at, collection, key FROM fongo_dirty
-              ORDER BY at, collection, key LIMIT 2 OFFSET ?1",
-            &[skip],
-        )?,
-        Some((at, collection, key)) => db.query(
-            "SELECT at, collection, key FROM fongo_dirty WHERE (at, collection, key) > (?1, ?2, ?3)
-              ORDER BY at, collection, key LIMIT 2 OFFSET ?4",
-            &[
-                Value::Int(*at),
-                Value::Text(collection.clone()),
-                Value::Text(key.clone()),
-                skip,
-            ],
-        )?,
-    };
-    let Some(r) = rows.first() else {
-        return Ok(None);
-    };
-    let place = (
-        as_int(&r[0])?,
-        as_text(&r[1])?.to_string(),
-        as_text(&r[2])?.to_string(),
-    );
-    Ok(Some((place, rows.len() > 1)))
 }
 
 /// How many rows are marked up to `place`, or in all with `None`.
@@ -229,13 +189,11 @@ enum Named {
 
 impl Replica {
     /// Records every edit the application made since the last collect, or with `through` those
-    /// of the rows marked up to that place, and merges the changes. With `want`, a prefix that
-    /// would collect fewer than that many rows, while more are marked, is reported short.
+    /// of the rows marked up to that place, and merges the changes.
     pub(crate) fn collect_edits(
         &self,
         cx: &mut Ctx,
         through: Option<&Place>,
-        want: Option<usize>,
         minted: &mut Minted,
     ) -> Result<Edits> {
         let db = cx.db;
@@ -455,12 +413,6 @@ impl Replica {
         if let Some(place) = names.beyond.take() {
             return Ok(Edits::Beyond(place));
         }
-        if let (Some(want), Some(place)) = (want, through) {
-            let rows = items.iter().filter(|i| !i.waits && !i.found).count();
-            if rows < want.div_ceil(2) && marked_past(db, place)? {
-                return Ok(Edits::Short(rows));
-            }
-        }
 
         // Record, in the order the application wrote.
         let mut order: Vec<usize> = (0..items.len()).collect();
@@ -636,6 +588,118 @@ impl Replica {
         set.extend(touched);
         self.remember_bases(cx)?;
         Ok(Edits::Recorded(set, collected))
+    }
+
+    /// How far a prefix of the marked rows that takes at least the first `rows` of them, and
+    /// reaches `to` if given, must reach so that collecting it reads no marked row past it: the
+    /// rows `collect_edits` would find it needs, found without collecting anything. Each marked
+    /// row is looked at once. `None` when that is every row.
+    pub(crate) fn closed(&self, db: &Db, to: Option<Place>, rows: usize) -> Result<Option<Place>> {
+        let mut to = to;
+        let mut taken = 0usize;
+        let mut after: Option<Place> = None;
+        // Read in order, in chunks that double, so a prefix that grows far is read in few scans.
+        let mut chunk = 256i64;
+        loop {
+            let marked = match &after {
+                None => db.query(
+                    "SELECT collection, key, at, gone FROM fongo_dirty
+                      ORDER BY at, collection, key LIMIT ?1",
+                    &[Value::Int(chunk)],
+                )?,
+                Some(after) => db.query(
+                    "SELECT collection, key, at, gone FROM fongo_dirty
+                      WHERE (at, collection, key) > (?1, ?2, ?3)
+                      ORDER BY at, collection, key LIMIT ?4",
+                    &[
+                        Value::Int(after.0),
+                        Value::Text(after.1.clone()),
+                        Value::Text(after.2.clone()),
+                        Value::Int(chunk),
+                    ],
+                )?,
+            };
+            if marked.is_empty() {
+                return Ok(None);
+            }
+            chunk = chunk.saturating_mul(2);
+            for r in marked {
+                let name = as_text(&r[0])?.to_string();
+                let key = as_text(&r[1])?.to_string();
+                let (at, gone) = (as_int(&r[2])?, as_int(&r[3])? > 0);
+                let place = (at, name.clone(), key.clone());
+                taken += 1;
+                if taken <= rows && to.as_ref().is_none_or(|to| *to < place) {
+                    to = Some(place.clone());
+                }
+                let Some(edge) = to.clone() else {
+                    continue;
+                };
+                if place > edge {
+                    return Ok(Some(edge));
+                }
+                let mut to_now = edge;
+                after = Some(place);
+                'row: {
+                    let Some(idx) = self.registry.index(&name) else {
+                        break 'row;
+                    };
+                    let c = self.collection(idx);
+                    let Some(row) = read_row(db, c, &key)? else {
+                        break 'row;
+                    };
+                    self.named_past(db, idx, &row, &mut to_now)?;
+                    let remade = gone
+                        && matches!(c.key, Key::Minted { .. })
+                        && mapping(db, &c.name, &key)?.is_some_and(|m| !m.doomed);
+                    let Some(local) = local_of(&key).filter(|_| remade) else {
+                        break 'row;
+                    };
+                    for (referrer, field) in self.referring(idx) {
+                        let rc = self.collection(referrer);
+                        for k in tables::rows_naming(db, rc, &field, local)? {
+                            match marked_at(db, &rc.name, &k)? {
+                                Some((when, _)) => to_now = to_now.max((when, rc.name.clone(), k)),
+                                None => {
+                                    if let Some(found) = read_row(db, rc, &k)? {
+                                        self.named_past(db, referrer, &found, &mut to_now)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                to = Some(to_now);
+            }
+        }
+    }
+
+    /// Raises `to` to each marked row past it that `row`, of collection `idx`, names and that
+    /// collecting could give another entity: one new, made again, or removed.
+    fn named_past(&self, db: &Db, idx: usize, row: &Row, to: &mut Place) -> Result<()> {
+        let c = self.collection(idx);
+        for f in &c.fields {
+            let (Some(t), Some(Value::Int(local))) = (self.target_of(c, &f.name), row.get(&f.name))
+            else {
+                continue;
+            };
+            let tc = self.collection(t);
+            let key = minted_key(*local);
+            let Some((at, gone)) = marked_at(db, &tc.name, &key)? else {
+                continue;
+            };
+            let place = (at, tc.name.clone(), key);
+            if place <= *to {
+                continue;
+            }
+            if gone
+                || mapping(db, &tc.name, &place.2)?.is_none()
+                || read_row(db, tc, &place.2)?.is_none()
+            {
+                *to = place;
+            }
+        }
+        Ok(())
     }
 
     fn item(

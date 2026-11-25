@@ -188,7 +188,6 @@ impl Replica {
                         continue;
                     }
                 };
-                cx.reached(c, t.members.iter().copied().chain([t.canonical]));
                 if blocked.contains(&(c.clone(), t.canonical)) {
                     held.insert((c.clone(), t.canonical));
                     continue;

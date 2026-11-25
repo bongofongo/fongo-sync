@@ -1372,3 +1372,312 @@ fn a_row_a_later_step_would_find_is_not_written_first() {
     })
     .unwrap();
 }
+
+/// SQLite's work on a connection, in units of 64 virtual machine instructions.
+async fn count_work(conn: &mut SqliteConnection) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let work = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = work.clone();
+    let mut handle = support::lock(conn).await;
+    handle.set_progress_handler(64, move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    });
+    work
+}
+
+/// Rows that each depend on one written after them: books, each naming its author, and authors,
+/// each naming the next book as a favourite, written in turn (`books`), highlights, each naming
+/// the next (`highlights`), or books that all name one new author written again after them
+/// (`fan`): no closed prefix is shorter than all of them. Or rows a step finds it needs only once
+/// it merges: every other book removed with its notes and tags (`owners`), or new series each
+/// found to be one with a series edited after the next new one is made (`found`).
+async fn chained(world: &World, shape: &str, n: usize) -> (SqliteConnection, Replica) {
+    let mut a = world.connect(0).await;
+    for sql in SCHEMA {
+        sqlx::query(sql).execute(&mut a).await.unwrap();
+    }
+    sqlx::query(
+        "CREATE TABLE highlights (id INTEGER PRIMARY KEY, body TEXT,
+            next INTEGER REFERENCES highlights(id) ON DELETE SET NULL)",
+    )
+    .execute(&mut a)
+    .await
+    .unwrap();
+    let mut collections: Vec<Collection> = registry(false).collections().to_vec();
+    collections.push(
+        Collection::minted("highlights", "highlights", "id")
+            .field("body")
+            .reference("next", "highlights"),
+    );
+    let replica = Replica::new(Registry::new(collections).unwrap());
+    replica.install(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["INSERT INTO shelves (id, name) VALUES (1, 's1')".into()],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    let seq =
+        format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n})");
+    if shape == "books" {
+        run(
+            &mut a,
+            &[
+                format!("{seq} INSERT INTO authors (id, name) SELECT i, 'a' || i FROM n"),
+                format!("{seq} INSERT INTO books (id, shelf_id, title, seen) SELECT i, 1, 't' || i, 0 FROM n"),
+            ],
+        )
+        .await;
+        for i in 1..=n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!("UPDATE books SET author_id = {i} WHERE id = {i}")],
+            )
+            .await;
+            if i < n {
+                world.later(1);
+                run(
+                    &mut a,
+                    &[format!(
+                        "UPDATE authors SET favourite = {} WHERE id = {i}",
+                        i + 1
+                    )],
+                )
+                .await;
+            }
+        }
+    } else if shape == "fan" {
+        run(
+            &mut a,
+            &[
+                "INSERT INTO authors (id, name) VALUES (1, 'a')".into(),
+                format!("{seq} INSERT INTO books (id, shelf_id, title, seen) SELECT i, 1, 't' || i, 0 FROM n"),
+            ],
+        )
+        .await;
+        for i in 1..=n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!("UPDATE books SET author_id = 1 WHERE id = {i}")],
+            )
+            .await;
+        }
+        world.later(1);
+        run(
+            &mut a,
+            &["UPDATE authors SET name = 'b' WHERE id = 1".into()],
+        )
+        .await;
+    } else if shape == "found" {
+        run(
+            &mut a,
+            &[format!(
+                "{seq} INSERT INTO series (id, code, name) SELECT i, 'c' || i, 's' || i FROM n"
+            )],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        for i in 1..=n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!(
+                    "INSERT INTO series (id, code, name) VALUES ({}, 'c{i}', 'again')",
+                    n + i
+                )],
+            )
+            .await;
+            if i > 1 {
+                world.later(1);
+                run(
+                    &mut a,
+                    &[format!(
+                        "UPDATE series SET name = 'edited' WHERE id = {}",
+                        i - 1
+                    )],
+                )
+                .await;
+            }
+        }
+        world.later(1);
+        run(
+            &mut a,
+            &[format!("UPDATE series SET name = 'edited' WHERE id = {n}")],
+        )
+        .await;
+    } else if shape == "owners" {
+        run(
+            &mut a,
+            &[
+                format!("{seq} INSERT INTO books (id, shelf_id, title, seen) SELECT i, 1, 't' || i, 0 FROM n"),
+                "INSERT INTO notes (book_id, body) SELECT id, 'n' FROM books".into(),
+                "INSERT INTO tags (book_id, tag) SELECT id, 'x' FROM books".into(),
+            ],
+        )
+        .await;
+        replica.collect(&mut a).await.unwrap();
+        world.later(1);
+        run(&mut a, &["DELETE FROM books WHERE id % 2 = 0".into()]).await;
+    } else {
+        run(
+            &mut a,
+            &[format!(
+                "{seq} INSERT INTO highlights (id, body) SELECT i, 'h' || i FROM n"
+            )],
+        )
+        .await;
+        for i in 1..n {
+            world.later(1);
+            run(
+                &mut a,
+                &[format!(
+                    "UPDATE highlights SET next = {} WHERE id = {i}",
+                    i + 1
+                )],
+            )
+            .await;
+        }
+    }
+    (a, replica)
+}
+
+/// A step never gives up more rows than it then takes, at any step size, so it costs at most
+/// about twice what collecting its rows at once costs; a chain is found before anything is tried
+/// and taken in one step, as large as it must be. In SQLite's work, steps of ten rows or more of
+/// a backlog cost at most twice one collect of it.
+#[tokio::test]
+async fn steps_cost_at_most_about_twice_one_collect() {
+    for shape in ["books", "highlights", "fan", "owners", "found"] {
+        let n = 600;
+        let whole = {
+            let world = World::new(3);
+            let (mut a, replica) = chained(&world, shape, n).await;
+            let work = count_work(&mut a).await;
+            replica.collect(&mut a).await.unwrap();
+            work.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for rows in [1, 10, 100, 1_000] {
+            let world = World::new(3);
+            let (mut a, replica) = chained(&world, shape, n).await;
+            let marked = replica.uncollected_rows(&mut a, usize::MAX).await.unwrap();
+            let work = count_work(&mut a).await;
+            let (mut taken, mut tried) = (0, 0);
+            loop {
+                let step = replica.collect_step(&mut a, rows).await.unwrap();
+                assert!(
+                    step.abandoned == 0 || step.abandoned < step.rows,
+                    "{shape}, steps of {rows}: gave up {} rows to take {}",
+                    step.abandoned,
+                    step.rows
+                );
+                taken += step.rows;
+                tried += step.abandoned;
+                if !step.more {
+                    break;
+                }
+            }
+            let work = work.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "{shape}, steps of {rows}: {taken} rows, {tried} given up, work {work} against {whole}"
+            );
+            assert_eq!(taken, marked, "{shape}, steps of {rows}");
+            if !["owners", "found"].contains(&shape) {
+                assert_eq!(tried, 0, "{shape}, steps of {rows}: a chain was tried");
+            }
+            assert!(
+                tried <= marked,
+                "{shape}, steps of {rows}: {tried} rows given up"
+            );
+            // A step is a transaction, with what any collect costs besides its rows: steps of a
+            // row or two cost that many times over.
+            if rows >= 10 {
+                assert!(
+                    work <= 2 * whole,
+                    "{shape}, steps of {rows}: work {work} against {whole} at once"
+                );
+            }
+        }
+    }
+}
+
+/// Removed owners, whose rows a step finds it needs only once it merges, in backlogs small enough
+/// that its tries grow until it takes every row: the tries it gave up still took fewer rows than
+/// it takes in the end.
+#[tokio::test]
+async fn a_step_that_grows_to_every_row_gave_up_fewer_than_it_takes() {
+    for n in [16, 20, 28, 32] {
+        for rows in 1..12 {
+            let world = World::new(3);
+            let (mut a, replica) = chained(&world, "owners", n).await;
+            loop {
+                let step = replica.collect_step(&mut a, rows).await.unwrap();
+                assert!(
+                    step.abandoned == 0 || step.abandoned < step.rows,
+                    "{n} books, steps of {rows}: gave up {} rows to take {}",
+                    step.abandoned,
+                    step.rows
+                );
+                if !step.more {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A book naming an author the kernel has not given an entity waits, and is first of the rows to
+/// collect: a step whose rows all wait takes more, so steps of one go on past it to the rest.
+#[tokio::test]
+async fn steps_go_on_past_a_row_that_waits() {
+    let world = World::new(3);
+    let mut a = world.connect(0).await;
+    for sql in SCHEMA {
+        sqlx::query(sql).execute(&mut a).await.unwrap();
+    }
+    let replica = Replica::new(registry(false));
+    replica.install(&mut a).await.unwrap();
+    run(
+        &mut a,
+        &["INSERT INTO shelves (id, name) VALUES (1, 's1')".into()],
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    // As the kernel's own writes are, so the author is neither marked nor mapped.
+    run(
+        &mut a,
+        &[
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 1)".into(),
+            "INSERT INTO authors (id, name) VALUES (1, 'unknown')".into(),
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 0)".into(),
+        ],
+    )
+    .await;
+    world.later(1);
+    run(
+        &mut a,
+        &[
+            "INSERT INTO books (id, shelf_id, title, author_id, seen) VALUES (1, 1, 't1', 1, 0)"
+                .into(),
+        ],
+    )
+    .await;
+    for i in 2..=5 {
+        world.later(1);
+        run(
+            &mut a,
+            &[format!(
+                "INSERT INTO books (id, shelf_id, title, seen) VALUES ({i}, 1, 't{i}', 0)"
+            )],
+        )
+        .await;
+    }
+    let mut steps = 0;
+    while replica.collect_step(&mut a, 1).await.unwrap().more {
+        steps += 1;
+        assert!(steps < 20, "steps of one never got past the row that waits");
+    }
+    let left = replica.inspect(&mut a).await.unwrap().uncollected;
+    assert_eq!(left, [("books".to_string(), "[1]".to_string())]);
+}

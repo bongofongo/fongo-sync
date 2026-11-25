@@ -55,6 +55,12 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE covers (
         book_id INTEGER NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
         path TEXT)",
+    // An identity no index enforces, so one replica can find two of its own rows to be one.
+    "CREATE TABLE series (id INTEGER PRIMARY KEY, code TEXT, name TEXT)",
+    "CREATE TABLE volumes (
+        id INTEGER PRIMARY KEY,
+        series_id INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        title TEXT)",
 ];
 
 /// The registry before and after an upgrade that adds a field.
@@ -98,6 +104,13 @@ fn registry(upgraded: bool) -> Registry {
         Collection::natural("settings", "settings", &["key"])
             .field("key")
             .field("value"),
+        Collection::minted("series", "series", "id")
+            .field("code")
+            .field("name")
+            .identity(&["code"]),
+        Collection::minted("volumes", "volumes", "id")
+            .owner("series_id", "series")
+            .field("title"),
     ])
     .unwrap()
 }
@@ -133,7 +146,15 @@ struct Peer {
 
 impl Peer {
     /// A replica whose tables hold `rows` before the kernel is installed.
-    async fn new(world: &World, n: u64, schema: &[&str], rows: &[&str], seed: u64) -> Peer {
+    /// `step` is the rows each step collects, `None` to collect whole; left out, the world picks.
+    async fn new(
+        world: &World,
+        n: u64,
+        schema: &[&str],
+        rows: &[&str],
+        seed: u64,
+        step: Option<Option<usize>>,
+    ) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
@@ -141,12 +162,12 @@ impl Peer {
         let mut peer = Peer {
             conn,
             replica: Replica::new(registry(false)),
-            step: match std::env::var("PROPERTY_STEP").as_deref() {
+            step: step.unwrap_or(match std::env::var("PROPERTY_STEP").as_deref() {
                 Ok("whole") => None,
                 Ok(rows) => rows.parse().ok(),
                 Err(_) => [None, Some(1), Some(2), Some(3), Some(COLLECT_ROWS)]
                     [(mix(seed, n as usize) % 5) as usize],
-            },
+            }),
             seed: mix(seed, 1_000 + n as usize),
             steps: 0,
             world: world.clone(),
@@ -177,12 +198,13 @@ impl Peer {
                 .await;
             return Ok(());
         };
-        let mut more = self
+        let first = self
             .replica
             .install_step(&mut self.conn, rows)
             .await
-            .unwrap()
-            .more;
+            .unwrap();
+        self.writes.touched(&first.touched);
+        let mut more = first.more;
         if more {
             self.writes
                 .installed_step(&mut self.conn, &self.replica, waiting)
@@ -195,12 +217,13 @@ impl Peer {
         while more {
             self.between().await;
             self.before_step().await;
-            more = self
+            let collected = self
                 .replica
                 .collect_step(&mut self.conn, rows)
                 .await
-                .unwrap()
-                .more;
+                .unwrap();
+            self.writes.touched(&collected.touched);
+            more = collected.more;
             if more {
                 self.writes.after_step(&mut self.conn, &self.replica).await;
             } else {
@@ -383,6 +406,7 @@ impl Peer {
                     .collect_step(&mut self.conn, rows)
                     .await
                     .unwrap();
+                self.writes.touched(&collected.touched);
                 if collected.more {
                     self.writes.after_step(&mut self.conn, &self.replica).await;
                 } else {
@@ -488,7 +512,8 @@ struct Left {
 async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left {
     let mut rows = Vec::new();
     for table in [
-        "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers",
+        "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers", "series",
+        "volumes",
     ] {
         let sql = format!("SELECT * FROM {table} ORDER BY rowid");
         for row in support::rows(conn, &sql, &[]).await {
@@ -581,6 +606,9 @@ enum Op {
     SetSetting(u8, u8),
     DeleteSetting(u8),
     AddCover(usize),
+    AddSeries(u8, u8),
+    SetSeriesCode(usize, u8),
+    AddVolume(usize, u8),
     /// A write with the triggers suspended, sent on resuming.
     Suspended(usize, u8),
     Upgrade,
@@ -624,6 +652,9 @@ fn arb_op() -> impl Strategy<Value = Op> {
         2 => (0u8..2, v.clone()).prop_map(|(a, b)| Op::SetSetting(a, b)),
         1 => (0u8..2).prop_map(Op::DeleteSetting),
         2 => n.clone().prop_map(Op::AddCover),
+        3 => (0u8..2, v.clone()).prop_map(|(a, b)| Op::AddSeries(a, b)),
+        2 => (n.clone(), 0u8..2).prop_map(|(a, b)| Op::SetSeriesCode(a, b)),
+        2 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddVolume(a, b)),
         1 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::Suspended(a, b)),
         1 => Just(Op::Upgrade),
         4 => Just(Op::Sync),
@@ -865,6 +896,17 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
             Some(b) => format!("INSERT OR IGNORE INTO covers (book_id, path) VALUES ({b}, 'c')"),
             None => return Ok(()),
         },
+        Op::AddSeries(c, v) => {
+            format!("INSERT INTO series (code, name) VALUES ('c{c}', 'name{v}')")
+        }
+        Op::SetSeriesCode(n, c) => match peer.pick("series", n).await {
+            Some(id) => format!("UPDATE series SET code = 'c{c}' WHERE id = {id}"),
+            None => return Ok(()),
+        },
+        Op::AddVolume(n, v) => match peer.pick("series", n).await {
+            Some(id) => format!("INSERT INTO volumes (series_id, title) VALUES ({id}, 'v{v}')"),
+            None => return Ok(()),
+        },
     };
     peer.run(&sql).await;
     Ok(())
@@ -1009,15 +1051,21 @@ fn found_at_install(n: u64) -> &'static [&'static str] {
 /// Runs a script on five peers of a world made from `seed`. The same seed and script always do
 /// the same thing.
 fn run(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, false, seed, script)
+    run_on(SCHEMA, false, seed, script, None)
 }
 
 /// [`run`] on replicas that hold [`found_at_install`] before they install.
 fn run_found(seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
-    run_on(SCHEMA, true, seed, script)
+    run_on(SCHEMA, true, seed, script, None)
 }
 
-fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Result<(), String> {
+fn run_on(
+    schema: &[&str],
+    found: bool,
+    seed: u64,
+    script: &[(usize, Op)],
+    step: Option<Option<usize>>,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -1027,7 +1075,7 @@ fn run_on(schema: &[&str], found: bool, seed: u64, script: &[(usize, Op)]) -> Re
         let mut peers = Vec::new();
         for n in 0..5 {
             let rows = if found { found_at_install(n) } else { &[] };
-            peers.push(Peer::new(&world, n, schema, rows, seed).await);
+            peers.push(Peer::new(&world, n, schema, rows, seed, step).await);
         }
         for (step, (who, op)) in script.iter().cloned().enumerate() {
             perform(&mut peers[who], op, &mut hub)
@@ -1193,7 +1241,7 @@ fn a_shelf_renamed_onto_one_its_book_moved_to() {
         (4, MoveBookDeleteShelf(0, 0)),
         (1, RenameShelf(0, 2)),
     ];
-    run_on(&schema, false, 0, &script).unwrap();
+    run_on(&schema, false, 0, &script, None).unwrap();
 }
 
 /// A title written while suspended is sent on resuming, so writing it back afterwards is an edit
@@ -1780,4 +1828,241 @@ fn a_reference_written_between_steps_and_back_sends_nothing() {
         (3, AddBook(1, 0, 1)),
     ];
     run_found(9882191972837468972, &script).unwrap();
+}
+
+/// The case behind the next test, by itself: a replica makes two series with one code, and an
+/// upgrade's install or a collect finds them to be one and removes a row; another replica's series
+/// then arrives, before or after the next collect, and may take the removed row's key. Both
+/// replicas end with one series of each code, holding what was written.
+#[tokio::test]
+async fn two_series_made_with_one_code_reach_another_replica_as_one() {
+    for upgrade in [true, false] {
+        for deliver_first in [true, false] {
+            let world = World::new(1);
+            let mut a = world.connect(2).await;
+            let mut c = world.connect(0).await;
+            for sql in SCHEMA {
+                sqlx::query(sql).execute(&mut a).await.unwrap();
+                sqlx::query(sql).execute(&mut c).await.unwrap();
+            }
+            let (before, after) = (Replica::new(registry(false)), Replica::new(registry(true)));
+            before.install(&mut a).await.unwrap();
+            before.install(&mut c).await.unwrap();
+            for _ in 0..2 {
+                world.later(10);
+                sqlx::query("INSERT INTO series (code, name) VALUES ('c1', 'name1')")
+                    .execute(&mut a)
+                    .await
+                    .unwrap();
+            }
+            world.later(10);
+            let on_a = if upgrade {
+                after.install(&mut a).await.unwrap();
+                &after
+            } else {
+                before.collect(&mut a).await.unwrap();
+                &before
+            };
+            world.later(10);
+            sqlx::query("INSERT INTO series (code, name) VALUES ('c0', 'name1')")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            before.collect(&mut c).await.unwrap();
+            let from_c = before.outbox(&mut c, u32::MAX).await.unwrap().changes;
+            if deliver_first {
+                on_a.apply(&mut a, &from_c).await.unwrap();
+            }
+            on_a.collect(&mut a).await.unwrap();
+            let from_a = on_a.outbox(&mut a, u32::MAX).await.unwrap().changes;
+            if !deliver_first {
+                on_a.apply(&mut a, &from_c).await.unwrap();
+            }
+            before.apply(&mut c, &from_a).await.unwrap();
+            for conn in [&mut a, &mut c] {
+                let held =
+                    support::rows(conn, "SELECT code, name FROM series ORDER BY code", &[]).await;
+                assert_eq!(
+                    format!("{held:?}"),
+                    r#"[[Text("c0"), Text("name1")], [Text("c1"), Text("name1")]]"#,
+                    "upgrade {upgrade}, delivered first {deliver_first}"
+                );
+            }
+        }
+    }
+}
+
+/// Found by a long run once series, an identity no index enforces, joined the test. An upgrade
+/// install collects two series a replica made with one code and merges them, removing one row;
+/// a delivery then gives that row's key to another series. What the install sent carries the
+/// application's writes; this checks the test's own account of them, with the replicas
+/// collecting in the steps the world picks and with every replica collecting whole.
+#[test]
+fn series_found_to_be_one_on_one_replica_keep_its_writes() {
+    use Op::*;
+    let script = vec![
+        (2, AddShelf(2)),
+        (4, AddBook(3, 1, 1)),
+        (3, Log(3, true)),
+        (4, SetSeriesCode(5, 0)),
+        (3, AddShelf(1)),
+        (1, AddCover(4)),
+        (1, SetIsbn(1, 3)),
+        (4, SetTitle(4, 2)),
+        (4, SetIsbn(4, 0)),
+        (4, Log(3, true)),
+        (0, DeleteShelf(4)),
+        (0, AddNote(5, 2)),
+        (1, AddBook(1, 2, 2)),
+        (1, AddCover(3)),
+        (0, SetFavourite(4, 5)),
+        (2, AddSeries(1, 1)),
+        (4, Deliver(12070878064311819280, false, true)),
+        (2, AddMark(1, 2)),
+        (2, AddTag(1, 0)),
+        (3, SetNote(1, 0)),
+        (2, AddSeries(1, 1)),
+        (3, SetTagNote(4, 2)),
+        (4, AddTag(1, 0)),
+        (4, AddBook(1, 0, 1)),
+        (1, RenameShelf(1, 2)),
+        (4, SetSeriesCode(1, 1)),
+        (4, AddBook(5, 0, 3)),
+        (0, Deliver(18220861876318342081, true, false)),
+        (3, Upgrade),
+        (1, AddAuthor(1)),
+        (0, Upgrade),
+        (2, Upgrade),
+        (1, Sync),
+        (4, AddBook(4, 0, 3)),
+        (3, AddCover(0)),
+        (2, Deliver(14353264754466172533, false, false)),
+        (4, Upgrade),
+        (0, SetAuthor(0, 5)),
+        (3, AddShelf(1)),
+        (4, AddNote(2, 2)),
+        (0, AddSeries(0, 1)),
+        (2, SetIsbn(3, 0)),
+        (1, AddCover(3)),
+        (2, Deliver(14648138576390885823, false, false)),
+        (3, Push),
+        (4, AddMark(5, 0)),
+        (3, DeleteShelf(3)),
+        (3, SetNote(0, 2)),
+        (2, SetStatus(5, 3)),
+        (1, SetStatus(5, 2)),
+        (3, DeleteNote(0)),
+        (0, AddBook(4, 1, 1)),
+        (4, RenameShelf(3, 2)),
+        (1, AddBook(2, 1, 3)),
+        (4, MoveBookDeleteShelf(1, 3)),
+        (3, Sync),
+        (0, Suspended(3, 2)),
+        (0, DeleteTag(3)),
+        (1, AddCover(1)),
+        (2, AddTag(2, 0)),
+        (2, Log(4, true)),
+        (1, AddBook(0, 0, 2)),
+        (2, AddShelf(1)),
+        (2, AddBook(0, 1, 1)),
+        (0, AddNote(4, 1)),
+        (2, AddBook(2, 1, 3)),
+        (4, SetFavourite(0, 3)),
+        (4, AddTag(2, 0)),
+        (2, AddMark(2, 1)),
+        (1, AddSeries(1, 2)),
+        (4, MoveMarkDeleteBook(2, 4)),
+        (2, Log(0, true)),
+        (3, Deliver(17844019385685927557, true, true)),
+        (0, Push),
+        (3, Deliver(9135296489156821608, false, false)),
+        (1, DeleteAuthor(0)),
+        (2, Deliver(14972710878109861610, false, true)),
+        (3, SetExtra(0, 1)),
+        (0, AddMark(1, 1)),
+        (3, SetIsbn(5, 1)),
+        (2, AddMark(1, 1)),
+        (1, Sync),
+        (0, AddSeries(1, 1)),
+        (1, AddShelf(1)),
+        (3, AddVolume(2, 2)),
+        (1, DeleteMark(4)),
+        (0, AddAuthor(1)),
+        (2, MoveMarkDeleteBook(1, 2)),
+        (3, MoveBookDeleteShelf(2, 0)),
+        (1, SetTitle(3, 1)),
+        (0, SetExtra(5, 0)),
+        (0, AddNote(1, 0)),
+        (1, SetAuthor(3, 5)),
+        (4, AddCover(1)),
+        (0, AddSeries(0, 2)),
+        (4, AddShelf(1)),
+        (2, RenameShelf(4, 0)),
+        (4, AddSeries(0, 2)),
+        (1, Log(2, false)),
+        (2, MoveNoteDeleteShelf(2, 2)),
+        (4, SetSetting(0, 2)),
+        (4, AddNote(4, 1)),
+        (2, DeleteAuthor(3)),
+        (4, AddBook(4, 1, 1)),
+        (1, RenameShelf(4, 2)),
+        (1, AddMark(1, 2)),
+        (2, AddCover(1)),
+        (0, AddSeries(0, 1)),
+        (3, AddMark(1, 2)),
+        (1, AddTag(1, 1)),
+        (4, AddTag(0, 1)),
+        (0, Log(4, true)),
+        (1, AddSeries(1, 1)),
+        (2, AddBook(3, 0, 0)),
+        (3, SetNote(3, 0)),
+        (4, Deliver(15985184485851326179, true, true)),
+        (3, AddBook(4, 0, 0)),
+        (3, MoveNoteDeleteShelf(0, 1)),
+        (3, AddCover(0)),
+        (1, DeleteBook(0)),
+        (1, AddBook(0, 1, 1)),
+        (2, AddVolume(1, 0)),
+    ];
+    run(5694626446472720197, &script).unwrap();
+    run_on(SCHEMA, false, 5694626446472720197, &script, Some(None)).unwrap();
+}
+/// Found at 500 cases once series joined the test. A series the replica received is found to be
+/// one with another of its own and its row is removed; two new series then share one code, the
+/// first at the removed row's key, and the push's collect merges that one away too. What it wrote
+/// is carried under the entity minted for it, which the test never saw at that key.
+#[test]
+fn a_series_made_at_a_key_a_merge_freed_and_merged_away_again_is_sent() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, SetTitle(0, 0)),
+        (0, AddShelf(0)),
+        (0, AddSeries(1, 0)),
+        (0, Sync),
+        (0, RenameShelf(0, 0)),
+        (0, AddSeries(0, 0)),
+        (0, AddShelf(0)),
+        (2, AddAuthor(0)),
+        (0, DeleteShelf(0)),
+        (0, AddShelf(0)),
+        (0, Sync),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (0, AddShelf(0)),
+        (2, Deliver(99234427557325516, false, false)),
+        (2, SetSeriesCode(2, 0)),
+        (2, AddVolume(0, 0)),
+        (2, AddShelf(1)),
+        (2, AddVolume(0, 0)),
+        (2, Suspended(0, 0)),
+        (0, AddShelf(0)),
+        (2, AddSeries(1, 0)),
+        (2, AddSeries(1, 0)),
+    ];
+    run(6847074269335888592, &script).unwrap();
+    run_on(SCHEMA, false, 6847074269335888592, &script, Some(None)).unwrap();
 }

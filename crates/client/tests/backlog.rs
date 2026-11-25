@@ -16,7 +16,7 @@ use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_client::sqlite::{
     Applied, COLLECT_ROWS, Collected, Collection, Registry, Replica, Resume,
 };
-use fongo_sync_client::{Apply, Error, Pace, create_library, sync_with};
+use fongo_sync_client::{Apply, Error, Pace, check_connection, create_library, sync_with};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteOperation};
 use sqlx::{ConnectOptions, Connection, SqliteConnection};
 use support::{Peer, Server, now, scratch};
@@ -368,9 +368,16 @@ const MIXED: &[&str] = &[
     "CREATE TABLE wide (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, f TEXT,
         g INTEGER, h INTEGER, i INTEGER, j INTEGER, k REAL, l REAL)",
     "CREATE TABLE w (id INTEGER PRIMARY KEY, at INTEGER)",
+    "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT,
+        favourite INTEGER REFERENCES works(id) ON DELETE SET NULL)",
+    "CREATE TABLE works (id INTEGER PRIMARY KEY, title TEXT,
+        author_id INTEGER REFERENCES authors(id) ON DELETE SET NULL)",
+    "CREATE TABLE highlights (id INTEGER PRIMARY KEY, body TEXT,
+        next INTEGER REFERENCES highlights(id) ON DELETE SET NULL)",
 ];
 
-/// Books with an identity, notes they own, tags with natural keys, and wide rows.
+/// Books with an identity, notes they own, tags with natural keys, and wide rows; and for
+/// [`chained_writes`], works and authors that name each other, and highlights that name the next.
 fn mixed() -> Registry {
     let mut wide = Collection::minted("wide", "wide", "id");
     for f in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"] {
@@ -391,8 +398,63 @@ fn mixed() -> Registry {
             .field("tag")
             .field("note"),
         wide,
+        Collection::minted("authors", "authors", "id")
+            .field("name")
+            .reference("favourite", "works"),
+        Collection::minted("works", "works", "id")
+            .field("title")
+            .reference("author_id", "authors"),
+        Collection::minted("highlights", "highlights", "id")
+            .field("body")
+            .reference("next", "highlights"),
     ])
     .unwrap()
+}
+
+/// `rows` rows that each name one written after them, so that no step can take fewer than all
+/// of them: works and authors in turn, each work naming its author and each author the next
+/// work as a favourite (`chain`), or highlights, each naming the next (`list`).
+async fn chained_writes(conn: &mut SqliteConnection, rows: u64, shape: &str) {
+    let seq = |n: u64| {
+        format!("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n})")
+    };
+    let mut writes = Vec::new();
+    if shape == "chain" {
+        let n = rows / 2;
+        writes.push(format!(
+            "{} INSERT INTO authors (id, name) SELECT i, 'author ' || i FROM n",
+            seq(n)
+        ));
+        writes.push(format!(
+            "{} INSERT INTO works (id, title) SELECT i, 'Middlemarch ' || i FROM n",
+            seq(n)
+        ));
+        for i in 1..=n {
+            writes.push(format!("UPDATE works SET author_id = {i} WHERE id = {i}"));
+            if i < n {
+                writes.push(format!(
+                    "UPDATE authors SET favourite = {} WHERE id = {i}",
+                    i + 1
+                ));
+            }
+        }
+    } else {
+        writes.push(format!(
+            "{} INSERT INTO highlights (id, body) SELECT i, 'passage ' || i FROM n",
+            seq(rows)
+        ));
+        for i in 1..rows {
+            writes.push(format!(
+                "UPDATE highlights SET next = {} WHERE id = {i}",
+                i + 1
+            ));
+        }
+    }
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    for sql in writes {
+        sqlx::query(&sql).execute(&mut *conn).await.unwrap();
+    }
+    commit(conn).await;
 }
 
 /// About `rows` rows of every shape, a quarter each: books, a note on each, a tag on each, and
@@ -633,9 +695,10 @@ async fn in_steps(replica: &Replica, conn: &mut SqliteConnection, first: Collect
 /// The measurement. A device writes `BACKLOG_ROWS` rows of mixed shapes (a quarter each of books
 /// with an identity, notes they own, tags with natural keys, and rows of twelve fields) and then:
 /// installs again, as an application does at each sync; writes as many more while its triggers
-/// are suspended and resumes; writes as many more and syncs. Meanwhile, every 20 ms with a busy
-/// timeout of `BACKLOG_BUSY_MS`, a connection here writes a row and another reads, and a process
-/// of its own writes one. With `BACKLOG_BOUNDED=0` each is done as before steps, in one
+/// are suspended and resumes; writes as many more and syncs; then, twice, writes as many rows
+/// that each name one written after them ([`chained_writes`]) and collects them. Meanwhile, every
+/// 20 ms with a busy timeout of `BACKLOG_BUSY_MS`, a connection here writes a row and another
+/// reads, and a process of its own writes one. With `BACKLOG_BOUNDED=0` each is done as before steps, in one
 /// transaction; otherwise in steps. `BACKLOG_JOURNAL` is `wal` or `delete`. Run it optimised:
 ///
 /// ```text
@@ -662,6 +725,10 @@ async fn in_steps(replica: &Replica, conn: &mut SqliteConnection, first: Collect
 /// | WAL | 100,000 | install, 1 s | 10.3 s, 10.0 s; 9 of 52 failed, reader 0.01 s | 23.6 s, 0.20 s; 0.72, 0.01, 0.91 s |
 /// | WAL | 100,000 | sync, 1 s | 21.5 s, 15.4 s; 14 of 337 failed, reader 0.01 s | 49.0 s, 0.53 s; 0.61, 0.04, 0.93 s |
 /// | WAL | 100,000 | sync, 5 s | 22.9 s, 16.5 s; 5.4 s, 3 failed | 48.5 s, 0.52 s; 0.58, 0.01, 0.88 s |
+///
+/// Rows that each name one written after them, a chain of works and authors or a list of
+/// highlights, cannot be collected in part: at 10,000 rows in WAL mode one step takes them all,
+/// holding the lock 0.77 to 0.79 s against 0.72 to 0.76 s for one collect.
 ///
 /// At 10,000 rows no statement failed with either timeout. Resume, whole in both, held the lock
 /// 1.0 s at 10,000 rows and 14 to 18 s at 100,000, where writers failed as above. A sync in steps
@@ -772,10 +839,28 @@ async fn measure_backlog() {
     .await;
     report("sync", took, waits, holds.take());
     let (held, tables) = holds.longest();
-    lines.push(format!(
+    let sync = format!(
         "{journal} {rows} sync's longest transaction {:.0} ms wrote {tables}",
         held.as_secs_f64() * 1e3
-    ));
+    );
+
+    for shape in ["chain", "list"] {
+        chained_writes(&mut conn, rows, shape).await;
+        holds.take();
+        let (took, waits) = alongside(&path, busy, async {
+            if bounded {
+                let first = replica.collect_step(&mut conn, COLLECT_ROWS).await.unwrap();
+                in_steps(&replica, &mut conn, first).await;
+            } else {
+                immediate(&mut conn).await;
+                replica.collect(&mut conn).await.unwrap();
+                commit(&mut conn).await;
+            }
+        })
+        .await;
+        report(shape, took, waits, holds.take());
+    }
+    lines.push(sync);
     for line in lines {
         eprintln!("RESULT {line}");
     }
@@ -1011,6 +1096,9 @@ struct Busy {
     pace: Pace,
     next: u64,
     steps: usize,
+    /// Rows the steps took, and rows waiting when each began.
+    taken: usize,
+    waiting: Vec<usize>,
 }
 
 impl Apply for Busy {
@@ -1021,7 +1109,11 @@ impl Apply for Busy {
         rows: usize,
     ) -> Result<Collected, Error> {
         self.steps += 1;
-        Ok(replica.collect_step(conn, rows).await?)
+        self.waiting
+            .push(replica.uncollected_rows(conn, usize::MAX).await?);
+        let collected = replica.collect_step(conn, rows).await?;
+        self.taken += collected.rows;
+        Ok(collected)
     }
 
     async fn between(&mut self, conn: &mut SqliteConnection) -> Result<(), Error> {
@@ -1060,6 +1152,8 @@ async fn writes_between_steps_do_not_keep_a_sync_collecting() {
         },
         next: 1,
         steps: 0,
+        taken: 0,
+        waiting: Vec::new(),
     };
     let report = sync_with(
         &mut a.conn,
@@ -1071,6 +1165,111 @@ async fn writes_between_steps_do_not_keep_a_sync_collecting() {
     )
     .await
     .unwrap();
-    assert!(busy.steps >= 3 && busy.steps <= 4, "{} steps", busy.steps);
+    // 400 rows waited; the steps stop once they have taken that many, though 150 more are
+    // written in every gap.
+    let at = format!(
+        "{} steps, {} rows, waiting {:?}",
+        busy.steps, busy.taken, busy.waiting
+    );
+    assert_eq!(busy.waiting[0], 400, "{at}");
+    assert!(busy.taken >= 400 && busy.taken < 500, "{at}");
+    assert!(busy.steps <= 4, "{at}");
     assert!(report.sent > 6 * 200, "{}", report.sent);
+}
+
+/// What a collect hook does wrong after its step.
+#[derive(Clone, Copy, Debug)]
+enum Wrong {
+    Fails,
+    Commits,
+    RollsBack,
+    Hangs,
+}
+
+struct Wayward(Wrong);
+
+impl Apply for Wayward {
+    async fn collect(
+        &mut self,
+        conn: &mut SqliteConnection,
+        replica: &Replica,
+        rows: usize,
+    ) -> Result<Collected, Error> {
+        let collected = replica.collect_step(conn, rows).await?;
+        match self.0 {
+            Wrong::Fails => return Err(Error::TransactionEnded),
+            Wrong::Commits => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+            }
+            Wrong::RollsBack => {
+                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+            }
+            Wrong::Hangs => std::future::pending::<()>().await,
+        }
+        Ok(collected)
+    }
+
+    fn pace(&self) -> Pace {
+        Pace {
+            collect: 50,
+            ..Pace::default()
+        }
+    }
+}
+
+/// A collect hook that fails, ends the sync's transaction or never returns, and is dropped,
+/// leaves the connection sound and loses nothing: what it collected and did not commit is still
+/// to collect, and the next sync sends every row.
+#[tokio::test]
+async fn a_collect_hook_that_goes_wrong_loses_nothing() {
+    for wrong in [Wrong::Fails, Wrong::Commits, Wrong::RollsBack, Wrong::Hangs] {
+        let server = Server::new();
+        let made = create_library(&server, now).await.unwrap();
+        let mut a = Peer::new(made).await;
+        write_books(&mut a.conn, 300).await;
+        let marked = a
+            .replica
+            .uncollected_rows(&mut a.conn, usize::MAX)
+            .await
+            .unwrap();
+        let waiting = a
+            .replica
+            .outbox(&mut a.conn, u32::MAX)
+            .await
+            .unwrap()
+            .changes
+            .len();
+        let mut hook = Wayward(wrong);
+        let synced = tokio::time::timeout(
+            Duration::from_millis(500),
+            sync_with(
+                &mut a.conn,
+                &a.replica,
+                &server,
+                &a.credentials,
+                now,
+                &mut hook,
+            ),
+        )
+        .await;
+        assert!(!matches!(synced, Ok(Ok(_))), "{wrong:?}: the sync went on");
+        check_connection(&mut a.conn).await.unwrap();
+        if !matches!(wrong, Wrong::Commits) {
+            let left = a
+                .replica
+                .uncollected_rows(&mut a.conn, usize::MAX)
+                .await
+                .unwrap();
+            let outbox = a
+                .replica
+                .outbox(&mut a.conn, u32::MAX)
+                .await
+                .unwrap()
+                .changes
+                .len();
+            assert_eq!((left, outbox), (marked, waiting), "{wrong:?}");
+        }
+        let report = a.sync(&server).await.unwrap();
+        assert!(report.sent >= 300, "{wrong:?}: sent {}", report.sent);
+    }
 }

@@ -58,12 +58,11 @@ pub struct Pace {
     pub apply: usize,
     /// About how many rows written since the last collect one transaction collects. Before each
     /// apply, while at least this many rows wait to be collected, the sync collects them through
-    /// [`Apply::collect`] in transactions of their own, paced as the others, so the apply
-    /// collects fewer; it takes no more rows in all than waited when its first step began, and
-    /// the apply collects what was written since. A step takes more where rows written later
-    /// depend on those it takes; see [`Replica::collect_step`]. 0 counts as 1. Default
-    /// [`COLLECT_ROWS`], 1,000: on a fast laptop a step took 65 to 230 ms in a library of tens of
-    /// thousands of changes and up to 340 ms in one of a million, by how wide the rows are.
+    /// [`Apply::collect`] in transactions of their own, paced as the others, until those steps
+    /// have taken, in all, as many rows as waited when the first of them began; the apply then
+    /// collects what is left, which is what was written during the steps and fewer than this many
+    /// besides. A step takes more where rows it takes depend on later ones; see
+    /// [`Replica::collect_step`]. 0 counts as 1. Default [`COLLECT_ROWS`].
     ///
     /// This field is new: code that builds a `Pace` naming every field must name it too, or
     /// start from `..Pace::default()`.
@@ -256,11 +255,20 @@ pub struct SyncReport {
 /// collecting local writes and each apply, then [`Apply::caught_up`], then a record and an
 /// acknowledgment for each envelope it sends. Each takes the write lock with its first statement,
 /// waiting for it in the connection's busy handler, and holds it until it commits, so the longest
-/// hold is the largest step or apply, which [`Pace::collect`] and [`Pace::apply`] bound. Between
-/// them no transaction is open; once the sync has held the lock for [`Pace::hold`] in all, it
-/// leaves it free for [`Pace::pause`] before the next, long enough for a writer waiting in
-/// SQLite's busy handler on another connection to wake and write. A sync that holds the lock for
-/// less than [`Pace::hold`] never pauses. [`sync_with`] also calls
+/// hold is the largest of them. What bounds each: a step of collecting takes about
+/// [`Pace::collect`] rows, more where rows depend on later ones, at worst every row waiting; an
+/// apply takes at most [`Pace::apply`] received changes unless one envelope holds more, and
+/// collects the rows written while the steps before it ran, which nothing bounds, with fewer
+/// than [`Pace::collect`] left over besides; [`Apply::caught_up`] holds what the application
+/// makes it hold; a record or an acknowledgment is small. Nothing here bounds what the
+/// application does outside a sync: [`Replica::resume`], a first [`Replica::install`] over rows
+/// already in its tables, and a plain [`Replica::install`] or [`Replica::collect`] each hold the
+/// lock for everything they do.
+///
+/// Between transactions no transaction is open; once the sync has held the lock for
+/// [`Pace::hold`] in all, it leaves it free for [`Pace::pause`] before the next, long enough for a
+/// writer waiting in SQLite's busy handler on another connection to wake and write. A sync that
+/// holds the lock for less than [`Pace::hold`] never pauses. [`sync_with`] also calls
 /// [`Apply::between`] in each gap, where an application can let its own writers through.
 ///
 /// # The connection
@@ -379,9 +387,10 @@ pub trait Apply: Send {
     /// everything would have reported them itself. An application that works from what an apply
     /// touched does the same with these, here, in the step's transaction.
     ///
-    /// It is called while at least [`Pace::collect`] rows wait to be collected, up to as many as
-    /// waited when the sync's first step began: what is written after that is collected by the
-    /// apply that follows. It is not called when fewer wait.
+    /// Before each apply it is called while at least [`Pace::collect`] rows wait to be
+    /// collected, until its steps have taken, in all, as many rows as waited when the first of
+    /// them began, whichever rows those are; the apply collects what is left. It is not called
+    /// when fewer wait.
     fn collect(
         &mut self,
         conn: &mut SqliteConnection,
@@ -547,7 +556,6 @@ async fn run<T: Transport, A: Apply>(
         failed: false,
         held,
         conflicts: Vec::new(),
-        backlog: None,
     };
     let pulled = read_pages(
         &rpc,
@@ -715,8 +723,6 @@ struct Steps<'a, A> {
     held: Duration,
     /// The conflicts each apply reported, in order.
     conflicts: Vec<Vec<Conflict>>,
-    /// Rows the steps of collecting may still take, counted when the first began.
-    backlog: Option<usize>,
 }
 
 impl<A: Apply> Steps<'_, A> {
@@ -775,15 +781,7 @@ impl<A: Apply> Steps<'_, A> {
     ) -> Result<(), Error> {
         let rows = self.pace.collect.max(1);
         let replica = self.replica;
-        let backlog = match self.backlog {
-            Some(left) => left,
-            None => {
-                let waiting = replica.uncollected_rows(conn, usize::MAX).await?;
-                self.backlog = Some(waiting);
-                waiting
-            }
-        };
-        let mut left = backlog;
+        let mut left = replica.uncollected_rows(conn, usize::MAX).await?;
         while left >= rows && replica.uncollected_rows(conn, rows).await? >= rows {
             let (mut tx, began) = self.begin(conn).await?;
             let collected = async {
@@ -800,7 +798,6 @@ impl<A: Apply> Steps<'_, A> {
             tx.commit().await?;
             self.committed(began);
             left = left.saturating_sub(collected.rows.max(1));
-            self.backlog = Some(left);
             if !collected.touched.is_empty() {
                 let applied = Applied {
                     touched: collected.touched,

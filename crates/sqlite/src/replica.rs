@@ -17,9 +17,7 @@ use fongo_sync_core::source::admit;
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
-use crate::collect::{
-    Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through, place_after,
-};
+use crate::collect::{Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through};
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
@@ -37,9 +35,10 @@ pub enum Resume {
     Baseline,
 }
 
-/// About how many rows written since the last collect one bounded step collects: on a fast laptop,
-/// a step of 1,000 rows took 65 to 230 ms in a library of tens of thousands of changes and up to
-/// 340 ms in one of a million, by how wide the rows are.
+/// About how many rows written since the last collect one bounded step collects. On a fast laptop
+/// a step of 1,000 rows that depend on no later ones took 65 to 230 ms in a library of tens of
+/// thousands of changes, and up to 340 ms in rollback-journal mode and 0.6 s in WAL mode in one of
+/// a million, by how wide the rows are; a step takes more rows where they depend on later ones.
 pub const COLLECT_ROWS: usize = 1_000;
 
 /// What one bounded step of collecting did; see [`Replica::collect_step`].
@@ -50,12 +49,18 @@ pub struct Collected {
     pub produced: usize,
     /// Marked rows the step collected.
     pub rows: usize,
+    /// Marked rows taken by tries the step gave up and took again, larger, because rows they
+    /// took depended on rows past them. Fewer than the marked rows the step took, those it
+    /// collected ([`Collected::rows`]) and those among them that wait: a step costs at most about
+    /// twice what collecting its rows at once costs.
+    pub abandoned: usize,
     /// Rows written later than those the step took are still to be collected: call
     /// [`Replica::collect_step`] again.
     pub more: bool,
     /// The rows the step wrote or removed in bringing rows up to date, as [`Applied::touched`]
     /// lists them: a merge of entities its rows were found to share, a row held back before
-    /// that it could write at last, and the like. The rows it collected are not among them.
+    /// that it could write at last, and the like. A row it collected is among them when bringing
+    /// rows up to date wrote or removed it, as one a merge gives up; one only collected is not.
     pub touched: Vec<Touched>,
 }
 
@@ -315,6 +320,8 @@ pub(crate) struct Ctx<'d> {
     pub bases: Vec<Base>,
     /// Marked rows collected.
     pub collected: usize,
+    /// Marked rows taken by tries of a bounded step that were given up.
+    pub abandoned: usize,
     /// While a bounded step brings rows up to date, what it reached.
     pub watch: Option<Watch>,
 }
@@ -335,14 +342,6 @@ struct Saved {
     accepted: usize,
     touched: BTreeMap<(usize, String, Gid), (usize, bool)>,
     bases: usize,
-}
-
-/// How a bounded step's prefix must grow before it is tried again.
-enum Grow {
-    /// To this place and as far again as half a step.
-    Past(Place),
-    /// By this many rows.
-    By(usize),
 }
 
 pub(crate) struct Base {
@@ -371,6 +370,7 @@ impl<'d> Ctx<'d> {
             touched: BTreeMap::new(),
             bases: Vec::new(),
             collected: 0,
+            abandoned: 0,
             watch: None,
         })
     }
@@ -589,9 +589,7 @@ impl Replica {
             debug_assert!(incoming.is_empty());
             return self.bounded(cx, set, want.max(1));
         }
-        if let Edits::Recorded(more, rows) =
-            self.collect_edits(cx, None, None, &mut Minted::new())?
-        {
+        if let Edits::Recorded(more, rows) = self.collect_edits(cx, None, &mut Minted::new())? {
             set.extend(more);
             cx.collected += rows;
         }
@@ -657,35 +655,15 @@ impl Replica {
     /// takes every row found at a first install. Returns whether rows are still marked past it.
     fn bounded(&self, cx: &mut Ctx, set: BTreeSet<(String, Gid)>, want: usize) -> Result<bool> {
         let db = cx.db;
-        let reach = |from: &Place, rows: usize| -> Result<Option<Place>> {
-            if rows == 0 {
-                return Ok(marked_past(db, from)?.then(|| from.clone()));
-            }
-            Ok(match place_after(db, Some(from), rows - 1)? {
-                Some((place, true)) => Some(place),
-                _ => None,
-            })
-        };
-        let mut through = match place_after(db, None, want - 1)? {
-            Some((place, true)) => Some(place),
-            _ => None,
-        };
         // Rows found when their collection was first installed are collected together: a write
         // to one before it is collected would make it the application's edit.
-        if let (Some(place), Some(found)) = (&through, last_adopted(db)?)
-            && found > *place
-        {
-            through = reach(&found, 0)?;
-        }
+        let mut through = self.closed(db, last_adopted(db)?, want)?;
         let wall = cx.wall;
         let mut minted = Minted::new();
-        let mut tries = 0u32;
         loop {
             let Some(place) = through.clone() else {
                 cx.wall = wall;
-                if let Edits::Recorded(more, rows) =
-                    self.collect_edits(cx, None, None, &mut minted)?
-                {
+                if let Edits::Recorded(more, rows) = self.collect_edits(cx, None, &mut minted)? {
                     cx.collected += rows;
                     let mut set = set;
                     set.extend(more);
@@ -698,9 +676,8 @@ impl Replica {
             // leaves are stamped after anything it records, as they would be after that collect.
             cx.wall = wall.min(u64::try_from(place.0).unwrap_or(0));
             db.exec("SAVEPOINT fongo_step", &[])?;
-            let grow = match self.collect_edits(cx, Some(&place), Some(want), &mut minted)? {
-                Edits::Beyond(past) => Some(Grow::Past(past)),
-                Edits::Short(rows) => Some(Grow::By(want - rows)),
+            let need = match self.collect_edits(cx, Some(&place), &mut minted)? {
+                Edits::Beyond(past) => Some(Some(past)),
                 Edits::Recorded(more, rows) => {
                     cx.collected += rows;
                     let mut set = set.clone();
@@ -709,43 +686,35 @@ impl Replica {
                     self.settle(cx, set)?;
                     let watch = cx.watch.take().unwrap_or_default();
                     match self.marked_beyond(db, &watch, &place)? {
-                        Some(past) => Some(Grow::Past(past)),
-                        None if rows == 0 && marked_past(db, &place)? => Some(Grow::By(want)),
+                        Some(past) => Some(Some(past)),
+                        // A prefix of rows that all wait collects nothing: it grows, or the
+                        // steps would never end.
+                        None if rows == 0 && marked_past(db, &place)? => Some(None),
                         None => None,
                     }
                 }
             };
-            let Some(grow) = grow else {
+            let Some(need) = need else {
                 db.exec("RELEASE fongo_step", &[])?;
                 cx.wall = wall;
-                return marked_past(db, &place);
+                // `closed` gave a place only with rows marked past it, which the step left.
+                return Ok(true);
             };
             db.exec("ROLLBACK TO fongo_step", &[])?;
             db.exec("RELEASE fongo_step", &[])?;
             cx.restore(saved);
-            through = match grow {
-                // A prefix that must reach past half of what is marked, and past two steps,
-                // takes it all, rather than be tried again for each row its larger self needs.
-                Grow::Past(past) => {
-                    let upto = marked_through(db, &Some(past.clone()))?;
-                    let wanted = i64::try_from(want).unwrap_or(i64::MAX);
-                    if upto > wanted.saturating_mul(2) && 2 * upto >= marked_through(db, &None)? {
-                        None
-                    } else {
-                        // To the row it needs; after a few tries, past it by twice as many rows
-                        // each time, so a chain of rows each needing the next takes few tries.
-                        let margin = if tries < 4 {
-                            0
-                        } else {
-                            1usize << (tries - 4).min(30)
-                        };
-                        reach(&past.max(place.clone()), margin.min(want))?
-                    }
-                }
-                Grow::By(rows) => reach(&place, rows)?,
-            };
-            tries += 1;
-            if through.as_ref().is_some_and(|next| *next <= place) {
+            // At least twice as many rows each time, and every row once that is more than half
+            // of them, so the rows of the tries given up come to fewer than the step takes.
+            let rows = marked_through(db, &Some(place.clone()))?;
+            cx.abandoned += usize::try_from(rows).unwrap_or(0);
+            through = self.closed(
+                db,
+                need.map(|need| need.max(place)),
+                usize::try_from(rows.saturating_mul(2)).unwrap_or(usize::MAX),
+            )?;
+            if through.is_some()
+                && marked_through(db, &through)?.saturating_mul(2) > marked_through(db, &None)?
+            {
                 through = None;
             }
         }
@@ -944,6 +913,7 @@ impl Replica {
         Ok(Collected {
             produced: cx.produced,
             rows: cx.collected,
+            abandoned: cx.abandoned,
             more,
             touched: self.touched_rows(cx.touched),
         })
@@ -1255,8 +1225,7 @@ impl Replica {
     /// [`Replica::collect`] in bounded steps: one transaction collects about `rows` of the rows
     /// written since the last collect, the earliest written, and says whether more are left. A
     /// caller that loops until none are, leaving the database free between calls, holds SQLite's
-    /// write lock for one step at a time; [`COLLECT_ROWS`] is a step of a few hundred
-    /// milliseconds or less.
+    /// write lock for one step at a time; see [`COLLECT_ROWS`] for how long one takes.
     ///
     /// What the steps send, hold and show is what ordinary collects would, each made just after
     /// the last row a step took was written: a step leaves the rows past it, and all that
@@ -1271,11 +1240,22 @@ impl Replica {
     /// one made since, made again, or removed, and written again later; rows naming a row the
     /// step makes again; what a removed owner owned, written later; rows found to be one; a row
     /// made again later at an id named by a row the step writes or removes; and a row found
-    /// through one the step makes again takes every row of that millisecond. A new
-    /// row written again after many rows naming it is collected with all of them, so at worst a
-    /// step takes every row. Rows found in a collection's tables when it is first installed are
-    /// collected by that install. A row that cannot be collected yet stays marked, as it does
-    /// after a collect, and does not count as more.
+    /// through one the step makes again takes every row of that millisecond. Most of these are
+    /// found by reading the rows before anything is collected, so a chain of rows each needing a
+    /// later one, such as rows each naming the next, is taken as one step as long as the chain.
+    /// The rest are found only once the step's changes are merged; the step then gives up what it
+    /// did and tries again with at least twice the rows, or with every row once that would be
+    /// more than half of them, so the rows of the tries it gives up come to fewer than those it
+    /// takes ([`Collected::abandoned`]), and a step costs at most about twice what collecting its
+    /// rows at once does. At worst a step takes every row. Rows found in
+    /// a collection's tables when it is first installed are collected by that install. A row that
+    /// cannot be collected yet stays marked, as it does after a collect, and does not count as
+    /// more.
+    ///
+    /// Each step also reads the places of the rows marked ahead of it, since nothing indexes them
+    /// in the order they are collected: steps of very few rows over many marked rows cost more in
+    /// all than one collect. On a test backlog of 900 rows, steps of ten cost 1.4 times one
+    /// collect in SQLite's work, and steps of one 4.3 times.
     ///
     /// Each step is a transaction of its own, committed whole or not at all: after a crash or a
     /// failure between steps, the rows not yet collected are still marked, and the next step or
@@ -1296,6 +1276,7 @@ impl Replica {
                 Ok(Collected {
                     produced: cx.produced,
                     rows: cx.collected,
+                    abandoned: cx.abandoned,
                     more,
                     touched: self.touched_rows(cx.touched),
                 })

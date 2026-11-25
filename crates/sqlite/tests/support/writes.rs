@@ -474,6 +474,28 @@ impl Writes {
         self.adopted
             .extend(outbox.changes.into_iter().skip(waiting));
         self.after(conn, replica).await;
+        self.gone_with_install();
+    }
+
+    /// What was owed of a row the install collected and then removed, merging its entity into
+    /// another's row, before anything here saw the entity: what the install sent is not checked,
+    /// as a push checks a row a collect removed and then skips it. Left owed, the row's key could
+    /// be given to another entity before the next push, which would then look for the write
+    /// under the wrong entity.
+    fn gone_with_install(&mut self) {
+        let gone = |at: &(String, String)| {
+            !self.after.contains_key(at) && self.gids.get(at).is_none_or(BTreeSet::is_empty)
+        };
+        let cells: Vec<(String, String, String)> = self
+            .owed
+            .keys()
+            .filter(|(c, k, _)| gone(&(c.clone(), k.clone())))
+            .cloned()
+            .collect();
+        for cell in cells {
+            self.owed.remove(&cell);
+            self.named.remove(&cell);
+        }
     }
 
     /// [`Writes::installed`] after an install that collected in a bounded step and left rows to
@@ -488,6 +510,7 @@ impl Writes {
         self.adopted
             .extend(outbox.changes.into_iter().skip(waiting));
         self.after_step(conn, replica).await;
+        self.gone_with_install();
     }
 
     /// The changes about to be sent that the application did not write, and rows it removed
@@ -704,10 +727,14 @@ impl Writes {
                 .map(|g| canonical(&c, *g))
                 .collect();
             group.extend(self.latest.get(&at).map(|g| canonical(&c, *g)));
+            // A row the application made that the step removed, merging the entity it minted
+            // into another's row, was never seen with that entity; `gids` names only the
+            // entities of earlier rows at its key. Any entity carrying the value will do.
+            let unseen = self.made.contains(&at) && !self.after.contains_key(&at);
             let carried = sent.iter().find(|ch| {
                 ch.collection == c
                     && ch.field == field
-                    && group.contains(&canonical(&c, ch.gid))
+                    && (unseen || group.contains(&canonical(&c, ch.gid)))
                     && match (&ch.value, &value, kind) {
                         (Value::Ref(a), Value::Int(_), Some(Kind::Ref { collection: t, .. })) => {
                             names.is_empty() || names.contains(&canonical(t, *a))
