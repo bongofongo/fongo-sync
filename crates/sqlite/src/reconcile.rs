@@ -9,6 +9,7 @@ use fongo_sync_core::model::Row;
 use fongo_sync_core::plan::{self, Planned, RowAction};
 use fongo_sync_core::{ALIAS, Change, Gid, Value};
 
+use crate::collect::marked_at;
 use crate::db::{Db, as_gid, as_text, loaded, quoted, refused};
 use crate::error::Result;
 use crate::image;
@@ -544,10 +545,17 @@ impl Replica {
                         cx.looked_at(&c.name, as_text(&r[0])?);
                     }
                 }
+                // Never a key a record waiting to be adopted holds.
+                let found = if crate::adopt::laid(db)? {
+                    ", COALESCE((SELECT max(json_extract(key, '$[0]')) FROM fongo_found
+                                  WHERE collection = ?1 AND batch >= 0), 0)"
+                } else {
+                    ""
+                };
                 let next = db.query(
                     &format!(
                         "SELECT max(COALESCE((SELECT max({col}) FROM {table}), 0),
-                                    COALESCE((SELECT max(local) FROM fongo_ids WHERE collection = ?1), 0)) + 1",
+                                    COALESCE((SELECT max(local) FROM fongo_ids WHERE collection = ?1), 0){found}) + 1",
                         col = quoted(column),
                         table = quoted(&c.table)
                     ),
@@ -643,7 +651,13 @@ impl Replica {
         // Adopting, a field the application wrote since is left as it wrote it: the image takes
         // the target, so the collect after finds the application's value as its edit.
         let mut values = values;
-        if cx.adopting
+        // A row removed or made again since stands for no recorded entity: it is left to the
+        // collect of its mark.
+        let remade = cx.adopting && marked_at(db, &c.name, &key)?.is_some_and(|(_, gone)| gone);
+        if remade {
+            image.extend(values.clone());
+            values.clear();
+        } else if cx.adopting
             && let Some(row) = tables::read_row(db, c, &key)?
         {
             let was = image.clone();
@@ -760,10 +774,13 @@ impl Replica {
             }
         }
         let sql = format!("DELETE FROM {} WHERE {}", quoted(&c.table), where_key(c));
-        match db.exec(&sql, &[tables::key_param(c, &key)?]) {
-            Ok(_) => {}
-            Err(e) if refused(&e) => return Ok(false),
-            Err(e) => return Err(e),
+        let remade = cx.adopting && marked_at(db, &c.name, &key)?.is_some_and(|(_, gone)| gone);
+        if !remade {
+            match db.exec(&sql, &[tables::key_param(c, &key)?]) {
+                Ok(_) => {}
+                Err(e) if refused(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            }
         }
         let at = [Value::Text(c.name.clone()), Value::Text(key.clone())];
         db.exec(

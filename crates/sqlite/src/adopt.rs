@@ -15,8 +15,22 @@ use crate::registry::Key;
 use crate::replica::{Ctx, Replica, meta_get, meta_set};
 use crate::tables::{every_row, minted_key, read_row};
 
+/// Whether the records' table is there: a database of an earlier layout gains it at its next
+/// install, and until then holds none.
+pub(crate) fn laid(db: &Db) -> Result<bool> {
+    Ok(!db
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_found'",
+            &[],
+        )?
+        .is_empty())
+}
+
 /// Whether found rows wait to be adopted from their records.
 pub(crate) fn recorded(db: &Db) -> Result<bool> {
+    if !laid(db)? {
+        return Ok(false);
+    }
     Ok(!db
         .query("SELECT 1 FROM fongo_found WHERE batch >= 0 LIMIT 1", &[])?
         .is_empty())
@@ -24,6 +38,9 @@ pub(crate) fn recorded(db: &Db) -> Result<bool> {
 
 /// How many found rows wait to be adopted, counting at most `at_most`.
 pub(crate) fn recorded_rows(db: &Db, at_most: i64) -> Result<usize> {
+    if !laid(db)? {
+        return Ok(0);
+    }
     let rows = db.query(
         "SELECT count(*) FROM (SELECT 1 FROM fongo_found WHERE batch >= 0 LIMIT ?1)",
         &[Value::Int(at_most)],
@@ -315,15 +332,14 @@ impl Replica {
                 row: image,
             });
         }
-        if records.is_empty() {
-            return Ok(0);
-        }
         let adopted = records.len();
-        cx.adopting = true;
-        if let Edits::Recorded(set, _) = self.adopt_edits(cx, &records)? {
-            self.settle(cx, set)?;
+        if !records.is_empty() {
+            cx.adopting = true;
+            if let Edits::Recorded(set, _) = self.adopt_edits(cx, &records)? {
+                self.settle(cx, set)?;
+            }
+            cx.adopting = false;
         }
-        cx.adopting = false;
         if !recorded(db)? {
             db.exec("DELETE FROM fongo_found", &[])?;
         }

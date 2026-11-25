@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+pub mod library;
 pub mod peer;
 pub mod statements;
 pub mod world;

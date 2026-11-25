@@ -251,14 +251,15 @@ impl Replica {
             items.push(item);
         }
         for f in records {
-            let c = self.collection(f.idx);
             if let Some(gid) = f.gid {
                 minted.insert((f.idx, f.key.clone()), gid);
             }
             let item = Item {
                 idx: f.idx,
                 row: Some(f.row.clone()),
-                mapped: mapping(db, &c.name, &f.key)?,
+                // Nothing maps a recorded key before it is adopted: a collect or an apply adopts
+                // every record first, and settle gives no new row a recorded key.
+                mapped: None,
                 key: f.key.clone(),
                 at: 0,
                 gone: false,

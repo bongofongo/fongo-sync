@@ -847,10 +847,12 @@ impl Replica {
         let mut adopted = Vec::new();
         // An install in steps records the rows it finds, unless rows written before it are still
         // to be collected: a whole install collects those with what it finds.
+        // Nor while an earlier install's records wait: its batches are ordered among themselves.
         let record = take.is_some()
             && db
                 .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
-                .is_empty();
+                .is_empty()
+            && !adopt::recorded(db)?;
         let mut to_record = Vec::new();
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
@@ -939,6 +941,9 @@ impl Replica {
         }
         set.extend(self.merge(&mut cx, &foreign, false)?);
         if let Some(how) = resuming {
+            // What was written while suspended is told apart from images, so every found row
+            // gets one first.
+            cx.collected += self.adopt(&mut cx, None)?;
             self.resume_in(db, how)?;
         }
         self.record_found(db, &to_record)?;
@@ -1998,9 +2003,13 @@ impl Replica {
                 .map_or(gid, |t| t.canonical);
             out.held.push((collection, canonical));
         }
+        let found = if adopt::laid(db)? {
+            " UNION SELECT collection, key FROM fongo_found WHERE batch >= 0"
+        } else {
+            ""
+        };
         for r in db.query(
-            "SELECT collection, key FROM fongo_dirty
-             UNION SELECT collection, key FROM fongo_found WHERE batch >= 0",
+            &format!("SELECT collection, key FROM fongo_dirty{found}"),
             &[],
         )? {
             out.uncollected
