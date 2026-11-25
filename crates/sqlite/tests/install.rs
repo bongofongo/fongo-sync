@@ -749,3 +749,40 @@ fn a_collection_holding_entities_from_elsewhere_is_adopted_whole() {
         );
     });
 }
+
+/// The registry kept with waiting records is read back as data: a name in it that is not an
+/// identifier is refused before it reaches any SQL, and a default the kernel writes into a
+/// column it does not sync comes from the registry the caller passes, never from the database.
+#[test]
+fn a_recorded_registry_is_read_back_as_data() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (before, after) = registries("field");
+        let (before, after) = (Replica::new(before), Replica::new(after));
+        let world = World::new(13);
+        let mut a = database(&world, 0).await;
+        existing(&mut a, 6).await;
+        assert!(before.install_step(&mut a, 1).await.unwrap().more);
+        let recorded: String =
+            sqlx::query_scalar("SELECT value FROM fongo_meta WHERE key = 'found_registry'")
+                .fetch_one(&mut a)
+                .await
+                .unwrap();
+        assert!(!recorded.contains("\tL\t") && !recorded.starts_with('L'));
+        sqlx::query(
+            "UPDATE fongo_meta SET value = replace(value, 'books', 'books; DROP TABLE notes')
+              WHERE key = 'found_registry'",
+        )
+        .execute(&mut a)
+        .await
+        .unwrap();
+        assert!(after.install_step(&mut a, 1).await.is_err());
+        let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM notes")
+            .fetch_one(&mut a)
+            .await
+            .unwrap();
+        assert_eq!(notes, 6);
+    });
+}

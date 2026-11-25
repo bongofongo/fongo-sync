@@ -322,7 +322,7 @@ impl Replica {
         if text == self.registry.encode() {
             return Ok(0);
         }
-        Replica::new(crate::registry::Registry::decode(&text)?).adopt(cx, None)
+        Replica::new(crate::registry::Registry::decode(&text, &self.registry)?).adopt(cx, None)
     }
 
     /// Adopts found rows from their records: the next batches, until at least `want` rows, or

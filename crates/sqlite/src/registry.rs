@@ -422,22 +422,6 @@ impl Registry {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(text: &str) -> Result<Vec<u8>> {
-    let bad = || Error::Corrupt("a recorded registry does not parse".into());
-    (0..text.len())
-        .step_by(2)
-        .map(|i| {
-            text.get(i..i + 2)
-                .and_then(|b| u8::from_str_radix(b, 16).ok())
-                .ok_or_else(bad)
-        })
-        .collect()
-}
-
 impl Registry {
     /// A text [`Registry::decode`] rebuilds this registry from, kept with the rows a first
     /// install in steps records, so they are adopted under the registry they were recorded
@@ -476,21 +460,14 @@ impl Registry {
             for (table, column) in &c.local_dependents {
                 lines.push(format!("D\t{table}\t{column}"));
             }
-            for (column, default) in &c.local_defaults {
-                lines.push(match default {
-                    LocalDefault::Value(v) => {
-                        let row: model::Row = [("v".to_string(), v.clone())].into();
-                        format!("L\t{column}\tV\t{}", hex(&crate::image::encode(&row)))
-                    }
-                    LocalDefault::Sql(sql) => format!("L\t{column}\tS\t{}", hex(sql.as_bytes())),
-                });
-            }
         }
         lines.join("\n")
     }
 
-    /// The registry [`Registry::encode`] wrote.
-    pub(crate) fn decode(text: &str) -> Result<Registry> {
+    /// The registry [`Registry::encode`] wrote, with the local defaults `current` gives its
+    /// collections: no SQL is read back from the database. Its names are checked as any
+    /// registry's are.
+    pub(crate) fn decode(text: &str, current: &Registry) -> Result<Registry> {
         let bad = || Error::Corrupt("a recorded registry does not parse".into());
         let list = |s: &str| -> Vec<String> {
             s.split(',')
@@ -547,18 +524,12 @@ impl Registry {
                 ["D", table, column] => c
                     .local_dependents
                     .push(((*table).to_string(), (*column).to_string())),
-                ["L", column, "V", value] => {
-                    let row = crate::image::decode(&unhex(value)?)?;
-                    c.local_defaults.push((
-                        (*column).to_string(),
-                        LocalDefault::Value(row.get("v").cloned().unwrap_or(Value::Null)),
-                    ));
-                }
-                ["L", column, "S", sql] => c.local_defaults.push((
-                    (*column).to_string(),
-                    LocalDefault::Sql(String::from_utf8(unhex(sql)?).map_err(|_| bad())?),
-                )),
                 _ => return Err(bad()),
+            }
+        }
+        for c in &mut collections {
+            if let Some(now) = current.collections.iter().find(|n| n.name == c.name) {
+                c.local_defaults.clone_from(&now.local_defaults);
             }
         }
         Registry::new(collections)
