@@ -797,7 +797,10 @@ impl Replica {
     /// earlier install's records still wait, the found rows are instead adopted whole by the
     /// next step. A collect or an apply made while records wait adopts the rest first, whole:
     /// a caller that wants the lock held briefly takes steps until [`Collected::more`] is false
-    /// before it applies anything. The design is set out with the kernel's tables, in `store.rs`.
+    /// before it applies anything. The adoptions are the changes a whole install would send,
+    /// with the same gids and clocks, but in the outbox in the order of their batches rather than
+    /// of their collections and keys. The design is set out with the kernel's tables, in
+    /// `store.rs`.
     pub async fn install_step(
         &self,
         conn: &mut SqliteConnection,
@@ -1348,8 +1351,9 @@ impl Replica {
         .await
     }
 
-    /// How many rows are marked as written since the last collect, counting at most `at_most`.
-    /// Rows that cannot be collected yet count. A read that writes nothing.
+    /// How many rows are still to be collected, counting at most `at_most`: those marked as
+    /// written since the last collect, rows that cannot be collected yet among them, and rows a
+    /// first install in steps found and has not adopted yet. A read that writes nothing.
     pub async fn uncollected_rows(
         &self,
         conn: &mut SqliteConnection,
@@ -1366,18 +1370,16 @@ impl Replica {
                 return Ok(0);
             }
             let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
-            let found = adopt::recorded_rows(db, limit)?;
             let rows = db.query(
-                "SELECT count(*) + ?2 FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
-                &[
-                    Value::Int(limit),
-                    Value::Int(i64::try_from(found).unwrap_or(0)),
-                ],
+                "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
+                &[Value::Int(limit)],
             )?;
-            Ok(rows
+            let marked = rows
                 .first()
                 .and_then(|r| as_int(&r[0]).ok())
-                .map_or(0, |n| usize::try_from(n).unwrap_or(0)))
+                .map_or(0, |n| usize::try_from(n).unwrap_or(0));
+            let left = i64::try_from(at_most.saturating_sub(marked)).unwrap_or(i64::MAX);
+            Ok(marked + adopt::recorded_rows(db, left)?)
         })
         .await
     }

@@ -545,17 +545,10 @@ impl Replica {
                         cx.looked_at(&c.name, as_text(&r[0])?);
                     }
                 }
-                // Never a key a record waiting to be adopted holds.
-                let found = if crate::adopt::laid(db)? {
-                    ", COALESCE((SELECT max(json_extract(key, '$[0]')) FROM fongo_found
-                                  WHERE collection = ?1 AND batch >= 0), 0)"
-                } else {
-                    ""
-                };
                 let next = db.query(
                     &format!(
                         "SELECT max(COALESCE((SELECT max({col}) FROM {table}), 0),
-                                    COALESCE((SELECT max(local) FROM fongo_ids WHERE collection = ?1), 0){found}) + 1",
+                                    COALESCE((SELECT max(local) FROM fongo_ids WHERE collection = ?1), 0)) + 1",
                         col = quoted(column),
                         table = quoted(&c.table)
                     ),

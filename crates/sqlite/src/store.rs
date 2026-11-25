@@ -48,7 +48,10 @@ use crate::error::{Error, Result};
 /// it, whole, so a change of registry meets them as it meets rows a whole install adopted.
 ///
 /// Layout 3 is upgraded in place by the next install: it gains the empty `fongo_found` table and
-/// the index of marks in collecting order, and keeps everything else as it was.
+/// the index of marks in collecting order, and keeps everything else as it was. The move is one
+/// way: a build of layout 3 refuses to install over layout 4, as over any layout it does not
+/// know. Such a build calling `collect` or `apply` without installing first is not refused, and
+/// would leave records waiting unadopted; an application installs at every open.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.

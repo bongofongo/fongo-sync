@@ -20,10 +20,13 @@ for long; `Replica::install_step` installs and takes the first step. A step ends
 next row is marked with a later time, and the steps end as some placing of ordinary collects
 among the same writes would; in every case the tests try, also as one collect of everything,
 but where an alias is stamped or a reference names another member of the group it joins. A
-step takes about the rows asked for, more where rows depend on later ones: a
-new row written again after the rows naming it is collected with all of them, rows written in
-one millisecond are collected together, and the rows found in a collection's tables when it is
-first installed are collected by that install whole.
+step takes about the rows asked for, more where rows depend on later ones: a new row written
+again after the rows naming it is collected with all of them, and rows written in one
+millisecond are collected together. The rows found in a collection's tables when it is first
+installed in steps are recorded by that install and adopted by the steps after it, in batches,
+as a whole install at that moment would adopt them; what the application writes meanwhile is
+collected after them as its edits. The kernel's tables are of layout 4: a build that knows only
+layout 3 refuses them, and this one upgrades layout 3 in place at its next install.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are

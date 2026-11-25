@@ -75,8 +75,7 @@ async fn remote(world: &World) -> Vec<Change> {
 
 async fn finish(world: &World, replica: &Replica, conn: &mut SqliteConnection) -> Outcome {
     replica.collect(conn).await.unwrap();
-    let mut outbox = replica.outbox(conn, u32::MAX).await.unwrap().changes;
-    outbox.sort_by_key(|c| c.clock);
+    let outbox = same_changes_in_any_order(replica.outbox(conn, u32::MAX).await.unwrap().changes);
     let inspection = replica.inspect(conn).await.unwrap();
     let ids = support::rows(
         conn,
@@ -94,6 +93,15 @@ async fn finish(world: &World, replica: &Replica, conn: &mut SqliteConnection) -
         inspection,
         elsewhere: tables(&mut other).await,
     }
+}
+
+/// The changes sent, each with its clock, as a set: a first install in steps puts its
+/// adoptions in the outbox in batch order, a whole one by collection and key.
+fn same_changes_in_any_order(mut changes: Vec<Change>) -> Vec<Change> {
+    changes.sort_by(|a, b| {
+        (a.clock, &a.collection, a.gid, &a.field).cmp(&(b.clock, &b.collection, b.gid, &b.field))
+    });
+    changes
 }
 
 async fn found_left(conn: &mut SqliteConnection) -> i64 {
@@ -394,10 +402,8 @@ fn a_found_row_given_up_after_its_id_was_taken_again() {
         let mut out = Vec::new();
         for conn in [&mut a, &mut b] {
             replica.collect(conn).await.unwrap();
-            let mut outbox = replica.outbox(conn, u32::MAX).await.unwrap().changes;
-            outbox.sort_by_key(|c| c.clock);
             out.push((
-                outbox,
+                same_changes_in_any_order(replica.outbox(conn, u32::MAX).await.unwrap().changes),
                 support::rows(conn, "SELECT * FROM series ORDER BY id", &[]).await,
                 replica.inspect(conn).await.unwrap(),
             ));
