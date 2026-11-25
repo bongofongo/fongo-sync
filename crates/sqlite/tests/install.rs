@@ -779,7 +779,7 @@ async fn recording_takes_a_small_part_of_a_whole_install() {
     replica.install_step(&mut a, 1).await.unwrap();
     let recording = began.elapsed();
     let largest: i64 = sqlx::query_scalar(
-        "SELECT max(n) FROM (SELECT count(*) AS n FROM fongo_found GROUP BY batch)",
+        "SELECT max(n) FROM (SELECT count(*) AS n FROM fongo_found WHERE batch >= 0 GROUP BY batch)",
     )
     .fetch_one(&mut a)
     .await
