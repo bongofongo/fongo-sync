@@ -20,15 +20,17 @@
 //!
 //! # What is supported and tested
 //!
-//! Collecting in bounded steps is held to its documented bar and bounds in the shape of
-//! registry and schema tested most: foreign keys enforced, minted collections with owners,
-//! references, sets written together, `Max` and last-writer-wins fields and local dependents,
-//! natural collections owned by minted ones, and identities each enforced by a unique index.
-//! Outside it, ignored tests record what is known not to hold: with foreign keys off, a
-//! reference to an id taken again after its row was collected gone can be lost (as with
+//! Collecting and installing in bounded steps are held to their documented bar and bounds in
+//! the shape of registry and schema tested most: foreign keys enforced, minted collections with
+//! owners, references, sets written together, `Max` and last-writer-wins fields and local
+//! dependents, natural collections owned by minted ones, and identities each enforced by a
+//! unique index. Outside it, ignored tests record what is known not to hold: with foreign keys
+//! off, a reference to an id taken again after its row was collected gone can be lost (as with
 //! ordinary collects), and natural rows naming a row that is gone make steps cost many times one
-//! collect; and many rows that cannot be collected yet, among others, make every step read them
-//! again.
+//! collect; many rows that cannot be collected yet, among others, make every step read them
+//! again; and with an identity no index enforces, a first install in steps can send changes that
+//! differ from a whole install's where it gives up a row found to be one with another whose id
+//! was taken again before it was adopted.
 
 mod adopt;
 mod collect;

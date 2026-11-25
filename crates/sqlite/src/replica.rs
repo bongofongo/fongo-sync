@@ -775,7 +775,8 @@ impl Replica {
     /// open. Rows that existed before a collection was first installed are queued as the oldest
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
-    /// and kernel tables of an earlier layout, which [`Replica::uninstall`] removes.
+    /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
+    /// layout 3 is upgraded in place.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
             db.atomically(|db| self.install_in(db, None, None).map(|_| ()))
@@ -784,12 +785,17 @@ impl Replica {
     }
 
     /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
-    /// What it adopts of the registry, every row that adoption brings up to date, and every row
-    /// found in the tables of a collection installed for the first time are done whole, as
-    /// `install` does them: a write to a found row before it was collected would make it an
-    /// edit of the application's rather than what was found. So a first install over a large
-    /// library holds the write lock as long as `install` does; only rows written since the last
-    /// collect are left to later steps, and are in the meantime as any row written since then.
+    /// What it adopts of the registry for collections installed before (new fields, sets now
+    /// written together), and every row that brings up to date, is done whole, as `install`
+    /// does it. The rows found in the tables of a collection installed for the first time are
+    /// recorded, with their values as they stand, and later steps adopt them from the records;
+    /// what the application writes to them meanwhile is collected once every record is adopted,
+    /// as an edit made after a whole install. Recording reads every found row in this one
+    /// transaction. Where rows written before this install are still to be collected, or an
+    /// earlier install's records still wait, the found rows are instead adopted whole by the
+    /// next step. A collect or an apply made while records wait adopts the rest first, whole:
+    /// a caller that wants the lock held briefly takes steps until [`Collected::more`] is false
+    /// before it applies anything. The design is set out with the kernel's tables, in `store.rs`.
     pub async fn install_step(
         &self,
         conn: &mut SqliteConnection,

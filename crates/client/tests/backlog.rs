@@ -1016,10 +1016,17 @@ fn library_registry() -> Registry {
 ///     --test backlog -- --ignored --nocapture measure_first_install
 /// ```
 ///
-/// On an 8 GB laptop, with a 1 s busy timeout: 10,000 books (30,000 rows) held the lock 2.0 s
-/// in either journal mode, and one statement of each other connection failed; 50,000 books held
-/// it 13.3 to 14.1 s, and about 12 of 40 statements of each writer failed (in WAL mode the
-/// reader never waited). A copy of every row took 0.01 s and 0.03 s.
+/// With `FIRST_STEPPED=1` the install is made in steps of [`COLLECT_ROWS`], paced as a sync
+/// paces them; its first transaction records every found row.
+///
+/// On an 8 GB laptop, while other tests ran: whole, 10,000 books (30,000 rows) held the lock 2.2
+/// to 4.7 s and with a 1 s busy timeout two or three statements of each other connection failed;
+/// 50,000 books held it 18 to 42 s, and with a 1 s timeout about 30 of 70 statements of each
+/// writer failed (in WAL mode the reader never waited). In steps, 10,000 books held it at most
+/// 0.21 s, the recording step 0.16 to 0.21 s, and nothing failed; 50,000 books held it at most
+/// 0.7 to 2.4 s, always in the recording step, the others about 0.2 s, and with a 1 s timeout one
+/// statement of each writer failed. In steps the install took 5 to 6 s and 35 to 78 s in all,
+/// mostly for its pauses. A copy of every row took 0.01 to 0.1 s.
 #[tokio::test]
 #[ignore]
 async fn measure_first_install() {
@@ -1077,17 +1084,27 @@ async fn measure_first_install() {
     let copy = began.elapsed();
     let replica = Replica::new(library_registry());
     let holds = Holds::watch(&mut conn).await;
+    let stepped = env("FIRST_STEPPED", 0) == 1;
     let (took, waits) = alongside(&path, busy, async {
-        immediate(&mut conn).await;
-        replica.install(&mut conn).await.unwrap();
-        commit(&mut conn).await;
+        if stepped {
+            let first = replica.install_step(&mut conn, COLLECT_ROWS).await.unwrap();
+            in_steps(&replica, &mut conn, first).await;
+        } else {
+            immediate(&mut conn).await;
+            replica.install(&mut conn).await.unwrap();
+            commit(&mut conn).await;
+        }
     })
     .await;
-    let longest = holds.take().into_iter().max().unwrap_or_default();
+    let held = holds.take();
+    let longest = held.iter().max().copied().unwrap_or_default();
     eprintln!(
-        "RESULT {journal} {books} books, {} rows: first install {:.2} s, held {:.2} s; {waits}; a copy of every row {:.2} s",
+        "RESULT {journal} {books} books, {} rows, {}: first install {:.2} s, {} transactions, first {:.2} s, longest {:.2} s; {waits}; a copy of every row {:.2} s",
         books * 3,
+        if stepped { "steps" } else { "whole" },
         took.as_secs_f64(),
+        held.len(),
+        held.first().copied().unwrap_or_default().as_secs_f64(),
         longest.as_secs_f64(),
         copy.as_secs_f64()
     );
