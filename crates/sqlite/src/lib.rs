@@ -18,6 +18,34 @@
 //! the handle itself, on a connection it passes to the kernel, should do the same: send any
 //! command it waits on, such as `ping` or a query, before each `lock_handle`.
 //!
+//! # Entry points
+//!
+//! Every call that reads or writes the database first reads, in one indexed statement inside
+//! the transaction or savepoint it works in, whether the kernel's tables are there, of which
+//! layout, and whether capture is suspended; what it refuses, it refuses before changing
+//! anything.
+//!
+//! - Tables of a later layout than this build's are refused by every call
+//!   ([`Error::NewerLayout`]).
+//! - Tables of layout 3 are upgraded by `install`, `install_step` and `resume`, and removed by
+//!   `uninstall`; every other call refuses them ([`Error::OlderLayout`]).
+//! - Tables of any other layout, or that record none, are removed by `uninstall` and refused by
+//!   every other call ([`Error::UnknownLayout`]).
+//! - With no kernel tables, `install`, `install_step` and `resume` install, `suspend` and
+//!   `uninstall` do nothing, `uncollected_rows` answers 0 and [`installed`] false; every other
+//!   call refuses ([`Error::NotInstalled`]).
+//! - While capture is suspended, `install`, `install_step`, `collect`, `collect_step`, `apply`
+//!   and `uncollected_rows` refuse ([`Error::Suspended`]); the reads, `acknowledge` and
+//!   `release_bases` answer as at any other time.
+//!
+//! Every call that writes, called with no transaction open, takes SQLite's write lock with its
+//! first statement, so while another connection writes it waits in the busy handler. Called
+//! inside the caller's transaction, it works in a savepoint of it and cannot take the lock
+//! itself: the caller begins that transaction with `BEGIN IMMEDIATE`, since a deferred one that
+//! has read fails with `SQLITE_BUSY` at its first write if another connection wrote meanwhile.
+//! Every read runs in a savepoint, so it answers from one state of the database; in
+//! rollback-journal mode, another connection's commit waits for it while it lasts.
+//!
 //! # What is supported and tested
 //!
 //! Collecting and installing in bounded steps are held to their documented bar and bounds in
@@ -48,5 +76,5 @@ pub use fongo_sync_core as core;
 pub use registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 pub use replica::{
     Applied, COLLECT_ROWS, Collected, Conflict, Held, Inspection, Made, Outbox, Replica, Resume,
-    Touched,
+    Touched, installed,
 };

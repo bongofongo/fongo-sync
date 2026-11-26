@@ -154,8 +154,12 @@ pub(crate) async fn clear_sending(
 }
 
 /// The sequence number of the last envelope in `library`'s log that this database has applied or
-/// knows it wrote; 0 before the first sync.
+/// knows it wrote; 0 before the first sync, and where the kernel is not installed. Fails, as the
+/// kernel's own calls do, where its tables are of a layout other than the one this build uses.
 pub async fn cursor(conn: &mut SqliteConnection, library: LibraryId) -> Result<u64, Error> {
+    if !fongo_sync_sqlite::installed(conn).await? {
+        return Ok(0);
+    }
     let exists = sqlx::query(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_client_state'",
     )

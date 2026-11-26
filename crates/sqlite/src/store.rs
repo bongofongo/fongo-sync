@@ -53,7 +53,9 @@ use crate::error::{Error, Result};
 /// the index of marks in collecting order, and keeps everything else as it was. The move is one
 /// way: a build of layout 3 refuses to install over layout 4, as over any layout it does not
 /// know. Such a build calling `collect` or `apply` without installing first is not refused, and
-/// would leave records waiting unadopted; an application installs at every open.
+/// would leave records waiting unadopted; an application installs at every open. This build
+/// refuses every call on a later layout, and every call but an install, a resume or an uninstall
+/// on layout 3.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.
@@ -161,6 +163,92 @@ pub(crate) const LAYOUT: i64 = 4;
 
 /// Earlier layouts the next install upgrades in place, adding what `TABLES` adds.
 pub(crate) const UPGRADES: &[i64] = &[3];
+
+/// The `fongo_meta` key that records that capture is suspended: set by `suspend` with dropping
+/// the triggers, removed by `resume` with putting them back.
+pub(crate) const SUSPENDED: &str = "suspended";
+
+/// What the kernel's tables are, as every operation reads them before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
+    /// There are none.
+    Absent,
+    /// [`LAYOUT`], and whether capture is suspended.
+    Current { suspended: bool },
+    /// An earlier layout in [`UPGRADES`].
+    Older(i64),
+    /// A layout later than [`LAYOUT`].
+    Newer(i64),
+    /// An earlier layout this build does not upgrade, or none recorded.
+    Unknown(Option<i64>),
+}
+
+impl State {
+    /// Whether capture is suspended, for an operation that needs the tables at [`LAYOUT`].
+    pub(crate) fn current(self) -> Result<bool> {
+        match self {
+            State::Current { suspended } => Ok(suspended),
+            State::Absent => Err(Error::NotInstalled),
+            State::Older(found) => Err(Error::OlderLayout {
+                found,
+                known: LAYOUT,
+            }),
+            State::Newer(found) => Err(Error::NewerLayout {
+                found,
+                known: LAYOUT,
+            }),
+            State::Unknown(found) => Err(Error::UnknownLayout {
+                found,
+                known: LAYOUT,
+            }),
+        }
+    }
+
+    /// For an operation that needs the tables at [`LAYOUT`] with capture running.
+    pub(crate) fn ready(self) -> Result<()> {
+        if self.current()? {
+            return Err(Error::Suspended);
+        }
+        Ok(())
+    }
+}
+
+/// Reads [`State`] in one statement, an indexed read of `fongo_meta`; only where that table is
+/// missing does it look in the schema to tell that apart from another failure.
+pub(crate) fn state(db: &Db) -> Result<State> {
+    let rows = match db.query(
+        "SELECT key, value FROM fongo_meta WHERE key IN ('layout', 'suspended')",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let missing = matches!(e, Error::Sqlite { code, .. } if code & 0xff == libsqlite3_sys::SQLITE_ERROR)
+                && db
+                    .query(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
+                        &[],
+                    )?
+                    .is_empty();
+            return if missing { Ok(State::Absent) } else { Err(e) };
+        }
+    };
+    let mut layout = None;
+    let mut suspended = false;
+    for r in rows {
+        match as_text(&r[0])? {
+            "layout" => layout = Some(r[1].clone()),
+            SUSPENDED => suspended = r[1] == Value::Int(1),
+            _ => {}
+        }
+    }
+    Ok(match layout {
+        Some(Value::Int(LAYOUT)) => State::Current { suspended },
+        Some(Value::Int(found)) if found > LAYOUT => State::Newer(found),
+        Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Older(found),
+        Some(Value::Int(found)) => State::Unknown(Some(found)),
+        _ => State::Unknown(None),
+    })
+}
 
 pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {
     Hlc::decode(as_text(value)?).ok_or_else(|| Error::Corrupt("a clock does not parse".into()))
