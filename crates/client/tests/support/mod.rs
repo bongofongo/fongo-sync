@@ -107,6 +107,12 @@ impl Server {
                     max_devices: Some(8),
                     max_page_batches: Some(4),
                     max_page_bytes: None,
+                    max_blob_bytes: None,
+                    max_blobs_bytes: None,
+                    max_query_ids: None,
+                    blob_wait_days: None,
+                    blob_incomplete_days: None,
+                    device_removal: false,
                 },
                 now: NOW,
                 libraries: HashMap::new(),
@@ -207,6 +213,9 @@ impl Server {
                 .push(DeviceRecord {
                     public_key: key,
                     recovery: false,
+                    wrap_key: None,
+                    removed: false,
+                    last_seen: None,
                 })
         });
     }
@@ -345,10 +354,16 @@ impl State {
                     DeviceRecord {
                         public_key: create.device_key,
                         recovery: false,
+                        wrap_key: None,
+                        removed: false,
+                        last_seen: None,
                     },
                     DeviceRecord {
                         public_key: create.recovery_key,
                         recovery: true,
+                        wrap_key: None,
+                        removed: false,
+                        last_seen: None,
                     },
                 ];
                 self.libraries.insert(
@@ -378,6 +393,9 @@ impl State {
                 let record = DeviceRecord {
                     public_key: add.device_key,
                     recovery: false,
+                    wrap_key: None,
+                    removed: false,
+                    last_seen: None,
                 };
                 if !library.devices.contains(&record) {
                     let count = library.devices.iter().filter(|d| !d.recovery).count();

@@ -65,14 +65,20 @@ codes! {
     StaleRequest = "stale_request", 401, "the request timestamp is outside the allowed clock skew";
     ReplayedRequest = "replayed_request", 401,
         "this device already used this request nonce within the clock skew";
+    DeviceRemoved = "device_removed", 401, "the signing device was removed from this library";
     NotEntitled = "not_entitled", 402, "this library is not entitled to the service";
     Forbidden = "forbidden", 403, "the recovery key may only list and add devices";
     DeviceLimit = "device_limit", 403, "the library has as many devices as it may";
     NotFound = "not_found", 404, "no such endpoint";
     LibraryNotFound = "library_not_found", 404, "no such library";
+    BlobNotFound = "blob_not_found", 404, "no such blob";
     MethodNotAllowed = "method_not_allowed", 405, "method not allowed on this endpoint";
     LibraryExists = "library_exists", 409, "a library with this id already exists";
+    BlobIncomplete = "blob_incomplete", 409, "the blob does not have all its chunks yet";
+    BlobMismatch = "blob_mismatch", 409,
+        "the blob was begun with a different size or chunk count";
     TooLarge = "too_large", 413, "the request body is larger than this server accepts";
+    BlobTooLarge = "blob_too_large", 413, "the blob is larger than this server accepts";
     EnvelopeWrongLibrary = "envelope_wrong_library", 422,
         "the envelope belongs to another library";
     EnvelopeWrongDevice = "envelope_wrong_device", 422,
@@ -148,7 +154,7 @@ mod tests {
 
     #[test]
     fn every_code_round_trips_through_its_string() {
-        assert_eq!(ErrorCode::ALL.len(), 22);
+        assert_eq!(ErrorCode::ALL.len(), 27);
         for &code in ErrorCode::ALL {
             assert_eq!(ErrorCode::parse(code.as_str()), code);
             assert!((400..600).contains(&code.status()));

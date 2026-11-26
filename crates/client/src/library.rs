@@ -1,6 +1,4 @@
-use fongo_sync_protocol::api::{
-    AddDevice, CreateLibrary, DeviceRecord, Devices, LIBRARIES_PATH, devices_path,
-};
+use fongo_sync_protocol::api::{AddDevice, CreateLibrary, Devices, LIBRARIES_PATH, devices_path};
 use fongo_sync_protocol::{LibraryKeys, SigningKey, VerifyingKey, generate_signing_key};
 
 use crate::credentials::Credentials;
@@ -94,6 +92,7 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
 ) -> Result<(), Error> {
     let body = serde_json::to_vec(&AddDevice {
         device_key: *device_key,
+        wrap_key: None,
     })
     .expect("protocol messages serialise");
     let response = rpc
@@ -114,8 +113,8 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
 }
 
 fn lists(devices: &Devices, key: &VerifyingKey, recovery: bool) -> bool {
-    devices.devices.contains(&DeviceRecord {
-        public_key: *key,
-        recovery,
-    })
+    devices
+        .devices
+        .iter()
+        .any(|d| d.public_key == *key && d.recovery == recovery)
 }
