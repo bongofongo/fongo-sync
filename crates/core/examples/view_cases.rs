@@ -299,6 +299,15 @@ fn full_cases() -> Vec<(&'static str, Vec<Change>)> {
             ],
         ),
         (
+            "a together set tied at one clock shows each field's greater value",
+            vec![
+                at("notes", gid(104), "text", text("A"), 5),
+                at("notes", gid(104), "page", Value::Int(1), 5),
+                at("notes", gid(104), "page", Value::Int(0), 5),
+                at("notes", gid(104), "text", text("B"), 5),
+            ],
+        ),
+        (
             "clocks beyond the text form",
             vec![
                 at("authors", author("Gus"), "name", text("Gus"), WALL_MAX + 1),
@@ -482,6 +491,37 @@ fn main() {
                 ch(2, DELETED, text("1"), 5),
                 ch(3, DELETED, Value::Int(-1), 6),
                 ch(4, DELETED, Value::Null, 7),
+            ],
+        ),
+        (
+            "an exact tie goes to the greater value",
+            vec![
+                ch(1, "title", text("b"), 1),
+                ch(1, "title", text("a"), 1),
+                ch(2, "title", text("a"), 1),
+                ch(2, "title", text("b"), 1),
+                ch(3, "high", Value::Int(4), 1),
+                ch(3, "link", Value::Ref(gid(2)), 1),
+                ch(3, "link", Value::Ref(gid(1)), 1),
+            ],
+        ),
+        (
+            "a tie between members goes to the greater value",
+            vec![
+                ch(1, "title", text("a"), 1),
+                ch(2, "title", text("b"), 1),
+                ch(2, ALIAS, Value::Ref(gid(1)), 2),
+            ],
+        ),
+        (
+            "a tombstone tie deletes",
+            vec![
+                ch(1, "title", text("a"), 1),
+                ch(1, DELETED, Value::Int(0), 2),
+                ch(1, DELETED, Value::Int(1), 2),
+                ch(2, "title", text("b"), 1),
+                ch(2, DELETED, Value::Int(1), 2),
+                ch(2, DELETED, Value::Int(0), 2),
             ],
         ),
     ];

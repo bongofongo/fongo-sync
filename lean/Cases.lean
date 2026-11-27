@@ -31,7 +31,15 @@ def cases : List (String × List (Change Value)) := [
     ch 3 "high" (.int 2) 4, ch 4 "high" (.text "z") 5]),
   ("tombstones neither 0 nor 1", [ch 1 "title" (.text "a") 1, ch 1 DELETED (.int 1) 2,
     ch 1 DELETED (.int 2) 3, ch 2 "title" (.text "b") 4, ch 2 DELETED (.text "1") 5,
-    ch 3 DELETED (.int (-1)) 6, ch 4 DELETED .null 7])
+    ch 3 DELETED (.int (-1)) 6, ch 4 DELETED .null 7]),
+  ("an exact tie goes to the greater value", [ch 1 "title" (.text "b") 1,
+    ch 1 "title" (.text "a") 1, ch 2 "title" (.text "a") 1, ch 2 "title" (.text "b") 1,
+    ch 3 "high" (.int 4) 1, ch 3 "link" (.ref 2) 1, ch 3 "link" (.ref 1) 1]),
+  ("a tie between members goes to the greater value", [ch 1 "title" (.text "a") 1,
+    ch 2 "title" (.text "b") 1, ch 2 ALIAS (.ref 1) 2]),
+  ("a tombstone tie deletes", [ch 1 "title" (.text "a") 1, ch 1 DELETED (.int 0) 2,
+    ch 1 DELETED (.int 1) 2, ch 2 "title" (.text "b") 1, ch 2 DELETED (.int 1) 2,
+    ch 2 DELETED (.int 0) 2])
 ]
 
 def showValue : Value → String
@@ -273,6 +281,11 @@ def fullCases : List (String × List (Change Value)) := [
     at_ "books" (book (author "A. Ann") "Middlemarch") "author" (.ref (author "A. Ann")) 5,
     at_ "books" (book (author "A. Ann") "Middlemarch") "title" (.text "Middlemarch") 5,
     at_ "books" (book (author "A. Ann") "Middlemarch") "pages" (.int 900) 6]),
+  ("a together set tied at one clock shows each field's greater value", [
+    at_ "notes" 104 "text" (.text "A") 5,
+    at_ "notes" 104 "page" (.int 1) 5,
+    at_ "notes" 104 "page" (.int 0) 5,
+    at_ "notes" 104 "text" (.text "B") 5]),
   ("clocks beyond the text form", [
     at_ "authors" (author "Gus") "name" (.text "Gus") (WALL_MAX + 1),
     at_ "notes" 102 "text" (.text "late") (WALL_MAX + 1),

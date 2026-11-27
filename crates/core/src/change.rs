@@ -21,17 +21,21 @@ pub struct Change {
     pub clock: Hlc,
 }
 
-/// How concurrent changes to one field resolve. Each is order-independent, so replicas that have
-/// seen the same changes hold the same value.
+/// How concurrent changes to one field resolve. Each orders changes totally, so the winner is a
+/// function of the set of changes seen, whatever order they arrived in: replicas that have seen
+/// the same changes hold the same value, even where two changes share a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// The change with the later clock wins.
+    /// The change with the later clock wins; of two at one clock, the greater value under
+    /// [`Value::total_cmp`]. Honest clocks are never equal; equal ones come from two databases
+    /// sharing one identity, such as a copied file or a restored backup.
     Lww,
-    /// The greater value wins, whenever it was written.
+    /// The greater value wins, whenever it was written; of two equal values, the later clock.
     Max,
 }
 
-/// Whether an incoming change replaces what is stored.
+/// Whether an incoming change replaces what is stored: whether `(clock, value)` is greater than
+/// what is stored for `Lww`, or `(value, clock)` for `Max`.
 pub fn wins(
     strategy: Strategy,
     stored: Option<(&Value, &Hlc)>,
@@ -42,7 +46,11 @@ pub fn wins(
         return true;
     };
     match strategy {
-        Strategy::Lww => clock > stored_clock,
+        Strategy::Lww => match clock.cmp(stored_clock) {
+            Ordering::Greater => true,
+            Ordering::Equal => value.total_cmp(stored_value) == Ordering::Greater,
+            Ordering::Less => false,
+        },
         Strategy::Max => match value.total_cmp(stored_value) {
             Ordering::Greater => true,
             Ordering::Equal => clock > stored_clock,
@@ -116,32 +124,37 @@ mod tests {
         ]
     }
 
+    /// Changes whose clocks come from a small range, so two changes to one field often share a
+    /// clock with different values.
     fn arb_changes() -> impl Strategy<Value = Vec<Change>> {
         let one = (
             0u8..3,
             prop_oneof![Just("title"), Just("high"), Just(DELETED)],
             arb_value(),
-            0u64..4,
-            0u8..3,
+            0u64..3,
+            0u32..2,
+            0u8..2,
         );
         proptest::collection::vec(one, 0..40).prop_map(|raw| {
             raw.into_iter()
                 .enumerate()
-                .map(|(i, (entity, field, value, wall_ms, node))| Change {
-                    collection: "things".into(),
-                    gid: Gid([entity; 16]),
-                    field: field.into(),
-                    value: if field == DELETED {
-                        Value::Int(i as i64 % 2)
-                    } else {
-                        value
+                .map(
+                    |(i, (entity, field, value, wall_ms, counter, node))| Change {
+                        collection: "things".into(),
+                        gid: Gid([entity; 16]),
+                        field: field.into(),
+                        value: if field == DELETED {
+                            Value::Int(i as i64 % 2)
+                        } else {
+                            value
+                        },
+                        clock: Hlc {
+                            wall_ms,
+                            counter,
+                            node: Gid([node; 16]),
+                        },
                     },
-                    clock: Hlc {
-                        wall_ms,
-                        counter: i as u32,
-                        node: Gid([node; 16]),
-                    },
-                })
+                )
                 .collect()
         })
     }
@@ -168,6 +181,54 @@ mod tests {
             twice.extend(changes.iter().cloned());
             prop_assert_eq!(merged(&changes), merged(&twice));
         }
+    }
+
+    #[test]
+    fn of_two_changes_at_one_clock_the_greater_value_wins_in_either_order() {
+        let at = Hlc {
+            wall_ms: 5,
+            counter: 0,
+            node: Gid([1; 16]),
+        };
+        let change = |field: &str, value: Value| Change {
+            collection: "things".into(),
+            gid: Gid([0; 16]),
+            field: field.into(),
+            value,
+            clock: at,
+        };
+        let pairs = [
+            ("title", Value::Text("a".into()), Value::Text("b".into())),
+            ("title", Value::Null, Value::Int(0)),
+            ("high", Value::Int(1), Value::Int(2)),
+            (DELETED, Value::Int(0), Value::Int(1)),
+        ];
+        for (field, smaller, greater) in pairs {
+            for order in [
+                [
+                    change(field, smaller.clone()),
+                    change(field, greater.clone()),
+                ],
+                [
+                    change(field, greater.clone()),
+                    change(field, smaller.clone()),
+                ],
+            ] {
+                let state = merged(&order);
+                assert_eq!(
+                    state.get("things", Gid([0; 16]), field),
+                    Some(&(greater.clone(), at)),
+                    "{field}"
+                );
+            }
+        }
+        assert!(
+            merged(&[
+                change(DELETED, Value::Int(1)),
+                change(DELETED, Value::Int(0))
+            ])
+            .is_deleted("things", Gid([0; 16]))
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod common;
 
 use common::{
     Counting, Rng, arb_case, arb_random_case, dense_changes, gid, mentioned, nested_schema,
-    random_schema,
+    random_schema, same_row,
 };
 use std::collections::BTreeMap;
 
@@ -103,7 +103,8 @@ fn agrees(schema: &Schema, changes: &[Change]) -> Result<(), TestCaseError> {
             prop_assert!(t.live.iter().all(|m| t.members.contains(m)));
             match &t.row {
                 Some(row) => {
-                    prop_assert_eq!(expected.row(&c.name, t.canonical), Some(row));
+                    let want = expected.row(&c.name, t.canonical);
+                    prop_assert!(same_row(want, Some(row)), "{:?} != {:?}", want, row);
                     shown.insert(&c.name, t.canonical, row.clone());
                 }
                 None => prop_assert_eq!(expected.row(&c.name, t.canonical), None),
@@ -152,7 +153,8 @@ proptest! {
             let alone = ev.target(&store, c, *g).expect("within limits");
             prop_assert_eq!(&shared.target(c, *g).expect("within limits"), &alone);
             if alone.canonical == *g {
-                prop_assert_eq!(alone.row.as_ref(), expected.row(c, *g));
+                let want = expected.row(c, *g);
+                prop_assert!(same_row(alone.row.as_ref(), want), "{:?} != {:?}", alone.row, want);
             }
         }
     }

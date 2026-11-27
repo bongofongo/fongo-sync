@@ -439,24 +439,18 @@ theorem mem_edges_iff (e : Edge) : e ∈ edges sc cs₁ ↔ e ∈ edges sc cs₂
   rw [unverified_eq sc same, home_eq sc same]
   simp only [List.mem_filterMap, mem_accepted_iff sc same]
 
-theorem registers_eq (unique : ClockDetermines cs₁) : registers sc cs₁ = registers sc cs₂ := by
+theorem registers_eq : registers sc cs₁ = registers sc cs₂ := by
   apply merged_eq_of_mem_iff
-  · intro c; simp only [List.mem_filter, mem_accepted_iff sc same]
-  · intro a ha b hb
-    have hsub : ∀ x, x ∈ (accepted sc cs₁).filter (fun c => c.field ≠ ALIAS) → x ∈ cs₁ := by
-      intro x hx
-      simp only [List.mem_filter, accepted, claimed] at hx
-      exact hx.1.1.1
-    exact unique a (hsub a ha) b (hsub b hb)
+  intro c; simp only [List.mem_filter, mem_accepted_iff sc same]
 
-theorem groupedAt_eq (unique : ClockDetermines cs₁) (k : Nat) :
+theorem groupedAt_eq (k : Nat) :
     groupedAt sc cs₁ k = groupedAt sc cs₂ k := by
   have he : (fun a b => (a, b) ∈ edges sc cs₁) = (fun a b => (a, b) ∈ edges sc cs₂) := by
     funext a b; exact propext (mem_edges_iff sc same _)
   have hk : KeyPair sc cs₁ = KeyPair sc cs₂ := by
     funext R a b
     simp only [KeyPair, homeCollection_eq sc same, home_eq sc same, unverified_eq sc same,
-      registers_eq sc same unique]
+      registers_eq sc same]
   induction k with
   | zero => simp only [groupedAt, he]
   | succ k ih =>
@@ -465,35 +459,32 @@ theorem groupedAt_eq (unique : ClockDetermines cs₁) (k : Nat) :
     funext a b
     rw [propext (mem_edges_iff sc same (a, b))]
 
-theorem canon_eq (unique : ClockDetermines cs₁) : canon sc cs₁ = canon sc cs₂ := by
+theorem canon_eq : canon sc cs₁ = canon sc cs₂ := by
   have : Grouped sc cs₁ = Grouped sc cs₂ := by
-    funext a b; simp only [Grouped, groupedAt_eq sc same unique]
+    funext a b; simp only [Grouped, groupedAt_eq sc same]
   funext g; unfold canon; rw [this]
 
-theorem inputs_eq (unique : ClockDetermines cs₁) : inputs sc cs₁ = inputs sc cs₂ := by
-  simp only [inputs, registers_eq sc same unique, home_eq sc same, gids_eq sc same,
-    canon_eq sc same unique, unverified_eq sc same]
+theorem inputs_eq : inputs sc cs₁ = inputs sc cs₂ := by
+  simp only [inputs, registers_eq sc same, home_eq sc same, gids_eq sc same,
+    canon_eq sc same, unverified_eq sc same]
 
 end Invariance
 
-/-- **The view over several collections depends only on the set of changes**, given that no two
-changes to one register share a clock with different values. -/
+/-- **The view over several collections depends only on the set of changes.** -/
 theorem view_eq_of_mem_iff (sc : Schema) {cs₁ cs₂ : List (Change Value)}
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     view sc cs₁ = view sc cs₂ := by
   simp only [view]
   rw [inputs_eq sc (cs₁ := candidates sc cs₁) (cs₂ := candidates sc cs₂)
-    (fun c => by simp [candidates, same])
-    (fun a ha b hb => unique a (List.mem_filter.mp ha).1 b (List.mem_filter.mp hb).1)]
+    (fun c => by simp [candidates, same])]
 
-theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂)
-    (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ :=
-  view_eq_of_mem_iff sc (fun _ => p.mem_iff) unique
+theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂) :
+    view sc cs₁ = view sc cs₂ :=
+  view_eq_of_mem_iff sc (fun _ => p.mem_iff)
 
-theorem view_dup (sc : Schema) (cs : List (Change Value)) (unique : ClockDetermines cs) :
+theorem view_dup (sc : Schema) (cs : List (Change Value)) :
     view sc (cs ++ cs) = view sc cs :=
-  view_eq_of_mem_iff sc (by simp) (by
-    intro a ha b hb; simp only [List.mem_append, or_self] at ha hb; exact unique a ha b hb)
+  view_eq_of_mem_iff sc (by simp)
 
 /-! ## Changes that are ignored -/
 

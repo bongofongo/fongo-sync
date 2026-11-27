@@ -174,14 +174,91 @@ pub fn pool(schema: &Schema) -> Vec<Gid> {
     all.into_iter().collect()
 }
 
+/// Numbers whose order is easy to get wrong: integers past 2^53 beside the reals they round to,
+/// both zeros, both infinities and NaNs of either sign.
+pub fn awkward_numbers() -> Vec<Value> {
+    let big = 1i64 << 53;
+    vec![
+        Value::Int(0),
+        Value::Int(big),
+        Value::Int(big + 1),
+        Value::Real(big as f64),
+        Value::Real((big + 2) as f64),
+        Value::Real(0.0),
+        Value::Real(-0.0),
+        Value::Real(f64::INFINITY),
+        Value::Real(f64::NEG_INFINITY),
+        Value::Real(f64::NAN),
+        Value::Real(-f64::NAN),
+        Value::Real(1.0),
+    ]
+}
+
 fn arb_value(pool: Vec<Gid>) -> impl Strategy<Value = Value> {
     prop_oneof![
         1 => Just(Value::Null),
         2 => (0i64..3).prop_map(Value::Int),
-        1 => Just(Value::Real(1.0)),
+        1 => prop::sample::select(awkward_numbers()),
         1 => "[ab]".prop_map(Value::Text),
         4 => prop::sample::select(pool).prop_map(Value::Ref),
     ]
+}
+
+/// Whether two values are the same under `Value::total_cmp`, so that a NaN equals itself.
+pub fn same(a: &Value, b: &Value) -> bool {
+    a.total_cmp(b) == std::cmp::Ordering::Equal
+}
+
+/// Whether two rows, or their absence, are the same under `Value::total_cmp`.
+pub fn same_row(
+    a: Option<&fongo_sync_core::model::Row>,
+    b: Option<&fongo_sync_core::model::Row>,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((fa, va), (fb, vb))| fa == fb && same(va, vb))
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// `change` again at its own clock with another value, as a copy of a database that issues the
+/// same clocks writes it: a tombstone flips, anything else takes `value`.
+pub fn twin(change: &Change, value: Value) -> Change {
+    let value = match (&change.field[..], &change.value) {
+        (DELETED, Value::Int(0)) => Value::Int(1),
+        (DELETED, Value::Int(1)) => Value::Int(0),
+        _ => value,
+    };
+    Change {
+        value,
+        ..change.clone()
+    }
+}
+
+/// `changes` with twins of those `picks` name, each placed before or after the change it copies.
+pub fn with_twins(mut changes: Vec<Change>, picks: &[(prop::sample::Index, Value)]) -> Vec<Change> {
+    if changes.is_empty() {
+        return changes;
+    }
+    for (i, (at, value)) in picks.iter().enumerate() {
+        let n = at.index(changes.len());
+        let copy = twin(&changes[n], value.clone());
+        changes.insert(if i % 2 == 0 { n } else { n + 1 }, copy);
+    }
+    changes
+}
+
+/// Twin picks for [`with_twins`] over `schema`'s values.
+pub fn arb_twins(
+    schema: &Schema,
+    len: std::ops::Range<usize>,
+) -> impl Strategy<Value = Vec<(prop::sample::Index, Value)>> + use<> {
+    proptest::collection::vec((any::<prop::sample::Index>(), arb_value(pool(schema))), len)
 }
 
 /// One raw step: which collection, entity, field, value, clock, oddity and key choice.
@@ -206,7 +283,7 @@ pub fn arb_raw(
 
 /// Turns raw steps into changes. Most changes to a natural entity arrive with the writes of its
 /// key (and its parents' keys); some key writes are hostile. `node` and `counter` give every
-/// change a distinct clock.
+/// change a distinct clock; [`with_twins`] adds changes that share one.
 pub fn changes(schema: &Schema, raw: &[Raw]) -> Vec<Change> {
     let mut out: Vec<Change> = Vec::new();
     for (c, g, f, value, wall_ms, odd, pick) in raw.iter().cloned() {
@@ -314,12 +391,13 @@ fn write_key(
     }
 }
 
-/// A schema from the family and changes over it.
+/// A schema from the family and changes over it, some of them twins.
 pub fn arb_case(len: std::ops::Range<usize>) -> impl Strategy<Value = (Schema, Vec<Change>)> {
     arb_family().prop_flat_map(move |family| {
         let schema = family.schema();
-        arb_raw(&schema, len.clone()).prop_map(move |raw| {
-            let changes = changes(&schema, &raw);
+        let twins = 0..len.end / 4 + 1;
+        (arb_raw(&schema, len.clone()), arb_twins(&schema, twins)).prop_map(move |(raw, picks)| {
+            let changes = with_twins(changes(&schema, &raw), &picks);
             (schema.clone(), changes)
         })
     })
@@ -566,7 +644,8 @@ pub fn random_pool(rng: &mut Rng, schema: &Schema, roots: u8) -> (Vec<Gid>, Vec<
 
 /// `n` changes over a random schema: honest key writes with most changes to natural entities,
 /// and hostile ones: tombstones that are not 0 or 1, aliases to themselves or to non-gids,
-/// undeclared fields and collections, unencodable clocks, repeats.
+/// undeclared fields and collections, unencodable clocks, repeats, and twins of earlier changes
+/// at their clocks.
 pub fn random_changes(rng: &mut Rng, schema: &Schema, n: usize) -> Vec<Change> {
     dense_changes(rng, schema, 4, n)
 }
@@ -575,9 +654,11 @@ pub fn random_changes(rng: &mut Rng, schema: &Schema, n: usize) -> Vec<Change> {
 pub fn dense_changes(rng: &mut Rng, schema: &Schema, roots: u8, n: usize) -> Vec<Change> {
     let (pool, keyed) = random_pool(rng, schema, roots);
     let mut out: Vec<Change> = Vec::new();
+    let awkward = awkward_numbers();
     let value = |rng: &mut Rng| match rng.below(10) {
         0 => Value::Null,
         1 | 2 => Value::Int(rng.below(3) as i64),
+        3 if rng.one_in(2) => rng.pick(&awkward).clone(),
         3 => Value::Real(0.5),
         4 => Value::Text("a".into()),
         _ => Value::Ref(*rng.pick(&pool)),
@@ -610,6 +691,11 @@ pub fn dense_changes(rng: &mut Rng, schema: &Schema, roots: u8, n: usize) -> Vec
         if roll < 6 && !out.is_empty() {
             let again = out[rng.below(out.len())].clone();
             out.push(again);
+            continue;
+        }
+        if roll < 10 && !out.is_empty() {
+            let copy = twin(&out[rng.below(out.len())], value(rng));
+            out.push(copy);
             continue;
         }
         let c = rng.pick(&schema.collections);

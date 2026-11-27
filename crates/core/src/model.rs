@@ -2,8 +2,10 @@
 //! of changes and returns the data an application sees. It favours being obviously right over
 //! being fast, and is meant as the oracle that storage adapters are tested against.
 //!
-//! The answer depends only on the set of changes: their order and any duplicates do not matter,
-//! provided no two changes to one field share a clock with different values.
+//! The answer depends only on the set of changes: their order and any duplicates do not matter.
+//! That holds also where two changes to one field share a clock with different values, as they do
+//! when two databases write as one node: of such a pair the greater value under
+//! [`Value::total_cmp`] counts.
 //!
 //! # What a member device can do
 //!
@@ -380,8 +382,9 @@ impl PartialEq for View {
 ///    entity's gid: one value per key field, each written to that field by a change that counts,
 ///    such that `Gid::derive` of them is the gid. Short of a hash collision only one key derives a
 ///    gid, so a rewrite of a key field is always ignored.
-/// 2. Each (gid, field) holds the winner among its changes by the field's strategy; `$deleted`
-///    and undeclared fields merge `Lww`.
+/// 2. Each (gid, field) holds the winner among its changes by the field's strategy (see
+///    [`crate::Strategy`]; of two `Lww` changes at one clock, the greater value); `$deleted` and
+///    undeclared fields merge `Lww`, so of a deletion and a restoring at one clock, the deletion.
 /// 3. An alias whose target belongs to the same collection joins the two gids. Groups are the
 ///    connected components, closed under natural keys becoming equal, and a group's canonical
 ///    gid is its smallest member. A natural entity whose key has not yet been seen to derive its
@@ -393,7 +396,10 @@ impl PartialEq for View {
 ///    cycle, and no answer to whether such rows are live is obviously right, so self-ownership is
 ///    not supported yet.
 /// 5. A live group shows, for each field, the strategy winner among its live members; for a
-///    `together` set, the set of the live member holding the latest clock across the set.
+///    `together` set, the set of the live member holding the latest clock across the set, the
+///    smallest such member on a tie. A field of the set shows only if that member holds it at
+///    that clock, so the set comes whole from one write, unless two writes to it share the clock:
+///    then each field shows its greater value, which can mix the two writes.
 ///    References read as described on [`FieldKind`].
 pub fn view(schema: &Schema, changes: &[Change]) -> View {
     Merged::new(schema, changes).present()

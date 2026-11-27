@@ -6,9 +6,11 @@ import FongoSync.Clock
 Mirrors `wins` and `State::apply` in `crates/core/src/change.rs`.
 
 A register holds the winning `(value, clock)` for one field of one entity. The merge is proven
-against an abstract "keep the entry with the greater key" (`keep`), where the key is the clock for
-`Lww` and the pair `(value, clock)` for `Max`. Values are any type with a lawful total order: the
-Rust `Value::total_cmp` is assumed, not proven, to be one, since `f64` is not modelled.
+against an abstract "keep the entry with the greater key" (`keep`), where the key is the pair
+`(clock, value)` for `Lww` and the pair `(value, clock)` for `Max`: two entries with equal keys are
+equal, so the winner is a function of the set of entries, with no condition on clocks. Values are
+any type with a lawful total order: the Rust `Value::total_cmp` is assumed, not proven, to be one,
+since `f64` is not modelled; the Rust tests check it against an exact comparison.
 -/
 
 namespace FongoSync
@@ -33,7 +35,7 @@ def join : Option E → Option E → Option E
   | a, none => a
   | a, some e => keep cmp key a e
 
-/-- No two different entries of `l` share a key. For `Lww` this is "clocks are unique". -/
+/-- No two different entries of `l` share a key. -/
 def KeyInj (l : List E) : Prop := ∀ a ∈ l, ∀ b ∈ l, key a = key b → a = b
 
 variable [TransCmp cmp] [LawfulEqCmp cmp]
@@ -271,7 +273,11 @@ def wins (strategy : Strategy) (stored : Option (Entry V)) (value : V) (clock : 
   | none => true
   | some s =>
     match strategy with
-    | .lww => compare clock s.clock == .gt
+    | .lww =>
+      match compare clock s.clock with
+      | .gt => true
+      | .eq => compare value s.value == .gt
+      | .lt => false
     | .max =>
       match compare value s.value with
       | .gt => true
@@ -287,16 +293,39 @@ def maxCmp (a b : V × Hlc) : Ordering := compareLex (compareOn (·.1)) (compare
 
 def Entry.pair (e : Entry V) : V × Hlc := (e.value, e.clock)
 
+/-- The order `Lww` compares entries by: clock first, then value. -/
+def lwwCmp (a b : Hlc × V) : Ordering := compareLex (compareOn (·.1)) (compareOn (·.2)) a b
+
+def Entry.stamp (e : Entry V) : Hlc × V := (e.clock, e.value)
+
+variable [TransOrd V] [LawfulEqOrd V]
+
+instance : TransCmp (lwwCmp (V := V)) :=
+  inferInstanceAs (TransCmp (compareLex (compareOn (fun p : Hlc × V => p.1))
+    (compareOn (fun p : Hlc × V => p.2))))
+
+instance : LawfulEqCmp (lwwCmp (V := V)) where
+  eq_of_compare {a b} h := by
+    simp only [lwwCmp, compareLex_eq_eq, compareOn] at h
+    exact Prod.ext (LawfulEqOrd.eq_of_compare h.1) (LawfulEqOrd.eq_of_compare h.2)
+
+theorem wins_lww (s : Entry V) (v : V) (c : Hlc) :
+    wins .lww (some s) v c = ((compare s.clock c).then (compare s.value v) == .lt) := by
+  simp only [wins]
+  rw [OrientedCmp.eq_swap (cmp := (compare : Hlc → Hlc → Ordering)) (a := c) (b := s.clock),
+    OrientedCmp.eq_swap (cmp := (compare : V → V → Ordering)) (a := v) (b := s.value)]
+  cases compare s.clock c <;> cases compare s.value v <;> rfl
+
 theorem apply_lww (held : Option (Entry V)) (e : Entry V) :
-    apply .lww held e = keep compare Entry.clock held e := by
+    apply .lww held e = keep lwwCmp Entry.stamp held e := by
   cases held with
   | none => rfl
   | some s =>
-    simp only [apply, wins, keep_held]
-    have := OrientedCmp.gt_iff_lt (cmp := (compare : Hlc → Hlc → Ordering)) (a := e.clock) (b := s.clock)
-    by_cases h : compare s.clock e.clock = .lt <;> simp_all
+    simp only [apply, wins_lww, keep_held, lwwCmp, Entry.stamp, compareLex, compareOn]
+    by_cases h : (compare s.clock e.clock).then (compare s.value e.value) = .lt <;> simp [h]
 
-variable [TransOrd V] [LawfulEqOrd V]
+theorem Entry.stamp_inj {a b : Entry V} (h : a.stamp = b.stamp) : a = b := by
+  cases a; cases b; simp_all [Entry.stamp]
 
 instance : TransCmp (maxCmp (V := V)) :=
   inferInstanceAs (TransCmp (compareLex (compareOn (fun p : V × Hlc => p.1))
@@ -329,13 +358,10 @@ theorem Entry.pair_inj {a b : Entry V} (h : a.pair = b.pair) : a = b := by
 theorem fold_apply_mem (s : Strategy) (l : List (Entry V)) (m : Entry V)
     (h : l.foldl (apply s) none = some m) : m ∈ l := by
   cases s
-  · rw [show apply (V := V) .lww = keep compare Entry.clock from funext fun h => funext fun e => apply_lww h e] at h
+  · rw [show apply (V := V) .lww = keep lwwCmp Entry.stamp from funext fun h => funext fun e => apply_lww h e] at h
     simpa using (fold_keep_spec l none m h).1
   · rw [show apply (V := V) .max = keep maxCmp Entry.pair from funext fun h => funext fun e => apply_max h e] at h
     simpa using (fold_keep_spec l none m h).1
-
-/-- No two different entries of `l` share a clock. -/
-def UniqueClocks (l : List (Entry V)) : Prop := KeyInj Entry.clock l
 
 /-! ### Register laws, for both strategies -/
 
@@ -345,13 +371,11 @@ theorem apply_twice (s : Strategy) (h : Option (Entry V)) (e : Entry V) :
   · simp only [apply_lww]; exact keep_idem h e
   · simp only [apply_max]; exact keep_idem h e
 
-/-- Two changes to one field may arrive in either order. `Max` needs nothing; `Lww` needs the
-two clocks to differ unless the changes are the same. -/
-theorem apply_any_order (s : Strategy) (h : Option (Entry V)) (a b : Entry V)
-    (unique : a.clock = b.clock → a = b) :
+/-- Two changes to one field may arrive in either order, under either strategy. -/
+theorem apply_any_order (s : Strategy) (h : Option (Entry V)) (a b : Entry V) :
     apply s (apply s h a) b = apply s (apply s h b) a := by
   cases s
-  · simp only [apply_lww]; exact keep_swap h a b unique
+  · simp only [apply_lww]; exact keep_swap h a b Entry.stamp_inj
   · simp only [apply_max]; exact keep_swap h a b Entry.pair_inj
 
 /-- Under `Lww` a register ends at the later of the two clocks. -/
@@ -359,11 +383,25 @@ theorem apply_lww_clock (held e : Entry V) :
     (apply .lww (some held) e).map (·.clock) =
       some (if held.clock < e.clock then e.clock else held.clock) := by
   rw [apply_lww, keep_held]
+  simp only [lwwCmp, Entry.stamp, compareLex, compareOn]
   by_cases h : held.clock < e.clock
   · have h' : compare held.clock e.clock = .lt := h
-    simp [h, h']
+    simp [h, h', Ordering.then]
   · have h' : compare held.clock e.clock ≠ .lt := h
-    simp [h, h']
+    by_cases he : compare held.clock e.clock = .eq
+    · have := LawfulEqOrd.eq_of_compare he
+      simp only [he, Ordering.then, h, ↓reduceIte]
+      split <;> simp [this]
+    · have hgt : compare held.clock e.clock = .gt := by
+        revert h' he; cases compare held.clock e.clock <;> simp
+      simp [hgt, h, Ordering.then]
+
+/-- Under `Lww`, of two entries at one clock the one with the greater value is kept. -/
+theorem apply_lww_tie (held e : Entry V) (h : held.clock = e.clock) :
+    apply .lww (some held) e = some (if compare held.value e.value = .lt then e else held) := by
+  rw [apply_lww, keep_held]
+  simp only [lwwCmp, Entry.stamp, compareLex, compareOn, h, ReflCmp.compare_self, Ordering.then]
+  split <;> rfl
 
 /-- `join` for a strategy: the register holding the winner of two registers. -/
 def merge (s : Strategy) : Option (Entry V) → Option (Entry V) → Option (Entry V)
@@ -372,19 +410,17 @@ def merge (s : Strategy) : Option (Entry V) → Option (Entry V) → Option (Ent
 
 theorem merge_eq_join (s : Strategy) (a b : Option (Entry V)) :
     merge s a b = match s with
-      | .lww => join compare Entry.clock a b
+      | .lww => join lwwCmp Entry.stamp a b
       | .max => join maxCmp Entry.pair a b := by
   cases s <;> cases b <;> simp [merge, join, apply_lww, apply_max]
 
 theorem merge_idem (s : Strategy) (a : Option (Entry V)) : merge s a a = a := by
   rw [merge_eq_join]; cases s <;> exact join_idem a
 
-theorem merge_comm (s : Strategy) (a b : Option (Entry V))
-    (unique : ∀ x ∈ a, ∀ y ∈ b, x.clock = y.clock → x = y) :
-    merge s a b = merge s b a := by
+theorem merge_comm (s : Strategy) (a b : Option (Entry V)) : merge s a b = merge s b a := by
   rw [merge_eq_join, merge_eq_join]
   cases s
-  · exact join_comm a b unique
+  · exact join_comm a b fun x _ y _ h => Entry.stamp_inj h
   · exact join_comm a b fun x _ y _ h => Entry.pair_inj h
 
 theorem merge_assoc (s : Strategy) (a b c : Option (Entry V)) :
@@ -395,24 +431,55 @@ theorem merge_assoc (s : Strategy) (a b c : Option (Entry V)) :
   · exact join_assoc a b c
 
 /-- **Register convergence.** A register fed the same set of entries ends the same, whatever the
-order and however often each arrived, provided clocks are unique. -/
+order and however often each arrived. -/
 theorem fold_apply_eq_of_mem_iff (s : Strategy) (l₁ l₂ : List (Entry V))
-    (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂) (unique : UniqueClocks l₁) :
+    (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂) :
     l₁.foldl (apply s) none = l₂.foldl (apply s) none := by
   cases s
-  · simp only [show apply (V := V) .lww = keep compare Entry.clock from funext fun h => funext fun e => apply_lww h e]
-    exact fold_keep_eq_of_mem_iff l₁ l₂ same unique
+  · simp only [show apply (V := V) .lww = keep lwwCmp Entry.stamp from funext fun h => funext fun e => apply_lww h e]
+    exact fold_keep_eq_of_mem_iff l₁ l₂ same fun a _ b _ h => Entry.stamp_inj h
   · simp only [show apply (V := V) .max = keep maxCmp Entry.pair from funext fun h => funext fun e => apply_max h e]
     exact fold_keep_eq_of_mem_iff l₁ l₂ same fun a _ b _ h => Entry.pair_inj h
 
 theorem fold_apply_perm (s : Strategy) {l₁ l₂ : List (Entry V)} (p : l₁.Perm l₂)
-    (unique : UniqueClocks l₁) (h : Option (Entry V)) :
+    (h : Option (Entry V)) :
     l₁.foldl (apply s) h = l₂.foldl (apply s) h :=
-  p.foldl_eq' (fun x hx y hy z => apply_any_order s z x y (unique x hx y hy)) h
+  p.foldl_eq' (fun x _ y _ z => apply_any_order s z x y) h
 
-theorem fold_apply_dup (s : Strategy) (l : List (Entry V)) (unique : UniqueClocks l) :
+theorem fold_apply_dup (s : Strategy) (l : List (Entry V)) :
     (l ++ l).foldl (apply s) none = l.foldl (apply s) none :=
-  fold_apply_eq_of_mem_iff s _ _ (by simp) (by intro a ha b hb; simp at ha hb; exact unique a ha b hb)
+  fold_apply_eq_of_mem_iff s _ _ (by simp)
+
+/-- What a `Lww` register ends at, from nothing: an entry it was given, at a clock no other entry
+passes, and of the entries at that clock the greatest value. -/
+theorem fold_lww_winner (l : List (Entry V)) (m : Entry V)
+    (h : l.foldl (apply .lww) none = some m) :
+    m ∈ l ∧ ∀ x ∈ l, x.clock < m.clock ∨ (x.clock = m.clock ∧ (compare x.value m.value).isLE) := by
+  rw [show apply (V := V) .lww = keep lwwCmp Entry.stamp from funext fun h => funext fun e => apply_lww h e] at h
+  have ⟨mem, all, _⟩ := fold_keep_spec l none m h
+  refine ⟨by simpa using mem, fun x hx => ?_⟩
+  have hle := all x hx
+  simp only [lwwCmp, Entry.stamp, compareLex, compareOn] at hle
+  cases hc : compare x.clock m.clock with
+  | lt => exact .inl hc
+  | eq => exact .inr ⟨LawfulEqOrd.eq_of_compare hc, by simpa [hc, Ordering.then] using hle⟩
+  | gt => simp [hc, Ordering.then] at hle
+
+/-- What a `Max` register ends at, from nothing: an entry it was given, with a value no other entry
+passes, and of the entries with that value the latest clock. -/
+theorem fold_max_winner (l : List (Entry V)) (m : Entry V)
+    (h : l.foldl (apply .max) none = some m) :
+    m ∈ l ∧ ∀ x ∈ l, compare x.value m.value = .lt ∨
+      (x.value = m.value ∧ (compare x.clock m.clock).isLE) := by
+  rw [show apply (V := V) .max = keep maxCmp Entry.pair from funext fun h => funext fun e => apply_max h e] at h
+  have ⟨mem, all, _⟩ := fold_keep_spec l none m h
+  refine ⟨by simpa using mem, fun x hx => ?_⟩
+  have hle := all x hx
+  simp only [maxCmp, Entry.pair, compareLex, compareOn] at hle
+  cases hc : compare x.value m.value with
+  | lt => exact .inl rfl
+  | eq => exact .inr ⟨LawfulEqOrd.eq_of_compare hc, by simpa [hc, Ordering.then] using hle⟩
+  | gt => simp [hc, Ordering.then] at hle
 
 end Wins
 

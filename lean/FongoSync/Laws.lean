@@ -59,11 +59,10 @@ section Register
 
 variable {V : Type} [Ord V] [Std.TransOrd V] [Std.LawfulEqOrd V]
 
-/-- Merging two registers is commutative when equal clocks mean equal entries. -/
-theorem merge_comm (s : Strategy) (a b : Option (Entry V))
-    (unique : ∀ x ∈ a, ∀ y ∈ b, x.clock = y.clock → x = y) :
+/-- Merging two registers is commutative, with no condition. -/
+theorem merge_comm (s : Strategy) (a b : Option (Entry V)) :
     merge s a b = merge s b a :=
-  FongoSync.merge_comm s a b unique
+  FongoSync.merge_comm s a b
 
 /-- Merging registers is associative, with no condition. -/
 theorem merge_assoc (s : Strategy) (a b c : Option (Entry V)) :
@@ -85,32 +84,48 @@ theorem apply_twice (s : Strategy) (h : Option (Entry V)) (e : Entry V) :
     apply s (apply s h e) e = apply s h e :=
   FongoSync.apply_twice s h e
 
-/-- Two changes may arrive in either order, unless they share a clock and differ. -/
-theorem apply_any_order (s : Strategy) (h : Option (Entry V)) (a b : Entry V)
-    (unique : a.clock = b.clock → a = b) :
+/-- Under `Lww`, of two changes at one clock the one with the greater value wins. -/
+theorem lww_tie (held e : Entry V) (h : held.clock = e.clock) :
+    apply .lww (some held) e = some (if compare held.value e.value = .lt then e else held) :=
+  apply_lww_tie held e h
+
+/-- Two changes may arrive in either order, under either strategy, with no condition. -/
+theorem apply_any_order (s : Strategy) (h : Option (Entry V)) (a b : Entry V) :
     apply s (apply s h a) b = apply s (apply s h b) a :=
-  FongoSync.apply_any_order s h a b unique
+  FongoSync.apply_any_order s h a b
 
 /-- Under `Max`, two changes may arrive in either order, with no condition. -/
 theorem max_any_order (h : Option (Entry V)) (a b : Entry V) :
-    apply .max (apply .max h a) b = apply .max (apply .max h b) a := by
-  simp only [apply_max]; exact keep_swap h a b Entry.pair_inj
+    apply .max (apply .max h a) b = apply .max (apply .max h b) a :=
+  FongoSync.apply_any_order .max h a b
 
 /-- A register fed the same set of entries ends the same, whatever the order and repeats. -/
-theorem register_set (s : Strategy) (l₁ l₂ : List (Entry V)) (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂)
-    (unique : UniqueClocks l₁) :
+theorem register_set (s : Strategy) (l₁ l₂ : List (Entry V)) (same : ∀ x, x ∈ l₁ ↔ x ∈ l₂) :
     l₁.foldl (apply s) none = l₂.foldl (apply s) none :=
-  fold_apply_eq_of_mem_iff s l₁ l₂ same unique
+  fold_apply_eq_of_mem_iff s l₁ l₂ same
+
+/-- What a `Lww` register fed a set of entries holds: one of them, at the latest clock among
+them, and of the entries at that clock the one with the greatest value. -/
+theorem lww_winner (l : List (Entry V)) (m : Entry V) (h : l.foldl (apply .lww) none = some m) :
+    m ∈ l ∧ ∀ x ∈ l, x.clock < m.clock ∨ (x.clock = m.clock ∧ (compare x.value m.value).isLE) :=
+  fold_lww_winner l m h
+
+/-- What a `Max` register fed a set of entries holds: one of them, with the greatest value among
+them, and of the entries with that value the one with the latest clock. -/
+theorem max_winner (l : List (Entry V)) (m : Entry V) (h : l.foldl (apply .max) none = some m) :
+    m ∈ l ∧ ∀ x ∈ l, compare x.value m.value = .lt ∨
+      (x.value = m.value ∧ (compare x.clock m.clock).isLE) :=
+  fold_max_winner l m h
 
 /-! ## A replica's state -/
 
 /-- Swapping two neighbouring changes anywhere in a delivery, from any state, leaves every
-register the same, unless they write one register at one clock with different values. -/
+register the same. -/
 theorem state_swap (σ : String → String → Strategy) (st : State V)
-    (pre post : List (Change V)) (a b : Change V) (h : Compatible a b) :
+    (pre post : List (Change V)) (a b : Change V) :
     (pre ++ a :: b :: post).foldl (State.apply σ) st =
       (pre ++ b :: a :: post).foldl (State.apply σ) st :=
-  State.foldl_swap σ st pre post a b h
+  State.foldl_swap σ st pre post a b
 
 /-- Receiving a change twice in a row anywhere in a delivery is receiving it once. -/
 theorem state_twice (σ : String → String → Strategy) (st : State V)
@@ -119,21 +134,45 @@ theorem state_twice (σ : String → String → Strategy) (st : State V)
       (pre ++ a :: post).foldl (State.apply σ) st :=
   State.foldl_twice σ st pre post a
 
-/-- Replicas that applied the same set of changes hold the same state. -/
+/-- Replicas that applied the same set of changes hold the same state, even where two changes
+to one register share a clock with different values. -/
 theorem state_set (σ : String → String → Strategy) (cs₁ cs₂ : List (Change V))
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     merged σ cs₁ = merged σ cs₂ :=
-  merged_eq_of_mem_iff σ cs₁ cs₂ same unique
+  merged_eq_of_mem_iff σ cs₁ cs₂ same
 
 end Register
 
-/-- Without unique clocks the order of arrival can matter. -/
-theorem unique_clocks_needed :
+/-- Two different `Lww` values at one clock: the greater wins, whichever arrives first. -/
+theorem equal_clocks_take_the_greater_value :
     let σ : String → String → Strategy := fun _ _ => .lww
     let a : Change Value := ⟨"things", 0, "title", .int 1, ⟨1, 0, 1⟩⟩
     let b : Change Value := ⟨"things", 0, "title", .int 2, ⟨1, 0, 1⟩⟩
-    merged σ [a, b] ("things", 0, "title") ≠ merged σ [b, a] ("things", 0, "title") :=
-  order_matters_without_unique_clocks
+    merged σ [a, b] ("things", 0, "title") = some ⟨.int 2, ⟨1, 0, 1⟩⟩ ∧
+      merged σ [b, a] ("things", 0, "title") = some ⟨.int 2, ⟨1, 0, 1⟩⟩ :=
+  FongoSync.equal_clocks_take_the_greater_value
+
+/-! ## The order on values
+
+Of the Rust `Value::total_cmp`, all but `Real`: a `Real` is compared with an `Int` exactly, which
+the Rust tests check against an exact comparison of the two. -/
+
+/-- Of two values, one is smaller, or they are the same value. -/
+theorem value_total (a b : Value) : compare a b = .lt ∨ a = b ∨ compare b a = .lt :=
+  Value.compare_total a b
+
+/-- Values that compare equal are the same value. -/
+theorem value_antisymm (a b : Value) (h : compare a b = .eq) : a = b :=
+  Std.LawfulEqOrd.eq_of_compare h
+
+/-- Comparing the other way round gives the opposite answer. -/
+theorem value_swap (a b : Value) : compare a b = (compare b a).swap :=
+  Std.OrientedCmp.eq_swap
+
+/-- The order is transitive. -/
+theorem value_trans (a b c : Value) (hab : compare a b = .lt) (hbc : compare b c = .lt) :
+    compare a c = .lt :=
+  Std.TransCmp.lt_trans hab hbc
 
 /-! ## Alias groups -/
 
@@ -169,18 +208,17 @@ theorem view_from_inputs (sc : Schema) {cs₁ cs₂ : List (Change Value)}
     (h : inputs sc cs₁ = inputs sc cs₂) : view sc cs₁ = view sc cs₂ :=
   FongoSync.view_from_inputs sc h
 
-/-- Swapping two neighbouring changes leaves the view the same, unless they write one register at
-one clock with different values. -/
-theorem view_swap_writes (sc : Schema) (pre post : List (Change Value)) (a b : Change Value)
-    (h : Compatible a b) :
+/-- Swapping two neighbouring changes leaves the view the same, even where they write one
+register at one clock with different values. -/
+theorem view_swap_writes (sc : Schema) (pre post : List (Change Value)) (a b : Change Value) :
     view sc (pre ++ a :: b :: post) = view sc (pre ++ b :: a :: post) :=
-  view_swap sc pre post a b (.inr (.inr h))
+  view_swap sc pre post a b
 
 /-- Swapping an alias with a neighbouring change leaves the view the same. -/
 theorem view_swap_alias (sc : Schema) (pre post : List (Change Value)) (a b : Change Value)
     (h : a.field = ALIAS) :
-    view sc (pre ++ a :: b :: post) = view sc (pre ++ b :: a :: post) :=
-  view_swap sc pre post a b (.inl h)
+    view sc (pre ++ a :: b :: post) = view sc (pre ++ b :: a :: post) := by
+  clear h; exact view_swap sc pre post a b
 
 /-- Receiving a change twice in a row leaves the view as receiving it once. -/
 theorem view_twice (sc : Schema) (pre post : List (Change Value)) (a : Change Value) :
@@ -192,11 +230,11 @@ same answer. -/
 theorem view_runs (sc : Schema) (cs : List (Change Value)) : runView sc cs = view sc cs :=
   runView_eq_view sc cs
 
-/-- **The view depends only on the set of changes**, given unique clocks per register. -/
+/-- **The view depends only on the set of changes.** -/
 theorem view_set (sc : Schema) {cs₁ cs₂ : List (Change Value)}
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     view sc cs₁ = view sc cs₂ :=
-  view_eq_of_mem_iff sc same unique
+  view_eq_of_mem_iff sc same
 
 /-! ## The view over several collections, with `together` sets and natural keys -/
 
@@ -224,12 +262,13 @@ theorem full_view_runs_from_inputs (sc : Full.Schema) (cs : List (Change Value))
     Full.runView sc cs = Full.present sc (Full.runInputs sc (Full.candidates sc cs)).toInputs :=
   Full.runView_eq sc cs
 
-/-- **The view over several collections depends only on the set of changes**, given unique
-clocks per register. -/
+/-- **The view over several collections depends only on the set of changes.** Where two changes
+to one register share a clock with different values, the greater value counts, so writes to a
+`together` set that share a clock can show a mix of the two. -/
 theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     Full.view sc cs₁ = Full.view sc cs₂ :=
-  Full.view_eq_of_mem_iff sc same unique
+  Full.view_eq_of_mem_iff sc same
 
 /-- A change whose clock the text form cannot hold is ignored. -/
 theorem full_view_ignores_unencodable (sc : Full.Schema) (c : Change Value)

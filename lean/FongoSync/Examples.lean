@@ -55,13 +55,13 @@ example :
     canonical E 7 = 3 ∧ canonical E 5 = 3 ∧ canonical E 12 = 11 ∧ canonical E 4 = 4 := by
   decide
 
-/-- Unique clocks are needed: two different `Lww` values at one clock give an answer that depends
-on the order they arrived in. -/
-theorem order_matters_without_unique_clocks :
+/-- Two different `Lww` values at one clock: the greater wins, whichever arrives first. -/
+theorem equal_clocks_take_the_greater_value :
     let σ : String → String → Strategy := fun _ _ => .lww
     let a : Change Value := ⟨"things", 0, "title", .int 1, ⟨1, 0, 1⟩⟩
     let b : Change Value := ⟨"things", 0, "title", .int 2, ⟨1, 0, 1⟩⟩
-    merged σ [a, b] ("things", 0, "title") ≠ merged σ [b, a] ("things", 0, "title") := by
+    merged σ [a, b] ("things", 0, "title") = some ⟨.int 2, ⟨1, 0, 1⟩⟩ ∧
+      merged σ [b, a] ("things", 0, "title") = some ⟨.int 2, ⟨1, 0, 1⟩⟩ := by
   decide
 
 end FongoSync

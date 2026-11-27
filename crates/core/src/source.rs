@@ -73,8 +73,8 @@ pub enum Body {
 /// A store keeps, for each (collection, gid) any fact names, the smallest clock among those facts
 /// (a [`Claim`]); for each (collection, gid, field), entries as the fact's [`Slot`] says; and the
 /// set of aliases. Undeclared fields are kept like declared ones. Merging facts this way is
-/// order-independent and idempotent, given that no two changes to one field share a clock with
-/// different values.
+/// order-independent and idempotent, also where two changes to one field share a clock: every
+/// slot orders its entries totally.
 pub fn admit(schema: &Schema, change: &Change) -> Option<Fact> {
     let collection = schema.collection(&change.collection)?;
     if !change.clock.encodable()

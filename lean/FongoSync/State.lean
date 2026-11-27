@@ -34,15 +34,6 @@ def Change.key (c : Change V) : Key := (c.collection, c.gid, c.field)
 
 def Change.entry (c : Change V) : Entry V := ⟨c.value, c.clock⟩
 
-/-- Two changes to one register (same collection, gid and field) at one clock carry one value. -/
-def Compatible (a b : Change V) : Prop :=
-  a.key = b.key → a.clock = b.clock → a.value = b.value
-
-/-- No two changes to one register share a clock with different values. Honest clocks give every
-change its own clock, which is stronger. -/
-def ClockDetermines (cs : List (Change V)) : Prop :=
-  ∀ a ∈ cs, ∀ b ∈ cs, Compatible a b
-
 /-- Which strategy a field merges by; `$deleted` always merges `Lww`. -/
 def strategyAt (strategyOf : String → String → Strategy) (k : Key) : Strategy :=
   if k.2.2 = DELETED then .lww else strategyOf k.1 k.2.2
@@ -87,20 +78,10 @@ theorem mem_entriesAt {cs : List (Change V)} {k : Key} {e : Entry V} :
     e ∈ entriesAt cs k ↔ ∃ c ∈ cs, c.key = k ∧ c.entry = e := by
   simp [entriesAt, and_assoc]
 
-theorem uniqueClocks_entriesAt {cs : List (Change V)} (h : ClockDetermines cs) (k : Key) :
-    UniqueClocks (entriesAt cs k) := by
-  intro a ha b hb hab
-  obtain ⟨ca, hca, kca, rfl⟩ := mem_entriesAt.mp ha
-  obtain ⟨cb, hcb, kcb, rfl⟩ := mem_entriesAt.mp hb
-  have hv := h ca hca cb hcb (kca.trans kcb.symm) hab
-  simp only [Change.entry] at hab ⊢
-  rw [hv, hab]
-
 variable [TransOrd V] [LawfulEqOrd V]
 
-/-- Two compatible changes may be applied in either order, to any state. -/
-theorem State.apply_swap (σ : String → String → Strategy) (st : State V) (a b : Change V)
-    (h : Compatible a b) :
+/-- Two changes may be applied in either order, to any state. -/
+theorem State.apply_swap (σ : String → String → Strategy) (st : State V) (a b : Change V) :
     State.apply σ (State.apply σ st a) b = State.apply σ (State.apply σ st b) a := by
   funext k
   simp only [State.apply]
@@ -110,10 +91,6 @@ theorem State.apply_swap (σ : String → String → Strategy) (st : State V) (a
     simp only [hb, ↓reduceIte]
     rw [← hab]
     apply apply_any_order
-    intro hc
-    have hv := h hab hc
-    simp only [Change.entry] at hc ⊢
-    rw [hv, hc]
   · subst ha
     have hab : a.key ≠ b.key := hb
     simp [hab]
@@ -131,13 +108,13 @@ theorem State.apply_twice (σ : String → String → Strategy) (st : State V) (
   · simp only [ha, ↓reduceIte]; exact FongoSync.apply_twice _ _ _
   · simp [ha]
 
-/-- Swapping two neighbouring compatible changes anywhere in a delivery, from any state, leaves
-every register the same. -/
+/-- Swapping two neighbouring changes anywhere in a delivery, from any state, leaves every
+register the same. -/
 theorem State.foldl_swap (σ : String → String → Strategy) (st : State V)
-    (pre post : List (Change V)) (a b : Change V) (h : Compatible a b) :
+    (pre post : List (Change V)) (a b : Change V) :
     (pre ++ a :: b :: post).foldl (State.apply σ) st =
       (pre ++ b :: a :: post).foldl (State.apply σ) st := by
-  simp only [List.foldl_append, List.foldl_cons, State.apply_swap σ _ a b h]
+  simp only [List.foldl_append, List.foldl_cons, State.apply_swap σ _ a b]
 
 /-- Receiving a change twice in a row anywhere in a delivery is receiving it once. -/
 theorem State.foldl_twice (σ : String → String → Strategy) (st : State V)
@@ -149,27 +126,26 @@ theorem State.foldl_twice (σ : String → String → Strategy) (st : State V)
 /-- **Convergence of the merged state.** Two replicas that applied the same set of changes hold
 the same state, whatever the order and however often each change arrived. -/
 theorem merged_eq_of_mem_iff (σ : String → String → Strategy) (cs₁ cs₂ : List (Change V))
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (h : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     merged σ cs₁ = merged σ cs₂ := by
   funext k
   rw [merged_at, merged_at]
-  apply fold_apply_eq_of_mem_iff _ _ _ _ (uniqueClocks_entriesAt h k)
+  apply fold_apply_eq_of_mem_iff
   intro e
   simp only [mem_entriesAt, same]
 
 theorem merged_perm (σ : String → String → Strategy) {cs₁ cs₂ : List (Change V)}
-    (p : cs₁.Perm cs₂) (h : ClockDetermines cs₁) : merged σ cs₁ = merged σ cs₂ :=
-  merged_eq_of_mem_iff σ cs₁ cs₂ (fun _ => p.mem_iff) h
+    (p : cs₁.Perm cs₂) : merged σ cs₁ = merged σ cs₂ :=
+  merged_eq_of_mem_iff σ cs₁ cs₂ (fun _ => p.mem_iff)
 
-theorem merged_dup (σ : String → String → Strategy) (cs : List (Change V))
-    (h : ClockDetermines cs) : merged σ (cs ++ cs) = merged σ cs :=
-  merged_eq_of_mem_iff σ _ _ (by simp) (by
-    intro a ha b hb; simp only [List.mem_append, or_self] at ha hb; exact h a ha b hb)
+theorem merged_dup (σ : String → String → Strategy) (cs : List (Change V)) :
+    merged σ (cs ++ cs) = merged σ cs :=
+  merged_eq_of_mem_iff σ _ _ (by simp)
 
 /-- Two replicas that received the same batches, each in its own order and with repeats, agree. -/
 theorem merged_batches (σ : String → String → Strategy) (b₁ b₂ : List (List (Change V)))
-    (same : ∀ b, b ∈ b₁ ↔ b ∈ b₂) (h : ClockDetermines b₁.flatten) :
+    (same : ∀ b, b ∈ b₁ ↔ b ∈ b₂) :
     merged σ b₁.flatten = merged σ b₂.flatten :=
-  merged_eq_of_mem_iff σ _ _ (by simp [same]) h
+  merged_eq_of_mem_iff σ _ _ (by simp [same])
 
 end FongoSync
