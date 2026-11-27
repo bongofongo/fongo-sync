@@ -75,8 +75,8 @@ pub struct Pace {
     /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
     /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
     /// Default 1,000. It also bounds how long a sync holds the write lock to read and seal an
-    /// envelope and record it as being sent: on a fast laptop, about a millisecond for 50
-    /// changes and up to about 14 ms for 1,000.
+    /// envelope and record it as being sent: on the order of a millisecond for 50 changes and
+    /// several milliseconds for 1,000.
     pub seal: u32,
     /// How long the sync holds the write lock, summed over its transactions, before it pauses.
     /// Default 250 ms.
@@ -363,15 +363,15 @@ pub struct SyncReport {
 /// landed, so a remote change between the two that edits a field reporting conflicts is reported
 /// as a conflict with this device's edit, though it may have been made knowing it.
 ///
-/// Syncs on several connections to one database at once do not seal the same changes twice: a
-/// sync that finds an envelope recorded by another sync it did not load at its start sends
-/// nothing more, sets [`SyncReport::sending_elsewhere`], and leaves that envelope to the other
-/// sync or, should it never be acknowledged, to the next sync. Each sync clears the record only of the bytes it found or sent, and the
-/// record of where a pull stopped only once the stored cursor is past it, so neither erases what
-/// another wrote. A pull that meets an envelope another sync appended meanwhile knows it as this
-/// device's own. What remains: a sync that finds at its start an envelope recorded by another
-/// sync still sending it cannot tell it from one left by a crash, and appends the same bytes
-/// again, which a server that stores an identical envelope only once answers with the first
+/// Syncs on several connections to one database at once do not seal the same changes twice: a sync
+/// that finds an envelope recorded by another sync it did not load at its start sends nothing more,
+/// sets [`SyncReport::sending_elsewhere`], and leaves that envelope to the other sync or, should it
+/// never be acknowledged, to the next sync. Each sync clears the record only of the bytes it found
+/// or sent, and the record of where a pull stopped only once the stored cursor is past it, so
+/// neither erases what another wrote. A pull that meets an envelope another sync appended meanwhile
+/// knows it as this device's own. What remains: a sync that finds at its start an envelope recorded
+/// by another sync still sending it cannot tell it from one left by a crash, and appends the same
+/// bytes again, which a server that stores an identical envelope only once answers with the first
 /// copy's place, and which otherwise leaves a copy in the log as above.
 ///
 /// Envelopes this device signed are applied like any other: applying a change already held is a
@@ -387,9 +387,9 @@ pub struct SyncReport {
 /// collecting local writes and each apply, then [`Apply::caught_up`], then for each envelope it
 /// sends one that seals and records it and one that acknowledges it. Each takes the write lock
 /// with its first statement, waiting for it in the connection's busy handler, and holds it until
-/// it commits, so the longest hold is the largest of them. What bounds each: a step of collecting takes about
-/// [`Pace::collect`] rows, more where rows depend on later ones, share a millisecond or follow
-/// rows that cannot be collected yet, at worst every row waiting; an
+/// it commits, so the longest hold is the largest of them. What bounds each: a step of
+/// collecting takes about [`Pace::collect`] rows, more where rows depend on later ones, share a
+/// millisecond or follow rows that cannot be collected yet, at worst every row waiting; an
 /// apply takes at most [`Pace::apply`] received changes unless one envelope holds more, and
 /// collects the rows written while the steps before it ran, which nothing bounds, with fewer
 /// than [`Pace::collect`] left over besides; [`Apply::caught_up`] holds what the application
