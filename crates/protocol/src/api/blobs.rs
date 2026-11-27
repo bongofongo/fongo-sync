@@ -204,8 +204,8 @@ impl BlobDigest {
 /// against [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids), and not against
 /// [`Capabilities::max_batch_bytes`](super::Capabilities::max_batch_bytes).
 ///
-/// The ids tell the server which envelope, and so which device and when, refers to which blob
-/// ids; not what the files are.
+/// The ids tell the server which envelope, and so which device and when, sets references to which
+/// blob ids; not what the files are.
 ///
 /// Bytes: a LEB128 count, that many 32-byte blob ids, then the envelope exactly as
 /// [`BATCHES_PATH`](super::BATCHES_PATH) takes it.
@@ -265,10 +265,12 @@ pub struct MissingBlobs {
     pub missing: Vec<BlobId>,
 }
 
-/// Marks complete blobs as referred to by no change through log position `through`, by the rules
-/// in [the module documentation](super#deleting-files). Ids the server does not hold complete are
-/// ignored. A server keeps the earliest retirement of an id that is not void, so sending one again
-/// never restarts the wait.
+/// Marks complete blobs as ones the changes through log position `through` do not refer to, by the
+/// rules in [the module documentation](super#deleting-files): the sender's state is exactly those
+/// changes, with nothing merged beyond them, nothing unsent but values it keeps as its own and no
+/// envelope of its own in the log past the last it pulled. Ids the server does not hold complete
+/// are ignored. A server keeps the earliest retirement of an id that is not void, so sending one
+/// again never restarts the wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireBlobs {
     pub through: u64,
@@ -276,10 +278,14 @@ pub struct RetireBlobs {
 }
 
 /// The sender has dealt with every envelope through sequence number `seq`, by merging it or by
-/// skipping it and recording that it did, and has nothing unsent. A device that skipped an
-/// envelope may settle, but never retires through it. A server keeps the greatest it was told,
-/// and keeps it when a removed device is restored; a `seq` above the library's head is
-/// [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
+/// skipping it and recording that it did, and has nothing unsent; a value it keeps as its own
+/// counts as sent once the file it names, if any, is claimed. After dealing with those envelopes
+/// and before this report, it claimed at [`BLOBS_CLAIM_PATH`](super::BLOBS_CLAIM_PATH) every file
+/// that a row it holds back or a value it keeps as its own names, having already claimed the ids of
+/// every envelope it appended plainly, and merged nothing since. A device that skipped an envelope
+/// may settle, but never retires with that state, since it is not the changes through any position.
+/// A server keeps the greatest it was told, and keeps it when a removed device is restored; a `seq`
+/// above the library's head is [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settled {
     pub seq: u64,
@@ -312,6 +318,15 @@ pub struct Entitlement {
 /// recovery key is refused with [`ErrorCode::Forbidden`](super::ErrorCode::Forbidden); naming an
 /// id the library does not list, or a device already removed, changes nothing. Either way the
 /// answer is the device list; [`Devices::remove`](super::Devices::remove) does this to a list.
+///
+/// Removing a device gives up the guarantee of [the module documentation](super#deleting-files) for
+/// the files named by envelopes it appended without their claims and had not yet claimed, because
+/// it had read [`Capabilities::blobs`](super::Capabilities::blobs) as false and sent an envelope
+/// plainly after the server began to offer it, or because its claiming append was refused with
+/// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and it sent the envelope plainly: such
+/// a file can be deleted while the log refers to it. Another device that holds such a file can make
+/// it available again by sending a change that sets a reference to it, with its claim, and
+/// uploading the file if the server lacks it.
 ///
 /// The server keeps the removed device's record, with its key, in the device list: a device stops
 /// reading the log at an envelope whose signer the list does not hold, so dropping the record would
