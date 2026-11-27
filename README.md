@@ -166,8 +166,10 @@ what the step wrote; `Apply::between`, called in each gap between transactions, 
 application send its own writers through, and `Apply::pace` sets the bounds.
 Syncs may also run at once on several connections to one database: each seals and records what
 it sends in one transaction, so no two seal the same changes, and none erases what another
-recorded as being sent or where another's pull stopped. One that starts while another's envelope
-is in flight cannot tell it from one a crash left, and appends the same bytes again.
+recorded as being sent or where another's pull stopped. One that comes to send while another's
+envelope is in flight sends nothing and says so in its report, and should be run again soon. One
+that starts while another's envelope is in flight cannot tell it from one a crash left, and
+appends the same bytes again.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 

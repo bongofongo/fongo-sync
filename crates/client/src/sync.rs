@@ -290,6 +290,11 @@ pub struct SyncReport {
     /// The pull stopped after the most pages one call reads, with more waiting. Everything read
     /// was applied and the outbox was sent; call again to read on.
     pub more: bool,
+    /// Changes were left unsent because another sync on this database had an envelope recorded
+    /// as being sent: this one sends nothing then, so as not to seal the same changes twice. The
+    /// other sync sends them once its envelope is acknowledged, but if it has stopped or crashed,
+    /// they wait for the next sync, which sends its envelope first. Sync again soon.
+    pub sending_elsewhere: bool,
     /// The last sequence number this sync knows the library's log to hold.
     pub head: u64,
     /// How long this sync held the write lock since it last paused, counting [`Pace::held`] when
@@ -358,8 +363,8 @@ pub struct SyncReport {
 ///
 /// Syncs on several connections to one database at once do not seal the same changes twice: a
 /// sync that finds an envelope recorded by another sync it did not load at its start sends
-/// nothing more, and leaves that envelope to the other sync or, should it never be acknowledged,
-/// to the next sync. Each sync clears the record only of the bytes it found or sent, and the
+/// nothing more, sets [`SyncReport::sending_elsewhere`], and leaves that envelope to the other
+/// sync or, should it never be acknowledged, to the next sync. Each sync clears the record only of the bytes it found or sent, and the
 /// record of where a pull stopped only once the stored cursor is past it, so neither erases what
 /// another wrote. A pull that meets an envelope another sync appended meanwhile knows it as this
 /// device's own. What remains: a sync that finds at its start an envelope recorded by another
@@ -814,8 +819,13 @@ async fn run<T: Transport, A: Apply>(
         };
         tx.commit().await?;
         steps.committed(began);
-        let Some((sending, count)) = claimed else {
-            break;
+        let (sending, count) = match claimed {
+            Claim::Sealed(sending, count) => (sending, count),
+            Claim::Empty => break,
+            Claim::Elsewhere => {
+                report.sending_elsewhere = true;
+                break;
+            }
         };
         let seq = append(&rpc, credentials, sending.envelope.clone()).await?;
         acknowledge(conn, &mut steps, library, &sending, seq).await?;
@@ -854,6 +864,16 @@ async fn clear_sending<A: Apply>(
     Ok(())
 }
 
+/// What [`Sealing::claim`] found.
+enum Claim {
+    /// The envelope sealed and recorded, and how many changes it holds.
+    Sealed(Sending, usize),
+    /// Nothing waited to be sent.
+    Empty,
+    /// Another envelope was recorded as being sent.
+    Elsewhere,
+}
+
 /// What the outbox is sealed with.
 struct Sealing<'a> {
     replica: &'a Replica,
@@ -865,21 +885,16 @@ struct Sealing<'a> {
 
 impl Sealing<'_> {
     /// Seals the front of the outbox and records it as being sent, inside a transaction that
-    /// holds the write lock, so that no other sync seals the same changes: returns the envelope
-    /// and how many changes it holds. Returns `None` when the outbox is empty, or when an
+    /// holds the write lock, so that no other sync seals the same changes. Seals nothing when an
     /// envelope is already recorded as being sent, by another sync that will acknowledge it or
     /// left for the next sync to find. `head` is the head of the log as the sync knows it.
-    async fn claim(
-        &self,
-        conn: &mut SqliteConnection,
-        head: u64,
-    ) -> Result<Option<(Sending, usize)>, Error> {
+    async fn claim(&self, conn: &mut SqliteConnection, head: u64) -> Result<Claim, Error> {
         if state::sending(conn, self.library).await? {
-            return Ok(None);
+            return Ok(Claim::Elsewhere);
         }
         let full = self.replica.outbox(conn, self.seal_at_most).await?;
         let Some(first) = full.changes.first() else {
-            return Ok(None);
+            return Ok(Claim::Empty);
         };
         let max = self.max;
         let mut n = fitting(&full.changes, max);
@@ -921,7 +936,7 @@ impl Sealing<'_> {
             after: Some(head),
         };
         state::record_sending(conn, self.library, &sending).await?;
-        Ok(Some((sending, outbox.changes.len())))
+        Ok(Claim::Sealed(sending, outbox.changes.len()))
     }
 }
 

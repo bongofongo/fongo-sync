@@ -211,6 +211,8 @@ async fn a_sync_that_finds_another_sending_sends_nothing() {
         let (waited, sent) = (waited.unwrap(), sent.unwrap());
         assert_no_change_sent_twice(&server, a.credentials.library());
         assert_eq!((waited.sent, waited.received), (0, 0), "handled: {handled}");
+        assert!(waited.sending_elsewhere, "handled: {handled}");
+        assert!(!sent.sending_elsewhere, "handled: {handled}");
         assert_eq!((sent.sent, sent.received), (n, 0), "handled: {handled}");
         check_after(&server, &mut a, &mut b, z, n).await;
     }
@@ -709,4 +711,46 @@ async fn a_sync_does_not_append_again_an_envelope_another_acknowledged_meanwhile
         "the envelope was appended twice"
     );
     assert_eq!(report.sent, 0);
+}
+
+/// A sync that finds another sync's envelope in flight sends nothing and says so; when that other
+/// sync dies, the next sync sends the envelope and the rest.
+#[tokio::test]
+async fn a_sync_that_leaves_its_changes_to_another_says_so() {
+    let n = some_changes().await;
+    let dir = scratch("left-to-another");
+    let server = Server::new();
+    let (mut a, mut b, _z) = devices(&dir, &server).await;
+    write_some(&mut a).await;
+    let (mut park, parked, go) = Park::new();
+    let mut waiting = Box::pin(sync_with(
+        &mut b.conn,
+        &b.replica,
+        &server,
+        &b.credentials,
+        now,
+        &mut park,
+    ));
+    tokio::select! {
+        _ = &mut waiting => panic!("the sync never parked"),
+        _ = parked => {}
+    }
+    let hold = server.hold_if(is_append, false);
+    {
+        let mut dying = Box::pin(sync(&mut a.conn, &a.replica, &server, &a.credentials, now));
+        tokio::select! {
+            _ = &mut dying => panic!("the append was never held"),
+            () = hold.reached() => {}
+        }
+    }
+    drop(a);
+    server.behave();
+    go.send(()).unwrap();
+    let left = waiting.await.unwrap();
+    assert_eq!(left.sent, 0);
+    assert!(left.sending_elsewhere);
+    let again = b.sync(&server).await.unwrap();
+    assert_eq!(again.sent, n);
+    assert!(!again.sending_elsewhere);
+    assert_no_change_sent_twice(&server, b.credentials.library());
 }
