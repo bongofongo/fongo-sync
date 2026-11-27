@@ -289,8 +289,15 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
     )
 }
 
-/// What a registration that succeeded left on the server. A server built before wrap keys or
-/// membership proofs drops what it does not know, and the device is registered all the same.
+/// A registration that succeeded, as the server's answer lists it for the device. A server
+/// built before wrap keys or membership proofs drops what it does not know, and the device is
+/// registered all the same.
+///
+/// The flags catch a server that does not store these fields, not one that lies: a server can
+/// list them in its answer and not keep them. What counts is the device list read when the
+/// library's secret is changed. An application should tell the person when a flag is false: the
+/// device will not be kept at a change of secret, or cannot be sent one.
+/// [`create_library`] and [`join_library`] do not report the flags at all.
 ///
 /// - Both true: the device is listed with the wrap key and membership proof it sent.
 /// - `wrap_kept` true, `proof_kept` false: listed with its wrap key but no proof. The device can
