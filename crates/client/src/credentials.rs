@@ -42,6 +42,7 @@ pub struct Credentials {
 
 /// Why stored credentials could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum CredentialsError {
     #[error("stored credentials of format {format} are {len} bytes, not {expected}")]
     Length {
