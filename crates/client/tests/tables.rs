@@ -265,3 +265,162 @@ async fn a_log_rolled_back_before_an_upgrade_is_found_by_hashing_it() {
         Err(Error::LogFault(LogFault::Behind { cursor: 3 }))
     ));
 }
+
+/// Several connections to one database of layout 2 sync at once, each on a thread of its own: one
+/// upgrades the tables and the others wait for it, in either journal mode.
+#[test]
+fn connections_upgrading_at_once_all_succeed() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    for wal in [false, true] {
+        for round in 0..8 {
+            let dir = support::scratch(&format!("upgrading-at-once-{wal}-{round}"));
+            let path = dir.join("x.db");
+            let server = Server::new();
+            let made = runtime().block_on(async {
+                let made = create_library(&server, now).await.unwrap();
+                let mut a = Peer::new_at(&path, made.clone()).await;
+                if wal {
+                    a.run("PRAGMA journal_mode = WAL").await;
+                }
+                a.run("INSERT INTO settings VALUES ('a', 'x')").await;
+                a.sync(&server).await.unwrap();
+                as_layout_two(&mut a).await;
+                made
+            });
+            std::thread::scope(|scope| {
+                let syncs: Vec<_> = (0..3)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            runtime().block_on(async {
+                                let mut peer = Peer::open(&path, made.clone()).await;
+                                peer.sync(&server).await
+                            })
+                        })
+                    })
+                    .collect();
+                for sync in syncs {
+                    let synced = sync.join().unwrap();
+                    assert!(synced.is_ok(), "wal {wal}, round {round}: {synced:?}");
+                }
+            });
+            runtime().block_on(async {
+                let mut a = Peer::open(&path, made).await;
+                assert_eq!(layout_of(&mut a).await, ["3"]);
+            });
+        }
+    }
+}
+
+/// The layout of the client's tables as a build of layout 2 reads it before anything else, its
+/// statements and rule as that build has them: `Err` with the layout found when it refuses.
+async fn as_layout_two_reads_it(conn: &mut sqlx::SqliteConnection) -> Result<(), (i64, i64)> {
+    const LAYOUT: i64 = 2;
+    let exists = |table: &'static str| {
+        sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").bind(table)
+    };
+    if exists("fongo_client_meta")
+        .fetch_optional(&mut *conn)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        return Ok(());
+    }
+    let found: Vec<i64> = sqlx::query_scalar("SELECT layout FROM fongo_client_meta")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    match found[..] {
+        [] | [LAYOUT] => Ok(()),
+        [later] if later > LAYOUT => Err((later, LAYOUT)),
+        _ => panic!("no single known layout"),
+    }
+}
+
+#[tokio::test]
+async fn a_build_of_layout_two_refuses_upgraded_tables() {
+    let server = Server::new();
+    let [mut a, _b] = pair(&server).await;
+    a.sync(&server).await.unwrap();
+    as_layout_two(&mut a).await;
+    assert_eq!(as_layout_two_reads_it(&mut a.conn).await, Ok(()));
+    a.sync(&server).await.unwrap();
+    assert_eq!(as_layout_two_reads_it(&mut a.conn).await, Err((3, 2)));
+}
+
+fn chain(library: [u8; 16], log: &[Vec<u8>]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let domain = b"fongo-sync/v1/log-chain\0";
+    let mut at: [u8; 32] = Sha256::new()
+        .chain_update(domain)
+        .chain_update([0])
+        .chain_update(library)
+        .finalize()
+        .into();
+    for (i, envelope) in log.iter().enumerate() {
+        at = Sha256::new()
+            .chain_update(domain)
+            .chain_update([1])
+            .chain_update(at)
+            .chain_update((i as u64 + 1).to_be_bytes())
+            .chain_update(Sha256::digest(envelope))
+            .finalize()
+            .into();
+    }
+    at
+}
+
+fn page_reads(server: &Server, from: usize) -> usize {
+    server.with(|s| {
+        s.requests[from..]
+            .iter()
+            .filter(|(m, t)| *m == Method::Get && t.contains("/batches"))
+            .count()
+    })
+}
+
+/// The first sync after an upgrade from layout 2 hashes the log read so far page by page. A
+/// request failing at any page keeps the pages hashed before it, and the next sync goes on from
+/// there, reading each page once more at most.
+#[tokio::test]
+async fn hashing_the_log_after_an_upgrade_goes_on_from_where_a_failure_stopped_it() {
+    const PAGE: u64 = 4;
+    const LOG: u64 = 40;
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(PAGE as u32));
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    b.run("INSERT INTO settings VALUES ('b', 'x')").await;
+    b.sync(&server).await.unwrap();
+    let one = server.log(id)[0].clone();
+    for _ in 1..LOG {
+        server.inject(id, one.clone());
+    }
+    while a.sync(&server).await.unwrap().more {}
+    assert_eq!(a.cursor().await, LOG);
+    let whole = chain(id.0, &server.log(id));
+    for failing in 1..=LOG / PAGE {
+        as_layout_two(&mut a).await;
+        // The capabilities, then one read per page of the log.
+        server.fail_at(1 + failing as usize);
+        assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+        server.behave();
+        let part = fingerprint(&mut a.conn, id).await.unwrap();
+        assert_eq!(part.seq, (failing - 1) * PAGE, "failing at page {failing}");
+        let from = server.with(|s| s.requests.len());
+        a.sync(&server).await.unwrap();
+        let left = (LOG - part.seq) / PAGE;
+        assert_eq!(
+            page_reads(&server, from),
+            left as usize + 1,
+            "failing at {failing}"
+        );
+        let done = fingerprint(&mut a.conn, id).await.unwrap();
+        assert_eq!((done.seq, done.digest), (LOG, whole));
+    }
+}

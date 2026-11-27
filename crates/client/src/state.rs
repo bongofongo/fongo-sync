@@ -233,9 +233,15 @@ async fn add_columns(
 /// Makes the client's tables of [`LAYOUT`], upgrading layouts 1 and 2 in place, in one
 /// transaction.
 async fn prepare(conn: &mut SqliteConnection) -> Result<(), Error> {
+    // Made on its own first, as an empty table records no layout: creating a table that exists
+    // writes nothing, so it cannot be what takes the write lock below.
+    sqlx::query(META).execute(&mut *conn).await?;
     let mut tx = conn.begin().await?;
-    // Written first, so the transaction holds the write lock before it looks.
-    sqlx::query(META).execute(&mut *tx).await?;
+    // A write even when it changes no row, so the transaction holds the write lock before it
+    // reads anything, and another connection upgrading at once waits for it in the busy handler.
+    sqlx::query("UPDATE fongo_client_meta SET layout = layout")
+        .execute(&mut *tx)
+        .await?;
     let found = layout(&mut tx).await?;
     if let Layout::None | Layout::One = found {
         if has_column(&mut tx, "fongo_client_state", "through").await? {
@@ -387,10 +393,37 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
     })
 }
 
+/// Whether another sync of this database stored `seq` as its cursor with another envelope there
+/// or another fingerprint through it than `anchor` and `chain`: the server served two logs.
+pub(crate) async fn diverges(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    seq: u64,
+    anchor: Option<Digest32>,
+    chain: Option<Digest32>,
+) -> Result<Option<LogFault>, Error> {
+    let row = sqlx::query(
+        "SELECT cursor, anchor, chain_seq, chain FROM fongo_client_state WHERE library = ?",
+    )
+    .bind(&library.0[..])
+    .fetch_one(&mut *conn)
+    .await?;
+    if row.try_get::<i64, _>(0)? != as_i64(seq)? {
+        return Ok(None);
+    }
+    let stored_anchor = digest_of(row.try_get(1)?)?;
+    let (chain_seq, stored_chain) = chain_of(library, row.try_get(2)?, row.try_get(3)?)?;
+    let differs = |stored: Option<Digest32>, mine: Option<Digest32>| {
+        stored.zip(mine).is_some_and(|(s, m)| s != m)
+    };
+    let diverged =
+        differs(stored_anchor, anchor) || (chain_seq == seq && differs(Some(stored_chain), chain));
+    Ok(diverged.then_some(LogFault::Diverged { seq }))
+}
+
 /// Moves the cursor forward to `seq`, with the digest of the envelope there and, when known, the
 /// fingerprint through it, all in one statement; never back. Where another sync already stored
-/// `seq`, fails with [`LogFault::Diverged`] if it found another envelope there or another
-/// fingerprint, and otherwise fills in what it lacks.
+/// `seq`, fills in what it lacks; [`diverges`] says first whether the two disagree.
 pub(crate) async fn advance(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -414,23 +447,6 @@ pub(crate) async fn advance(
     .rows_affected();
     if moved == 1 {
         return Ok(());
-    }
-    let row = sqlx::query(
-        "SELECT cursor, anchor, chain_seq, chain FROM fongo_client_state WHERE library = ?",
-    )
-    .bind(&library.0[..])
-    .fetch_one(&mut *conn)
-    .await?;
-    if row.try_get::<i64, _>(0)? != at {
-        return Ok(());
-    }
-    let stored_anchor = digest_of(row.try_get(1)?)?;
-    let (chain_seq, stored_chain) = chain_of(library, row.try_get(2)?, row.try_get(3)?)?;
-    let differs = |stored: Option<Digest32>, mine: Option<Digest32>| {
-        stored.zip(mine).is_some_and(|(s, m)| s != m)
-    };
-    if differs(stored_anchor, anchor) || (chain_seq == seq && differs(Some(stored_chain), chain)) {
-        return Err(Error::LogFault(LogFault::Diverged { seq }));
     }
     sqlx::query(
         "UPDATE fongo_client_state SET anchor = coalesce(anchor, ?1),
@@ -504,8 +520,20 @@ pub(crate) async fn record_fault(
     resets: i64,
     fault: LogFault,
 ) -> Result<LogFault, Error> {
-    let (kind, seq, other) = fault_columns(fault);
     let mut tx = conn.begin().await?;
+    let stored = record_fault_in(&mut tx, library, resets, fault).await?;
+    tx.commit().await?;
+    stored.ok_or(Error::ResolvedMeanwhile)
+}
+
+/// [`record_fault`] in the caller's transaction; `None` when a fault was resolved since.
+pub(crate) async fn record_fault_in(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    resets: i64,
+    fault: LogFault,
+) -> Result<Option<LogFault>, Error> {
+    let (kind, seq, other) = fault_columns(fault);
     sqlx::query(
         "UPDATE fongo_client_state SET fault_kind = ?1, fault_seq = ?2, fault_other = ?3
          WHERE library = ?4 AND fault_kind IS NULL AND resets = ?5",
@@ -515,17 +543,15 @@ pub(crate) async fn record_fault(
     .bind(other.map(as_i64).transpose()?)
     .bind(&library.0[..])
     .bind(resets)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     let row = sqlx::query(
         "SELECT fault_kind, fault_seq, fault_other FROM fongo_client_state WHERE library = ?",
     )
     .bind(&library.0[..])
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-    let stored = fault_of(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)?;
-    tx.commit().await?;
-    stored.ok_or(Error::ResolvedMeanwhile)
+    fault_of(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)
 }
 
 /// Whether an append of the envelope with `digest`, answered with `seq`, may reuse a position:

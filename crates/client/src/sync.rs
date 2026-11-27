@@ -437,13 +437,15 @@ pub struct SyncReport {
 ///
 /// - Numbering each library's envelopes 1, 2, 3 and so on without gaps, as the protocol states. A
 ///   page that skips, repeats or reorders a number is refused as malformed.
-/// - Keeping what it stored, which is checked as far as this device can: each sync reads first
-///   the envelope at the cursor again, and compares it with the digest kept of it; an envelope
-///   this device appended must be at the place the server named; and a new append must land past
-///   everything this device read and appended. A sync that finds otherwise fails with
-///   [`Error::LogFault`] and stores the fault; see [`crate::LogFault`]. The first sync after the
-///   client's tables are upgraded from a layout that kept no fingerprint reads the log from its
-///   start to the cursor, at most as many pages as one sync reads, to make one.
+/// - Keeping what it stored, byte for byte, which is checked as far as this device can: each sync
+///   reads first the envelope at the cursor again, and compares it with the digest kept of it; an
+///   envelope this device appended must be at the place the server named; and an append answered
+///   at a position this device has read must be read back there. A sync that finds otherwise fails
+///   with [`Error::LogFault`] and stores the fault; see [`crate::LogFault`]. Reading the envelope
+///   at the cursor costs its bytes in every sync, and a page read more where the new envelopes
+///   fill whole pages. The first syncs after the client's tables are upgraded from a layout that
+///   kept no fingerprint read the log from its start to the cursor, at most half the pages one
+///   sync reads each, storing how far they got after each page, to make one.
 /// - Nothing else about appends: storing an identical envelope only once is welcome but not
 ///   relied on, since a copy is applied idempotently.
 pub async fn sync<T: Transport>(
@@ -1250,6 +1252,23 @@ impl Pull {
             steps.collect(conn, report).await?;
         }
         let (mut tx, began) = steps.begin(conn).await?;
+        // Stored with its evidence, before anything is applied, so a crash cannot lose it.
+        let diverged = state::diverges(&mut tx, library, self.read, self.anchor, self.chain).await;
+        match diverged {
+            Ok(None) => {}
+            Ok(Some(fault)) => {
+                let stored = state::record_fault_in(&mut tx, library, steps.resets, fault).await;
+                return match stored {
+                    Ok(stored) => {
+                        tx.commit().await?;
+                        steps.committed(began);
+                        Err(stored.map_or(Error::ResolvedMeanwhile, Error::LogFault))
+                    }
+                    Err(error) => Err(abandon(tx, error).await),
+                };
+            }
+            Err(error) => return Err(abandon(tx, error).await),
+        }
         let written = async {
             let applied = if collect || !self.held.is_empty() {
                 begin_watch(&mut tx).await?;
@@ -1317,8 +1336,10 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     let me = keys.credentials.device_id();
     let mut pages = 0;
     let mut probe = pull.read > 0 && pull.anchor.is_some();
-    if let Some((from, chain)) = pull.rehash.take() {
-        if !rehash(
+    // A fingerprint short of the cursor, left by tables of a layout that kept none, is hashed on
+    // first, in part when the log is long; the pull reads on either way.
+    if let Some((from, chain)) = pull.rehash.take()
+        && rehash(
             rpc,
             conn,
             steps,
@@ -1330,10 +1351,7 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             &mut pages,
         )
         .await?
-        {
-            report.more = true;
-            return Ok(());
-        }
+    {
         probe = false;
     }
     let mut first = true;
@@ -1474,11 +1492,12 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     Ok(())
 }
 
-/// Hashes the log on from `from`, through which `chain` is its fingerprint, to the cursor
-/// `pull.read`, in pages counted in `pages`, and stores how far it got. Returns whether it reached
-/// the cursor; then `pull` holds the fingerprint and digest there. Fails with
-/// [`LogFault::Behind`] when the log ends first, and with [`LogFault::Rewritten`] when the
-/// envelope at the cursor is not the one recorded there.
+/// Hashes the log on from `from`, through which `chain` is its fingerprint, toward the cursor
+/// `pull.read`, in at most half the pages one sync reads, counted in `pages`, storing the
+/// fingerprint after each page with its position, so that a failure loses one page of the work.
+/// Returns whether it reached the cursor; then `pull` holds the fingerprint and digest there.
+/// Fails with [`LogFault::Behind`] when the log ends first, and with [`LogFault::Rewritten`] when
+/// the envelope at the cursor is not the one recorded there.
 #[allow(clippy::too_many_arguments)]
 async fn rehash<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     rpc: &Rpc<'_, T, N>,
@@ -1493,9 +1512,10 @@ async fn rehash<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
 ) -> Result<bool, Error> {
     let mut at = from;
     let mut last = None;
-    while at < pull.read && *pages < MAX_PAGES {
+    while at < pull.read && *pages < MAX_PAGES / 2 {
         *pages += 1;
         let page = read_page(rpc, credentials, at, limit).await?;
+        let before = at;
         for batch in page.batches.iter().take_while(|b| b.seq <= pull.read) {
             let digest = state::digest(&batch.envelope);
             chain = state::chain_step(chain, batch.seq, digest);
@@ -1505,22 +1525,20 @@ async fn rehash<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
         if at < pull.read && !page.more {
             return Err(Error::LogFault(LogFault::Behind { cursor: pull.read }));
         }
-    }
-    let done = at == pull.read;
-    if done && pull.anchor.is_some() && last != pull.anchor {
-        return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
-    }
-    if at > from {
+        let done = at == pull.read;
+        if done && pull.anchor.is_some() && last != pull.anchor {
+            return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
+        }
         let anchor = if done { last } else { None };
         let (mut tx, began) = steps.begin(conn).await?;
-        if let Err(error) =
-            state::record_chain(&mut tx, steps.library, from, at, chain, anchor).await
-        {
+        let stored = state::record_chain(&mut tx, steps.library, before, at, chain, anchor).await;
+        if let Err(error) = stored {
             return Err(abandon(tx, error).await);
         }
         tx.commit().await?;
         steps.committed(began);
     }
+    let done = at == pull.read;
     if done {
         pull.chain = Some(chain);
         pull.anchor = last.or(pull.anchor);
