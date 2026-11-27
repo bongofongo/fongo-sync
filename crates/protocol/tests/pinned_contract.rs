@@ -1,6 +1,6 @@
-//! The contract between devices and a server, pinned: every error code and its status, the header
-//! names, the paths, every JSON field name of every message, the binary bodies and the close
-//! codes. A change here breaks deployed peers, so it needs a new protocol version, not an updated
+//! The contract between devices and a server, pinned beside `pinned.rs`: the error body, the
+//! header values, the paths and their methods, every JSON field name of every message, the binary
+//! bodies and the close codes. A change here breaks deployed peers, so it needs a new protocol version, not an updated
 //! expectation.
 
 use fongo_sync_protocol::api::{
@@ -11,12 +11,11 @@ use fongo_sync_protocol::api::{
     CompleteBlobs, CreateLibrary, DEVICES_PATH, DeviceRecord, Devices, ENTITLEMENT_PATH,
     Entitlement, ErrorBody, ErrorCode, HaveChunk, LIBRARIES_PATH, LibraryStatus, MissingBlobs,
     NOTIFICATION_FORMAT, NOTIFICATIONS_PATH, Notification, REMOVE_DEVICE_PATH, ReadBatches,
-    RemoveDevice, RetireBlobs, SETTLED_PATH, STATUS_PATH, Settled, StoredBatch,
+    RemoveDevice, RetireBlobs, Route, SETTLED_PATH, STATUS_PATH, Settled, StoredBatch,
 };
 use fongo_sync_protocol::{
-    BlobId, DeviceId, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, LibraryId,
-    LibraryKeys, PROTOCOL_VERSION, SigningKey, WrapKey, seal, sign_request, sign_request_digest,
-    verify_request, verify_request_digest,
+    BlobId, DeviceId, LibraryId, LibraryKeys, PROTOCOL_VERSION, SigningKey, WrapKey, seal,
+    sign_request, sign_request_digest, verify_request, verify_request_digest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -50,42 +49,10 @@ fn pinned<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
     assert_eq!(serde_json::to_string(&back).unwrap(), expected);
 }
 
+/// The codes and their statuses are pinned in `pinned.rs`; this adds the body's keys and the
+/// reading of a code this version does not know.
 #[test]
-fn every_error_code_has_its_string_and_status() {
-    let codes: Vec<(&str, u16)> = ErrorCode::ALL
-        .iter()
-        .map(|c| (c.as_str(), c.status()))
-        .collect();
-    let expected = [
-        ("malformed_request", 400),
-        ("malformed_envelope", 400),
-        ("invalid_proof", 400),
-        ("unauthenticated", 401),
-        ("unknown_device", 401),
-        ("bad_signature", 401),
-        ("stale_request", 401),
-        ("replayed_request", 401),
-        ("device_removed", 401),
-        ("not_entitled", 402),
-        ("forbidden", 403),
-        ("device_limit", 403),
-        ("not_found", 404),
-        ("library_not_found", 404),
-        ("blob_not_found", 404),
-        ("method_not_allowed", 405),
-        ("library_exists", 409),
-        ("blob_incomplete", 409),
-        ("blob_mismatch", 409),
-        ("too_large", 413),
-        ("blob_too_large", 413),
-        ("envelope_wrong_library", 422),
-        ("envelope_wrong_device", 422),
-        ("envelope_bad_signature", 422),
-        ("internal", 500),
-        ("library_full", 507),
-        ("quota_exceeded", 507),
-    ];
-    assert_eq!(codes, expected);
+fn every_error_body_is_a_code_and_a_message() {
     for &code in ErrorCode::ALL {
         assert_eq!(ErrorCode::parse(code.as_str()), code);
         let body = serde_json::to_value(ErrorBody::new(code)).unwrap();
@@ -112,21 +79,7 @@ fn every_error_code_has_its_string_and_status() {
 }
 
 #[test]
-fn header_names_paths_and_constants_are_fixed() {
-    assert_eq!(
-        [
-            HEADER_DEVICE,
-            HEADER_TIMESTAMP,
-            HEADER_NONCE,
-            HEADER_SIGNATURE
-        ],
-        [
-            "x-fongo-device",
-            "x-fongo-timestamp",
-            "x-fongo-nonce",
-            "x-fongo-signature"
-        ]
-    );
+fn paths_methods_and_constants_are_fixed() {
     assert_eq!(
         [
             CAPABILITIES_PATH,
@@ -167,6 +120,64 @@ fn header_names_paths_and_constants_are_fixed() {
             "/v1/libraries/{library}/devices/remove",
         ]
     );
+    let library = LibraryId([0xab; 16]);
+    let blob = BlobId([0xcd; 32]);
+    let methods: Vec<(String, &[&str])> = [
+        Route::Capabilities,
+        Route::Libraries,
+        Route::Devices(library),
+        Route::Batches(library),
+        Route::BatchesClaiming(library),
+        Route::Notifications(library),
+        Route::Blob(library, blob),
+        Route::BlobChunk(library, blob, 3),
+        Route::BlobComplete(library, blob),
+        Route::BlobWhole(library, blob),
+        Route::BlobsQuery(library),
+        Route::BlobsClaim(library),
+        Route::BlobsRetire(library),
+        Route::Settled(library),
+        Route::Status(library),
+        Route::Entitlement(library),
+        Route::RemoveDevice(library),
+    ]
+    .iter()
+    .map(|route| {
+        (
+            route
+                .path()
+                .replace(&library.to_hex(), "L")
+                .replace(&blob.to_hex(), "B"),
+            route.methods(),
+        )
+    })
+    .collect();
+    let get: &[&str] = &["GET"];
+    let post: &[&str] = &["POST"];
+    let both: &[&str] = &["GET", "POST"];
+    let expected: Vec<(String, &[&str])> = [
+        ("/v1/capabilities", get),
+        ("/v1/libraries", post),
+        ("/v1/libraries/L/devices", both),
+        ("/v1/libraries/L/batches", both),
+        ("/v1/libraries/L/batches/claiming", post),
+        ("/v1/libraries/L/notifications", get),
+        ("/v1/libraries/L/blobs/B", both),
+        ("/v1/libraries/L/blobs/B/chunks/3", both),
+        ("/v1/libraries/L/blobs/B/complete", post),
+        ("/v1/libraries/L/blobs/B/whole", post),
+        ("/v1/libraries/L/blobs/query", post),
+        ("/v1/libraries/L/blobs/claim", post),
+        ("/v1/libraries/L/blobs/retire", post),
+        ("/v1/libraries/L/settled", post),
+        ("/v1/libraries/L/status", get),
+        ("/v1/libraries/L/entitlement", post),
+        ("/v1/libraries/L/devices/remove", post),
+    ]
+    .into_iter()
+    .map(|(path, methods)| (path.to_owned(), methods))
+    .collect();
+    assert_eq!(methods, expected);
     assert_eq!(BINARY_CONTENT_TYPE, "application/octet-stream");
     assert_eq!(PROTOCOL_VERSION, 1);
     assert_eq!(NOTIFICATION_FORMAT, 1);
@@ -191,6 +202,19 @@ fn a_signature_over_a_digest_is_the_signature_over_its_body() {
     assert_eq!(
         hex(&by_digest.signature.to_bytes()),
         "c00ce7d98565c00019243c37dfc032cd88684527005030e6e993dab6a5128d12270659ad04db71cecf55f2359dbda355e218feb83b529beeb6bc1c60d78be305"
+    );
+    let headers = by_body
+        .headers()
+        .map(|(name, value)| (name.to_owned(), value));
+    assert_eq!(
+        headers,
+        [
+            ("x-fongo-device", "b62e867fa2f33afe62d5d6b1642e1621"),
+            ("x-fongo-timestamp", "1700000000"),
+            ("x-fongo-nonce", "06060606060606060606060606060606"),
+            ("x-fongo-signature", "c00ce7d98565c00019243c37dfc032cd88684527005030e6e993dab6a5128d12270659ad04db71cecf55f2359dbda355e218feb83b529beeb6bc1c60d78be305"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
     );
     let key = device().verifying_key();
     let at = 1_700_000_000;
