@@ -1557,6 +1557,153 @@ async fn a_database_without_a_record_of_its_sets_widens_them_as_any_other() {
     );
 }
 
+const FOUND: &[&str] = &[
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT,
+                                             finished INTEGER, rating INTEGER, extra TEXT)",
+];
+
+/// `paired`, `widened`, or `widened` with a plain field more.
+fn found(version: u8) -> Registry {
+    let books = Collection::minted("books", "books", "id")
+        .field("title")
+        .field("status")
+        .field("finished");
+    let books = match version {
+        0 => books.together(&["status", "finished"]),
+        1 => books
+            .field("rating")
+            .together(&["status", "finished", "rating"]),
+        _ => books
+            .field("rating")
+            .field("extra")
+            .together(&["status", "finished", "rating"]),
+    };
+    Registry::new(vec![books]).unwrap()
+}
+
+/// Requires that no two of `sent` give one register one clock.
+fn one_clock_per_write(sent: &[Change]) {
+    for (i, a) in sent.iter().enumerate() {
+        for b in &sent[..i] {
+            assert!(
+                !(a.gid == b.gid && a.field == b.field && a.clock == b.clock),
+                "{a:?}\n{b:?}"
+            );
+        }
+    }
+}
+
+/// A found row's set is written at wall 0; a change from elsewhere at wall 0 with a counter near
+/// the last becomes the set's latest write. Completing the set past it must not spend this
+/// node's adoption sequence, or every later adoption would take one clock, and a field adopted
+/// twice with two values would carry two values at one clock.
+#[tokio::test]
+async fn a_foreign_adoption_counter_never_makes_a_clock_reused() {
+    let mut a = Peer::bare(FOUND, found(0)).await;
+    a.run(
+        "INSERT INTO books (title, status, finished, rating, extra)
+         VALUES ('one', 'r', 1, 4, 'e1'), ('two', 'r', 2, 5, 'e2')",
+    )
+    .await;
+    a.install().await;
+    let mut peers = vec![a, Peer::new(FOUND, found(0)).await];
+    let mut hub = Vec::new();
+    settle(&mut peers, &mut hub).await;
+    let gid = peers[0].gid("books", 1).await;
+    hub.push(Change {
+        collection: "books".into(),
+        gid,
+        field: "status".into(),
+        value: Value::Text("f".into()),
+        clock: Hlc {
+            wall_ms: 0,
+            counter: u32::MAX - 1,
+            node: Gid([7; 16]),
+        },
+    });
+    settle(&mut peers, &mut hub).await;
+    let mut sent = Vec::new();
+    for version in [1, 2, 1, 2] {
+        if version == 1 {
+            peers[0].run("UPDATE books SET extra = extra || '+'").await;
+        }
+        upgrade(&mut peers[0], found(version)).await;
+        sent.extend(peers[0].push(&mut hub).await);
+    }
+    let mine = node_of(&mut peers[0]).await;
+    assert!(sent.iter().all(|c| c.clock.node == mine), "{sent:#?}");
+    assert!(
+        sent.iter()
+            .all(|c| c.clock.wall_ms != 0 || c.clock.counter < 100),
+        "{sent:#?}"
+    );
+    one_clock_per_write(&sent);
+    none_shared(&mut peers, &hub).await;
+    upgrade(&mut peers[1], found(2)).await;
+    settle(&mut peers, &mut hub).await;
+    none_shared(&mut peers, &hub).await;
+    assert_eq!(
+        same_everywhere(
+            &mut peers,
+            "SELECT title || ' ' || status || ' ' || rating || ' ' || extra FROM books ORDER BY 1"
+        )
+        .await,
+        ["one f 4 e1++", "two r 5 e2++"]
+    );
+}
+
+/// Widening, narrowing and widening again over a set whose latest write is a change from
+/// elsewhere at wall 0 with a counter near the last, with a plain field adopted at each widening:
+/// every clock this node gives one register is its own, and no replica takes it for another
+/// database's.
+#[tokio::test]
+async fn widening_again_over_a_foreign_adoption_counter_reuses_no_clock() {
+    let mut a = Peer::bare(FOUND, found(0)).await;
+    a.run(
+        "INSERT INTO books (title, status, finished, rating, extra) VALUES ('one', 'r', 1, 4, 'e')",
+    )
+    .await;
+    a.install().await;
+    let mut peers = vec![a, Peer::new(FOUND, found(0)).await];
+    let mut hub = Vec::new();
+    settle(&mut peers, &mut hub).await;
+    let gid = peers[0].gid("books", 1).await;
+    for (field, value) in [
+        ("status", Value::Text("f".into())),
+        ("finished", Value::Int(9)),
+    ] {
+        hub.push(Change {
+            collection: "books".into(),
+            gid,
+            field: field.into(),
+            value,
+            clock: Hlc {
+                wall_ms: 0,
+                counter: u32::MAX - 1,
+                node: Gid([7; 16]),
+            },
+        });
+    }
+    settle(&mut peers, &mut hub).await;
+    let mut sent = Vec::new();
+    for n in 0..6 {
+        let version = if n % 2 == 0 { 2 } else { 0 };
+        if version == 0 {
+            peers[0]
+                .run(&format!("UPDATE books SET rating = {n}, extra = 'e{n}'"))
+                .await;
+        }
+        upgrade(&mut peers[0], found(version)).await;
+        sent.extend(peers[0].push(&mut hub).await);
+    }
+    one_clock_per_write(&sent);
+    none_shared(&mut peers, &hub).await;
+    upgrade(&mut peers[1], found(2)).await;
+    settle(&mut peers, &mut hub).await;
+    none_shared(&mut peers, &hub).await;
+    same_everywhere(&mut peers, WIDE_ROWS).await;
+}
+
 const NOTED: &[&str] = &[
     "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT,
                                               note TEXT, rating INTEGER)",
