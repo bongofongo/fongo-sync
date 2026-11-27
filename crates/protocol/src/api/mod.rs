@@ -23,11 +23,11 @@
 //! A device is added by `POST` [`AddDevice`] at [`DEVICES_PATH`]. A key not yet listed needs a
 //! free slot: a library already listing [`Capabilities::max_devices`] keys that are neither removed
 //! nor the recovery key refuses it with [`ErrorCode::DeviceLimit`]. Adding a key that is listed
-//! and not removed succeeds and changes nothing, its stored wrap key included. Adding a removed
-//! key restores it: the server answers 201, needs a free slot as for a new key
-//! ([`ErrorCode::DeviceLimit`] otherwise), keeps the [`Settled`] position the device reported
-//! before it was removed, and stores the wrap key the request carries; a request that carries
-//! none may leave the restored record without one.
+//! and not removed succeeds and changes nothing, its stored wrap key and membership proof
+//! included. Adding a removed key restores it: the server answers 201, needs a free slot as for a
+//! new key ([`ErrorCode::DeviceLimit`] otherwise), keeps the [`Settled`] position the device
+//! reported before it was removed, and stores the wrap key and membership proof the request
+//! carries; a request that carries none may leave the restored record without them.
 //!
 //! A [`DeviceRecord`]'s `last_seen`, documented there as the time of the last accepted request, is
 //! more precisely the start of the hour, a multiple of 3600, in which the key last made a request
@@ -546,8 +546,8 @@ fn wrap_message(library: LibraryId, device: &VerifyingKey, wrap_key: &WrapKey) -
 ///
 /// A key already listed and not removed is accepted and changes nothing, its stored wrap key and
 /// membership proof included, so a device can repeat an add whose answer it lost. A removed one is
-/// restored, taking the wrap key and membership proof this request carries, or none if it
-/// carries none; a wrap key whose proof does not verify is refused as for a new key.
+/// restored with the wrap key and membership proof this request carries. See
+/// [the module documentation](self#devices) for slots and status codes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawAddDevice")]
 pub struct AddDevice {

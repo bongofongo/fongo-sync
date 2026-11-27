@@ -14,8 +14,8 @@ use fongo_sync_protocol::api::{
     RemoveDevice, RetireBlobs, Route, SETTLED_PATH, STATUS_PATH, Settled, StoredBatch,
 };
 use fongo_sync_protocol::{
-    BlobId, DeviceId, LibraryId, LibraryKeys, PROTOCOL_VERSION, SigningKey, WrapKey, seal,
-    sign_request, sign_request_digest, verify_request, verify_request_digest,
+    BlobId, DeviceId, LibraryId, LibraryKeys, MemberCheck, PROTOCOL_VERSION, SigningKey, WrapKey,
+    seal, sign_request, sign_request_digest, verify_request, verify_request_digest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -36,6 +36,7 @@ fn recovery() -> SigningKey {
 const DEVICE_KEY: &str = "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1";
 const RECOVERY_KEY: &str = "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c";
 const LIBRARY: LibraryId = LibraryId([1; 16]);
+const MEMBER_PROOF: &str = "723678f618a4622771c815b2dbcb470f805b2e9d12fad868611edd6b7f9d20d7";
 
 /// Writes `value` as JSON, checks it against `expected`, and checks that `expected` reads back to
 /// `value` and is written again unchanged.
@@ -310,6 +311,7 @@ fn every_device_message_field_is_named() {
         public_key: device().verifying_key(),
         recovery: false,
         wrap: add.wrap,
+        member_proof: None,
         removed: true,
         last_seen: Some(1_700_002_800),
     };
@@ -324,6 +326,7 @@ fn every_device_message_field_is_named() {
                 public_key: recovery().verifying_key(),
                 recovery: true,
                 wrap: None,
+                member_proof: None,
                 removed: false,
                 last_seen: None,
             },
@@ -333,6 +336,32 @@ fn every_device_message_field_is_named() {
         &devices,
         &format!(
             r#"{{"devices":[{record_json},{{"public_key":"{RECOVERY_KEY}","recovery":true}}]}}"#
+        ),
+    );
+
+    let keys = LibraryKeys::new(LIBRARY, [2; 32]);
+    let proof = format!(r#""member_proof":"{MEMBER_PROOF}""#);
+    pinned(
+        &create.clone().with_member_proof(&keys),
+        &format!(
+            r#"{{"library":"{}","device_key":"{DEVICE_KEY}","recovery_key":"{RECOVERY_KEY}","proof":"{PROOF}",{wrap},{proof},"entitlement":"token"}}"#,
+            "01".repeat(16)
+        ),
+    );
+    let proven = add.clone().with_member_proof(&keys);
+    pinned(
+        &proven,
+        &format!(r#"{{"device_key":"{DEVICE_KEY}",{wrap},{proof}}}"#),
+    );
+    let proven_record = DeviceRecord {
+        member_proof: proven.member_proof.map(Into::into),
+        ..devices.devices[0].clone()
+    };
+    assert_eq!(proven_record.check_member_proof(&keys), MemberCheck::Valid);
+    pinned(
+        &proven_record,
+        &format!(
+            r#"{{"public_key":"{DEVICE_KEY}","recovery":false,{wrap},{proof},"removed":true,"last_seen":1700002800}}"#
         ),
     );
     pinned(

@@ -479,19 +479,25 @@ impl State {
                     .filter(|d| !d.recovery && !d.removed)
                     .count();
                 let full = max.is_some_and(|max| live >= max as usize);
-                match library
+                let status = match library
                     .devices
                     .iter_mut()
                     .find(|d| d.public_key == record.public_key)
                 {
-                    Some(listed) if !listed.removed => {}
+                    Some(listed) if !listed.removed => 200,
                     Some(_) if full => return Err(ErrorCode::DeviceLimit),
-                    Some(listed) => *listed = record,
+                    Some(listed) => {
+                        *listed = record;
+                        201
+                    }
                     None if full => return Err(ErrorCode::DeviceLimit),
-                    None => library.devices.push(record),
-                }
+                    None => {
+                        library.devices.push(record);
+                        200
+                    }
+                };
                 Ok(json(
-                    200,
+                    status,
                     &Devices {
                         devices: library.devices.clone(),
                     },
