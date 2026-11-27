@@ -1577,10 +1577,11 @@ fn noting(widened: bool) -> Registry {
     Registry::new(vec![books]).unwrap()
 }
 
-/// A set recorded again by an upgrade carries the value an edit elsewhere replaced: the edit
-/// wins, and nothing is reported. A write that does change the field is still reported.
+/// A set recorded again by an upgrade carries the value an edit elsewhere replaced. The edit
+/// wins, and the record is reported as a conflict whose remote value is the base, so a three-way
+/// merge gives the local value back. A write that does change the field is reported too.
 #[tokio::test]
-async fn a_completion_is_not_reported_as_a_conflict() {
+async fn a_completion_is_reported_with_the_base_and_the_edit_kept() {
     let rows = "SELECT title || ' ' || COALESCE(status, '-') || ' ' || COALESCE(note, '-') || ' '
                        || COALESCE(rating, '-') FROM books";
     let mut hub = Vec::new();
@@ -1597,27 +1598,13 @@ async fn a_completion_is_not_reported_as_a_conflict() {
     upgrade(&mut peers[0], noting(true)).await;
     peers[0].push(&mut hub).await;
     let applied = peers[1].pull(&hub).await;
-    assert_eq!(applied.conflicts, [], "{:#?}", applied.conflicts);
+    assert_eq!(told(&applied), [conflict("n0", "mine", "n0", false)]);
+    assert_eq!(peers[1].lines("SELECT note FROM books").await, ["mine"]);
     later();
     peers[0].run("UPDATE books SET note = 'theirs'").await;
     peers[0].push(&mut hub).await;
     let applied = peers[1].pull(&hub).await;
-    assert_eq!(applied.conflicts.len(), 1, "{:#?}", applied.conflicts);
-    let conflict = &applied.conflicts[0];
-    assert_eq!(
-        (
-            &conflict.base,
-            &conflict.local,
-            &conflict.remote,
-            conflict.remote_won
-        ),
-        (
-            &Some(Value::Text("n0".into())),
-            &Value::Text("mine".into()),
-            &Value::Text("theirs".into()),
-            true
-        )
-    );
+    assert_eq!(told(&applied), [conflict("n0", "mine", "theirs", true)]);
     upgrade(&mut peers[1], noting(true)).await;
     settle(&mut peers, &mut hub).await;
     assert_eq!(
@@ -1625,6 +1612,107 @@ async fn a_completion_is_not_reported_as_a_conflict() {
         ["one reading theirs 4"]
     );
 }
+
+fn conflict(base: &str, local: &str, remote: &str, won: bool) -> (String, String, String, bool) {
+    (base.into(), local.into(), remote.into(), won)
+}
+
+/// Base, local and remote text of each conflict reported, and whether the remote edit won.
+fn told(applied: &fongo_sync_sqlite::Applied) -> Vec<(String, String, String, bool)> {
+    fn text(v: &Value) -> String {
+        match v {
+            Value::Text(t) => t.clone(),
+            _ => panic!("{v:?}"),
+        }
+    }
+    applied
+        .conflicts
+        .iter()
+        .map(|c| {
+            (
+                c.base.as_ref().map_or("-".into(), text),
+                text(&c.local),
+                text(&c.remote),
+                c.remote_won,
+            )
+        })
+        .collect()
+}
+
+/// Peer 2 changes the note from x to z; peer 1, having seen z, sets it back to x; peer 0, having
+/// seen neither, edits it to y and then takes both, in one apply or in two. Peer 0 is told the
+/// remote side's latest value, x, and never z alone as the last word. The world's clock puts
+/// many writes in one millisecond and steps back.
+async fn set_back(seed: u64, apart: bool) -> Vec<Vec<(String, String, String, bool)>> {
+    let world = support::world::World::stepping_back(seed, 4, 3);
+    let mut peers = Vec::new();
+    for n in 0..3 {
+        peers.push(Peer::in_world(&world, n, NOTED, noting(false)).await);
+    }
+    let mut hub = Vec::new();
+    peers[0]
+        .run("INSERT INTO books (title, status, note) VALUES ('one', 'reading', 'x')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    peers[2].run("UPDATE books SET note = 'z'").await;
+    peers[2].push(&mut hub).await;
+    peers[1].pull(&hub).await;
+    peers[1].run("UPDATE books SET note = 'x'").await;
+    peers[1].push(&mut hub).await;
+    peers[0].run("UPDATE books SET note = 'y'").await;
+    let theirs = hub[peers[0].cursor..].to_vec();
+    let mut reports = Vec::new();
+    let applies: Vec<&[Change]> = if apart {
+        let z = theirs
+            .iter()
+            .position(|c| c.value == Value::Text("x".into()))
+            .unwrap();
+        vec![&theirs[..z], &theirs[z..]]
+    } else {
+        vec![&theirs[..]]
+    };
+    for changes in applies {
+        let applied = peers[0].apply(changes).await;
+        reports.push(told(&applied));
+    }
+    peers[0].cursor = hub.len();
+    let shown = peers[0].lines("SELECT note FROM books").await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, "SELECT note FROM books").await,
+        shown
+    );
+    reports
+}
+
+#[tokio::test]
+async fn a_remote_set_back_in_one_apply_is_reported_as_the_latest_remote_value() {
+    for seed in 0..4 {
+        let reports = set_back(seed, false).await;
+        assert_eq!(reports.len(), 1);
+        let [(base, local, remote, _)] = &reports[0][..] else {
+            panic!("seed {seed}: {reports:?}");
+        };
+        assert_eq!(
+            (&base[..], &local[..], &remote[..]),
+            ("x", "y", "x"),
+            "seed {seed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_remote_set_back_after_its_change_was_reported_is_reported_again() {
+    for seed in 0..4 {
+        let reports = set_back(seed, true).await;
+        let remotes: Vec<Vec<&str>> = reports
+            .iter()
+            .map(|r| r.iter().map(|(_, _, remote, _)| remote.as_str()).collect())
+            .collect();
+        assert_eq!(remotes, [vec!["z"], vec!["x"]], "seed {seed}: {reports:?}");
+    }
+}
+
 // What a table refuses, or retries, never stops an apply.
 
 /// Applies to a fresh replica `n` books whose titles, unique in the table but not an identity,
