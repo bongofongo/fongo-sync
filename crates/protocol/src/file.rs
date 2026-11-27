@@ -44,7 +44,7 @@ impl ContentHash {
 
 impl fmt::Debug for ContentHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ContentHash({})", crate::hex::encode(&self.0))
+        write!(f, "ContentHash({}..)", crate::hex::encode(&self.0[..4]))
     }
 }
 
@@ -97,12 +97,13 @@ impl FileNameKey {
 }
 
 impl FileKeyRoot {
-    /// The key of the file whose content hash is `hash`: HKDF-Expand (RFC 5869, section 2.3) with
+    /// The key of the file whose content hash is `hash`, which [`FileSealer`] expands into its
+    /// chunk key and nonce key: HKDF-Expand (RFC 5869, section 2.3) with
     /// this root as the pseudorandom key, info `fongo-sync/v1/file-key` followed by the hash's
     /// 32 bytes, and 32 bytes of output. There is no Extract step: the root, itself HKDF output,
     /// is the pseudorandom key. With one block of output this is HMAC-SHA256 keyed with the root
     /// over the info followed by the byte 1.
-    pub fn file_key(&self, hash: &ContentHash) -> FileKey {
+    pub(crate) fn file_key(&self, hash: &ContentHash) -> FileKey {
         let mut out = [0u8; 32];
         Hkdf::<Sha256>::from_prk(self.as_bytes())
             .expect("32 bytes is a valid HKDF-SHA256 pseudorandom key")
@@ -1187,6 +1188,12 @@ mod tests {
                 prop_assert_eq!(read.to_hex(), text);
             }
         }
+    }
+
+    #[test]
+    fn a_content_hash_prints_only_a_prefix() {
+        let hash = ContentHash([0xab; 32]);
+        assert_eq!(format!("{hash:?}"), "ContentHash(abababab..)");
     }
 
     #[test]

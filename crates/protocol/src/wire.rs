@@ -36,6 +36,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Everything not yet read.
+    pub(crate) fn rest(self) -> &'a [u8] {
+        self.rest
+    }
+
     pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if n > self.rest.len() {
             return Err(DecodeError::Truncated);

@@ -57,7 +57,7 @@ pub use file::{
     BlobId, ContentHash, FILE_CHUNK_LEN, FILE_REF_FORMAT, FileError, FileHasher, FileLayout,
     FileOpener, FileRef, FileSealer, SEALED_CHUNK_LEN, SealedChunk, padme,
 };
-pub use keys::{DeviceId, FileKey, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey};
+pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey};
 #[cfg(feature = "rand")]
 pub use keys::{generate_signing_key, random_nonce, random_request_nonce};
 pub use recovery::RecoveryError;

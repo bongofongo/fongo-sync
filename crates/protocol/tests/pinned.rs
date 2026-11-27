@@ -4,9 +4,10 @@
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use fongo_sync_core::{Change, Gid, Hlc, Value};
+use fongo_sync_protocol::BlobId;
 use fongo_sync_protocol::api::{
-    AddDevice, Appended, BatchPage, BlobDigest, Capabilities, CreateLibrary, DeviceRecord, Devices,
-    ErrorBody, ErrorCode, Notification, ReadBatches, StoredBatch,
+    AddDevice, Appended, BatchPage, BlobDigest, Capabilities, ClaimingAppend, CreateLibrary,
+    DeviceRecord, Devices, ErrorBody, ErrorCode, Notification, ReadBatches, Route, StoredBatch,
 };
 use fongo_sync_protocol::{
     ContentHash, DeviceId, FILE_CHUNK_LEN, FileHasher, FileOpener, FileRef, FileSealer,
@@ -328,6 +329,23 @@ fn error_codes_and_headers_do_not_drift() {
     );
 }
 
+/// A file's key by its documented derivation: HKDF-Expand of the root over the label and the hash,
+/// one block of which is HMAC-SHA256 keyed with the root over the info and the byte 1.
+fn file_key(hash: &ContentHash) -> [u8; 32] {
+    let root = keys().file_key_root();
+    let mut by_hkdf = [0u8; 32];
+    Hkdf::<Sha256>::from_prk(root.as_bytes())
+        .unwrap()
+        .expand_multi_info(&[b"fongo-sync/v1/file-key", &hash.0], &mut by_hkdf)
+        .unwrap();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(root.as_bytes()).unwrap();
+    mac.update(b"fongo-sync/v1/file-key");
+    mac.update(&hash.0);
+    mac.update(&[1]);
+    assert_eq!(by_hkdf[..], mac.finalize().into_bytes()[..]);
+    by_hkdf
+}
+
 #[test]
 fn the_file_derivations_do_not_drift() {
     let hash = ContentHash::of(b"Middlemarch");
@@ -335,7 +353,7 @@ fn the_file_derivations_do_not_drift() {
     let actual = [
         hex(keys().file_name_key().as_bytes()),
         hex(root.as_bytes()),
-        hex(root.file_key(&hash).as_bytes()),
+        hex(&file_key(&hash)),
         keys().file_name_key().blob_id(&hash).to_hex(),
         hex(&FileRef { hash, size: 11 }.encode()),
         hex(&FileRef { hash, size: 300 }.encode()),
@@ -350,14 +368,6 @@ fn the_file_derivations_do_not_drift() {
     ];
     assert_eq!(actual, expected);
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(root.as_bytes()).unwrap();
-    mac.update(b"fongo-sync/v1/file-key");
-    mac.update(&hash.0);
-    mac.update(&[1]);
-    assert_eq!(
-        root.file_key(&hash).as_bytes()[..],
-        mac.finalize().into_bytes()[..]
-    );
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(keys().file_name_key().as_bytes()).unwrap();
     mac.update(&hash.0);
     assert_eq!(
@@ -468,8 +478,8 @@ fn sealed_files_are_laid_out_as_documented() {
         assert_eq!(chunks.len(), count);
 
         let id = keys().file_name_key().blob_id(&file.hash);
-        let key = keys().file_key_root().file_key(&file.hash);
-        let expand = Hkdf::<Sha256>::from_prk(key.as_bytes()).unwrap();
+        let key = file_key(&file.hash);
+        let expand = Hkdf::<Sha256>::from_prk(&key).unwrap();
         let mut chunk_key = [0u8; 32];
         let mut nonce_key = [0u8; 32];
         expand
@@ -607,5 +617,26 @@ fn a_blob_digest_does_not_drift() {
     assert_eq!(
         hex(&digest),
         "ad4b3c00a266c6cb31d389764c56bbb0e33add2fc8801210faa5b5947536218c"
+    );
+}
+
+#[test]
+fn a_claiming_append_is_laid_out_as_documented() {
+    let envelope = seal(&changes(), &keys(), 3, &device(), [5; 24]);
+    let body = ClaimingAppend {
+        ids: vec![BlobId([0xab; 32]), BlobId([0xcd; 32])],
+        envelope: envelope.clone(),
+    };
+    let bytes = body.encode();
+    let head = ["02", &"ab".repeat(32), &"cd".repeat(32)].concat();
+    assert_eq!(hex(&bytes[..65]), head);
+    assert_eq!(&bytes[65..], &envelope[..]);
+    assert_eq!(
+        hex(&Sha256::digest(&bytes)),
+        "ca41c8a4c83670489aa29c799e078b0dbd66d7dac58e88a070a2be2c8e50812b"
+    );
+    assert_eq!(
+        Route::BatchesClaiming(keys().id).path(),
+        "/v1/libraries/01010101010101010101010101010101/batches/claiming"
     );
 }

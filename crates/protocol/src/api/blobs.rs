@@ -6,9 +6,11 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+use crate::envelope::Envelope;
 use crate::file::{BlobId, CHUNK_OVERHEAD, FileLayout, SEALED_CHUNK_LEN, SealedChunk, padme};
 use crate::hex::serde_digest;
 use crate::keys::DeviceId;
+use crate::wire::{DecodeError, Reader, put_varint};
 
 const OVERHEAD: u64 = CHUNK_OVERHEAD as u64;
 
@@ -191,8 +193,56 @@ impl BlobDigest {
     }
 }
 
+/// The body of [`BATCHES_CLAIMING_PATH`](super::BATCHES_CLAIMING_PATH): an envelope and the ids of
+/// the blobs its changes set references to. The server appends the envelope as
+/// [`BATCHES_PATH`](super::BATCHES_PATH) would, with the same checks and errors, and in the same
+/// atomic step records each id as claimed at the envelope's sequence number; it answers
+/// [`Appended`](super::Appended).
+///
+/// The ids tell the server which envelope, and so which device and when, refers to which blob
+/// ids; not what the files are.
+///
+/// Bytes: a LEB128 count, that many 32-byte blob ids, then the envelope exactly as
+/// [`BATCHES_PATH`](super::BATCHES_PATH) takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimingAppend {
+    pub ids: Vec<BlobId>,
+    pub envelope: Vec<u8>,
+}
+
+impl ClaimingAppend {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + 32 * self.ids.len() + self.envelope.len());
+        put_varint(&mut out, self.ids.len() as u64);
+        for id in &self.ids {
+            out.extend_from_slice(&id.0);
+        }
+        out.extend_from_slice(&self.envelope);
+        out
+    }
+
+    /// Fails on anything `encode` would not write from an envelope that [`Envelope::decode`]
+    /// reads; the envelope's signature is not checked here. Allocation is bounded by a constant
+    /// multiple of the input's length.
+    pub fn decode(bytes: &[u8]) -> Result<ClaimingAppend, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let count = r.len(32)?;
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(BlobId(r.array()?));
+        }
+        let envelope = r.rest();
+        Envelope::decode(envelope)?;
+        Ok(ClaimingAppend {
+            ids,
+            envelope: envelope.to_vec(),
+        })
+    }
+}
+
 /// The body of a query or a claim. A query takes at most
-/// [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids) ids.
+/// [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids) ids. A claim sent to
+/// [`BLOBS_CLAIM_PATH`](super::BLOBS_CLAIM_PATH) is recorded at the library's current head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobIds {
     pub ids: Vec<BlobId>,
@@ -204,20 +254,15 @@ pub struct CompleteBlobs {
     pub complete: Vec<BlobId>,
 }
 
-/// The answer to a claim: those of the ids claimed that are not complete on the server. The
-/// claim has cleared any retirement of every id.
+/// The answer to a claim: those of the ids claimed that are not complete on the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingBlobs {
     pub missing: Vec<BlobId>,
 }
 
-/// Marks complete blobs as referred to by nothing in the sender's merged state as of log position
-/// `through`. Ids the server does not hold are ignored.
-///
-/// A server deletes a retired blob only when no claim has named it since, every device not
-/// removed has reported [`Settled`] at or past `through` (one that never reported counts as 0), and
-/// [`Capabilities::blob_wait_days`](super::Capabilities::blob_wait_days) have passed since the
-/// retirement.
+/// Marks complete blobs as referred to by no change through log position `through`, by the rules
+/// in [the module documentation](super#deleting-files). Ids the server does not hold complete are
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireBlobs {
     pub through: u64,
@@ -225,7 +270,7 @@ pub struct RetireBlobs {
 }
 
 /// The sender has merged every envelope through sequence number `seq` and has nothing unsent. A
-/// server keeps the greatest it was told.
+/// server keeps the greatest it was told, and keeps it when a removed device is restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settled {
     pub seq: u64,
@@ -251,7 +296,10 @@ pub struct Entitlement {
 
 /// Removes a device, which may be the sender. From then on the server refuses the removed
 /// device's requests with [`ErrorCode::DeviceRemoved`](super::ErrorCode::DeviceRemoved), keeps
-/// the envelopes it appended, and no longer waits for it before deleting retired blobs.
+/// the envelopes it appended, and no longer waits for it before deleting retired blobs. Naming the
+/// recovery key is refused with [`ErrorCode::Forbidden`](super::ErrorCode::Forbidden); naming an
+/// id the library does not list, or a device already removed, changes nothing. Either way the
+/// answer is the device list; [`Devices::remove`](super::Devices::remove) does this to a list.
 ///
 /// Removal does not lock anyone out: whoever holds the library secret can derive the recovery
 /// key and add a device again, and can read whatever they obtain.
@@ -449,6 +497,60 @@ mod tests {
                 json!({ "digest": crate::hex::encode(&whole).to_uppercase() })
             )
             .is_err()
+        );
+    }
+
+    fn envelope() -> Vec<u8> {
+        crate::seal(
+            &[],
+            &crate::LibraryKeys::new(crate::LibraryId([1; 16]), [2; 32]),
+            0,
+            &crate::SigningKey::from_bytes(&[3; 32]),
+            [4; 24],
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn claiming_appends_round_trip(ids in proptest::collection::vec(any::<[u8; 32]>(), 0..5)) {
+            let body = ClaimingAppend {
+                ids: ids.into_iter().map(BlobId).collect(),
+                envelope: envelope(),
+            };
+            let bytes = body.encode();
+            prop_assert_eq!(ClaimingAppend::decode(&bytes), Ok(body));
+            for cut in 0..bytes.len() {
+                prop_assert!(ClaimingAppend::decode(&bytes[..cut]).is_err());
+            }
+            let mut longer = bytes;
+            longer.push(0);
+            prop_assert_eq!(ClaimingAppend::decode(&longer), Err(DecodeError::TrailingBytes));
+        }
+
+        #[test]
+        fn decoding_arbitrary_claiming_appends_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..400)) {
+            if let Ok(body) = ClaimingAppend::decode(&bytes) {
+                prop_assert_eq!(body.encode(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn a_claiming_append_refuses_padding_huge_counts_and_a_bad_envelope() {
+        let mut padded = vec![0x81, 0x00];
+        padded.extend_from_slice(&[0; 32]);
+        padded.extend_from_slice(&envelope());
+        assert_eq!(ClaimingAppend::decode(&padded), Err(DecodeError::BadLength));
+        let mut huge = Vec::new();
+        put_varint(&mut huge, u64::MAX >> 1);
+        huge.extend_from_slice(&envelope());
+        assert_eq!(ClaimingAppend::decode(&huge), Err(DecodeError::Truncated));
+        let mut other = vec![0];
+        other.extend_from_slice(&envelope());
+        other[1] = 2;
+        assert_eq!(
+            ClaimingAppend::decode(&other),
+            Err(DecodeError::UnsupportedVersion(2))
         );
     }
 

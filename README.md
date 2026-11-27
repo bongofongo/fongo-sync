@@ -73,9 +73,9 @@ content hash and size, as an ordinary blob value; the server stores the file und
 that hash keyed from the library secret, as padded chunks each sealed under a key derived from the
 secret and the hash, with each chunk's nonce derived from the chunk itself, so the same file
 seals to the same bytes on every device of a library and different bytes never share a nonce. It
-defines the routes to upload and read such files, to ask which a server holds, and to claim and
-retire them so that a server deletes a file only once every device not removed has settled past
-the point where nothing referred to it. It also defines removing a device: the server then refuses that
+defines the routes to upload and read such files, to ask which a server holds, to claim them in
+the same step as appending the changes that refer to them, and to retire them, with rules under
+which a server deletes a file only once no change in the library can refer to it. It also defines removing a device: the server then refuses that
 device and stops waiting for it, which does not exclude anyone who holds the library secret. No
 client or server in this repository implements any of this yet.
 

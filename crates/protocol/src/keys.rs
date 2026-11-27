@@ -178,17 +178,17 @@ impl fmt::Debug for LibraryKeys {
 }
 
 macro_rules! secret_key {
-    ($(#[$doc:meta])* $name:ident) => {
+    ($(#[$doc:meta])* $vis:vis $name:ident) => {
         $(#[$doc])*
         #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-        pub struct $name([u8; 32]);
+        $vis struct $name([u8; 32]);
 
         impl $name {
             pub(crate) fn from_bytes(bytes: [u8; 32]) -> $name {
                 $name(bytes)
             }
 
-            pub fn as_bytes(&self) -> &[u8; 32] {
+            $vis fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
             }
         }
@@ -204,15 +204,15 @@ macro_rules! secret_key {
 secret_key!(
     /// [`LibraryKeys::file_name_key`]: turns a content hash into the name the server knows a file
     /// by.
-    FileNameKey
+    pub FileNameKey
 );
 secret_key!(
     /// [`LibraryKeys::file_key_root`]: what each file's key is expanded from.
-    FileKeyRoot
+    pub FileKeyRoot
 );
 secret_key!(
-    /// The XChaCha20-Poly1305 key of one file's chunks, from [`FileKeyRoot::file_key`].
-    FileKey
+    /// One file's key: the pseudorandom key its chunk key and nonce key are expanded from.
+    pub(crate) FileKey
 );
 
 /// A new device signing key from the operating system's randomness.

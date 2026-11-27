@@ -1,10 +1,10 @@
 use thiserror::Error;
 
 use super::{
-    BATCHES_PATH, BLOB_CHUNK_PATH, BLOB_COMPLETE_PATH, BLOB_PATH, BLOB_WHOLE_PATH,
-    BLOBS_CLAIM_PATH, BLOBS_QUERY_PATH, BLOBS_RETIRE_PATH, CAPABILITIES_PATH, DEVICES_PATH,
-    ENTITLEMENT_PATH, LIBRARIES_PATH, NOTIFICATIONS_PATH, REMOVE_DEVICE_PATH, ReadBatches,
-    SETTLED_PATH, STATUS_PATH, batches_path,
+    BATCHES_CLAIMING_PATH, BATCHES_PATH, BLOB_CHUNK_PATH, BLOB_COMPLETE_PATH, BLOB_PATH,
+    BLOB_WHOLE_PATH, BLOBS_CLAIM_PATH, BLOBS_QUERY_PATH, BLOBS_RETIRE_PATH, CAPABILITIES_PATH,
+    DEVICES_PATH, ENTITLEMENT_PATH, LIBRARIES_PATH, NOTIFICATIONS_PATH, REMOVE_DEVICE_PATH,
+    ReadBatches, SETTLED_PATH, STATUS_PATH, batches_path,
 };
 use crate::file::BlobId;
 use crate::keys::LibraryId;
@@ -18,6 +18,7 @@ pub enum Route {
     Libraries,
     Devices(LibraryId),
     Batches(LibraryId),
+    BatchesClaiming(LibraryId),
     Notifications(LibraryId),
     Blob(LibraryId, BlobId),
     BlobChunk(LibraryId, BlobId, u64),
@@ -59,6 +60,7 @@ impl Route {
                 ["devices"] => Route::Devices(library),
                 ["devices", "remove"] => Route::RemoveDevice(library),
                 ["batches"] => Route::Batches(library),
+                ["batches", "claiming"] => Route::BatchesClaiming(library),
                 ["notifications"] => Route::Notifications(library),
                 ["settled"] => Route::Settled(library),
                 ["status"] => Route::Status(library),
@@ -85,6 +87,7 @@ impl Route {
             Route::Libraries => return LIBRARIES_PATH.to_owned(),
             Route::Devices(l) => (DEVICES_PATH, l, None, None),
             Route::Batches(l) => (BATCHES_PATH, l, None, None),
+            Route::BatchesClaiming(l) => (BATCHES_CLAIMING_PATH, l, None, None),
             Route::Notifications(l) => (NOTIFICATIONS_PATH, l, None, None),
             Route::Blob(l, id) => (BLOB_PATH, l, Some(id), None),
             Route::BlobChunk(l, id, n) => (BLOB_CHUNK_PATH, l, Some(id), Some(n)),
@@ -113,6 +116,7 @@ impl Route {
         match self {
             Route::Capabilities | Route::Notifications(_) | Route::Status(_) => &["GET"],
             Route::Libraries
+            | Route::BatchesClaiming(_)
             | Route::BlobComplete(..)
             | Route::BlobWhole(..)
             | Route::BlobsQuery(_)
@@ -197,7 +201,7 @@ mod tests {
     const ID: LibraryId = LibraryId([0xab; 16]);
     const BLOB: BlobId = BlobId([0xcd; 32]);
 
-    fn every_route(library: LibraryId, blob: BlobId, chunk: u64) -> [Route; 16] {
+    fn every_route(library: LibraryId, blob: BlobId, chunk: u64) -> [Route; 17] {
         [
             Route::Capabilities,
             Route::Libraries,
@@ -215,6 +219,7 @@ mod tests {
             Route::Status(library),
             Route::Entitlement(library),
             Route::RemoveDevice(library),
+            Route::BatchesClaiming(library),
         ]
     }
 
@@ -242,6 +247,7 @@ mod tests {
             format!("/v1/libraries/{lib}/status"),
             format!("/v1/libraries/{lib}/entitlement"),
             format!("/v1/libraries/{lib}/devices/remove"),
+            format!("/v1/libraries/{lib}/batches/claiming"),
         ];
         for (route, path) in every_route(ID, BLOB, 7).iter().zip(paths) {
             assert_eq!(route.path(), path);
@@ -304,6 +310,9 @@ mod tests {
             format!("/v1/libraries/{hex}/settled/x"),
             format!("/v1/libraries/{hex}/Status"),
             format!("/v1/libraries/{hex}/batches/x/y/z/w"),
+            format!("/v1/libraries/{hex}/batches/claiming/"),
+            format!("/v1/libraries/{hex}/batches/Claiming"),
+            format!("/v1/libraries/{hex}/batches/claiming/x"),
             "/v1/capabilities/".to_owned(),
             "/v1/libraries/".to_owned(),
             "/V1/capabilities".to_owned(),
@@ -323,6 +332,7 @@ mod tests {
         assert_eq!(Route::BlobChunk(ID, BLOB, 0).methods(), &["GET", "POST"]);
         assert_eq!(Route::Status(ID).methods(), &["GET"]);
         assert_eq!(Route::RemoveDevice(ID).methods(), &["POST"]);
+        assert_eq!(Route::BatchesClaiming(ID).methods(), &["POST"]);
     }
 
     proptest! {

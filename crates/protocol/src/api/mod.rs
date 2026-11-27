@@ -8,10 +8,75 @@
 //! [`ErrorCode::DeviceRemoved`].
 //!
 //! A library that is not entitled to the service is refused [`ErrorCode::NotEntitled`] when
-//! appending an envelope, claiming, retiring or writing a blob; every `GET`, a blob query, adding a
+//! appending an envelope (at either batch path), claiming, retiring or writing a blob; every `GET`, a blob query, adding a
 //! device, [`STATUS_PATH`], [`ENTITLEMENT_PATH`], [`SETTLED_PATH`] and [`REMOVE_DEVICE_PATH`]
 //! still work. A library over its allowance is refused [`ErrorCode::QuotaExceeded`] when beginning
 //! or writing a blob, and everything else works.
+//!
+//! # Blob routes at their edges
+//!
+//! | request | when the blob | answer |
+//! |---|---|---|
+//! | a chunk upload, `complete`, or a `GET` | was never begun | [`ErrorCode::BlobNotFound`] |
+//! | a chunk upload | is begun, but the index is not below its chunk count or the body is not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
+//! | a chunk upload | is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`]; nothing changes |
+//! | `complete` | is complete | success if the digest matches, else [`ErrorCode::BlobMismatch`] |
+//! | `whole` | was begun with the same one-chunk shape | stores the chunk and completes |
+//! | `whole` | was begun with another shape | [`ErrorCode::BlobMismatch`] |
+//! | `whole` | is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`] |
+//! | `GET` a chunk or the blob | is not complete | [`ErrorCode::BlobIncomplete`] |
+//! | begin | is complete with the same shape | `{complete: true, have: every chunk}` |
+//!
+//! # Deleting files
+//!
+//! A server deletes a complete blob only when no change in the library can refer to it any more.
+//! The rules rest on one definition. A set of changes refers to a file when, for some field the
+//! application marks as naming files and some collection and gid, the field's strategy winner
+//! among the set's changes to that collection, gid and field is a reference to the file. Every
+//! change to it whose clock is valid counts, whatever the row's liveness, group or collection: a deleted
+//! or merged row still refers to its file until a later change to that field replaces it. Adding
+//! changes to a set therefore makes it refer to a file only through an added change that sets a
+//! reference to it. What an application shows is not monotone in this way (removing one member of
+//! a merged group can show an older member's file again without any change naming it), which is
+//! why it is not the definition.
+//!
+//! A device:
+//!
+//! - sends each envelope any of whose changes sets a file reference to [`BATCHES_CLAIMING_PATH`],
+//!   with the id of every file it sets, so that the claim is recorded at the envelope's sequence
+//!   number in the same step as the append. A server whose [`Capabilities::blobs`] is false gets
+//!   it at [`BATCHES_PATH`].
+//! - retires a file ([`RetireBlobs`]) only when it has merged every envelope through `through`,
+//!   has nothing unsent, and the changes through `through` do not refer to the file; its rows held
+//!   back count as referring.
+//! - reports [`Settled`] `seq` only when it has merged every envelope through `seq` and has
+//!   nothing unsent.
+//! - may claim at [`BLOBS_CLAIM_PATH`] without appending, recorded at the current head: to keep a
+//!   file a row held back needs, or to learn which files the server lacks.
+//!
+//! A server:
+//!
+//! - treats a retirement `(through, id)` as void once the id has a claim recorded at a sequence
+//!   number at or above `through`, whether the claim arrived before or after the retirement.
+//! - deletes a complete blob only when it has a retirement that is not void, every device in
+//!   [`Devices::settling`] has reported [`Settled`] at or above that retirement's `through` (one
+//!   that never reported counts as 0), and [`Capabilities::blob_wait_days`] have passed since the
+//!   retirement arrived. A deletion and a claim of the same id are ordered: a claim after the
+//!   deletion finds the blob missing.
+//!
+//! Why no change that is or will be in the log refers to a deleted file: an honest retirement at
+//! `through` means the changes through `through` do not refer to it. Every later set of changes
+//! holds those, so one that refers to the file holds a later change setting a reference to it. If
+//! that change was appended, it was appended with a claim at a sequence number above `through`,
+//! which voids the retirement. If it is not yet appended, it is unsent on a device, and a device
+//! holding unsent changes has not settled; every device that counts has settled at or above
+//! `through`, so it made the change after settling.
+//!
+//! That last case is the limit: a device that newly refers to a file while it is retired, and
+//! sends the change after the file is deleted, finds it missing. If it holds the file it uploads
+//! it again; if not, the file is unavailable. The same holds for a removed device that joins
+//! again and sends changes it had not sent. A device that refers anew to a file it does not hold
+//! can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
 
 mod blobs;
 mod error;
@@ -22,15 +87,16 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 pub use blobs::{
-    BlobDigest, BlobIds, BlobInfo, BlobState, CompleteBlob, CompleteBlobs, DigestError,
-    Entitlement, HaveChunk, LibraryStatus, MissingBlobs, RemoveDevice, RetireBlobs, Settled,
+    BlobDigest, BlobIds, BlobInfo, BlobState, ClaimingAppend, CompleteBlob, CompleteBlobs,
+    DigestError, Entitlement, HaveChunk, LibraryStatus, MissingBlobs, RemoveDevice, RetireBlobs,
+    Settled,
 };
 pub use error::{ErrorBody, ErrorCode};
 pub use notify::{NOTIFICATION_FORMAT, Notification};
 pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
-use crate::keys::{LibraryId, WrapKey};
+use crate::keys::{DeviceId, LibraryId, WrapKey};
 use crate::wire::{DecodeError, Reader, put_blob, put_varint};
 
 /// `GET`: [`Capabilities`].
@@ -41,6 +107,9 @@ pub const LIBRARIES_PATH: &str = "/v1/libraries";
 pub const DEVICES_PATH: &str = "/v1/libraries/{library}/devices";
 /// `POST` envelope bytes: [`Appended`]. `GET` with [`ReadBatches`] as the query: a [`BatchPage`].
 pub const BATCHES_PATH: &str = "/v1/libraries/{library}/batches";
+/// `POST` a [`ClaimingAppend`] (binary): [`Appended`]. An append that also claims the blobs its
+/// envelope's changes set references to.
+pub const BATCHES_CLAIMING_PATH: &str = "/v1/libraries/{library}/batches/claiming";
 /// `GET` upgraded to a WebSocket: a stream of [`Notification`]s. Offered when
 /// [`Capabilities::notifications`] is true.
 pub const NOTIFICATIONS_PATH: &str = "/v1/libraries/{library}/notifications";
@@ -75,7 +144,7 @@ pub const SETTLED_PATH: &str = "/v1/libraries/{library}/settled";
 pub const STATUS_PATH: &str = "/v1/libraries/{library}/status";
 /// `POST` [`Entitlement`]: [`LibraryStatus`].
 pub const ENTITLEMENT_PATH: &str = "/v1/libraries/{library}/entitlement";
-/// `POST` [`RemoveDevice`]: [`Devices`].
+/// `POST` [`RemoveDevice`]: [`Devices`]. Naming the recovery key is [`ErrorCode::Forbidden`].
 pub const REMOVE_DEVICE_PATH: &str = "/v1/libraries/{library}/devices/remove";
 
 /// Content type of envelope request bodies and [`BatchPage`] responses.
@@ -105,8 +174,9 @@ pub fn notifications_path(library: LibraryId) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub protocol_version: u32,
-    /// Whether the blob routes, [`BLOB_PATH`] to [`BLOBS_RETIRE_PATH`], and [`SETTLED_PATH`],
-    /// [`STATUS_PATH`] and [`ENTITLEMENT_PATH`] are served.
+    /// Whether [`BATCHES_CLAIMING_PATH`], the blob routes ([`BLOB_PATH`] to
+    /// [`BLOBS_RETIRE_PATH`]), [`SETTLED_PATH`], [`STATUS_PATH`] and [`ENTITLEMENT_PATH`] are
+    /// served.
     pub blobs: bool,
     /// Whether [`NOTIFICATIONS_PATH`] is served.
     pub notifications: bool,
@@ -133,8 +203,8 @@ pub struct Capabilities {
     /// Most ids in one [`BlobIds`] sent to [`BLOBS_QUERY_PATH`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_ids: Option<u32>,
-    /// Days a retired blob is kept at least, counted from its retirement. It is also kept until
-    /// every device not removed has settled past the retirement.
+    /// Days a retired blob is kept at least, counted from when its retirement arrived; see
+    /// [the module documentation](self#deleting-files).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_wait_days: Option<u32>,
     /// Days without activity after which an incomplete upload may be dropped.
@@ -235,7 +305,8 @@ fn proof_message(library: LibraryId, device: &VerifyingKey, recovery: &Verifying
 ///
 /// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's
 /// public key and the wrap key. A server refuses a wrap key whose proof does not verify, with
-/// [`ErrorCode::InvalidProof`].
+/// [`ErrorCode::InvalidProof`]. The proof carries no counter, so a server can present any wrap key
+/// a device ever signed for the library; replacing a wrap key will need a new label or a counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SignedWrapKey {
     pub wrap_key: WrapKey,
@@ -379,7 +450,7 @@ struct RawDeviceRecord {
     #[serde(default)]
     wrap_proof: Option<ProofHex>,
     #[serde(default)]
-    removed: bool,
+    removed: Option<bool>,
     #[serde(default)]
     last_seen: Option<u64>,
 }
@@ -441,7 +512,7 @@ impl TryFrom<RawDeviceRecord> for DeviceRecord {
             public_key: raw.public_key,
             recovery: raw.recovery,
             wrap: pair(raw.wrap_key, raw.wrap_proof)?,
-            removed: raw.removed,
+            removed: raw.removed.unwrap_or(false),
             last_seen: raw.last_seen,
         })
     }
@@ -451,6 +522,31 @@ impl TryFrom<RawDeviceRecord> for DeviceRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Devices {
     pub devices: Vec<DeviceRecord>,
+}
+
+impl Devices {
+    /// The devices a server waits for before deleting a retired blob: every key that is neither
+    /// removed nor the recovery key.
+    pub fn settling(&self) -> impl Iterator<Item = &DeviceRecord> {
+        self.devices.iter().filter(|d| !d.removed && !d.recovery)
+    }
+
+    /// Applies a [`RemoveDevice`]: marks `device` removed. The recovery key is
+    /// [`ErrorCode::Forbidden`]; an id not listed, or a device already removed, changes nothing.
+    pub fn remove(&mut self, device: DeviceId) -> Result<(), ErrorCode> {
+        match self
+            .devices
+            .iter_mut()
+            .find(|d| DeviceId::of(&d.public_key) == device)
+        {
+            Some(d) if d.recovery => Err(ErrorCode::Forbidden),
+            Some(d) => {
+                d.removed = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// The response to an appended envelope: the sequence number the server gave it. Sequence numbers
@@ -732,6 +828,40 @@ mod tests {
         let value = serde_json::to_value(&create).unwrap();
         assert_eq!(value["entitlement"], json!("token"));
         assert!(value.get("wrap_key").is_none() && value.get("wrap_proof").is_none());
+    }
+
+    #[test]
+    fn removal_spares_the_recovery_key_and_ignores_strangers() {
+        let record = |seed: u8, recovery: bool| DeviceRecord {
+            public_key: SigningKey::from_bytes(&[seed; 32]).verifying_key(),
+            recovery,
+            wrap: None,
+            removed: false,
+            last_seen: None,
+        };
+        let mut devices = Devices {
+            devices: vec![record(1, false), record(2, true), record(3, false)],
+        };
+        let id = |seed: u8| DeviceId::of(&SigningKey::from_bytes(&[seed; 32]).verifying_key());
+        assert_eq!(devices.settling().count(), 2);
+        let before = devices.clone();
+        assert_eq!(devices.remove(id(2)), Err(ErrorCode::Forbidden));
+        assert_eq!(devices.remove(id(9)), Ok(()));
+        assert_eq!(devices, before);
+        assert_eq!(devices.remove(id(3)), Ok(()));
+        assert_eq!(devices.remove(id(3)), Ok(()));
+        assert!(devices.devices[2].removed);
+        let settling: Vec<_> = devices.settling().map(|d| d.public_key).collect();
+        assert_eq!(settling, [before.devices[0].public_key]);
+    }
+
+    #[test]
+    fn a_null_removed_reads_as_false() {
+        let key = crate::hex::encode(SigningKey::from_bytes(&[1; 32]).verifying_key().as_bytes());
+        let record: DeviceRecord =
+            serde_json::from_value(json!({"public_key": key, "recovery": false, "removed": null}))
+                .unwrap();
+        assert!(!record.removed);
     }
 
     #[test]
