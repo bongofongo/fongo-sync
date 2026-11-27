@@ -461,16 +461,15 @@ impl CreateLibrary {
     }
 
     /// The same request with the [`MemberProof`] `keys` make for its device key and wrap key.
-    ///
-    /// # Panics
-    ///
-    /// If `keys` are not those of `library`: their proof would never check.
-    pub fn with_member_proof(self, keys: &LibraryKeys) -> CreateLibrary {
-        assert_eq!(keys.id, self.library, "the keys are another library's");
-        CreateLibrary {
+    /// [`OtherLibrary`] if `keys` are not those of `library`, whose proof would never check.
+    pub fn with_member_proof(self, keys: &LibraryKeys) -> Result<CreateLibrary, OtherLibrary> {
+        if keys.id != self.library {
+            return Err(OtherLibrary);
+        }
+        Ok(CreateLibrary {
             member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
             ..self
-        }
+        })
     }
 
     /// Whether `proof` shows the caller holds `device_key`'s private half.
@@ -589,20 +588,17 @@ impl AddDevice {
 
     /// The same request with the [`MemberProof`] the library's `keys` make for its device key
     /// and wrap key. `keys` must be those of the library the request is sent to: the request does
-    /// not name its library, so only a wrap key, signed for one, shows a mismatch.
-    ///
-    /// # Panics
-    ///
-    /// If the request carries a wrap key its device key did not sign for `keys`' library.
-    pub fn with_member_proof(self, keys: &LibraryKeys) -> AddDevice {
-        assert!(
-            self.wrap.is_none() || self.verify_wrap(keys.id),
-            "the wrap key is not signed for the keys' library"
-        );
-        AddDevice {
+    /// not name its library, so only a wrap key, signed for one, shows a mismatch, and
+    /// [`OtherLibrary`] is returned if the request carries a wrap key its device key did not sign
+    /// for `keys`' library.
+    pub fn with_member_proof(self, keys: &LibraryKeys) -> Result<AddDevice, OtherLibrary> {
+        if self.wrap.is_some() && !self.verify_wrap(keys.id) {
+            return Err(OtherLibrary);
+        }
+        Ok(AddDevice {
             member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
             ..self
-        }
+        })
     }
 
     /// Whether the request carries a wrap key that the new device's key signed for `library`.
@@ -723,6 +719,12 @@ struct RawDeviceRecord {
 
 #[derive(Deserialize)]
 struct ProofHex(#[serde(with = "serde_sig")] Signature);
+
+/// Why a membership proof was not added to a request: the keys given are another library's than
+/// the request's, so their proof would never check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the keys are another library's than the request's")]
+pub struct OtherLibrary;
 
 /// Why a message was refused that carried a wrap key without its proof, or a proof without its
 /// key.
@@ -967,8 +969,9 @@ mod tests {
     fn a_record_shows_whether_its_member_proof_checks() {
         let keys = LibraryKeys::new(LibraryId([3; 16]), [7; 32]);
         let device = SigningKey::from_bytes(&[1; 32]);
-        let add =
-            AddDevice::with_wrap_key(keys.id, &device, WrapKey([5; 32])).with_member_proof(&keys);
+        let add = AddDevice::with_wrap_key(keys.id, &device, WrapKey([5; 32]))
+            .with_member_proof(&keys)
+            .unwrap();
         let record = DeviceRecord {
             public_key: device.verifying_key(),
             recovery: false,
@@ -1002,11 +1005,13 @@ mod tests {
         assert_eq!(bare.check_member_proof(&keys), MemberCheck::Absent);
 
         let other = SigningKey::from_bytes(&[2; 32]);
-        let other_add =
-            AddDevice::with_wrap_key(keys.id, &other, WrapKey([5; 32])).with_member_proof(&keys);
+        let other_add = AddDevice::with_wrap_key(keys.id, &other, WrapKey([5; 32]))
+            .with_member_proof(&keys)
+            .unwrap();
         let elsewhere = LibraryKeys::new(LibraryId([4; 16]), [7; 32]);
         let elsewhere_add = AddDevice::with_wrap_key(elsewhere.id, &device, WrapKey([5; 32]))
-            .with_member_proof(&elsewhere);
+            .with_member_proof(&elsewhere)
+            .unwrap();
         assert_ne!(other_add.member_proof, add.member_proof);
         assert_ne!(elsewhere_add.member_proof, add.member_proof);
         assert!(add.member_proof.is_some() && add.verify_wrap(keys.id));
@@ -1017,7 +1022,9 @@ mod tests {
         let keys = LibraryKeys::new(LibraryId([3; 16]), [7; 32]);
         let device = SigningKey::from_bytes(&[1; 32]);
         let key_hex = crate::hex::encode(device.verifying_key().as_bytes());
-        let good = AddDevice::new(device.verifying_key()).with_member_proof(&keys);
+        let good = AddDevice::new(device.verifying_key())
+            .with_member_proof(&keys)
+            .unwrap();
         let good_hex = good.member_proof.unwrap().to_hex();
         for (proof, expected) in [
             (json!("zz"), MemberCheck::Invalid),
@@ -1049,19 +1056,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "another library")]
-    fn a_create_proof_from_another_librarys_keys_is_refused() {
+    fn a_proof_from_another_librarys_keys_is_refused() {
         let device = SigningKey::from_bytes(&[1; 32]);
-        let _ = CreateLibrary::new(LibraryId([3; 16]), &device, device.verifying_key())
-            .with_member_proof(&LibraryKeys::new(LibraryId([4; 16]), [7; 32]));
-    }
-
-    #[test]
-    #[should_panic(expected = "not signed for the keys' library")]
-    fn an_add_proof_from_another_librarys_keys_is_refused() {
-        let device = SigningKey::from_bytes(&[1; 32]);
-        let _ = AddDevice::with_wrap_key(LibraryId([3; 16]), &device, WrapKey([5; 32]))
-            .with_member_proof(&LibraryKeys::new(LibraryId([4; 16]), [7; 32]));
+        let elsewhere = LibraryKeys::new(LibraryId([4; 16]), [7; 32]);
+        let create = CreateLibrary::new(LibraryId([3; 16]), &device, device.verifying_key());
+        assert_eq!(create.with_member_proof(&elsewhere), Err(OtherLibrary));
+        let add = AddDevice::with_wrap_key(LibraryId([3; 16]), &device, WrapKey([5; 32]));
+        assert_eq!(add.with_member_proof(&elsewhere), Err(OtherLibrary));
+        let bare = AddDevice::new(device.verifying_key());
+        assert!(bare.with_member_proof(&elsewhere).is_ok());
     }
 
     #[test]

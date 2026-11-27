@@ -678,7 +678,8 @@ fn the_member_proof_macs_the_documented_bytes() {
     let recovery = SigningKey::from_bytes(&[4; 32]).verifying_key();
     let create =
         CreateLibrary::with_wrap_key(LibraryId([1; 16]), &signer, recovery, WrapKey([6; 32]))
-            .with_member_proof(&keys());
+            .with_member_proof(&keys())
+            .unwrap();
     assert_eq!(create.member_proof, Some(with));
     let text = serde_json::to_string(&create).unwrap();
     assert!(
@@ -689,7 +690,7 @@ fn the_member_proof_macs_the_documented_bytes() {
         serde_json::from_str::<CreateLibrary>(&text).unwrap(),
         create
     );
-    let add = AddDevice::new(device).with_member_proof(&keys());
+    let add = AddDevice::new(device).with_member_proof(&keys()).unwrap();
     assert_eq!(
         serde_json::to_string(&add).unwrap(),
         format!(

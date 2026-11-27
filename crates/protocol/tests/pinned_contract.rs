@@ -342,13 +342,13 @@ fn every_device_message_field_is_named() {
     let keys = LibraryKeys::new(LIBRARY, [2; 32]);
     let proof = format!(r#""member_proof":"{MEMBER_PROOF}""#);
     pinned(
-        &create.clone().with_member_proof(&keys),
+        &create.clone().with_member_proof(&keys).unwrap(),
         &format!(
             r#"{{"library":"{}","device_key":"{DEVICE_KEY}","recovery_key":"{RECOVERY_KEY}","proof":"{PROOF}",{wrap},{proof},"entitlement":"token"}}"#,
             "01".repeat(16)
         ),
     );
-    let proven = add.clone().with_member_proof(&keys);
+    let proven = add.clone().with_member_proof(&keys).unwrap();
     pinned(
         &proven,
         &format!(r#"{{"device_key":"{DEVICE_KEY}",{wrap},{proof}}}"#),

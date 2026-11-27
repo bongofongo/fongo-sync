@@ -30,8 +30,9 @@ pub enum MemberCheck {
     /// with the proof dropped by the server, or planted by the server, which is exactly what a key
     /// of its own looks like. It gives no assurance at all, and must never be treated more
     /// leniently than [`MemberCheck::Invalid`] when deciding who receives a secret; it is told
-    /// apart only so that an application can tell a device that needs to register again from a
-    /// forgery.
+    /// apart only so that an application can tell a device registered without a proof from a
+    /// forgery. Such a device gains a proof only by joining again under a new device key, or by
+    /// being removed and its key added again; adding its key while it is listed changes nothing.
     Absent,
     /// The proof does not check: made under another secret, or for another key or wrap key.
     Invalid,
@@ -43,7 +44,8 @@ pub enum MemberCheck {
 /// [`MemberCheck::Invalid`] and is written back as an empty string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListedMemberProof {
-    /// 64 hex digits, read as a proof; whether it checks is [`DeviceRecord::check_member_proof`](crate::api::DeviceRecord::check_member_proof)'s question.
+    /// 64 hex digits, read as a proof. Whether it checks is for
+    /// [`DeviceRecord::check_member_proof`](crate::api::DeviceRecord::check_member_proof).
     Readable(MemberProof),
     /// Anything else the server listed in the field.
     Unreadable,

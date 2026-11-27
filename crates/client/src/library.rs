@@ -42,7 +42,8 @@ pub async fn create_library_with<T: Transport>(
         Some(wrap) => CreateLibrary::with_wrap_key(library.id, device, recovery, wrap),
         None => CreateLibrary::new(library.id, device, recovery),
     }
-    .with_member_proof(library);
+    .with_member_proof(library)
+    .expect("the request is made for these keys' library");
     let body = serde_json::to_vec(&request).expect("protocol messages serialise");
     let devices = match rpc
         .call(
@@ -149,7 +150,8 @@ pub async fn join_library_with<T: Transport>(
         Some(wrap) => AddDevice::with_wrap_key(library.id, device, wrap),
         None => AddDevice::new(device.verifying_key()),
     }
-    .with_member_proof(library);
+    .with_member_proof(library)
+    .expect("the wrap key is signed for these keys' library");
     post_device(&rpc, library, &library.recovery_signing_key(), &request).await
 }
 
@@ -259,7 +261,8 @@ pub async fn add_device<T: Transport>(
         wrap: Some(offer.wrap),
         member_proof: None,
     }
-    .with_member_proof(credentials.library());
+    .with_member_proof(credentials.library())
+    .expect("the offer's wrap key was checked against this library");
     post_device(&rpc, credentials.library(), credentials.device(), &request).await
 }
 
@@ -305,12 +308,16 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
 /// | `wrap` | `proof_kept` | the device |
 /// |---|---|---|
 /// | [`WrapListing::Kept`] | true | can be sent a new secret and recognised as a member |
-/// | [`WrapListing::Kept`] | false | can be sent a new secret, but is not recognised as a member until a server that keeps proofs lists it with one |
+/// | [`WrapListing::Kept`] | false | can be sent a new secret, but is not recognised as a member |
 /// | [`WrapListing::Dropped`] | false | cannot be sent a new secret: the server dropped its wrap key, and a proof over a wrap key the record lacks shows nothing |
 /// | [`WrapListing::NoneSent`] | true | cannot be sent a new secret, having no wrap key, but is recognised as a member |
 /// | [`WrapListing::NoneSent`] | false | cannot be sent a new secret, and is not recognised as a member |
 ///
-/// Adding a listed key again changes nothing, so it does not add what was dropped.
+/// What was dropped is never added for this key while it is listed, since adding a listed key
+/// again changes nothing. The device is recognised, and can be sent a new secret, only after one
+/// of two things on a server that keeps these fields: it joins again under a new device key, or
+/// someone removes it and its key is then added again, since a restored key takes the wrap key and
+/// proof its request carries. The second needs the device removed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Registered {
