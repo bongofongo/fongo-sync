@@ -391,7 +391,7 @@ impl State {
                 let create: CreateLibrary = serde_json::from_slice(&request.body)
                     .map_err(|_| ErrorCode::MalformedRequest)?;
                 self.authenticate(request, &create.device_key)?;
-                if !create.verify() {
+                if !create.verify() || (create.wrap.is_some() && !create.verify_wrap()) {
                     return Err(ErrorCode::InvalidProof);
                 }
                 if self.libraries.contains_key(&create.library) {
@@ -401,8 +401,8 @@ impl State {
                     DeviceRecord {
                         public_key: create.device_key,
                         recovery: false,
-                        wrap: None,
-                        member_proof: None,
+                        wrap: create.wrap,
+                        member_proof: create.member_proof,
                         removed: false,
                         last_seen: None,
                     },
@@ -437,17 +437,24 @@ impl State {
                 self.member(request, id)?;
                 let add: AddDevice = serde_json::from_slice(&request.body)
                     .map_err(|_| ErrorCode::MalformedRequest)?;
+                if add.wrap.is_some() && !add.verify_wrap(id) {
+                    return Err(ErrorCode::InvalidProof);
+                }
                 let max = self.caps.max_devices;
                 let library = self.libraries.get_mut(&id).unwrap();
                 let record = DeviceRecord {
                     public_key: add.device_key,
                     recovery: false,
-                    wrap: None,
-                    member_proof: None,
+                    wrap: add.wrap,
+                    member_proof: add.member_proof,
                     removed: false,
                     last_seen: None,
                 };
-                if !library.devices.contains(&record) {
+                if !library
+                    .devices
+                    .iter()
+                    .any(|d| d.public_key == record.public_key)
+                {
                     let count = library.devices.iter().filter(|d| !d.recovery).count();
                     if max.is_some_and(|max| count >= max as usize) {
                         return Err(ErrorCode::DeviceLimit);
