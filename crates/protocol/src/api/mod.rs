@@ -15,17 +15,26 @@
 //!
 //! # Blob routes at their edges
 //!
-//! | request | when the blob | answer |
+//! Where two rows apply, a malformed request ([`ErrorCode::MalformedRequest`]) is answered before
+//! a state error ([`ErrorCode::BlobMismatch`], [`ErrorCode::BlobIncomplete`]). A blob that was
+//! deleted, or an incomplete upload that was dropped, counts as never begun.
+//!
+//! | request | when | answer |
 //! |---|---|---|
-//! | a chunk upload, `complete`, or a `GET` | was never begun | [`ErrorCode::BlobNotFound`] |
-//! | a chunk upload | is begun, but the index is not below its chunk count or the body is not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
-//! | a chunk upload | is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`]; nothing changes |
-//! | `complete` | is complete | success if the digest matches, else [`ErrorCode::BlobMismatch`] |
-//! | `whole` | was begun with the same one-chunk shape | stores the chunk and completes |
-//! | `whole` | was begun with another shape | [`ErrorCode::BlobMismatch`] |
-//! | `whole` | is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`] |
-//! | `GET` a chunk or the blob | is not complete | [`ErrorCode::BlobIncomplete`] |
-//! | begin | is complete with the same shape | `{complete: true, have: every chunk}` |
+//! | begin | the shape is not valid ([`BlobInfo::is_valid`] is false) | [`ErrorCode::MalformedRequest`] |
+//! | begin or `whole` | the stored size is above [`Capabilities::max_blob_bytes`] | [`ErrorCode::BlobTooLarge`] |
+//! | begin or `whole` | an earlier begin, or a completion through `whole`, gave another shape | [`ErrorCode::BlobMismatch`] |
+//! | begin | the blob is complete with the same shape | `{complete: true, have: every chunk}` |
+//! | `whole` | the body is not the stored form of a one-chunk blob | [`ErrorCode::MalformedRequest`] |
+//! | `whole` | the blob was begun with the same one-chunk shape | stores the chunk and completes |
+//! | `whole` | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`] |
+//! | a chunk upload, `complete`, or a `GET` | the blob was never begun | [`ErrorCode::BlobNotFound`] |
+//! | a chunk upload or `GET` of a chunk | the index is not below the chunk count | [`ErrorCode::MalformedRequest`] |
+//! | a chunk upload | the body is not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
+//! | a chunk upload | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`]; nothing changes |
+//! | `complete` | the blob is complete | success if the digest matches, else [`ErrorCode::BlobMismatch`] |
+//! | `GET` a chunk or the blob | the blob is not complete | [`ErrorCode::BlobIncomplete`] |
+//! | [`RetireBlobs`] | `through` is above the library's current head | [`ErrorCode::MalformedRequest`] |
 //!
 //! # Deleting files
 //!
@@ -33,12 +42,24 @@
 //! The rules rest on one definition. A set of changes refers to a file when, for some field the
 //! application marks as naming files and some collection and gid, the field's strategy winner
 //! among the set's changes to that collection, gid and field is a reference to the file. Every
-//! change to it whose clock is valid counts, whatever the row's liveness, group or collection: a deleted
-//! or merged row still refers to its file until a later change to that field replaces it. Adding
-//! changes to a set therefore makes it refer to a file only through an added change that sets a
-//! reference to it. What an application shows is not monotone in this way (removing one member of
-//! a merged group can show an older member's file again without any change naming it), which is
-//! why it is not the definition.
+//! change to it whose clock is valid counts, whatever the row's liveness, group or collection: a
+//! deleted or merged row still refers to its file until a later change to that field replaces it.
+//! Adding changes to a set therefore makes it refer to a file only through an added change that
+//! sets a reference to it. What an application shows is not monotone in this way (removing one
+//! member of a merged group can show an older member's file again without any change naming it),
+//! which is why it is not the definition.
+//!
+//! The guarantee below holds under these conditions:
+//!
+//! - no two changes to one field share a clock with different values, the condition under which
+//!   replicas converge. A winner is then a function of the set of changes and one of its values,
+//!   the same on every replica. Without it a replica can keep a value that the retiring device's
+//!   winner replaced, for instance after a device restored from a backup reuses a clock.
+//! - every device that sends file references sends them through [`BATCHES_CLAIMING_PATH`]. A
+//!   server that stops offering [`Capabilities::blobs`] and offers it again voids every retirement
+//!   it holds when it resumes, since appends meanwhile carried no claims.
+//! - no file field is a key field of a natural collection: the definition and the treatment of
+//!   rewritten key fields differ. A registry must not mark one.
 //!
 //! A device:
 //!
@@ -48,14 +69,20 @@
 //!   it at [`BATCHES_PATH`].
 //! - retires a file ([`RetireBlobs`]) only when it has merged every envelope through `through`,
 //!   has nothing unsent, and the changes through `through` do not refer to the file; its rows held
-//!   back count as referring.
+//!   back count as referring. Only the changes through `through` count: its own envelopes appended
+//!   after `through` are in its local state but not in that set.
 //! - reports [`Settled`] `seq` only when it has merged every envelope through `seq` and has
-//!   nothing unsent.
-//! - may claim at [`BLOBS_CLAIM_PATH`] without appending, recorded at the current head: to keep a
-//!   file a row held back needs, or to learn which files the server lacks.
+//!   nothing unsent. Before each such report it claims at [`BLOBS_CLAIM_PATH`] every file that a
+//!   row it holds back names: that claim is recorded at a head at or past `seq`, so it voids any
+//!   retirement the report could otherwise let through.
+//! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
+//!   lacks.
 //!
 //! A server:
 //!
+//! - records a claim, in a claiming append or at [`BLOBS_CLAIM_PATH`], for every id it names,
+//!   whether it holds that blob complete, incomplete or not at all. A claim dropped because an
+//!   upload was still incomplete would let an older retirement delete the blob once it completes.
 //! - treats a retirement `(through, id)` as void once the id has a claim recorded at a sequence
 //!   number at or above `through`, whether the claim arrived before or after the retirement.
 //! - deletes a complete blob only when it has a retirement that is not void, every device in
@@ -72,11 +99,19 @@
 //! holding unsent changes has not settled; every device that counts has settled at or above
 //! `through`, so it made the change after settling.
 //!
-//! That last case is the limit: a device that newly refers to a file while it is retired, and
-//! sends the change after the file is deleted, finds it missing. If it holds the file it uploads
-//! it again; if not, the file is unavailable. The same holds for a removed device that joins
-//! again and sends changes it had not sent. A device that refers anew to a file it does not hold
-//! can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
+//! The limits:
+//!
+//! - any change a device makes after its [`Settled`] at or above `through` that refers to the
+//!   file, and that it sends after the deletion, finds the file missing. If the device holds the
+//!   file it uploads it again; if not, the file is unavailable. The same holds for a removed device
+//!   that joins again and sends changes it had not sent. A device that refers anew to a file it
+//!   does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
+//! - a device catching up, newly joined or restored, passes through states that refer to files
+//!   rightly deleted since. Fetching one answers [`ErrorCode::BlobNotFound`], which is not an error
+//!   in the library.
+//! - a retirement of an id that is not complete is ignored, so a blob completed later that nothing
+//!   refers to stays.
+//! - a device that never reports [`Settled`] holds back every deletion until it is removed.
 
 mod blobs;
 mod error;
