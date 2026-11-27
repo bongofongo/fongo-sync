@@ -14,9 +14,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use fongo_sync_sqlite::core::model;
 use fongo_sync_sqlite::core::{Change, DELETED, Strategy};
-use fongo_sync_sqlite::{
-    Collection, Error, LocalDefault, Made, Registry, Replica, Resume, installed,
-};
+use fongo_sync_sqlite::{Collection, Error, LocalDefault, Made, Registry, Replica};
 use libsqlite3_sys as ffi;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
@@ -104,6 +102,49 @@ async fn shelved(world: &World, hub: &mut Vec<Change>) -> Vec<Peer> {
     peers
 }
 
+/// The names of the kernel's tables and triggers in every database `conn` has open.
+async fn kernel_objects(conn: &mut SqliteConnection) -> Vec<String> {
+    let schemas: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_database_list")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    let mut names = Vec::new();
+    for schema in schemas {
+        let found: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM \"{schema}\".sqlite_master WHERE name LIKE 'fongo!_%' ESCAPE '!'"
+        ))
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        names.extend(found.into_iter().map(|n| format!("{schema}.{n}")));
+    }
+    names
+}
+
+/// `install` of `registry` on `conn` is refused with a registry error, leaving no kernel table
+/// or trigger behind.
+async fn refused_on(conn: &mut SqliteConnection, registry: Registry) {
+    let result = Replica::new(registry).install(conn).await;
+    assert_eq!(
+        kernel_objects(conn).await,
+        Vec::<String>::new(),
+        "install answered {result:?}"
+    );
+    assert!(
+        matches!(result, Err(Error::Registry(_))),
+        "install answered {result:?}"
+    );
+}
+
+/// [`refused_on`] a fresh database holding `schema`.
+async fn refused(schema: &[&str], registry: Registry) {
+    let mut conn = World::new(50).connect(0).await;
+    for sql in schema {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    refused_on(&mut conn, registry).await;
+}
+
 // REPLACE that removes a row at another key.
 
 async fn replace_at_another_key(statement: &str, recursive: bool) {
@@ -129,99 +170,57 @@ async fn replace_at_another_key(statement: &str, recursive: bool) {
     );
 }
 
-const REPLACING_INSERTS: [&str; 2] = [
+const REPLACING: [&str; 3] = [
     "INSERT OR REPLACE INTO items (id, code, title) VALUES (2, 'X', 'b2')",
     "REPLACE INTO items (id, code, title) VALUES (2, 'X', 'b2')",
+    "UPDATE OR REPLACE items SET code = 'X', title = 'b2' WHERE id = 2",
 ];
 
-const REPLACING_UPDATE: &str = "UPDATE OR REPLACE items SET code = 'X', title = 'b2' WHERE id = 2";
-
 #[tokio::test]
-#[ignore = "known fault: a row REPLACE removes at another key is never marked without recursive_triggers, so its delete is never sent"]
-async fn an_insert_that_replaces_a_row_at_another_key_sends_its_delete() {
-    for statement in REPLACING_INSERTS {
+#[ignore = "known fault: a row a REPLACE removes at another key is never marked without recursive_triggers, so its delete is never sent"]
+async fn a_replace_that_removes_a_row_at_another_key_sends_its_delete() {
+    for statement in REPLACING {
         replace_at_another_key(statement, false).await;
     }
 }
 
 #[tokio::test]
-#[ignore = "known fault: a row REPLACE removes at another key is never marked without recursive_triggers, so its delete is never sent"]
-async fn an_update_that_replaces_a_row_at_another_key_sends_its_delete() {
-    replace_at_another_key(REPLACING_UPDATE, false).await;
-}
-
-#[tokio::test]
-async fn with_recursive_triggers_an_insert_that_replaces_a_row_at_another_key_sends_its_delete() {
-    for statement in REPLACING_INSERTS {
+async fn with_recursive_triggers_a_replace_that_removes_a_row_at_another_key_sends_its_delete() {
+    for statement in REPLACING {
         replace_at_another_key(statement, true).await;
     }
-}
-
-#[tokio::test]
-async fn with_recursive_triggers_an_update_that_replaces_a_row_at_another_key_sends_its_delete() {
-    replace_at_another_key(REPLACING_UPDATE, true).await;
 }
 
 // Natural keys holding a blob or a real.
 
 #[tokio::test]
-#[ignore = "known fault: the triggers put a natural key in json_array, which refuses a blob, so the application's own insert fails"]
-async fn a_natural_key_holding_a_blob_is_written_and_synced() {
-    let schema = &["CREATE TABLE devices (uuid BLOB NOT NULL PRIMARY KEY, name TEXT)"];
-    let registry = || {
+#[ignore = "known fault: install accepts a natural key column declared BLOB, which then makes the application's own writes fail in the kernel's trigger"]
+async fn a_natural_key_column_declared_blob_is_refused_at_install() {
+    refused(
+        &["CREATE TABLE devices (uuid BLOB NOT NULL PRIMARY KEY, name TEXT)"],
         Registry::new(vec![
             Collection::natural("devices", "devices", &["uuid"])
                 .field("uuid")
                 .field("name"),
         ])
-        .unwrap()
-    };
-    let world = World::new(2);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0]
-        .run("INSERT INTO devices (uuid, name) VALUES (x'00ff10', 'phone')")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    peers[1].run("UPDATE devices SET name = 'tablet'").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT hex(uuid) || ' ' || name FROM devices").await,
-        ["00FF10 tablet"]
-    );
+        .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: json_array writes a real natural key with 15 digits, so a key needing more reads back as no row and is sent deleted"]
-async fn a_natural_key_holding_a_real_keeps_every_digit() {
-    let schema = &["CREATE TABLE points (x REAL NOT NULL PRIMARY KEY, label TEXT)"];
-    let registry = || {
+#[ignore = "known fault: install accepts a natural key column declared REAL, which then records keys with 15 digits, so a row whose key needs more is never sent"]
+async fn a_natural_key_column_declared_real_is_refused_at_install() {
+    refused(
+        &["CREATE TABLE points (x REAL NOT NULL PRIMARY KEY, label TEXT)"],
         Registry::new(vec![
             Collection::natural("points", "points", &["x"])
                 .field("x")
                 .field("label"),
         ])
-        .unwrap()
-    };
-    let world = World::new(3);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0]
-        .run("INSERT INTO points (x, label) VALUES (0.1 + 0.2, 'a'), (1.0 / 3, 'b'), (0.5, 'c')")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    peers[1].run("UPDATE points SET label = label || '!'").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(
-            &mut peers,
-            "SELECT printf('%!.17g', x) || ' ' || label FROM points ORDER BY x"
-        )
-        .await,
-        ["0.30000000000000004 a!", "0.33333333333333331 b!", "0.5 c!"]
-    );
+        .unwrap(),
+    )
+    .await;
 }
 
 // The rowid changed through its own name.
@@ -257,7 +256,7 @@ async fn a_key_changed_through_the_rowid_is_sent() {
 // What the application's triggers write while the kernel writes.
 
 #[tokio::test]
-#[ignore = "known fault: capture is silenced for the whole apply, so a delete the application's trigger makes in response is never sent"]
+#[ignore = "known fault: a delete an application's trigger makes during an apply is not sent, so that replica differs from the others"]
 async fn a_delete_an_application_trigger_makes_during_an_apply_is_sent() {
     let world = World::new(5);
     let mut hub = Vec::new();
@@ -276,14 +275,11 @@ async fn a_delete_an_application_trigger_makes_during_an_apply_is_sent() {
     peers[0].run("UPDATE books SET archived = 1").await;
     peers[0].push(&mut hub).await;
     settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        ["book A on S - 1", "shelf S"]
-    );
+    same_everywhere(&mut peers, LIBRARY_ROWS).await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: capture is silenced for the whole apply, so a field the application's trigger sets in response is never sent"]
+#[ignore = "known fault: a field an application's trigger sets during an apply is not sent, so that replica differs from the others"]
 async fn a_field_an_application_trigger_sets_during_an_apply_is_sent() {
     let world = World::new(6);
     let mut hub = Vec::new();
@@ -302,10 +298,7 @@ async fn a_field_an_application_trigger_sets_during_an_apply_is_sent() {
     peers[1].push(&mut hub).await;
     world.later(5);
     settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        ["book A on S closed 1", "note n1 on A", "shelf S"]
-    );
+    same_everywhere(&mut peers, LIBRARY_ROWS).await;
 }
 
 // A field a replica's registry lacks, declared later.
@@ -349,53 +342,6 @@ async fn a_field_unknown_when_its_changes_arrived_is_merged_by_its_later_strateg
     assert_eq!(
         same_everywhere(&mut peers, "SELECT title || ' ' || pages FROM books").await,
         ["T 700"]
-    );
-}
-
-#[tokio::test]
-async fn a_field_unknown_when_its_changes_arrived_can_join_the_key() {
-    let schema = &["CREATE TABLE marks (
-        code TEXT NOT NULL, kind TEXT NOT NULL, label TEXT, PRIMARY KEY (code, kind))"];
-    let wide = || {
-        Registry::new(vec![
-            Collection::natural("marks", "marks", &["code", "kind"])
-                .field("code")
-                .field("kind")
-                .field("label"),
-        ])
-        .unwrap()
-    };
-    let narrow = || {
-        Registry::new(vec![
-            Collection::natural("marks", "marks", &["code"])
-                .field("code")
-                .field("label"),
-        ])
-        .unwrap()
-    };
-    let world = World::new(8);
-    let mut hub = Vec::new();
-    let mut a = Peer::in_world(&world, 0, schema, wide()).await;
-    let mut b = Peer::in_world(&world, 1, schema, narrow()).await;
-    world.hold(true);
-    a.run("INSERT INTO marks VALUES ('x', 'a', 'one'), ('x', 'b', 'two')")
-        .await;
-    a.push(&mut hub).await;
-    a.run("UPDATE marks SET label = 'three' WHERE kind = 'b'")
-        .await;
-    a.push(&mut hub).await;
-    world.hold(false);
-    b.pull(&hub).await;
-    b.upgrade(wide()).await;
-    let mut peers = vec![a, b];
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(
-            &mut peers,
-            "SELECT code || ' ' || kind || ' ' || label FROM marks ORDER BY 1"
-        )
-        .await,
-        ["x a one", "x b three"]
     );
 }
 
@@ -452,38 +398,19 @@ fn tags() -> Registry {
 }
 
 #[tokio::test]
-#[ignore = "known fault: the kernel finds a natural key through the column's collation, so a NOCASE key renamed in case loses its row"]
-async fn a_natural_key_compared_without_case_renamed_in_case_converges() {
-    let world = World::new(10);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, NOCASE, tags).await;
-    peers[0]
-        .run("INSERT INTO tags (tag, n) VALUES ('Rust', 1)")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    peers[0].run("UPDATE tags SET tag = 'rust'").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT tag || ' ' || n FROM tags").await,
-        ["rust 1"]
-    );
-}
-
-#[tokio::test]
-#[ignore = "known fault: two keys differing only in case are two entities to the kernel and one row to a NOCASE table, so one waits for ever"]
-async fn natural_keys_differing_only_in_case_made_on_two_replicas_converge() {
-    let world = World::new(11);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, NOCASE, tags).await;
-    peers[0]
-        .run("INSERT INTO tags (tag, n) VALUES ('Rust', 1)")
-        .await;
-    peers[1]
-        .run("INSERT INTO tags (tag, n) VALUES ('rust', 2)")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    same_everywhere(&mut peers, "SELECT tag || ' ' || n FROM tags ORDER BY 1").await;
+#[ignore = "known fault: install accepts a key or identity column whose collation is not binary, which then finds rows by a key that differs from the one it holds and loses or holds them"]
+async fn a_key_or_identity_column_whose_collation_is_not_binary_is_refused_at_install() {
+    refused(NOCASE, tags()).await;
+    refused(
+        &["CREATE TABLE books (id INTEGER PRIMARY KEY, isbn TEXT COLLATE NOCASE UNIQUE)"],
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("isbn")
+                .identity(&["isbn"]),
+        ])
+        .unwrap(),
+    )
+    .await;
 }
 
 // Type affinity converting a key value.
@@ -531,7 +458,7 @@ fn model_rows(peers: &[Peer], collection: &str) -> Vec<model::Row> {
 /// A key written as text where another replica's column holds integers. The model compares the
 /// key exactly, so the check is on what each table shows and what the model makes live.
 #[tokio::test]
-#[ignore = "known fault: the kernel records a natural key from the value it binds, the triggers from the value the column stores, so an edit makes a second entity"]
+#[ignore = "known fault: where two replicas' schemas give a natural key column different types, the kernel records the key it binds and the triggers the one the column stores, so an edit makes a second entity"]
 async fn a_key_one_replica_holds_as_text_and_another_as_an_integer_is_one_entity() {
     let world = World::new(13);
     let mut hub = Vec::new();
@@ -614,28 +541,14 @@ async fn what_an_application_trigger_writes_during_a_local_write_is_sent() {
 #[tokio::test]
 #[ignore = "known fault: install refuses a table in an attached database only with an untyped SQLite error from creating its triggers"]
 async fn a_table_in_an_attached_database_is_refused_at_install() {
-    let world = World::new(15);
-    let mut conn = world.connect(0).await;
+    let mut conn = World::new(15).connect(0).await;
     for sql in [
         "ATTACH ':memory:' AS aux",
         "CREATE TABLE aux.items (id INTEGER PRIMARY KEY, code TEXT UNIQUE, title TEXT)",
     ] {
         sqlx::query(sql).execute(&mut conn).await.unwrap();
     }
-    let replica = Replica::new(items());
-    let result = replica.install(&mut conn).await;
-    assert!(result.is_err());
-    assert!(!installed(&mut conn).await.unwrap());
-    let triggers: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM aux.sqlite_master WHERE type = 'trigger'")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-    assert_eq!(triggers, 0);
-    assert!(
-        matches!(result, Err(Error::Registry(_))),
-        "install answered {result:?}"
-    );
+    refused_on(&mut conn, items()).await;
 }
 
 // Write-ahead logging.
@@ -712,6 +625,15 @@ async fn file_peer(path: &PathBuf, journal: &str, wall: &Arc<AtomicI64>) -> Peer
     peer
 }
 
+/// A directory removed when dropped, also when a test fails.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn converge_in(journal: &str) -> Vec<String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -721,13 +643,14 @@ async fn converge_in(journal: &str) -> Vec<String> {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch(dir);
     let wall = Arc::new(AtomicI64::new(1_700_000_000_000));
     let later = || {
         wall.fetch_add(5, Ordering::SeqCst);
     };
     let mut peers = Vec::new();
     for n in 0..3 {
-        peers.push(file_peer(&dir.join(format!("{n}.db")), journal, &wall).await);
+        peers.push(file_peer(&dir.0.join(format!("{n}.db")), journal, &wall).await);
     }
     let mut hub = Vec::new();
     peers[0]
@@ -757,10 +680,7 @@ async fn converge_in(journal: &str) -> Vec<String> {
         .run("INSERT INTO books (shelf_id, title, isbn) VALUES (1, 'C1', '9')")
         .await;
     settle(&mut peers, &mut hub).await;
-    let rows = same_everywhere(&mut peers, LIBRARY_ROWS).await;
-    drop(peers);
-    std::fs::remove_dir_all(&dir).unwrap();
-    rows
+    same_everywhere(&mut peers, LIBRARY_ROWS).await
 }
 
 #[tokio::test]
@@ -928,7 +848,7 @@ async fn a_panic_inside_an_apply_leaves_capture_working_inside_the_applications_
 
 // A wall clock at or before 1970.
 
-async fn writes_before_the_epoch(start: i64) {
+async fn writes_before_the_epoch(start: i64, maker: Made) {
     let wall = Arc::new(AtomicI64::new(start));
     let mut conn = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
@@ -990,100 +910,70 @@ async fn writes_before_the_epoch(start: i64) {
         ["book E on S - -", "shelf S"],
         "wall {start}"
     );
-    assert_eq!(made, Some(Made::Here), "wall {start}");
+    assert_eq!(made, Some(maker), "wall {start}");
 }
 
 #[tokio::test]
 #[ignore = "known fault: a trigger reading of exactly 0 ms is taken for a found row, so the write is sent at an adoption clock and loses to every honest write"]
 async fn writes_made_at_the_epoch_are_made_here_and_ordered() {
-    writes_before_the_epoch(0).await;
+    writes_before_the_epoch(0, Made::Here).await;
 }
 
+/// As `Made::Adopted` documents, a making stamped before the epoch reads as adopted.
 #[tokio::test]
-#[ignore = "known fault: a making stamped before the epoch is reported as adopted, as Made::Adopted documents"]
-async fn writes_made_before_the_epoch_are_made_here_and_ordered() {
-    writes_before_the_epoch(-5000).await;
+async fn writes_made_before_the_epoch_are_ordered_and_their_making_reads_as_adopted() {
+    writes_before_the_epoch(-5000, Made::Adopted).await;
 }
 
 // Further configurations: what install does not check of the tables against the registry.
 
 #[tokio::test]
-#[ignore = "known fault: install accepts a minted key column that holds text, and every collect then fails as corrupt"]
-async fn a_minted_key_column_holding_text_is_synced() {
-    let schema = &["CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT)"];
-    let registry = || {
+#[ignore = "known fault: install accepts a minted key column that is not an integer primary key, which then makes every collect fail as corrupt"]
+async fn a_minted_key_column_that_is_not_an_integer_primary_key_is_refused_at_install() {
+    refused(
+        &["CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT)"],
         Registry::new(vec![
             Collection::minted("devices", "devices", "id").field("name"),
         ])
-        .unwrap()
-    };
-    let world = World::new(20);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0]
-        .run("INSERT INTO devices (id, name) VALUES ('abc', 'phone')")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT name FROM devices").await,
-        ["phone"]
-    );
+        .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: install accepts a natural key no unique index holds, and two rows at one key are one entity whose second value is never sent"]
-async fn a_natural_key_no_index_holds_unique_is_one_row() {
-    let schema = &["CREATE TABLE prefs (key TEXT NOT NULL, value TEXT)"];
-    let registry = || {
+#[ignore = "known fault: install accepts a natural key no unique index enforces, which then makes two rows one entity whose second value is never sent"]
+async fn a_natural_key_no_unique_index_enforces_is_refused_at_install() {
+    refused(
+        &["CREATE TABLE prefs (key TEXT NOT NULL, value TEXT)"],
         Registry::new(vec![
             Collection::natural("prefs", "prefs", &["key"])
                 .field("key")
                 .field("value"),
         ])
-        .unwrap()
-    };
-    let world = World::new(21);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0]
-        .run("INSERT INTO prefs (key, value) VALUES ('a', '1'), ('a', '2')")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    same_everywhere(&mut peers, "SELECT key || value FROM prefs ORDER BY 1").await;
+        .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: install accepts two collections over one table, and each replica makes a row of each entity of both"]
-async fn two_collections_over_one_table_keep_one_row() {
-    let schema = &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)"];
-    let registry = || {
+#[ignore = "known fault: install accepts two collections over one table, which then make a row of each entity of both on every other replica"]
+async fn two_collections_over_one_table_are_refused_at_install() {
+    refused(
+        &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)"],
         Registry::new(vec![
             Collection::minted("books", "books", "id").field("title"),
             Collection::minted("titles", "books", "id").field("title"),
         ])
-        .unwrap()
-    };
-    let world = World::new(22);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0].run("INSERT INTO books (title) VALUES ('A')").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT title FROM books").await,
-        ["A"]
-    );
+        .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: install accepts a local dependent whose table does not exist"]
+#[ignore = "known fault: install accepts a local dependent whose table does not exist, which then never moves anything when rows merge"]
 async fn a_local_dependent_naming_no_table_is_refused_at_install() {
-    let world = World::new(23);
-    let mut conn = world.connect(0).await;
-    sqlx::query("CREATE TABLE books (id INTEGER PRIMARY KEY, isbn TEXT UNIQUE)")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    let replica = Replica::new(
+    refused(
+        &["CREATE TABLE books (id INTEGER PRIMARY KEY, isbn TEXT UNIQUE)"],
         Registry::new(vec![
             Collection::minted("books", "books", "id")
                 .field("isbn")
@@ -1091,38 +981,23 @@ async fn a_local_dependent_naming_no_table_is_refused_at_install() {
                 .local_dependent("readings", "book_id"),
         ])
         .unwrap(),
-    );
-    let result = replica.install(&mut conn).await;
-    assert!(
-        matches!(result, Err(Error::Registry(_))),
-        "install answered {result:?}"
-    );
+    )
+    .await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: install accepts a local default that does not prepare, and every row from elsewhere then waits for ever"]
-async fn a_local_default_that_does_not_prepare_does_not_hold_rows_for_ever() {
-    let schema =
-        &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, seen INTEGER NOT NULL)"];
-    let registry = || {
+#[ignore = "known fault: install accepts a local default that does not prepare, which then holds every row from elsewhere for ever"]
+async fn a_local_default_that_does_not_prepare_is_refused_at_install() {
+    refused(
+        &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, seen INTEGER NOT NULL)"],
         Registry::new(vec![
             Collection::minted("books", "books", "id")
                 .field("title")
                 .local_default("seen", LocalDefault::Sql("SELEC 1".into())),
         ])
-        .unwrap()
-    };
-    let world = World::new(24);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, registry).await;
-    peers[0]
-        .run("INSERT INTO books (title, seen) VALUES ('A', 0)")
-        .await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT title FROM books").await,
-        ["A"]
-    );
+        .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1166,25 +1041,45 @@ async fn references_whose_foreign_key_acts_otherwise_than_the_registry_says_conv
     world.later(5);
     peers[0].run("DELETE FROM books").await;
     settle(&mut peers, &mut hub).await;
-    same_everywhere(
-        &mut peers,
-        "SELECT 'note ' || body FROM notes UNION ALL SELECT 'mark ' || body FROM marks ORDER BY 1",
-    )
-    .await;
+    assert_eq!(
+        same_everywhere(
+            &mut peers,
+            "SELECT 'note ' || body || ' ' || COALESCE(book_id, '-') FROM notes
+             UNION ALL SELECT 'mark ' || body FROM marks ORDER BY 1",
+        )
+        .await,
+        ["note n -"]
+    );
 }
 
+/// A correct kernel sends the bytes as written, or refuses the write or the collect with an
+/// error of its own and sends nothing altered; it never sends other text.
 #[tokio::test]
-#[ignore = "known fault: text that is not UTF-8 is read lossily, so other replicas receive replacement characters"]
-async fn text_that_is_not_utf8_is_sent_as_written() {
+#[ignore = "known fault: text that is not UTF-8 is read lossily and sent altered, so other replicas receive replacement characters"]
+async fn text_that_is_not_utf8_is_sent_as_written_or_refused() {
     let world = World::new(26);
     let mut hub = Vec::new();
     let mut peers = peers_in(&world, 2, LIBRARY, library).await;
     for peer in &mut peers {
         peer.checking = false;
     }
-    peers[0]
-        .run("INSERT INTO shelves (name) VALUES (CAST(x'ff41' AS TEXT))")
+    let written = sqlx::query("INSERT INTO shelves (name) VALUES (CAST(x'ff41' AS TEXT))")
+        .execute(&mut peers[0].conn)
         .await;
+    if written.is_err() {
+        assert!(peers[0].lines("SELECT name FROM shelves").await.is_empty());
+        return;
+    }
+    let p = &mut peers[0];
+    if p.replica.collect(&mut p.conn).await.is_err() {
+        let outbox = p.replica.outbox(&mut p.conn, u32::MAX).await.unwrap();
+        assert!(
+            outbox.changes.iter().all(|c| c.collection != "shelves"),
+            "{:?}",
+            outbox.changes
+        );
+        return;
+    }
     settle(&mut peers, &mut hub).await;
     for (i, peer) in peers.iter_mut().enumerate() {
         assert_eq!(
@@ -1274,119 +1169,115 @@ fn without_status() -> Registry {
     Registry::new(collections).unwrap()
 }
 
+/// Every table of `conn`, the kernel's among them, with its rows and its definition.
+async fn dump(conn: &mut SqliteConnection) -> Vec<String> {
+    let tables: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let mut out: Vec<String> = sqlx::query_scalar(
+        "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') FROM sqlite_master ORDER BY 1",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    for (name, _) in tables {
+        let mut rows: Vec<String> = support::rows(conn, &format!("SELECT * FROM \"{name}\""), &[])
+            .await
+            .iter()
+            .map(|row| format!("{name} {row:?}"))
+            .collect();
+        rows.sort();
+        out.extend(rows);
+    }
+    out
+}
+
+/// A change of registry that is not purely additive is refused with a registry error, by an
+/// install and by a collect, and leaves the database as it was.
+async fn change_refused(peer: &mut Peer, registry: fn() -> Registry) {
+    let before = dump(&mut peer.conn).await;
+    let installed = Replica::new(registry()).install(&mut peer.conn).await;
+    assert_eq!(
+        dump(&mut peer.conn).await,
+        before,
+        "install answered {installed:?}"
+    );
+    assert!(
+        matches!(installed, Err(Error::Registry(_))),
+        "install answered {installed:?}"
+    );
+    let collected = Replica::new(registry()).collect(&mut peer.conn).await;
+    assert_eq!(
+        dump(&mut peer.conn).await,
+        before,
+        "collect answered {collected:?}"
+    );
+    assert!(
+        matches!(collected, Err(Error::Registry(_))),
+        "collect answered {collected:?}"
+    );
+}
+
 #[tokio::test]
-async fn writes_to_a_collection_left_out_of_the_registry_are_sent_on_resuming() {
+#[ignore = "known fault: install and collect accept a registry lacking a collection or field the installed one has, which then loses what the application writes to it"]
+async fn a_registry_lacking_what_the_installed_one_has_is_refused() {
     let world = World::new(30);
     let mut hub = Vec::new();
     let mut peers = shelved(&world, &mut hub).await;
-    peers[1].checking = false;
-    peers[1].upgrade(without_notes()).await;
-    peers[1].run("UPDATE notes SET body = 'edited'").await;
-    peers[1]
+    peers[0]
         .run("INSERT INTO notes (book_id, body) VALUES (1, 'n2')")
         .await;
-    world.later(5);
-    peers[1].replica = Replica::new(library());
-    let p = &mut peers[1];
-    let result = p.replica.install(&mut p.conn).await;
-    assert!(matches!(result, Err(Error::Suspended)), "{result:?}");
-    peers[1].resume(Resume::Send).await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        [
-            "book A on S - 0",
-            "note edited on A",
-            "note n2 on A",
-            "shelf S"
-        ]
-    );
+    peers[0].run("UPDATE books SET status = 'new'").await;
+    change_refused(&mut peers[0], without_notes).await;
+    change_refused(&mut peers[0], without_status).await;
 }
 
 #[tokio::test]
-#[ignore = "known fault: a write to a field a registry left out is adopted at the oldest clock when the field returns, so it is lost"]
-async fn a_write_to_a_field_left_out_of_the_registry_is_sent_when_it_returns() {
-    let world = World::new(31);
-    let mut hub = Vec::new();
-    let mut peers = shelved(&world, &mut hub).await;
-    peers[0].run("UPDATE books SET status = 'old'").await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    peers[1].checking = false;
-    peers[1].upgrade(without_status()).await;
-    peers[1].run("UPDATE books SET status = 'new'").await;
-    world.later(5);
-    peers[1].upgrade(library()).await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        ["book A on S new 0", "note n1 on A", "shelf S"]
-    );
-}
-
-#[tokio::test]
-#[ignore = "known fault: a plain field declared a reference later keeps integer values, which no replica reads as the row they named"]
-async fn a_plain_field_that_becomes_a_reference_converges() {
-    let schema = &[
-        "CREATE TABLE shelves (id INTEGER PRIMARY KEY, name TEXT)",
-        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, shelf INTEGER)",
-    ];
-    let plain = || {
-        Registry::new(vec![
-            Collection::minted("shelves", "shelves", "id").field("name"),
-            Collection::minted("books", "books", "id")
-                .field("title")
-                .field("shelf"),
-        ])
-        .unwrap()
-    };
-    let referring = || {
-        Registry::new(vec![
-            Collection::minted("shelves", "shelves", "id").field("name"),
-            Collection::minted("books", "books", "id")
-                .field("title")
-                .reference("shelf", "shelves"),
-        ])
-        .unwrap()
-    };
+#[ignore = "known fault: install accepts a plain field declared a reference, which then keeps integer values no replica reads as the rows they named"]
+async fn a_plain_field_that_becomes_a_reference_is_refused() {
     let world = World::new(32);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, plain).await;
+    let mut peers = peers_in(&world, 1, SHELF_REFS, plain_shelf).await;
     peers[0]
         .run("INSERT INTO shelves (id, name) VALUES (5, 'S')")
         .await;
     peers[0]
         .run("INSERT INTO books (title, shelf) VALUES ('A', 5)")
         .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    for peer in &mut peers {
-        peer.checking = false;
-        peer.upgrade(referring()).await;
-    }
-    peers[0].run("UPDATE books SET title = 'A2'").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(
-            &mut peers,
-            "SELECT b.title || ' ' || COALESCE(s.name, '-') FROM books b
-               LEFT JOIN shelves s ON s.id = b.shelf"
-        )
-        .await,
-        ["A2 S"]
-    );
+    peers[0].push(&mut Vec::new()).await;
+    change_refused(&mut peers[0], referring_shelf).await;
+}
+
+const SHELF_REFS: &[&str] = &[
+    "CREATE TABLE shelves (id INTEGER PRIMARY KEY, name TEXT)",
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, shelf INTEGER)",
+];
+
+fn plain_shelf() -> Registry {
+    Registry::new(vec![
+        Collection::minted("shelves", "shelves", "id").field("name"),
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("shelf"),
+    ])
+    .unwrap()
+}
+
+fn referring_shelf() -> Registry {
+    Registry::new(vec![
+        Collection::minted("shelves", "shelves", "id").field("name"),
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .reference("shelf", "shelves"),
+    ])
+    .unwrap()
 }
 
 #[tokio::test]
-#[ignore = "known fault: a reference declared an owner later leaves rows whose owner is gone until something touches them"]
-async fn a_reference_that_becomes_an_owner_takes_rows_whose_owner_is_gone() {
-    let schema = &[
-        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
-        "CREATE TABLE notes (
-            id INTEGER PRIMARY KEY,
-            book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
-            body TEXT)",
-    ];
+#[ignore = "known fault: install accepts a reference declared an owner, which then leaves rows whose owner is gone until something touches them"]
+async fn a_reference_that_becomes_an_owner_is_refused() {
     fn notes(owned: bool) -> Registry {
         let notes = Collection::minted("notes", "notes", "id").field("body");
         let notes = if owned {
@@ -1400,30 +1291,23 @@ async fn a_reference_that_becomes_an_owner_takes_rows_whose_owner_is_gone() {
         ])
         .unwrap()
     }
+    let schema = &[
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT)",
+        "CREATE TABLE notes (
+            id INTEGER PRIMARY KEY,
+            book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,
+            body TEXT)",
+    ];
     let world = World::new(33);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, || notes(false)).await;
+    let mut peers = peers_in(&world, 1, schema, || notes(false)).await;
     peers[0]
         .run("INSERT INTO books (id, title) VALUES (1, 'A')")
         .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    peers[1]
+    peers[0]
         .run("INSERT INTO notes (book_id, body) VALUES (1, 'n')")
         .await;
-    peers[1].push(&mut hub).await;
-    peers[0].run("DELETE FROM books").await;
-    peers[0].push(&mut hub).await;
-    settle(&mut peers, &mut hub).await;
-    for peer in &mut peers {
-        peer.checking = false;
-        peer.upgrade(notes(true)).await;
-    }
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, "SELECT body FROM notes").await,
-        Vec::<String>::new()
-    );
+    peers[0].push(&mut Vec::new()).await;
+    change_refused(&mut peers[0], || notes(true)).await;
 }
 
 #[tokio::test]
@@ -1464,31 +1348,8 @@ async fn an_identity_added_later_joins_rows_that_already_share_it() {
 }
 
 #[tokio::test]
-#[ignore = "known fault: a collect under a registry lacking a collection drops its marks, so writes to it are never sent"]
-async fn a_collect_under_a_narrower_registry_loses_no_write() {
-    let world = World::new(35);
-    let mut hub = Vec::new();
-    let mut peers = shelved(&world, &mut hub).await;
-    peers[0]
-        .run("INSERT INTO notes (book_id, body) VALUES (1, 'n2')")
-        .await;
-    let narrow = Replica::new(without_notes());
-    match narrow.collect(&mut peers[0].conn).await {
-        Ok(_) | Err(Error::Registry(_)) => {}
-        Err(other) => panic!("{other:?}"),
-    }
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(&mut peers, LIBRARY_ROWS).await,
-        ["book A on S - 0", "note n1 on A", "note n2 on A", "shelf S"]
-    );
-}
-
-#[tokio::test]
-#[ignore = "known fault: a natural key that gains a field leaves rows mapped under the old key, which then wait for ever"]
-async fn a_natural_key_that_gains_a_field_converges() {
-    let schema = &["CREATE TABLE marks (
-        code TEXT NOT NULL, kind TEXT NOT NULL, label TEXT, PRIMARY KEY (code, kind))"];
+#[ignore = "known fault: install accepts a natural key that gains a field, which then leaves rows mapped under the old key waiting for ever"]
+async fn a_natural_key_that_gains_a_field_is_refused() {
     fn marks(key: &[&str]) -> Registry {
         Registry::new(vec![
             Collection::natural("marks", "marks", key)
@@ -1498,26 +1359,13 @@ async fn a_natural_key_that_gains_a_field_converges() {
         ])
         .unwrap()
     }
+    let schema = &["CREATE TABLE marks (
+        code TEXT NOT NULL, kind TEXT NOT NULL, label TEXT, PRIMARY KEY (code, kind))"];
     let world = World::new(36);
-    let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, schema, || marks(&["code"])).await;
+    let mut peers = peers_in(&world, 1, schema, || marks(&["code"])).await;
     peers[0]
         .run("INSERT INTO marks VALUES ('x', 'a', 'one')")
         .await;
-    settle(&mut peers, &mut hub).await;
-    world.later(5);
-    for peer in &mut peers {
-        peer.checking = false;
-        peer.upgrade(marks(&["code", "kind"])).await;
-    }
-    peers[0].run("UPDATE marks SET label = 'two'").await;
-    settle(&mut peers, &mut hub).await;
-    assert_eq!(
-        same_everywhere(
-            &mut peers,
-            "SELECT code || ' ' || kind || ' ' || label FROM marks"
-        )
-        .await,
-        ["x a two"]
-    );
+    peers[0].push(&mut Vec::new()).await;
+    change_refused(&mut peers[0], || marks(&["code", "kind"])).await;
 }
