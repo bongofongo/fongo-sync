@@ -1,5 +1,6 @@
 //! An in-memory sync server that follows the protocol closely enough to drive the client, and can
-//! be told to misbehave; and replicas over in-memory SQLite to sync through it.
+//! be told to misbehave; replicas over in-memory SQLite to sync through it; and a writer of
+//! envelopes in formats this build does not read.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -10,9 +11,9 @@ use fongo_sync_client::protocol::api::{
     ErrorCode, ReadBatches, Route, StoredBatch,
 };
 use fongo_sync_client::protocol::{
-    DeviceId, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, LibraryId,
-    LibraryKeys, PROTOCOL_VERSION, RequestAuth, VerifyingKey, open, verify_envelope,
-    verify_request,
+    BATCH_FORMAT, DeviceId, Envelope, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE,
+    HEADER_TIMESTAMP, LibraryId, LibraryKeys, PROTOCOL_VERSION, RequestAuth, SigningKey,
+    VerifyingKey, encode_batch, open, verify_envelope, verify_request,
 };
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Collection, Registry, Replica};
@@ -30,6 +31,7 @@ pub fn now() -> u64 {
 
 type Tamper = Box<dyn FnMut(BatchPage) -> Vec<u8> + Send>;
 type Respond = Box<dyn FnMut(&Request) -> Option<Response> + Send>;
+type Lose = Box<dyn FnMut(&Request) -> bool + Send>;
 
 pub struct Library {
     pub devices: Vec<DeviceRecord>,
@@ -43,6 +45,14 @@ pub struct State {
     seen: HashSet<(DeviceId, [u8; 16])>,
     /// Every request that reached the server, as method and target.
     pub requests: Vec<(Method, String)>,
+    /// The length of the body answering each request in `requests`, whether or not it arrived.
+    pub answered: Vec<usize>,
+    /// An append of bytes the log already holds stores them again, as the protocol allows.
+    pub store_again: bool,
+    /// Loses the response to each request it returns true for, once handled.
+    lose_if: Option<Lose>,
+    /// Fails each request it returns true for before it reaches the server.
+    fail_if: Option<Lose>,
     counted: usize,
     /// The n-th request from when it was set never reaches the server.
     fail_at: Option<usize>,
@@ -117,6 +127,10 @@ impl Server {
                 libraries: HashMap::new(),
                 seen: HashSet::new(),
                 requests: Vec::new(),
+                answered: Vec::new(),
+                store_again: false,
+                lose_if: None,
+                fail_if: None,
                 counted: 0,
                 fail_at: None,
                 lose_at: None,
@@ -177,6 +191,27 @@ impl Server {
         self.with(|s| s.tamper = Some(Box::new(f)));
     }
 
+    pub fn lose_if(&self, f: impl FnMut(&Request) -> bool + Send + 'static) {
+        self.with(|s| s.lose_if = Some(Box::new(f)));
+    }
+
+    pub fn fail_if(&self, f: impl FnMut(&Request) -> bool + Send + 'static) {
+        self.with(|s| s.fail_if = Some(Box::new(f)));
+    }
+
+    /// Bytes of the bodies answering requests to targets starting with `path`, from request
+    /// number `from` on.
+    pub fn bytes_since(&self, from: usize, path: &str) -> usize {
+        self.with(|s| {
+            s.requests[from..]
+                .iter()
+                .zip(&s.answered[from..])
+                .filter(|((_, t), _)| t.starts_with(path))
+                .map(|(_, n)| n)
+                .sum()
+        })
+    }
+
     pub fn respond(&self, f: impl FnMut(&Request) -> Option<Response> + Send + 'static) {
         self.with(|s| s.respond = Some(Box::new(f)));
     }
@@ -188,6 +223,9 @@ impl Server {
             s.hang_at = None;
             s.tamper = None;
             s.respond = None;
+            s.lose_if = None;
+            s.fail_if = None;
+            s.store_again = false;
             s.stale_devices = false;
             s.hidden.clear();
         });
@@ -200,6 +238,12 @@ impl Server {
     /// Appends bytes to a library's log without any of the checks an append gets.
     pub fn inject(&self, library: LibraryId, envelope: Vec<u8>) {
         self.with(|s| s.libraries.get_mut(&library).unwrap().log.push(envelope));
+    }
+
+    /// Puts other bytes at `seq` in a library's log, as a server read by a build that understands
+    /// what was stored there would serve it.
+    pub fn replace(&self, library: LibraryId, seq: u64, envelope: Vec<u8>) {
+        self.with(|s| s.libraries.get_mut(&library).unwrap().log[seq as usize - 1] = envelope);
     }
 
     /// Lists a key as a device without any request.
@@ -265,7 +309,8 @@ impl Server {
         let mut state = self.state.lock().unwrap();
         state.counted += 1;
         let n = state.counted;
-        if state.fail_at == Some(n) {
+        let fail = state.fail_if.as_mut().is_some_and(|f| f(&request));
+        if state.fail_at == Some(n) || fail {
             return Some(Err(TransportError::new("connection refused")));
         }
         if state.hang_at == Some((n, false)) {
@@ -279,11 +324,13 @@ impl Server {
             Some(response) => response,
             None => state.handle(&request).unwrap_or_else(error),
         };
+        state.answered.push(response.body.len());
         if state.hang_at == Some((n, true)) {
             state.hang();
             return None;
         }
-        if state.lose_at == Some(n) {
+        let lose = state.lose_if.as_mut().is_some_and(|f| f(&request));
+        if state.lose_at == Some(n) || lose {
             return Some(Err(TransportError::new("connection reset")));
         }
         Some(Ok(response))
@@ -427,7 +474,8 @@ impl State {
                     return Err(ErrorCode::EnvelopeWrongLibrary);
                 }
                 let log = &mut self.libraries.get_mut(&id).unwrap().log;
-                let seq = match log.iter().position(|stored| *stored == request.body) {
+                let stored = log.iter().position(|stored| *stored == request.body);
+                let seq = match stored.filter(|_| !self.store_again) {
                     Some(at) => at + 1,
                     None => {
                         log.push(request.body.clone());
@@ -706,4 +754,104 @@ pub fn assert_no_change_sent_twice(server: &Server, keys: &LibraryKeys) {
         );
         assert!(seen.insert(key), "sent twice: {change:?}");
     }
+}
+
+/// Seals `plaintext` as the protocol seals a batch, writing `format` as the envelope's format in
+/// its bytes, its signature and its associated data: what a version that kept the layout but
+/// wrote that format would send. With `ENVELOPE_FORMAT` and `encode_batch`'s output it is
+/// exactly what `seal` writes.
+pub fn seal_as(
+    format: u8,
+    plaintext: &[u8],
+    keys: &LibraryKeys,
+    epoch: u32,
+    device: &SigningKey,
+    nonce: [u8; 24],
+) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+
+    let mut info = b"fongo-sync/v1/batch-key".to_vec();
+    info.extend_from_slice(&epoch.to_be_bytes());
+    let mut key = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(&keys.id.0), keys.secret())
+        .expand(&info, &mut key)
+        .unwrap();
+    let device_id = DeviceId::of(&device.verifying_key());
+    let mut aad = b"fongo-sync/v1/batch\0".to_vec();
+    aad.push(format);
+    aad.extend_from_slice(&keys.id.0);
+    aad.extend_from_slice(&device_id.0);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    let ciphertext = chacha20poly1305::XChaCha20Poly1305::new(&key.into())
+        .encrypt(
+            chacha20poly1305::XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+    let mut out = vec![format];
+    out.extend_from_slice(&keys.id.0);
+    out.extend_from_slice(&device_id.0);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&nonce);
+    put_varint(&mut out, ciphertext.len() as u64);
+    out.extend_from_slice(&ciphertext);
+    sign_unsigned(out, device)
+}
+
+/// Appends to an envelope's unsigned bytes `device`'s signature over them.
+fn sign_unsigned(mut unsigned: Vec<u8>, device: &SigningKey) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+
+    let mut message = b"fongo-sync/v1/envelope\0".to_vec();
+    message.extend_from_slice(&unsigned);
+    unsigned.extend_from_slice(&device.sign(&message).to_bytes());
+    unsigned
+}
+
+/// `envelope` signed again by `device`, so that what was changed in it is all that is wrong.
+pub fn re_signed(envelope: &Envelope, device: &SigningKey) -> Vec<u8> {
+    let bytes = envelope.encode();
+    sign_unsigned(bytes[..bytes.len() - 64].to_vec(), device)
+}
+
+/// `encode_batch`'s bytes with another format and flags.
+pub fn batch_as(format: u8, flags: u8, changes: &[Change]) -> Vec<u8> {
+    let mut bytes = encode_batch(changes);
+    bytes[0] = format;
+    bytes[1] = flags;
+    bytes
+}
+
+/// A batch of `changes` in the current format, but with the first change's value written as
+/// `tag` followed by `payload`, as a version with a type of value this build lacks would.
+pub fn batch_with_value(changes: &[Change], tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![BATCH_FORMAT, 0];
+    put_varint(&mut out, changes.len() as u64);
+    let first = &changes[0];
+    put_varint(&mut out, first.collection.len() as u64);
+    out.extend_from_slice(first.collection.as_bytes());
+    out.extend_from_slice(&first.gid.0);
+    put_varint(&mut out, first.field.len() as u64);
+    out.extend_from_slice(first.field.as_bytes());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&first.clock.wall_ms.to_be_bytes());
+    out.extend_from_slice(&first.clock.counter.to_be_bytes());
+    out.extend_from_slice(&first.clock.node.0);
+    for change in &changes[1..] {
+        // A batch of one change: format, flags and a count of 1, then the change.
+        out.extend_from_slice(&encode_batch(std::slice::from_ref(change))[3..]);
+    }
+    out
+}
+
+fn put_varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
 }

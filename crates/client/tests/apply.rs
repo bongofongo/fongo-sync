@@ -182,9 +182,9 @@ async fn sync_via(via: Via, peer: &mut Peer, server: &Server) -> String {
         Via::Default => sync_hooked(peer, server, &mut ()).await,
     };
     // How long it held the lock is a matter of timing.
-    let result = result.map(|report| SyncReport {
-        held: Duration::ZERO,
-        ..report
+    let result = result.map(|mut report| {
+        report.held = Duration::ZERO;
+        report
     });
     format!("{result:?}")
 }
@@ -1745,9 +1745,10 @@ async fn caught_up_waits_while_the_page_bound_leaves_more_to_read() {
     server.with(|s| s.caps.max_page_batches = Some(1));
     let [mut a, _b] = pair(&server).await;
     let id = a.credentials.library_id();
-    // One call reads at most a thousand pages.
+    // One call reads at most a thousand pages. The junk is of the current format: junk of a
+    // later one stops the pull.
     for _ in 0..1_001 {
-        server.inject(id, b"not an envelope".to_vec());
+        server.inject(id, b"\x01not an envelope".to_vec());
     }
     let mut hook = Marking::default();
     let report = sync_hooked(&mut a, &server, &mut hook).await.unwrap();
@@ -3088,8 +3089,9 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                 // More than one sync reads, once in a case at most: a thousand pages.
                 5 if page == 1 && !long && rng.below(3) == 0 => {
                     long = true;
+                    // Of the current format: junk of a later one stops the pull.
                     for _ in 0..1_001 {
-                        server.inject(id, b"not an envelope".to_vec());
+                        server.inject(id, b"\x01not an envelope".to_vec());
                     }
                 }
                 5 => {}

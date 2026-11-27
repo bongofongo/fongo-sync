@@ -106,10 +106,14 @@ this yet.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
-does not hold yet, applies the rest, then seals and appends the outbox. It refuses, before reading
-or writing anything, a database whose capture is suspended or whose kernel tables are missing or
-of another layout. Credentials stay with the application; the client stores only its cursor,
-the envelope it is sending and where its recent envelopes landed, in tables of its own.
+does not hold yet, stops at one a later version of the protocol may have written and reports it,
+so that the application can ask for an update and nothing is skipped, applies the rest, then seals
+and appends the outbox. `step_past` lets an application give up one such envelope that no build
+will read, on the user's say. A sync refuses, before reading or writing anything, a database whose
+capture is suspended or whose kernel tables are missing or of another layout. Credentials stay
+with the application; the client stores only its cursor, the envelope it is sending, where its
+recent envelopes landed and where its pull stopped, in tables of its own, which record their own
+layout.
 `sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
 application derives from the rows an apply touched is committed with them and the cursor, and that
 is called once a pull has read the whole log, before the outbox is sent.

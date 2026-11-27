@@ -3,15 +3,22 @@
 //! [`sync_with`] lets the application do work of its own in the transaction of each apply, and
 //! once a pull has read the whole log.
 //!
+//! What a sync cannot read it skips only when it is damaged or forged. An envelope a later version
+//! of the protocol may have written stops the pull where it is, and [`SyncReport::newer`] says so,
+//! so that the application can ask for an update; a build that reads it continues from there.
+//! [`step_past`] gives up one such envelope, for one that no build will read.
+//!
 //! The crate picks no HTTP client and no async runtime. An application implements [`Transport`]
 //! over whatever HTTP client it uses; every request and response is plain bytes and headers, and
 //! every future this crate returns is `Send`.
 //!
 //! Secrets live in [`Credentials`], which the application keeps wherever it keeps secrets and
 //! passes in on each call. This crate never writes them to disk or to the database, and never
-//! logs them. What it does keep in the database, in its own `fongo_client_state` and
-//! `fongo_client_appended` tables, is the position in the server's log, an envelope waiting to be
-//! sent, which is already encrypted, and where the envelopes it appended landed in the log.
+//! logs them. What it does keep in the database, in its own `fongo_client_state`,
+//! `fongo_client_appended` and `fongo_client_meta` tables, is the position in the server's log, an
+//! envelope waiting to be sent, which is already encrypted, where the envelopes it appended landed
+//! in the log, where its pull stopped at an envelope it cannot read, and the layout of those
+//! tables. A build refuses tables of a later layout with [`Error::NewerClientTables`].
 //!
 //! Native targets only: keys and nonces come from the operating system.
 //!
@@ -41,9 +48,9 @@ pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
 pub use library::{add_device, create_library, join_library};
 pub use notify::{message_worth_syncing, worth_syncing};
-pub use state::cursor;
+pub use state::{cursor, step_past};
 pub use sync::{
-    Apply, Blocked, Pace, Refusal, Refused, SyncReport, check_connection, merge_applied, sync,
-    sync_with,
+    Apply, Blocked, Newer, Pace, Refusal, Refused, SyncReport, Unknown, check_connection,
+    merge_applied, sync, sync_with,
 };
 pub use transport::{Method, Request, Response, Transport, TransportError};

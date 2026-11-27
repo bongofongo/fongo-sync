@@ -2,6 +2,10 @@ use fongo_sync_protocol::api::Notification;
 
 /// Whether a change notification says the log holds something past `cursor`, the position
 /// [`crate::cursor`] reports. A notification is only a hint; syncing anyway is always safe.
+///
+/// While a sync reports [`crate::SyncReport::newer`], this build reads no further than that
+/// envelope, so a notification past it says nothing this build can read: a sync is worth running
+/// then only to send what this device writes.
 pub fn worth_syncing(notification: &Notification, cursor: u64) -> bool {
     notification.seq > cursor
 }
