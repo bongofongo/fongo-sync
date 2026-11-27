@@ -1182,11 +1182,10 @@ async fn edits_of_entities_merged_part_way_through_a_pull_are_reported_once_each
         let server = Server::new();
         server.with(|s| s.caps.max_page_batches = None);
         let [made, joined] = credentials(&server).await;
-        let key = generate_signing_key().unwrap();
-        fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
+        let third = Credentials::for_new_device(made.library().clone()).unwrap();
+        fongo_sync_client::add_device(&server, &made, &third.device_offer().unwrap(), now)
             .await
             .unwrap();
-        let third = Credentials::new(made.library().clone(), key, 0);
         let mut a = tag_peer(&dir, &format!("a{n}.db"), made).await;
         let mut b = tag_peer(&dir, &format!("b{n}.db"), joined).await;
         let mut c = tag_peer(&dir, &format!("c{n}.db"), third).await;
@@ -1966,11 +1965,10 @@ async fn three_devices_keep_counts_from_what_each_apply_touched() {
     let server = Server::new();
     server.with(|s| s.caps.max_page_batches = Some(2));
     let [made, joined] = credentials(&server).await;
-    let key = generate_signing_key().unwrap();
-    fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
+    let third = Credentials::for_new_device(made.library().clone()).unwrap();
+    fongo_sync_client::add_device(&server, &made, &third.device_offer().unwrap(), now)
         .await
         .unwrap();
-    let third = Credentials::new(made.library().clone(), key, 0);
     let mut peers = [
         file_peer(made).await,
         file_peer(joined).await,
@@ -3033,11 +3031,10 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             held: Duration::ZERO,
         };
         let [made, joined] = credentials(&server).await;
-        let key = generate_signing_key().unwrap();
-        fongo_sync_client::add_device(&server, &made, &key.verifying_key(), now)
+        let third = Credentials::for_new_device(made.library().clone()).unwrap();
+        fongo_sync_client::add_device(&server, &made, &third.device_offer().unwrap(), now)
             .await
             .unwrap();
-        let third = Credentials::new(made.library().clone(), key, 0);
         let keys = made.library().clone();
         let id = keys.id;
         let mut peers = [

@@ -8,12 +8,12 @@ use std::sync::Mutex;
 
 use fongo_sync_client::protocol::api::{
     AddDevice, Appended, BatchPage, Capabilities, CreateLibrary, DeviceRecord, Devices, ErrorBody,
-    ErrorCode, ReadBatches, Route, StoredBatch,
+    ErrorCode, ReadBatches, Route, SignedWrapKey, StoredBatch,
 };
 use fongo_sync_client::protocol::{
     BATCH_FORMAT, DeviceId, Envelope, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE,
-    HEADER_TIMESTAMP, LibraryId, LibraryKeys, PROTOCOL_VERSION, RequestAuth, SigningKey,
-    VerifyingKey, encode_batch, open, verify_envelope, verify_request,
+    HEADER_TIMESTAMP, LibraryId, LibraryKeys, ListedMemberProof, PROTOCOL_VERSION, RequestAuth,
+    SigningKey, VerifyingKey, encode_batch, open, verify_envelope, verify_request,
 };
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Collection, Registry, Replica};
@@ -72,6 +72,11 @@ pub struct State {
     pub stale_devices: bool,
     /// Keys every device list leaves out.
     pub hidden: Vec<VerifyingKey>,
+    /// Stores this as every registered device's membership proof in place of the one sent, as a
+    /// server that drops or mangles the field would.
+    pub stored_proof: Option<Option<ListedMemberProof>>,
+    /// Stores this as every registered device's wrap key in place of the one sent.
+    pub stored_wrap: Option<Option<SignedWrapKey>>,
 }
 
 pub struct Server {
@@ -141,6 +146,8 @@ impl Server {
                 respond: None,
                 stale_devices: false,
                 hidden: Vec::new(),
+                stored_proof: None,
+                stored_wrap: None,
             }),
         }
     }
@@ -257,9 +264,22 @@ impl Server {
                     public_key: key,
                     recovery: false,
                     wrap: None,
+                    member_proof: None,
                     removed: false,
                     last_seen: None,
                 })
+        });
+    }
+
+    /// Marks a listed key removed, as a removal would, without any request.
+    pub fn mark_removed(&self, library: LibraryId, key: VerifyingKey) {
+        self.with(|s| {
+            let devices = &mut s.libraries.get_mut(&library).unwrap().devices;
+            let record = devices
+                .iter_mut()
+                .find(|d| d.public_key == key)
+                .expect("the key is listed");
+            record.removed = true;
         });
     }
 
@@ -390,7 +410,7 @@ impl State {
                 let create: CreateLibrary = serde_json::from_slice(&request.body)
                     .map_err(|_| ErrorCode::MalformedRequest)?;
                 self.authenticate(request, &create.device_key)?;
-                if !create.verify() {
+                if !create.verify() || (create.wrap.is_some() && !create.verify_wrap()) {
                     return Err(ErrorCode::InvalidProof);
                 }
                 if self.libraries.contains_key(&create.library) {
@@ -400,7 +420,10 @@ impl State {
                     DeviceRecord {
                         public_key: create.device_key,
                         recovery: false,
-                        wrap: None,
+                        wrap: self.stored_wrap.unwrap_or(create.wrap),
+                        member_proof: self
+                            .stored_proof
+                            .unwrap_or(create.member_proof.map(Into::into)),
                         removed: false,
                         last_seen: None,
                     },
@@ -408,6 +431,7 @@ impl State {
                         public_key: create.recovery_key,
                         recovery: true,
                         wrap: None,
+                        member_proof: None,
                         removed: false,
                         last_seen: None,
                     },
@@ -434,24 +458,46 @@ impl State {
                 self.member(request, id)?;
                 let add: AddDevice = serde_json::from_slice(&request.body)
                     .map_err(|_| ErrorCode::MalformedRequest)?;
+                if add.wrap.is_some() && !add.verify_wrap(id) {
+                    return Err(ErrorCode::InvalidProof);
+                }
                 let max = self.caps.max_devices;
                 let library = self.libraries.get_mut(&id).unwrap();
                 let record = DeviceRecord {
                     public_key: add.device_key,
                     recovery: false,
-                    wrap: None,
+                    wrap: self.stored_wrap.unwrap_or(add.wrap),
+                    member_proof: self
+                        .stored_proof
+                        .unwrap_or(add.member_proof.map(Into::into)),
                     removed: false,
                     last_seen: None,
                 };
-                if !library.devices.contains(&record) {
-                    let count = library.devices.iter().filter(|d| !d.recovery).count();
-                    if max.is_some_and(|max| count >= max as usize) {
-                        return Err(ErrorCode::DeviceLimit);
+                let live = library
+                    .devices
+                    .iter()
+                    .filter(|d| !d.recovery && !d.removed)
+                    .count();
+                let full = max.is_some_and(|max| live >= max as usize);
+                let status = match library
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.public_key == record.public_key)
+                {
+                    Some(listed) if !listed.removed => 200,
+                    Some(_) if full => return Err(ErrorCode::DeviceLimit),
+                    Some(listed) => {
+                        *listed = record;
+                        201
                     }
-                    library.devices.push(record);
-                }
+                    None if full => return Err(ErrorCode::DeviceLimit),
+                    None => {
+                        library.devices.push(record);
+                        200
+                    }
+                };
                 Ok(json(
-                    200,
+                    status,
                     &Devices {
                         devices: library.devices.clone(),
                     },

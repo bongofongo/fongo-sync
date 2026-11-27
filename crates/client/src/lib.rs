@@ -20,6 +20,16 @@
 //! in the log, where its pull stopped at an envelope it cannot read, and the layout of those
 //! tables. A build refuses tables of a later layout with [`Error::NewerClientTables`].
 //!
+//! To create or join a library so that a lost response can be retried, make the credentials
+//! first ([`Credentials::for_new_library`], [`Credentials::for_recovery_code`]), store them, then
+//! register them with [`create_library_with`] or [`join_library_with`], repeating the call until
+//! it gives an answer. Each registers the device's wrap key and a membership proof, which another
+//! device checks with [`Credentials::check_member`]. [`create_library`] and [`join_library`] do
+//! both steps in one call and return the credentials, which a lost response loses.
+//! A device can also be added by another: the new device makes its credentials from the library's
+//! keys with [`Credentials::for_new_device`], stores them and hands over
+//! [`Credentials::device_offer`], which the other passes to [`add_device`].
+//!
 //! Native targets only: keys and nonces come from the operating system.
 //!
 //! # Shaped by the kernel as it stands
@@ -42,11 +52,16 @@ mod state;
 mod sync;
 mod transport;
 
-pub use credentials::{CREDENTIALS_FORMAT, Credentials, CredentialsError};
+pub use credentials::{
+    CREDENTIALS_FORMAT, CREDENTIALS_FORMAT_WITHOUT_WRAP, Credentials, CredentialsError,
+};
 pub use error::Error;
 pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
-pub use library::{add_device, create_library, join_library};
+pub use library::{
+    DeviceOffer, Registered, WrapListing, add_device, create_library, create_library_with,
+    join_library, join_library_with,
+};
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::{cursor, step_past};
 pub use sync::{

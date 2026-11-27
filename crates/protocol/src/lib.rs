@@ -54,6 +54,37 @@
 //! they are hints, nor on anything a server reports about a library (`last_seen`, its status) for
 //! the library's content.
 //!
+//! # Membership proofs
+//!
+//! [`api::CreateLibrary`] and [`api::AddDevice`] may carry a `member_proof`: an HMAC-SHA256, under
+//! a key only holders of the library secret can derive, over the device's public key and its wrap
+//! key ([`LibraryKeys::member_proof`] gives the exact bytes). A server stores it and returns it
+//! unchanged in the device's [`api::DeviceRecord`]; it cannot check it, since it lacks the secret,
+//! and a build that knows nothing of it ignores it. A device that is to seal a new secret to the
+//! others can then seal only to records whose proof checks
+//! ([`api::DeviceRecord::check_member_proof`]), so that a server that lists a key of its own is
+//! not handed the secret. That holds only while every proof is made by a holder of the secret for
+//! a key it got over a channel the server cannot alter. A device that adds another makes the
+//! proof itself, for the key and wrap key the new device hands it; anyone who knows the library
+//! id can make such a hand-over for a key of their own, so one relayed through the server lets
+//! the server have its own key vouched for.
+//!
+//! What a valid proof gives: whoever registered that key and wrap key held the secret at the
+//! time. What it does not give: that the device still holds the secret or is still wanted, that
+//! it holds the private halves of the keys named (the wrap key's own signature shows that of the
+//! device key), or anything against a holder of the secret, who can make a proof for any key. A
+//! server can drop a proof, so that a device that registered one shows none; it cannot make one,
+//! or move one to another key or wrap key. Absent and invalid proofs are told apart only so that
+//! an application can tell a device registered without a proof from a forgery: an absent proof is
+//! also exactly what a key the server planted looks like, so it gives no assurance at all and must
+//! never be treated more leniently than an invalid one when deciding who receives a secret. A
+//! device listed without a proof never gains one under that key while it is listed, since adding
+//! a listed key again changes nothing. It is recognised only after it joins again under a new
+//! device key with a server that keeps proofs, or after someone removes it and its key is added
+//! again, since a restored key takes the proof its request carries. A record whose proof is not
+//! 64 hex digits still parses, and its proof checks as invalid; a request carrying one does not
+//! parse.
+//!
 //! # Limits of version 1
 //!
 //! - The library secret cannot be rotated. A device can be removed through
@@ -64,6 +95,8 @@
 //!   remaining devices, which is future work; a device may register a [`WrapKey`] for it now,
 //!   which nothing in this version uses. Each wrap key is signed by its device's key, but the
 //!   device list as a whole is still taken from the server, which can add or leave out a key.
+//!   A device may also register a [`MemberProof`], which shows that whoever registered it held
+//!   the library secret then; see [Membership proofs](#membership-proofs).
 //! - Every key epoch's key derives from the one library secret, so a new epoch does not exclude
 //!   anyone who held the secret. The protocol sets no server-side rules for epochs: a server
 //!   neither checks nor orders them.
@@ -76,6 +109,7 @@ mod envelope;
 mod file;
 mod hex;
 mod keys;
+mod member;
 mod recovery;
 mod request;
 mod wire;
@@ -87,9 +121,10 @@ pub use file::{
     BlobId, ContentHash, FILE_CHUNK_LEN, FILE_REF_FORMAT, FileError, FileHasher, FileLayout,
     FileOpener, FileRef, FileSealer, SEALED_CHUNK_LEN, SealedChunk, padme,
 };
-pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey};
+pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey, WrapSecret};
 #[cfg(feature = "rand")]
 pub use keys::{generate_signing_key, random_nonce, random_request_nonce};
+pub use member::{ListedMemberProof, MemberCheck, MemberProof};
 pub use recovery::RecoveryError;
 pub use request::{
     HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestAuth, RequestError,

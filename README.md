@@ -150,6 +150,10 @@ capture is suspended or whose kernel tables are missing or of another layout. Cr
 with the application; the client stores only its cursor, the envelope it is sending, where its
 recent envelopes landed and where its pull stopped, in tables of its own, which record their own
 layout.
+A device makes its credentials and stores them before creating or joining a library, so that a
+create or join whose response is lost can be repeated with the same result; each registers the
+device's wrap key and a membership proof, which shows the library's other devices that whoever
+registered it held the library secret.
 `sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
 application derives from the rows an apply touched is committed with them and the cursor, and that
 is called once a pull has read the whole log, before the outbox is sent.

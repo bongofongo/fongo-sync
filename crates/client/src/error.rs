@@ -40,6 +40,24 @@ pub enum Error {
     /// nothing can be sent until it is raised.
     #[error("the server accepts envelopes of at most {max} bytes, smaller than any envelope")]
     MaxBatchTooSmall { max: u64 },
+    /// The key is listed in the library with a wrap key other than the one the request carried, or
+    /// with a membership proof other than the one it carried (an unreadable one included):
+    /// registered earlier with other credentials for the same key, or changed by the server. A
+    /// listing that lacks the wrap key or proof is not this error; see [`crate::Registered`].
+    ///
+    /// The library or device slot exists. From [`crate::create_library`] and
+    /// [`crate::join_library`], which make the credentials themselves, `credentials` holds them;
+    /// from the other calls, whose caller holds them, it is `None`. The device can sync, but
+    /// must not count on receiving a new library secret sealed to its wrap key. A first create or
+    /// join made the library or slot; a repeat left the listing as it was.
+    #[error("this device's key is registered with another wrap key or membership proof")]
+    RegisteredOtherwise {
+        credentials: Option<Box<crate::Credentials>>,
+    },
+    /// The wrap key offered for a new device is not signed by that device's key for this
+    /// library. Nothing was sent.
+    #[error("the new device's wrap key is not signed by its key for this library")]
+    WrapKeyNotSigned,
     #[error("recovery code: {0}")]
     RecoveryCode(#[from] RecoveryError),
     #[error("the operating system's randomness source failed")]

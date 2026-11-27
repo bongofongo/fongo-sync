@@ -12,7 +12,8 @@ use fongo_sync_protocol::api::{
 use fongo_sync_protocol::{
     ContentHash, DeviceId, FILE_CHUNK_LEN, FileHasher, FileOpener, FileRef, FileSealer,
     HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, LibraryId, LibraryKeys,
-    SEALED_CHUNK_LEN, SealedChunk, SigningKey, WrapKey, encode_batch, padme, seal, sign_request,
+    MemberCheck, MemberProof, SEALED_CHUNK_LEN, SealedChunk, SigningKey, WrapKey, WrapSecret,
+    encode_batch, padme, seal, sign_request,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -145,6 +146,7 @@ fn the_existing_json_messages_do_not_drift() {
         public_key,
         recovery,
         wrap: None,
+        member_proof: None,
         removed: false,
         last_seen: None,
     };
@@ -639,4 +641,104 @@ fn a_claiming_append_is_laid_out_as_documented() {
         Route::BatchesClaiming(keys().id).path(),
         "/v1/libraries/01010101010101010101010101010101/batches/claiming"
     );
+}
+
+#[test]
+fn the_member_proof_macs_the_documented_bytes() {
+    let signer = device();
+    let device = signer.verifying_key();
+    let mut member_key = [0; 32];
+    Hkdf::<Sha256>::new(Some(&[1; 16]), &[2; 32])
+        .expand(b"fongo-sync/v1/member-key", &mut member_key)
+        .unwrap();
+    assert_eq!(
+        hex(&member_key),
+        "ad220c746385c607f7b2535121e280e34912d530899f22a85212e01adf0b6d78"
+    );
+    let by_hand = |tail: &[u8]| {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&member_key).unwrap();
+        mac.update(b"fongo-sync/v1/member-proof\0");
+        mac.update(&[1; 16]);
+        mac.update(device.as_bytes());
+        mac.update(tail);
+        hex(&mac.finalize().into_bytes())
+    };
+    let mut present = vec![1];
+    present.extend_from_slice(&[6; 32]);
+    let with = keys().member_proof(&device, Some(&WrapKey([6; 32])));
+    let without = keys().member_proof(&device, None);
+    let actual = [with.to_hex(), without.to_hex()];
+    let expected = [
+        "723678f618a4622771c815b2dbcb470f805b2e9d12fad868611edd6b7f9d20d7",
+        "b5a4d9d0fd9e427d39e28a0beadd1b11df4a4f351ef5fc5d105cd5f24a18f193",
+    ];
+    assert_eq!(actual, expected);
+    assert_eq!([by_hand(&present), by_hand(&[0])], expected);
+
+    let recovery = SigningKey::from_bytes(&[4; 32]).verifying_key();
+    let create =
+        CreateLibrary::with_wrap_key(LibraryId([1; 16]), &signer, recovery, WrapKey([6; 32]))
+            .with_member_proof(&keys())
+            .unwrap();
+    assert_eq!(create.member_proof, Some(with));
+    let text = serde_json::to_string(&create).unwrap();
+    assert!(
+        text.ends_with(&format!(r#","member_proof":"{}"}}"#, expected[0])),
+        "{text}"
+    );
+    assert_eq!(
+        serde_json::from_str::<CreateLibrary>(&text).unwrap(),
+        create
+    );
+    let add = AddDevice::new(device).with_member_proof(&keys()).unwrap();
+    assert_eq!(
+        serde_json::to_string(&add).unwrap(),
+        format!(
+            r#"{{"device_key":"{}","member_proof":"{}"}}"#,
+            hex(device.as_bytes()),
+            expected[1]
+        )
+    );
+    let record = DeviceRecord {
+        public_key: device,
+        recovery: false,
+        wrap: create.wrap,
+        member_proof: Some(MemberProof::from_hex(expected[0]).unwrap().into()),
+        removed: false,
+        last_seen: None,
+    };
+    let text = serde_json::to_string(&record).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            r#"{{"public_key":"{}","recovery":false,"wrap_key":"{}","wrap_proof":"{}","member_proof":"{}"}}"#,
+            hex(device.as_bytes()),
+            "06".repeat(32),
+            "924c4bdf5afe54d7c40d93340b62f477cffa57f44f8b9d38c553a6fab65d1ad149804a24060e419a284ebbbd6068907ab4b7224378f8e1367bbd3015ec2dae07",
+            expected[0]
+        )
+    );
+    assert_eq!(serde_json::from_str::<DeviceRecord>(&text).unwrap(), record);
+    assert_eq!(record.check_member_proof(&keys()), MemberCheck::Valid);
+}
+
+#[test]
+fn a_wrap_key_is_the_x25519_public_key_of_its_secret() {
+    let secret = WrapSecret::from_bytes(
+        &<[u8; 32]>::try_from(
+            &hex_bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")[..],
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        secret.wrap_key().to_hex(),
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    );
+}
+
+fn hex_bytes(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
 }

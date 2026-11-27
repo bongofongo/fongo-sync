@@ -153,8 +153,9 @@ async fn stops_at_and_reads_on_from(later: Later) {
     let [mut a, mut b] = pair(&server).await;
     let keys = a.credentials.library().clone();
     let id = keys.id;
-    let writer = generate_signing_key().unwrap();
-    add_device(&server, &b.credentials, &writer.verifying_key(), now)
+    let added = Credentials::for_new_device(keys.clone()).unwrap();
+    let writer = added.device().clone();
+    add_device(&server, &b.credentials, &added.device_offer().unwrap(), now)
         .await
         .unwrap();
     for n in 1..=5 {

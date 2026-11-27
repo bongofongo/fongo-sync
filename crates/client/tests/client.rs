@@ -113,11 +113,11 @@ async fn two_replicas_converge_through_interleaved_edits() {
 async fn three_replicas_converge_one_of_them_added_by_another_device() {
     let server = Server::new();
     let [a, b] = pair(&server).await;
-    let key = generate_signing_key().unwrap();
-    add_device(&server, &a.credentials, &key.verifying_key(), now)
+    let added = Credentials::for_new_device(a.credentials.library().clone()).unwrap();
+    add_device(&server, &a.credentials, &added.device_offer().unwrap(), now)
         .await
         .unwrap();
-    let c = Peer::new(Credentials::new(a.credentials.library().clone(), key, 0)).await;
+    let c = Peer::new(added).await;
     let mut peers = [a, b, c];
 
     for (who, sql) in [
@@ -326,11 +326,12 @@ async fn a_server_that_keeps_leaving_a_device_out_blocks_at_its_envelope_every_t
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;
     let keys = a.credentials.library().clone();
-    let hidden = generate_signing_key().unwrap();
-    let mut c = Peer::new(Credentials::new(keys.clone(), hidden.clone(), 0)).await;
-    add_device(&server, &b.credentials, &hidden.verifying_key(), now)
+    let added = Credentials::for_new_device(keys.clone()).unwrap();
+    let hidden = added.device().clone();
+    add_device(&server, &b.credentials, &added.device_offer().unwrap(), now)
         .await
         .unwrap();
+    let mut c = Peer::new(added).await;
     server.with(|s| s.hidden.push(hidden.verifying_key()));
     b.run("INSERT INTO settings VALUES ('b1', 'x')").await;
     b.sync(&server).await.unwrap();
@@ -1270,11 +1271,11 @@ fn every_future_is_send(
     server: &Server,
     credentials: &Credentials,
 ) {
-    let key = credentials.device().verifying_key();
+    let offer = credentials.device_offer().unwrap();
     assert_send(sync(conn, replica, server, credentials, now));
     assert_send(create_library(server, now));
     assert_send(join_library(server, "", now));
-    assert_send(add_device(server, credentials, &key, now));
+    assert_send(add_device(server, credentials, &offer, now));
 }
 
 /// A sync refuses a database whose capture is suspended, or whose kernel tables are of a later
