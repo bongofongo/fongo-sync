@@ -160,11 +160,13 @@ impl Collection {
     /// are never sent this way: the edit is collected afterwards, as an edit. So an edit to the
     /// set made elsewhere and not yet received still wins, unless it was made in the same
     /// millisecond as that latest write, as is any part of that write still on its way, or it is
-    /// older than that write and wrote a field of the new set that the write did not, which the
-    /// new set hides anyway. Replicas that do this apart agree on one of their values. Sets
+    /// older than that write and wrote a field of the new set that the write did not. Such an
+    /// edit is lost for good: the record replaces it in the merge, so it does not come back when
+    /// the set is later narrowed. Replicas that do this apart agree on one of their values. Sets
     /// removed, narrowed or reordered send nothing; a field that leaves a set shows its own
-    /// latest write again, which the install writes into the rows. A replica with an edit to a field of the
-    /// set that reports conflicts, not yet sent, is told of such a record as a
+    /// latest write that the merge still holds, which the install writes into the rows: it
+    /// writes every row of the collection again, in its one transaction. A replica with an edit
+    /// to a field of the set that reports conflicts, not yet sent, is told of such a record as a
     /// [`crate::Conflict`] whose remote value is the base, and keeps its edit.
     ///
     /// Adding a field to a set changes what the set means. Where a replica still on the old

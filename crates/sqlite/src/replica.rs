@@ -964,7 +964,10 @@ impl Replica {
     /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
     /// layout 3 is upgraded in place. Refuses with [`Error::Suspended`] while capture is
     /// suspended: only [`Replica::resume`] puts the triggers back then, having compared the
-    /// tables with what the kernel last saw of them.
+    /// tables with what the kernel last saw of them. An install whose registry narrows a set of
+    /// fields that change together, or removes one, writes every row of that collection again,
+    /// which for a hundred thousand rows takes seconds with the write lock held (see
+    /// [`Collection::together`]).
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| self.install_in(db, None, None).map(|_| ()))
@@ -974,8 +977,8 @@ impl Replica {
 
     /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
     /// What it adopts of the registry for collections installed before (new fields, sets now
-    /// written together), and every row that brings up to date, is done whole, as `install`
-    /// does it; records an install under another registry left waiting are first adopted whole,
+    /// written together, sets narrowed, whose collections' rows are all written again), and every
+    /// row that brings up to date, is done whole in this first step, as `install` does it; records an install under another registry left waiting are first adopted whole,
     /// under the registry they were recorded with, as by that install. The rows found in the tables of a collection installed for the first time are
     /// recorded, with their values as they stand, and later steps adopt them from the records;
     /// what the application writes to them meanwhile is collected once every record is adopted,

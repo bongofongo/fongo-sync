@@ -1155,9 +1155,9 @@ fn plain_rating() -> Registry {
     .unwrap()
 }
 
-/// A field that leaves a set shows its own latest write again: a row that showed it NULL under
-/// the wider set, because a later write to the set did not carry it, takes its value back on
-/// install, and nothing is sent.
+/// A field that leaves a set shows its own latest write that the merge still holds: a row that
+/// showed it NULL under the wider set, because a later write to the set did not carry it, takes
+/// its value back on install, and nothing is sent.
 #[tokio::test]
 async fn a_field_that_leaves_a_set_shows_its_own_value_again() {
     let mut hub = Vec::new();
@@ -1774,6 +1774,52 @@ async fn widening_again_over_a_foreign_adoption_counter_reuses_no_clock() {
     settle(&mut peers, &mut hub).await;
     none_shared(&mut peers, &hub).await;
     same_everywhere(&mut peers, WIDE_ROWS).await;
+}
+
+const APART: &[&str] =
+    &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT, note TEXT)"];
+
+fn apart(grouped: bool) -> Registry {
+    let books = Collection::minted("books", "books", "id")
+        .field("title")
+        .field("status")
+        .field("note");
+    let books = if grouped {
+        books.together(&["status", "note"])
+    } else {
+        books
+    };
+    Registry::new(vec![books]).unwrap()
+}
+
+/// Grouping fields written apart records the set again just past its latest write, which can be
+/// later than an edit made elsewhere to another of its fields and not yet received. That edit
+/// is lost for good: the merge no longer holds it, so narrowing the set again does not bring it
+/// back.
+#[tokio::test]
+async fn an_older_edit_beaten_by_grouping_fields_stays_lost_after_narrowing() {
+    let rows = "SELECT title || ' ' || status || ' ' || note FROM books";
+    let mut hub = Vec::new();
+    let mut peers = make(2, APART, || apart(false)).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, note) VALUES ('one', 's0', 'n0')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1].run("UPDATE books SET status = 's1'").await;
+    peers[1].push(&mut hub).await;
+    later();
+    peers[0].run("UPDATE books SET note = 'n1'").await;
+    upgrade(&mut peers[0], apart(true)).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], apart(true)).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(same_everywhere(&mut peers, rows).await, ["one s0 n1"]);
+    for peer in peers.iter_mut() {
+        upgrade(peer, apart(false)).await;
+    }
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(same_everywhere(&mut peers, rows).await, ["one s0 n1"]);
 }
 
 const NOTED: &[&str] = &[
