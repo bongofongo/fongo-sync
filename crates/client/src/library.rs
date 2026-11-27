@@ -232,7 +232,10 @@ impl DeviceOffer {
 ///
 /// Fails with [`Error::WrapKeyNotSigned`], sending nothing, unless the offer's wrap key is signed
 /// by its device key for this library. A repeat after a lost response is accepted and changes
-/// nothing; [`Error::RegisteredOtherwise`] says the key is listed with another wrap key or proof.
+/// nothing, and a key the library removed is restored. Because of that, an application told that
+/// the added device was removed must not repeat this call in a loop: on a server that follows
+/// the protocol, the repeat brings the device back. [`Error::RegisteredOtherwise`] says the key
+/// is listed with another wrap key or proof.
 /// A listing without a wrap key or proof is a success, reported in [`Registered`].
 pub async fn add_device<T: Transport>(
     transport: &T,
