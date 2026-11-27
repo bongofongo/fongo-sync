@@ -7,7 +7,7 @@ use fongo_sync_core::model::Schema;
 use fongo_sync_core::source::{Alias, Body, Claim, Entry, Fact, Slot, Source, keep};
 use fongo_sync_core::{Gid, Hlc, Value};
 
-use crate::db::{Db, as_gid, as_text, loaded, stored};
+use crate::db::{Db, as_gid, as_int, as_text, loaded, stored};
 use crate::error::{Error, Result};
 
 /// The kernel's own tables. Layout 4: facts as `source::admit` keeps them, a row image and the
@@ -173,7 +173,7 @@ pub(crate) const SUSPENDED: &str = "suspended";
 pub(crate) enum State {
     /// There are none.
     Absent,
-    /// [`LAYOUT`], and whether capture is suspended.
+    /// [`LAYOUT`], and whether suspending was recorded.
     Current { suspended: bool },
     /// An earlier layout in [`UPGRADES`].
     Older(i64),
@@ -181,10 +181,12 @@ pub(crate) enum State {
     Newer(i64),
     /// An earlier layout this build does not upgrade, or none recorded.
     Unknown(Option<i64>),
+    /// Some of the tables of the layout recorded, or the record itself, are missing.
+    Partial,
 }
 
 impl State {
-    /// Whether capture is suspended, for an operation that needs the tables at [`LAYOUT`].
+    /// Whether suspending was recorded, for an operation that needs the tables at [`LAYOUT`].
     pub(crate) fn current(self) -> Result<bool> {
         match self {
             State::Current { suspended } => Ok(suspended),
@@ -201,53 +203,104 @@ impl State {
                 found,
                 known: LAYOUT,
             }),
+            State::Partial => Err(Error::Corrupt(
+                "some of the kernel's tables are missing; uninstall them".into(),
+            )),
         }
-    }
-
-    /// For an operation that needs the tables at [`LAYOUT`] with capture running.
-    pub(crate) fn ready(self) -> Result<()> {
-        if self.current()? {
-            return Err(Error::Suspended);
-        }
-        Ok(())
     }
 }
 
-/// Reads [`State`] in one statement, an indexed read of `fongo_meta`; only where that table is
-/// missing does it look in the schema to tell that apart from another failure.
-pub(crate) fn state(db: &Db) -> Result<State> {
-    let rows = match db.query(
-        "SELECT key, value FROM fongo_meta WHERE key IN ('layout', 'suspended')",
-        &[],
-    ) {
+/// The tables [`TABLES`] makes.
+pub(crate) fn kernel_tables() -> impl Iterator<Item = &'static str> {
+    TABLES.iter().filter_map(|sql| {
+        sql.strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split([' ', '(']).next())
+    })
+}
+
+/// The table layout 4 added to layout 3.
+const ADDED: &str = "fongo_found";
+
+/// Reads [`State`] in one statement: an indexed read of `fongo_meta` and a count of the kernel's
+/// tables in the schema. With `capture`, the same statement also names each collection ever
+/// adopted whose three capture triggers are not all there, as [`capture`] returns them.
+fn read(db: &Db, capture: bool) -> Result<(State, Vec<String>)> {
+    let names = kernel_tables()
+        .filter(|t| *t != ADDED)
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lost = if capture {
+        "UNION ALL
+         SELECT 'lost', substr(key, 9) FROM fongo_meta
+          WHERE key > 'adopted:' AND key < 'adopted;'
+            AND (SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+                 'fongo_' || substr(key, 9) || '_ai', 'fongo_' || substr(key, 9) || '_au',
+                 'fongo_' || substr(key, 9) || '_ad')) < 3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT key, value FROM fongo_meta WHERE key IN ('layout', '{SUSPENDED}')
+         UNION ALL
+         SELECT 'tables', count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({names})
+         UNION ALL
+         SELECT 'added', count(*) FROM sqlite_master WHERE type = 'table' AND name = '{ADDED}'
+         {lost}"
+    );
+    let rows = match db.query(&sql, &[]) {
         Ok(rows) => rows,
         Err(e) => {
-            let missing = matches!(e, Error::Sqlite { code, .. } if code & 0xff == libsqlite3_sys::SQLITE_ERROR)
-                && db
-                    .query(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
-                        &[],
-                    )?
-                    .is_empty();
-            return if missing { Ok(State::Absent) } else { Err(e) };
+            let found = db.query(
+                &format!(
+                    "SELECT sum(name = 'fongo_meta'), count(*) FROM sqlite_master
+                      WHERE type = 'table' AND name IN ({names}, '{ADDED}')"
+                ),
+                &[],
+            )?;
+            return match found.first().map(|r| (&r[0], &r[1])) {
+                Some((Value::Int(1), _)) => Err(e),
+                Some((_, Value::Int(0))) => Ok((State::Absent, Vec::new())),
+                _ => Ok((State::Partial, Vec::new())),
+            };
         }
     };
-    let mut layout = None;
-    let mut suspended = false;
+    let core = i64::try_from(kernel_tables().filter(|t| *t != ADDED).count()).unwrap_or(0);
+    let (mut layout, mut suspended, mut tables, mut added) = (None, false, 0, 0);
+    let mut lost = Vec::new();
     for r in rows {
         match as_text(&r[0])? {
             "layout" => layout = Some(r[1].clone()),
-            SUSPENDED => suspended = r[1] == Value::Int(1),
+            SUSPENDED => suspended = true,
+            "tables" => tables = as_int(&r[1])?,
+            "added" => added = as_int(&r[1])?,
+            "lost" => lost.push(as_text(&r[1])?.to_string()),
             _ => {}
         }
     }
-    Ok(match layout {
-        Some(Value::Int(LAYOUT)) => State::Current { suspended },
+    let state = match layout {
+        Some(Value::Int(LAYOUT)) if tables == core && added == 1 => State::Current { suspended },
+        Some(Value::Int(LAYOUT)) => State::Partial,
         Some(Value::Int(found)) if found > LAYOUT => State::Newer(found),
-        Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Older(found),
+        Some(Value::Int(found)) if UPGRADES.contains(&found) && tables == core => {
+            State::Older(found)
+        }
+        Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Partial,
         Some(Value::Int(found)) => State::Unknown(Some(found)),
         _ => State::Unknown(None),
-    })
+    };
+    Ok((state, lost))
+}
+
+/// [`State`], read in one statement.
+pub(crate) fn state(db: &Db) -> Result<State> {
+    Ok(read(db, false)?.0)
+}
+
+/// [`State`], and the collections ever adopted whose capture triggers are not all there: dropped
+/// by a suspend, or with their table when an application rebuilt it.
+pub(crate) fn capture(db: &Db) -> Result<(State, Vec<String>)> {
+    read(db, true)
 }
 
 pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {

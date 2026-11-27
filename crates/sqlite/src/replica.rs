@@ -23,7 +23,7 @@ use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
-use crate::store::{Facts, LAYOUT, SUSPENDED, State, TABLES, as_clock, state};
+use crate::store::{Facts, LAYOUT, SUSPENDED, State, TABLES, as_clock, capture, state};
 use crate::tables::{self, NOW, every_row, read_row};
 
 /// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
@@ -836,10 +836,15 @@ impl Replica {
         resuming: Option<Resume>,
         take: Option<usize>,
     ) -> Result<Collected> {
-        // Only a resume of suspended capture compares the tables with the images; any other
-        // install would put the triggers back over rows written meanwhile, unrecorded.
-        let resuming = match state(db)? {
-            State::Current { suspended: true } => Some(resuming.ok_or(Error::Suspended)?),
+        // Only a resume compares the tables whose capture was off with the images; an install
+        // would put the triggers back over rows written meanwhile, unrecorded.
+        let (laid, lost) = capture(db)?;
+        let lost = self.lost(&lost);
+        let resuming = match laid {
+            State::Current { suspended: true } => Some((resuming.ok_or(Error::Suspended)?, None)),
+            State::Current { suspended: false } | State::Older(_) if !lost.is_empty() => {
+                Some((resuming.ok_or(Error::Suspended)?, Some(lost)))
+            }
             State::Current { suspended: false } | State::Absent | State::Older(_) => None,
             other => {
                 other.current()?;
@@ -960,11 +965,11 @@ impl Replica {
             }
         }
         set.extend(self.merge(&mut cx, &foreign, false)?);
-        if let Some(how) = resuming {
+        if let Some((how, only)) = resuming {
             // What was written while suspended is told apart from images, so every found row
             // gets one first.
             cx.collected += self.adopt(&mut cx, None)?;
-            self.resume_in(db, how)?;
+            self.resume_in(db, how, only.as_ref())?;
             db.exec(
                 "DELETE FROM fongo_meta WHERE key = ?1",
                 &[Value::Text(SUSPENDED.into())],
@@ -1185,11 +1190,39 @@ impl Replica {
         .await
     }
 
-    /// Whether capture is suspended: [`Replica::suspend`] has run and [`Replica::resume`] has
-    /// not. Fails as every other call does where the kernel's tables are missing or of another
-    /// layout.
+    /// Whether capture is suspended, as [`Replica::resume`] defines it: a suspend is recorded,
+    /// or a collection that was installed lacks a trigger. Fails as every other call does where
+    /// the kernel's tables are missing or of another layout.
     pub async fn suspended(&self, conn: &mut SqliteConnection) -> Result<bool> {
-        with_db(conn, |db| db.atomically(|db| state(db)?.current())).await
+        with_db(conn, |db| {
+            db.atomically(|db| {
+                let (laid, lost) = capture(db)?;
+                Ok(laid.current()? || !self.lost(&lost).is_empty())
+            })
+        })
+        .await
+    }
+
+    /// The collections of the registry among `names`.
+    fn lost(&self, names: &[String]) -> BTreeSet<usize> {
+        names
+            .iter()
+            .filter_map(|n| self.registry.index(n))
+            .collect()
+    }
+
+    /// Fails unless the kernel's tables are of this build's layout with capture running: not
+    /// suspended, and every collection ever adopted with its triggers in place; or there are
+    /// none, which it returns for the caller to decide.
+    fn ready(&self, db: &Db) -> Result<State> {
+        let (laid, lost) = capture(db)?;
+        if laid == State::Absent {
+            return Ok(laid);
+        }
+        if laid.current()? || !self.lost(&lost).is_empty() {
+            return Err(Error::Suspended);
+        }
+        Ok(laid)
     }
 
     /// Puts the triggers back after [`Replica::suspend`], installing again so that collections
@@ -1203,7 +1236,11 @@ impl Replica {
     /// collect would otherwise lose both writes. It is as long as the rows changed meanwhile are
     /// many; collecting with [`Replica::collect_step`] before suspending leaves it only those.
     ///
-    /// When capture is not suspended, it is [`Replica::install`]: rows written since the last
+    /// Capture is suspended when a suspend is recorded, or when a collection of the registry
+    /// that was installed lacks any of its triggers: a build that recorded no suspension left
+    /// them dropped, or the application rebuilt the collection's table, which drops its
+    /// triggers with it. Without a record, only the tables of those collections are compared.
+    /// When capture is intact, `resume` is [`Replica::install`]: rows written since the last
     /// collect are edits like any other, whichever `how`.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
         with_db(conn, |db| {
@@ -1212,7 +1249,8 @@ impl Replica {
         .await
     }
 
-    fn resume_in(&self, db: &Db, how: Resume) -> Result<()> {
+    /// Compares the tables of the collections in `only`, or of every collection, with the images.
+    fn resume_in(&self, db: &Db, how: Resume, only: Option<&BTreeSet<usize>>) -> Result<()> {
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut session = ev.session(&facts);
@@ -1230,7 +1268,10 @@ impl Replica {
                 ],
             )
         };
-        for c in self.registry.collections() {
+        for (idx, c) in self.registry.collections().iter().enumerate() {
+            if only.is_some_and(|only| !only.contains(&idx)) {
+                continue;
+            }
             let rows: BTreeMap<String, Row> = every_row(db, c)?.into_iter().collect();
             let mapped = db.query(
                 "SELECT key, gid, image, doomed FROM fongo_ids WHERE collection = ?1",
@@ -1325,7 +1366,7 @@ impl Replica {
     pub async fn collect(&self, conn: &mut SqliteConnection) -> Result<usize> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
-                state(db)?.ready()?;
+                self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
                 self.step(&mut cx, &[], BTreeSet::new(), None)?;
                 cx.finish()?;
@@ -1398,7 +1439,7 @@ impl Replica {
     ) -> Result<Collected> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
-                state(db)?.ready()?;
+                self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
                 let more = self.step(&mut cx, &[], BTreeSet::new(), Some(rows))?;
                 cx.finish()?;
@@ -1426,9 +1467,8 @@ impl Replica {
     ) -> Result<usize> {
         with_db(conn, |db| {
             db.atomically(|db| {
-                match state(db)? {
-                    State::Absent => return Ok(0),
-                    other => other.ready()?,
+                if self.ready(db)? == State::Absent {
+                    return Ok(0);
                 }
                 let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
                 let rows = db.query(
@@ -1491,7 +1531,7 @@ impl Replica {
     pub async fn apply(&self, conn: &mut SqliteConnection, changes: &[Change]) -> Result<Applied> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
-                state(db)?.ready()?;
+                self.ready(db)?.current()?;
                 self.apply_in(db, changes)
             })
         })

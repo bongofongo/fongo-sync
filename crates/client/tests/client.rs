@@ -1316,3 +1316,46 @@ async fn a_sync_refuses_a_suspended_or_newer_kernel_before_reaching_the_server()
     assert_eq!(std::fs::read(&path).unwrap(), file);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A sync refuses a database the kernel is not installed in, or whose tables are of layout 3
+/// until an install upgrades them, before it reaches the server or changes the file.
+#[tokio::test]
+async fn a_sync_refuses_a_database_not_installed_or_of_layout_three() {
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let dir = scratch("uninstalled");
+    let path = dir.join("peer.db");
+    let mut peer = Peer::new_at(&path, made).await;
+    peer.run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peer.sync(&server).await.unwrap();
+    for (setup, refusal) in [
+        (
+            &[
+                "DROP TABLE fongo_found",
+                "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+            ][..],
+            "OlderLayout { found: 3, known: 4 }",
+        ),
+        (&[][..], "NotInstalled"),
+    ] {
+        if setup.is_empty() {
+            peer.replica.uninstall(&mut peer.conn).await.unwrap();
+        }
+        for sql in setup {
+            peer.run(sql).await;
+        }
+        let requests = server.with(|s| s.requests.len());
+        let file = std::fs::read(&path).unwrap();
+        let refused = peer.sync(&server).await;
+        match &refused {
+            Err(Error::Database(e)) => assert_eq!(format!("{e:?}"), refusal),
+            other => panic!("{refusal}: {other:?}"),
+        }
+        assert_eq!(server.with(|s| s.requests.len()), requests, "{refusal}");
+        assert_eq!(std::fs::read(&path).unwrap(), file, "{refusal}");
+        peer.replica.install(&mut peer.conn).await.unwrap();
+        peer.sync(&server).await.unwrap();
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

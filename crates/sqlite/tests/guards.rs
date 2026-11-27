@@ -392,16 +392,59 @@ enum Laid {
     Unrecorded,
     /// No kernel tables.
     Absent,
+    /// No kernel tables, but the client's own.
+    ClientOnly,
+    /// Kernel tables without `fongo_meta`.
+    NoMeta,
+    /// Kernel tables without `fongo_dirty`.
+    NoDirty,
+    /// Kernel tables without `fongo_ids`.
+    NoIds,
+    /// Every capture trigger dropped by hand, and no suspension recorded.
+    TriggersLost,
+    /// A suspension recorded with a value no build writes.
+    OddFlag,
+}
+
+/// Drops the kernel's triggers whose names are like `like`.
+async fn drop_triggers(conn: &mut SqliteConnection, like: &str) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE ?1",
+    )
+    .bind(like)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert!(!names.is_empty(), "no trigger like {like}");
+    for name in names {
+        run(conn, &format!("DROP TRIGGER \"{name}\"")).await;
+    }
 }
 
 async fn laid(state: Laid) -> (SqliteConnection, Replica) {
     let world = World::new(7);
-    if let Laid::Absent = state {
-        return (database(&world, 0).await, Replica::new(registry()));
+    if let Laid::Absent | Laid::ClientOnly = state {
+        let mut c = database(&world, 0).await;
+        if let Laid::ClientOnly = state {
+            run(
+                &mut c,
+                "CREATE TABLE fongo_client_state (library BLOB PRIMARY KEY)",
+            )
+            .await;
+        }
+        return (c, Replica::new(registry()));
     }
     let (mut c, replica) = installed(&world).await;
     let sql: &[&str] = match state {
-        Laid::Installed | Laid::Absent => &[],
+        Laid::Installed | Laid::Absent | Laid::ClientOnly => &[],
+        Laid::NoMeta => &["DROP TABLE fongo_meta"],
+        Laid::NoDirty => &["DROP TABLE fongo_dirty"],
+        Laid::NoIds => &["DROP TABLE fongo_ids"],
+        Laid::TriggersLost => {
+            drop_triggers(&mut c, "fongo%").await;
+            &["UPDATE books SET title = 'Romola!' WHERE id = 2"]
+        }
+        Laid::OddFlag => &["INSERT INTO fongo_meta (key, value) VALUES ('suspended', 'x')"],
         Laid::Suspended => {
             replica.suspend(&mut c).await.unwrap();
             &["UPDATE books SET title = 'Romola!' WHERE id = 2"]
@@ -435,13 +478,18 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
             UncollectedRows => ("Ok(1)".into(), true),
             _ => ok(read),
         },
-        Laid::Suspended => match call {
+        Laid::Suspended | Laid::TriggersLost | Laid::OddFlag => match call {
             Install | InstallStep | Collect | CollectStep | Apply | UncollectedRows => {
                 refused("Suspended")
             }
             Installed | Suspended => ("Ok(true)".into(), true),
-            Suspend => ok(true),
+            // Without a record, suspending records one.
+            Suspend => ok(!matches!(state, Laid::TriggersLost)),
             _ => ok(read),
+        },
+        Laid::NoMeta | Laid::NoDirty | Laid::NoIds => match call {
+            Uninstall => ok(false),
+            _ => ("Err(Corrupt(".into(), true),
         },
         Laid::Newer => refused("NewerLayout { found: 5, known: 4 }"),
         Laid::Older => match call {
@@ -456,9 +504,11 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
             Uninstall => ok(false),
             _ => refused("UnknownLayout { found: None, known: 4 }"),
         },
-        Laid::Absent => match call {
+        Laid::Absent | Laid::ClientOnly => match call {
             Install | InstallStep | Resume => ok(false),
-            Suspend | Uninstall => ok(true),
+            Suspend => ok(true),
+            // It removes the client's tables too.
+            Uninstall => ok(matches!(state, Laid::Absent)),
             Installed => ("Ok(false)".into(), true),
             UncollectedRows => ("Ok(0)".into(), true),
             _ => refused("NotInstalled"),
@@ -478,13 +528,23 @@ async fn every_call_in_every_state() {
         Laid::Unknown,
         Laid::Unrecorded,
         Laid::Absent,
+        Laid::ClientOnly,
+        Laid::NoMeta,
+        Laid::NoDirty,
+        Laid::NoIds,
+        Laid::TriggersLost,
+        Laid::OddFlag,
     ] {
         for &c in CALLS {
             let (mut conn, replica) = laid(state).await;
             let before = dump(&mut conn).await;
             let got = call(c, &replica, &mut conn).await;
             let (want, unchanged) = expected(state, c);
-            if got != want {
+            let matched = match want.strip_suffix('(') {
+                Some(prefix) => got.starts_with(prefix),
+                None => got == want,
+            };
+            if !matched {
                 failures.push(format!("{state:?} {c:?}: {got}, not {want}"));
             }
             if unchanged && dump(&mut conn).await != before {
@@ -743,4 +803,168 @@ async fn a_writing_call_takes_the_lock_before_it_reads() {
     }
     let _ = std::fs::remove_dir_all(dir);
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+fn pinned(inspection: &fongo_sync_sqlite::Inspection, field: &str) -> bool {
+    inspection.pinned.iter().any(|(_, _, f)| f == field)
+}
+
+/// Capture dropped without a suspend being recorded, as a build that recorded none left it, at
+/// this layout or at layout 3: an install is refused, and a resume compares the tables as after
+/// a suspend, sending or keeping what was written meanwhile as asked.
+#[tokio::test]
+async fn capture_lost_without_a_record_is_resumed_as_a_suspension() {
+    for layout in [4, 3] {
+        for how in [Resume::Send, Resume::Baseline] {
+            let world = World::new(10);
+            let mut c = database(&world, 0).await;
+            let replica = Replica::new(registry());
+            replica.install(&mut c).await.unwrap();
+            run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+            replica.collect(&mut c).await.unwrap();
+            sent(&replica, &mut c).await;
+            drop_triggers(&mut c, "fongo%").await;
+            run(&mut c, "UPDATE books SET title = 'Romola'").await;
+            if layout == 3 {
+                run(&mut c, "DROP TABLE fongo_found").await;
+                run(
+                    &mut c,
+                    "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+                )
+                .await;
+            }
+            let at = format!("layout {layout}, {how:?}");
+            let before = dump(&mut c).await;
+            let installed = replica.install(&mut c).await;
+            assert!(
+                matches!(installed, Err(Error::Suspended)),
+                "{at}: {installed:?}"
+            );
+            assert_eq!(dump(&mut c).await, before, "{at}");
+            replica.resume(&mut c, how).await.unwrap();
+            assert!(!replica.suspended(&mut c).await.unwrap(), "{at}");
+            replica.collect(&mut c).await.unwrap();
+            let out = sent(&replica, &mut c).await;
+            let inspection = replica.inspect(&mut c).await.unwrap();
+            match how {
+                Resume::Send => assert!(sends(&out, "Romola"), "{at}: {out:?}"),
+                Resume::Baseline => {
+                    assert!(!sends(&out, "Romola"), "{at}: {out:?}");
+                    assert!(pinned(&inspection, "title"), "{at}: {inspection:?}");
+                }
+            }
+            run(&mut c, "UPDATE books SET title = 'Felix Holt'").await;
+            replica.collect(&mut c).await.unwrap();
+            assert!(sends(&sent(&replica, &mut c).await, "Felix Holt"), "{at}");
+        }
+    }
+}
+
+/// One trigger of one collection missing suspends capture; the resume compares that
+/// collection's table alone, so an edit to another collection, captured and not yet collected,
+/// stays an edit to send even when the resume keeps what it finds as a baseline.
+#[tokio::test]
+async fn capture_lost_for_one_collection_is_resumed_for_it_alone() {
+    let world = World::new(11);
+    let mut c = database(&world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+    run(
+        &mut c,
+        "INSERT INTO notes (book_id, body) VALUES (1, 'slow')",
+    )
+    .await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    run(&mut c, "UPDATE notes SET body = 'quick'").await;
+    drop_triggers(&mut c, "fongo_books_au").await;
+    run(&mut c, "UPDATE books SET title = 'Romola'").await;
+    assert!(replica.suspended(&mut c).await.unwrap());
+    for refused in [
+        replica.install(&mut c).await.map(drop),
+        replica.collect(&mut c).await.map(drop),
+        replica.apply(&mut c, &[]).await.map(drop),
+    ] {
+        assert!(matches!(refused, Err(Error::Suspended)), "{refused:?}");
+    }
+    replica.resume(&mut c, Resume::Baseline).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    let out = sent(&replica, &mut c).await;
+    let inspection = replica.inspect(&mut c).await.unwrap();
+    assert!(!sends(&out, "Romola"), "{out:?}");
+    assert!(pinned(&inspection, "title"), "{inspection:?}");
+    assert!(!pinned(&inspection, "body"), "{inspection:?}");
+    assert!(
+        out.iter()
+            .any(|ch| ch.field == "body" && ch.value == Value::Text("quick".into())),
+        "{out:?}"
+    );
+}
+
+/// An application that rebuilds a synced table without suspending, as SQLite's way of changing
+/// a table does, drops its triggers with it: an install is refused, and a resume sends what the
+/// rebuild changed.
+#[tokio::test]
+async fn a_table_rebuilt_without_a_suspend_is_resumed() {
+    let world = World::new(12);
+    let mut c = database(&world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    for sql in [
+        "PRAGMA foreign_keys = OFF",
+        "CREATE TABLE books_new (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE, year INTEGER)",
+        "INSERT INTO books_new (id, title, isbn) SELECT id, upper(title), isbn FROM books",
+        "DROP TABLE books",
+        "ALTER TABLE books_new RENAME TO books",
+        "PRAGMA foreign_keys = ON",
+    ] {
+        run(&mut c, sql).await;
+    }
+    let installed = replica.install(&mut c).await;
+    assert!(matches!(installed, Err(Error::Suspended)), "{installed:?}");
+    replica.resume(&mut c, Resume::Send).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    assert!(sends(&sent(&replica, &mut c).await, "MIDDLEMARCH"));
+}
+
+/// Capture is intact where it was never laid: a first install in steps part of the way through,
+/// and a collection the registry gains or loses.
+#[tokio::test]
+async fn capture_never_laid_is_not_taken_for_lost() {
+    let world = World::new(13);
+    let mut c = database(&world, 0).await;
+    run(
+        &mut c,
+        "INSERT INTO books (title) VALUES ('Middlemarch'), ('Romola')",
+    )
+    .await;
+    run(
+        &mut c,
+        "INSERT INTO notes (book_id, body) VALUES (1, 'slow'), (2, 'quick')",
+    )
+    .await;
+    let books = Replica::new(
+        Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .field("isbn")
+                .identity(&["isbn"]),
+        ])
+        .unwrap(),
+    );
+    assert!(books.install_step(&mut c, 1).await.unwrap().more);
+    assert!(!books.suspended(&mut c).await.unwrap());
+    while books.collect_step(&mut c, 1).await.unwrap().more {}
+    books.install(&mut c).await.unwrap();
+    let both = Replica::new(registry());
+    assert!(!both.suspended(&mut c).await.unwrap());
+    both.install(&mut c).await.unwrap();
+    both.collect(&mut c).await.unwrap();
+    books.install(&mut c).await.unwrap();
+    assert!(!books.suspended(&mut c).await.unwrap());
+    books.collect(&mut c).await.unwrap();
 }

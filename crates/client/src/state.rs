@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use fongo_sync_protocol::LibraryId;
-use sqlx::{Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::error::Error;
 
@@ -157,8 +157,19 @@ pub(crate) async fn clear_sending(
 /// knows it wrote; 0 before the first sync, and where the kernel is not installed. Fails, as the
 /// kernel's own calls do, where its tables are of a layout other than the one this build uses.
 pub async fn cursor(conn: &mut SqliteConnection, library: LibraryId) -> Result<u64, Error> {
+    // One transaction, so the checks and the read see one state of the database.
+    let mut tx = conn.begin().await?;
+    let cursor = read_cursor(&mut tx, library).await;
+    tx.rollback().await?;
+    u64::try_from(cursor?.unwrap_or(0)).map_err(|_| corrupt("the cursor is negative"))
+}
+
+async fn read_cursor(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<Option<i64>, Error> {
     if !fongo_sync_sqlite::installed(conn).await? {
-        return Ok(0);
+        return Ok(None);
     }
     let exists = sqlx::query(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_client_state'",
@@ -167,12 +178,12 @@ pub async fn cursor(conn: &mut SqliteConnection, library: LibraryId) -> Result<u
     .await?
     .is_some();
     if !exists {
-        return Ok(0);
+        return Ok(None);
     }
-    let cursor: Option<i64> =
+    Ok(
         sqlx::query_scalar("SELECT cursor FROM fongo_client_state WHERE library = ?")
             .bind(&library.0[..])
             .fetch_optional(&mut *conn)
-            .await?;
-    u64::try_from(cursor.unwrap_or(0)).map_err(|_| corrupt("the cursor is negative"))
+            .await?,
+    )
 }
