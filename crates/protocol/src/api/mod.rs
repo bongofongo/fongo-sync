@@ -148,12 +148,15 @@
 //! On a build that settles clock ties by value, a winner is a function of the set of changes and is
 //! one of its values, the same on every replica, with no condition on clocks: of two changes to one
 //! field at one clock, which a database restored from a backup or a copy of a database can write,
-//! the greater value wins. That holds also on a replica that kept the changes for a collection its
-//! registry lacked and declared it later: it keeps one value for each field and clock, the greater,
-//! which is exact for a field merged by clock or by greatest value. A file field is such a field, a
-//! plain field that is never a key field of a natural collection, so it is not one of the two cases
-//! where such a replica keeps too few values (aliases, and key fields of natural collections). So a
-//! replica never keeps a value that the retiring device's winner replaced.
+//! the greater value wins. That holds also on a replica that kept the changes its registry did not
+//! declare, as a device that retires must (see its obligations): for a collection its registry
+//! lacked, it keeps one value for each field and clock, the greater, which is exact for a field
+//! merged by clock or by greatest value, also once it declares the collection later; for a field
+//! its registry lacked, of a collection it declares, it keeps at least the value that wins by
+//! clock, which is the field's winner wherever the field names files. A file field is such a field,
+//! a plain field that is never a key field of a natural collection, so it is not one of the two
+//! cases where such a replica keeps too few values (aliases, and key fields of natural
+//! collections). So a replica never keeps a value that the retiring device's winner replaced.
 //!
 //! The guarantee below holds under these conditions:
 //!
@@ -174,8 +177,10 @@
 //!   database or a backup restored while the database it was taken from went on, are one device to
 //!   the server; see the limits.
 //! - a device's state holds only its own changes and the changes of envelopes in the log, each
-//!   envelope applied whole. A device that takes changes from outside the log, or applies only part
-//!   of an envelope, can retire a file that the log refers to.
+//!   envelope applied whole, its changes to fields and collections the device's version does not
+//!   declare included, as far as the obligations below ask them to be kept. A device that takes
+//!   changes from outside the log, or applies only part of an envelope, can retire a file that the
+//!   log refers to.
 //! - the server holds to what a device relies on it for (see [the crate
 //!   documentation](crate#what-a-device-relies-on-the-server-for)).
 //!
@@ -194,16 +199,21 @@
 //!   server states it, since a claiming append with more ids is refused as malformed.
 //! - retires a file ([`RetireBlobs`]) with `through` only from a state that is exactly the changes
 //!   through `through`: it has merged every envelope through `through` and nothing beyond it, holds
-//!   nothing unsent but values it keeps as its own, and has no envelope of its own in the log past
-//!   the last envelope it has pulled. In that state it finds that the changes through `through` do
-//!   not refer to the file and that no row it holds back and no value it keeps as its own names it.
-//!   The request may be sent later, since it states a fact about a fixed set of changes.
+//!   nothing unsent but values it keeps as its own, has no envelope of its own in the log past the
+//!   last envelope it has pulled, and keeps what it merged of fields and collections its version
+//!   does not declare, as below. In that state it finds that the changes through `through` do not
+//!   refer to the file and that no row it holds back and no value it keeps as its own names it. The
+//!   request may be sent later, since it states a fact about a fixed set of changes.
 //! - never retires once it has skipped an envelope, that is, refused it (as damaged, forged or
 //!   signed by a key it does not accept) or stepped past it without merging it, for whatever
 //!   reason: its state is then not the changes through any position, whatever `through` it would
 //!   name. A device that cannot tell whether it skipped one counts as having skipped. It may retire
-//!   again only once it joins again with a fresh state built by merging the log from its start,
-//!   discarding the state that skipped.
+//!   again only with a state that has merged every envelope of the log, which it can build only by
+//!   merging the log from its start: under a new device key, or under its old key once the state
+//!   that skipped and every change it had not sent are discarded, since a fresh database on a key
+//!   that an older database still uses is two databases on one key, against the conditions. Where
+//!   some envelope can be merged by no device, such as one that is damaged or forged, no device
+//!   retires again.
 //! - reports [`Settled`] `seq` only when it has dealt with every envelope through `seq`, by merging
 //!   it or by skipping it and recording that it did, and has nothing unsent; for this, a value it
 //!   keeps as its own counts as sent once the file it names, if any, is claimed as follows. Before
@@ -219,8 +229,12 @@
 //!   files with its claim. When it judges what a set of changes refers to, it counts every field
 //!   its version marks as naming files, and, since a later version may declare a field its own does
 //!   not know, it counts as referring to a file every value it holds, in a field or a collection
-//!   its version does not declare, that has the form of a reference to that file. A version from
-//!   before files existed claims, settles and retires nothing; the limits say what that costs.
+//!   its version does not declare, that has the form of a reference to that file. It retires only
+//!   if its state keeps, for every field and collection of every change it merged, declared by its
+//!   version or not, at least the value that wins by clock, so that it can judge what the changes
+//!   refer to; a device that drops the changes or the winning values of fields or collections its
+//!   version does not declare never retires. A version from before files existed claims, settles
+//!   and retires nothing; the limits say what that costs.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -283,11 +297,12 @@
 //!
 //! Rows held back. Take a device that counts, and its first report at or above t. A file named by a
 //! row it held back when it claimed before that report was claimed then, at a head at or past the
-//! report and so at or above t, which voids the retirement. None begins to be held back between
-//! that claim and the report, since the device merges nothing in between. A row it began to hold
-//! back after the report shows the row as it was in the device's state at the moment holding began,
-//! a state after that report and so at or past t, which, for a device that never skipped an
-//! envelope, refers to the file only through a change of the kind above.
+//! report and so at or above t, which voids the retirement. A row it began to hold back between
+//! that claim and the report shows the row as it was in a state at or past the report's `seq`,
+//! which is at or above t, so the next case covers it. A row it began to hold back after the report
+//! shows the row as it was in the device's state at the moment holding began, a state after that
+//! report and so at or past t, which, for a device that never skipped an envelope, refers to the
+//! file only through a change of the kind above.
 //!
 //! Values kept as its own. Such a value is unsent until the device sends it. One the device kept
 //! before its first report at or above t was claimed before that report, which voids the retirement
@@ -332,11 +347,13 @@
 //!   device does not settle, and no retirement through a position above its last report can take
 //!   effect. The same holds for a device whose row held back or value kept as its own names a file
 //!   the server has no record for. Deletion stays safe but stops: it goes on only through
-//!   retirements already pending at or below that device's last report, whose deletions free
-//!   records and so can let its claim succeed, or once the device is removed, with the limit on
-//!   removing a device.
-//! - if every device has skipped an envelope, none retires, and nothing is deleted until one joins
-//!   again with a fresh state.
+//!   retirements judged at or below that device's last report, whenever they are sent, whose
+//!   deletions free records and so can let its claim succeed, or once the device is removed, with
+//!   the limit on removing a device.
+//! - if every device has skipped an envelope, none retires, and nothing is deleted until one has a
+//!   state that has merged every envelope, built as the obligations say. Where some envelope can be
+//!   merged by no device, such as one that is damaged or forged, no device ever retires again and
+//!   nothing more is deleted in that library.
 //! - removing a device gives up the guarantee for the files named by envelopes it appended without
 //!   their claims and had not yet claimed, because it had read [`Capabilities::blobs`] as false and
 //!   sent an envelope plainly after the server began to offer it, or because its claiming append
