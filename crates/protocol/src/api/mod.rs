@@ -270,7 +270,8 @@ pub use notify::{CLOSE_DEVICE_REMOVED, CLOSE_SUPERSEDED, NOTIFICATION_FORMAT, No
 pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
-use crate::keys::{DeviceId, LibraryId, WrapKey};
+use crate::keys::{DeviceId, LibraryId, LibraryKeys, WrapKey};
+use crate::member::{MemberCheck, MemberProof};
 use crate::wire::{DecodeError, Reader, put_blob, put_varint};
 
 /// `GET`: [`Capabilities`].
@@ -398,6 +399,9 @@ fn is_false(value: &bool) -> bool {
 
 /// Registers a library with its first device and its recovery key. The server must refuse an id
 /// already taken and a `proof` that does not verify.
+///
+/// A device that repeats a create whose answer it lost is refused the id; it learns that its
+/// first create took effect by reading the device list with its own key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawCreateLibrary")]
 pub struct CreateLibrary {
@@ -414,6 +418,11 @@ pub struct CreateLibrary {
     /// The first device's wrap key, stored and returned in its [`DeviceRecord`].
     #[serde(flatten)]
     pub wrap: Option<SignedWrapKey>,
+    /// The device's [`MemberProof`] over its key and the wrap key this message carries, made by
+    /// [`CreateLibrary::with_member_proof`]. The server stores it and returns it unchanged in the
+    /// device's [`DeviceRecord`], and cannot check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_proof: Option<MemberProof>,
     /// An opaque token for the server's own policy. Nothing signs it: whoever holds it may
     /// present it, as with [`Entitlement`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -433,6 +442,7 @@ impl CreateLibrary {
             recovery_key,
             proof: device.sign(&proof_message(library, &device_key, &recovery_key)),
             wrap: None,
+            member_proof: None,
             entitlement: None,
         }
     }
@@ -447,6 +457,15 @@ impl CreateLibrary {
         CreateLibrary {
             wrap: Some(SignedWrapKey::new(library, device, wrap_key)),
             ..CreateLibrary::new(library, device, recovery_key)
+        }
+    }
+
+    /// The same request with the [`MemberProof`] `keys` make for its device key and wrap key.
+    /// `keys` are the library's, whose id is `library`.
+    pub fn with_member_proof(self, keys: &LibraryKeys) -> CreateLibrary {
+        CreateLibrary {
+            member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
+            ..self
         }
     }
 
@@ -525,7 +544,8 @@ fn wrap_message(library: LibraryId, device: &VerifyingKey, wrap_key: &WrapKey) -
 /// Adds a device. Signed, through [`RequestAuth`](crate::RequestAuth), by a device already in the
 /// library or by its recovery key.
 ///
-/// A key already listed and not removed is accepted and changes nothing; a removed one is
+/// A key already listed and not removed is accepted and changes nothing, its stored wrap key and
+/// membership proof included, so a device can repeat an add whose answer it lost; a removed one is
 /// restored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawAddDevice")]
@@ -536,6 +556,11 @@ pub struct AddDevice {
     /// [`DeviceRecord`].
     #[serde(flatten)]
     pub wrap: Option<SignedWrapKey>,
+    /// The device's [`MemberProof`] over its key and the wrap key this message carries, made by
+    /// [`AddDevice::with_member_proof`]. The server stores it and returns it unchanged in the
+    /// device's [`DeviceRecord`], and cannot check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_proof: Option<MemberProof>,
 }
 
 impl AddDevice {
@@ -543,6 +568,7 @@ impl AddDevice {
         AddDevice {
             device_key,
             wrap: None,
+            member_proof: None,
         }
     }
 
@@ -552,6 +578,16 @@ impl AddDevice {
         AddDevice {
             device_key: device.verifying_key(),
             wrap: Some(SignedWrapKey::new(library, device, wrap_key)),
+            member_proof: None,
+        }
+    }
+
+    /// The same request with the [`MemberProof`] the library's `keys` make for its device key
+    /// and wrap key.
+    pub fn with_member_proof(self, keys: &LibraryKeys) -> AddDevice {
+        AddDevice {
+            member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
+            ..self
         }
     }
 
@@ -574,6 +610,10 @@ pub struct DeviceRecord {
     /// The wrap key the device registered, if any.
     #[serde(flatten)]
     pub wrap: Option<SignedWrapKey>,
+    /// The [`MemberProof`] the device registered, if any, as the server received it; see
+    /// [`DeviceRecord::check_member_proof`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_proof: Option<MemberProof>,
     /// Removed through [`REMOVE_DEVICE_PATH`]: the server refuses its requests, and it no longer
     /// holds back the deletion of retired blobs.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -591,6 +631,31 @@ impl DeviceRecord {
             .as_ref()
             .is_some_and(|wrap| wrap.verify(library, &self.public_key))
     }
+
+    /// Checks the record's [`MemberProof`] against the library's `keys`, for the record's key
+    /// and its wrap key as listed, whether or not that wrap key's own proof verifies; a caller
+    /// sealing to the wrap key also checks [`DeviceRecord::verify_wrap`].
+    pub fn check_member_proof(&self, keys: &LibraryKeys) -> MemberCheck {
+        match &self.member_proof {
+            None => MemberCheck::Absent,
+            Some(proof) => {
+                let wrap = self.wrap.as_ref().map(|wrap| &wrap.wrap_key);
+                if keys.verify_member_proof(&self.public_key, wrap, proof) {
+                    MemberCheck::Valid
+                } else {
+                    MemberCheck::Invalid
+                }
+            }
+        }
+    }
+}
+
+fn member_proof(
+    keys: &LibraryKeys,
+    device: &VerifyingKey,
+    wrap: Option<&SignedWrapKey>,
+) -> MemberProof {
+    keys.member_proof(device, wrap.map(|wrap| &wrap.wrap_key))
 }
 
 #[derive(Deserialize)]
@@ -607,6 +672,8 @@ struct RawCreateLibrary {
     #[serde(default)]
     wrap_proof: Option<ProofHex>,
     #[serde(default)]
+    member_proof: Option<MemberProof>,
+    #[serde(default)]
     entitlement: Option<String>,
 }
 
@@ -618,6 +685,8 @@ struct RawAddDevice {
     wrap_key: Option<WrapKey>,
     #[serde(default)]
     wrap_proof: Option<ProofHex>,
+    #[serde(default)]
+    member_proof: Option<MemberProof>,
 }
 
 #[derive(Deserialize)]
@@ -629,6 +698,8 @@ struct RawDeviceRecord {
     wrap_key: Option<WrapKey>,
     #[serde(default)]
     wrap_proof: Option<ProofHex>,
+    #[serde(default)]
+    member_proof: Option<MemberProof>,
     #[serde(default)]
     removed: Option<bool>,
     #[serde(default)]
@@ -668,6 +739,7 @@ impl TryFrom<RawCreateLibrary> for CreateLibrary {
             recovery_key: raw.recovery_key,
             proof: raw.proof,
             wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+            member_proof: raw.member_proof,
             entitlement: raw.entitlement,
         })
     }
@@ -680,6 +752,7 @@ impl TryFrom<RawAddDevice> for AddDevice {
         Ok(AddDevice {
             device_key: raw.device_key,
             wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+            member_proof: raw.member_proof,
         })
     }
 }
@@ -692,6 +765,7 @@ impl TryFrom<RawDeviceRecord> for DeviceRecord {
             public_key: raw.public_key,
             recovery: raw.recovery,
             wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+            member_proof: raw.member_proof,
             removed: raw.removed.unwrap_or(false),
             last_seen: raw.last_seen,
         })
@@ -862,6 +936,7 @@ mod tests {
             public_key: device.verifying_key(),
             recovery: false,
             wrap: add.wrap,
+            member_proof: None,
             removed: false,
             last_seen: None,
         };
@@ -871,6 +946,55 @@ mod tests {
             ..record
         };
         assert!(!impostor.verify_wrap(library));
+    }
+
+    #[test]
+    fn a_record_shows_whether_its_member_proof_checks() {
+        let keys = LibraryKeys::new(LibraryId([3; 16]), [7; 32]);
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let add =
+            AddDevice::with_wrap_key(keys.id, &device, WrapKey([5; 32])).with_member_proof(&keys);
+        let record = DeviceRecord {
+            public_key: device.verifying_key(),
+            recovery: false,
+            wrap: add.wrap,
+            member_proof: add.member_proof,
+            removed: false,
+            last_seen: None,
+        };
+        assert_eq!(record.check_member_proof(&keys), MemberCheck::Valid);
+        let wrong_secret = LibraryKeys::new(keys.id, [8; 32]);
+        assert_eq!(
+            record.check_member_proof(&wrong_secret),
+            MemberCheck::Invalid
+        );
+
+        let mut tampered = record.clone();
+        tampered.wrap.as_mut().unwrap().wrap_key = WrapKey([6; 32]);
+        assert_eq!(tampered.check_member_proof(&keys), MemberCheck::Invalid);
+        let mut dropped = record.clone();
+        dropped.wrap = None;
+        assert_eq!(dropped.check_member_proof(&keys), MemberCheck::Invalid);
+        let moved = DeviceRecord {
+            public_key: SigningKey::from_bytes(&[2; 32]).verifying_key(),
+            ..record.clone()
+        };
+        assert_eq!(moved.check_member_proof(&keys), MemberCheck::Invalid);
+        let bare = DeviceRecord {
+            member_proof: None,
+            ..record.clone()
+        };
+        assert_eq!(bare.check_member_proof(&keys), MemberCheck::Absent);
+
+        let other = SigningKey::from_bytes(&[2; 32]);
+        let other_add =
+            AddDevice::with_wrap_key(keys.id, &other, WrapKey([5; 32])).with_member_proof(&keys);
+        let elsewhere = LibraryKeys::new(LibraryId([4; 16]), [7; 32]);
+        let elsewhere_add = AddDevice::with_wrap_key(elsewhere.id, &device, WrapKey([5; 32]))
+            .with_member_proof(&elsewhere);
+        assert_ne!(other_add.member_proof, add.member_proof);
+        assert_ne!(elsewhere_add.member_proof, add.member_proof);
+        assert!(add.member_proof.is_some() && add.verify_wrap(keys.id));
     }
 
     #[test]
@@ -959,6 +1083,7 @@ mod tests {
             public_key: key,
             recovery: false,
             wrap: Some(wrap),
+            member_proof: None,
             removed: true,
             last_seen: Some(1_700_000_000),
         };
@@ -1016,6 +1141,7 @@ mod tests {
             public_key: SigningKey::from_bytes(&[seed; 32]).verifying_key(),
             recovery,
             wrap: None,
+            member_proof: None,
             removed: false,
             last_seen: None,
         };

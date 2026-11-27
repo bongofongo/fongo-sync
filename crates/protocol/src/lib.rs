@@ -64,6 +64,27 @@
 //!   remaining devices, which is future work; a device may register a [`WrapKey`] for it now,
 //!   which nothing in this version uses. Each wrap key is signed by its device's key, but the
 //!   device list as a whole is still taken from the server, which can add or leave out a key.
+//!   A device may also register a [`MemberProof`], which shows that whoever registered it held
+//!   the library secret then; see [Membership proofs](#membership-proofs).
+//!
+//! # Membership proofs
+//!
+//! [`api::CreateLibrary`] and [`api::AddDevice`] may carry a `member_proof`: an HMAC-SHA256, under
+//! a key only holders of the library secret can derive, over the device's public key and its wrap
+//! key ([`LibraryKeys::member_proof`] gives the exact bytes). A server stores it and returns it
+//! unchanged in the device's [`api::DeviceRecord`]; it cannot check it, since it lacks the secret,
+//! and a build that knows nothing of it ignores it. A device that is to seal a new secret to the
+//! others can then seal only to records whose proof checks
+//! ([`api::DeviceRecord::check_member_proof`]), so that a server that lists a key of its own is
+//! not handed the secret.
+//!
+//! What a valid proof gives: whoever registered that key and wrap key held the secret at the
+//! time. What it does not give: that the device still holds the secret or is still wanted, that
+//! it holds the private halves of the keys named (the wrap key's own signature shows that of the
+//! device key), or anything against a holder of the secret, who can make a proof for any key. A
+//! server can drop a proof, so that a device that registered one shows none; it cannot make one,
+//! or move one to another key or wrap key. Absent and invalid proofs are told apart, so that
+//! devices registered before proofs existed can be treated otherwise than forged ones.
 //! - Every key epoch's key derives from the one library secret, so a new epoch does not exclude
 //!   anyone who held the secret. The protocol sets no server-side rules for epochs: a server
 //!   neither checks nor orders them.
@@ -76,6 +97,7 @@ mod envelope;
 mod file;
 mod hex;
 mod keys;
+mod member;
 mod recovery;
 mod request;
 mod wire;
@@ -87,9 +109,10 @@ pub use file::{
     BlobId, ContentHash, FILE_CHUNK_LEN, FILE_REF_FORMAT, FileError, FileHasher, FileLayout,
     FileOpener, FileRef, FileSealer, SEALED_CHUNK_LEN, SealedChunk, padme,
 };
-pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey};
+pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey, WrapSecret};
 #[cfg(feature = "rand")]
 pub use keys::{generate_signing_key, random_nonce, random_request_nonce};
+pub use member::{MemberCheck, MemberProof};
 pub use recovery::RecoveryError;
 pub use request::{
     HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestAuth, RequestError,

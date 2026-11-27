@@ -12,6 +12,7 @@ rand = ["dep:getrandom"]
 
 [dependencies]
 chacha20poly1305.workspace = true
+curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 fongo-sync-core.workspace = true
 getrandom = { workspace = true, optional = true }

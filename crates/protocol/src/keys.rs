@@ -1,9 +1,10 @@
 use std::fmt;
 
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const BATCH_KEY_INFO: &[u8] = b"fongo-sync/v1/batch-key";
 const RECOVERY_KEY_INFO: &[u8] = b"fongo-sync/v1/recovery-key";
@@ -102,6 +103,42 @@ impl<'de> serde::Deserialize<'de> for WrapKey {
     }
 }
 
+/// The private half of a [`WrapKey`]: an X25519 secret key (RFC 7748), kept with the device's
+/// other secrets.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct WrapSecret([u8; 32]);
+
+impl WrapSecret {
+    pub fn from_bytes(bytes: [u8; 32]) -> WrapSecret {
+        WrapSecret(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// The public key: X25519 of these bytes, clamped, and the base point.
+    pub fn wrap_key(&self) -> WrapKey {
+        WrapKey(MontgomeryPoint::mul_base_clamped(self.0).to_bytes())
+    }
+
+    /// A new wrap secret from the operating system's randomness.
+    #[cfg(feature = "rand")]
+    pub fn generate() -> Result<WrapSecret, getrandom::Error> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)?;
+        let secret = WrapSecret(bytes);
+        bytes.zeroize();
+        Ok(secret)
+    }
+}
+
+impl fmt::Debug for WrapSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WrapSecret({:?})", self.wrap_key())
+    }
+}
+
 /// Everything a device needs to read and write a library's batches: its id and its 32-byte secret.
 /// The secret never leaves the library's devices.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -158,6 +195,11 @@ impl LibraryKeys {
     /// secret as input keying material and info `fongo-sync/v1/file-key-root`.
     pub fn file_key_root(&self) -> FileKeyRoot {
         FileKeyRoot::from_bytes(self.expand(FILE_KEY_ROOT_INFO))
+    }
+
+    /// The key of [`LibraryKeys::member_proof`].
+    pub(crate) fn member_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.expand(crate::member::MEMBER_KEY_INFO))
     }
 
     fn expand(&self, info: &[u8]) -> [u8; 32] {

@@ -257,6 +257,7 @@ impl Server {
                     public_key: key,
                     recovery: false,
                     wrap: None,
+                    member_proof: None,
                     removed: false,
                     last_seen: None,
                 })
@@ -401,6 +402,7 @@ impl State {
                         public_key: create.device_key,
                         recovery: false,
                         wrap: None,
+                        member_proof: None,
                         removed: false,
                         last_seen: None,
                     },
@@ -408,6 +410,7 @@ impl State {
                         public_key: create.recovery_key,
                         recovery: true,
                         wrap: None,
+                        member_proof: None,
                         removed: false,
                         last_seen: None,
                     },
@@ -440,6 +443,7 @@ impl State {
                     public_key: add.device_key,
                     recovery: false,
                     wrap: None,
+                    member_proof: None,
                     removed: false,
                     last_seen: None,
                 };

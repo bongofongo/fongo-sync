@@ -129,6 +129,7 @@ mod tests {
             public_key: key,
             recovery: false,
             wrap: None,
+            member_proof: None,
             removed: false,
             last_seen: Some(1),
         };
