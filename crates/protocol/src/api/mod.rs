@@ -54,12 +54,14 @@
 //! any other wrong length is [`ErrorCode::MalformedRequest`].
 //!
 //! A server may bound how many blob records a library has: one for each id it holds a claim, an
-//! upload or a complete blob for. For blobs it answers [`ErrorCode::LibraryFull`] only to a
-//! request that needs a record for an id that has none (a begin, `whole`, a claim at
-//! [`BLOBS_CLAIM_PATH`] or a [`ClaimingAppend`]) while the library has as many as it allows. A
-//! claiming append so refused appends nothing. A server drops idle records of ids it holds no
-//! complete blob for, whether or not devices have settled, so the refusal does not last for
-//! ever. This version has no capability that states the bound.
+//! upload or a complete blob for. For blobs it answers [`ErrorCode::LibraryFull`] only to a request
+//! that needs a record for an id that has none (a begin, `whole`, a claim at [`BLOBS_CLAIM_PATH`]
+//! or a [`ClaimingAppend`]) while the library has as many as it allows. A claiming append so
+//! refused appends nothing. A server drops idle records of ids it holds no complete blob for,
+//! whether or not devices have settled, so a refusal caused by such records passes. One caused by
+//! records of complete blobs lasts until deletions free records, which a device the refusal keeps
+//! from settling can hold back for good; see the limits under [Deleting
+//! files](self#deleting-files). This version has no capability that states the bound.
 //!
 //! # Entitlement and allowance
 //!
@@ -160,22 +162,14 @@
 //!   as one node. A build that keeps whichever of two such changes arrived first can keep a value
 //!   that the retiring device's winner replaced.
 //! - every device that sends file references sends their claims as described below.
-//! - whether a field names files is a property of the field across every version of the
-//!   application, not of one version's description of its data. A field that names files in any
-//!   version names files in every version that can still send a change to it, whether or not that
-//!   version writes it, and in every version that retires: such a version sends each change to the
-//!   field with its claim, and counts the field when it judges what a set of changes refers to,
-//!   even if its own description of its data no longer lists the field. A version that cannot do
-//!   so, such as one written before the field was marked, does not send a change to the field and
-//!   does not retire, since it would judge what a set of changes refers to without the field. Such
-//!   a field is merged by clock in every version, is never a key field of a natural collection, and
-//!   once marked is never unmarked: the definition and the treatment of rewritten key fields
-//!   differ, and a device that does not count a field as naming files can send a reference in it
-//!   without its claim or retire what it names. A registry must not mark a key field. So an
-//!   application marks a field as naming files from the first version that writes it, or, when it
-//!   marks a field that already exists, only once no device that can still append runs a version
-//!   from before the marking; how it ensures that is its own concern, and a removed device cannot
-//!   append.
+//! - a field names files from the first version of the application that declares it, or never: a
+//!   field that any version has declared without marking it is never marked later, and a marked
+//!   field is never unmarked; an application that needs a field of the other kind adds a new field.
+//!   Marking a field that already exists would leave references in the log that were sent with no
+//!   claim, which no later claim or retirement accounts for. A field that names files is merged by
+//!   clock in every version that declares it and is never a key field of a natural collection: the
+//!   definition and the treatment of rewritten key fields differ. A registry must not mark a key
+//!   field.
 //! - each device key is used by one database. Two databases on one key, such as a copy of a
 //!   database or a backup restored while the database it was taken from went on, are one device to
 //!   the server; see the limits.
@@ -195,16 +189,21 @@
 //!   number in the same step as the append. An envelope it appends at [`BATCHES_PATH`] instead,
 //!   because [`Capabilities::blobs`] was false when it sent it or because the claiming append was
 //!   refused with [`ErrorCode::LibraryFull`], has its ids claimed at [`BLOBS_CLAIM_PATH`], by a
-//!   claim that succeeds, before the device next reports [`Settled`].
+//!   claim that succeeds, before the device next reports [`Settled`]. It cuts its envelopes so that
+//!   none sets references to more distinct files than [`Capabilities::max_query_ids`], where the
+//!   server states it, since a claiming append with more ids is refused as malformed.
 //! - retires a file ([`RetireBlobs`]) with `through` only from a state that is exactly the changes
 //!   through `through`: it has merged every envelope through `through` and nothing beyond it, holds
 //!   nothing unsent but values it keeps as its own, and has no envelope of its own in the log past
 //!   the last envelope it has pulled. In that state it finds that the changes through `through` do
 //!   not refer to the file and that no row it holds back and no value it keeps as its own names it.
 //!   The request may be sent later, since it states a fact about a fixed set of changes.
-//! - never retires once it has skipped an envelope, because the envelope was damaged, forged or
-//!   given up: its state is then not the changes through any position, whatever `through` it would
-//!   name. A device that cannot tell whether it skipped one counts as having skipped.
+//! - never retires once it has skipped an envelope, that is, refused it (as damaged, forged or
+//!   signed by a key it does not accept) or stepped past it without merging it, for whatever
+//!   reason: its state is then not the changes through any position, whatever `through` it would
+//!   name. A device that cannot tell whether it skipped one counts as having skipped. It may retire
+//!   again only once it joins again with a fresh state built by merging the log from its start,
+//!   discarding the state that skipped.
 //! - reports [`Settled`] `seq` only when it has dealt with every envelope through `seq`, by merging
 //!   it or by skipping it and recording that it did, and has nothing unsent; for this, a value it
 //!   keeps as its own counts as sent once the file it names, if any, is claimed as follows. Before
@@ -216,15 +215,12 @@
 //!   report could otherwise let through. A device that skipped an envelope may still settle: a
 //!   report asserts only that it has dealt with every envelope through `seq` and has nothing
 //!   unsent, and the guarantee needs no more of it than that and the claim before it.
-//! - treats a field that names files in any version of the application as naming files in every
-//!   step above, also when its own version's description of its data no longer lists the field: it
-//!   sends each change to the field with its claim, counts the field when it judges what a set of
-//!   changes refers to, and claims the files named in the field by rows it holds back and values it
-//!   keeps as its own before each report. A device whose version cannot do this for a field does
-//!   not send a change to it, does not retire, and does not report [`Settled`] while a row it holds
-//!   back or a value it keeps as its own names a file in it. A version written before the field was
-//!   marked cannot know to do this; the conditions say when a field may be marked, and the limits
-//!   say what such a version costs when it runs anyway.
+//! - sends a change only to a field its version declares, and each change to a field that names
+//!   files with its claim. When it judges what a set of changes refers to, it counts every field
+//!   its version marks as naming files, and, since a later version may declare a field its own does
+//!   not know, it counts as referring to a file every value it holds, in a field or a collection
+//!   its version does not declare, that has the form of a reference to that file. A version from
+//!   before files existed claims, settles and retires nothing; the limits say what that costs.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -261,11 +257,11 @@
 //!   claim of the same id are ordered: a claim after the deletion finds the blob missing.
 //!
 //! Here is why the whole log, as it is and as it will become, does not refer to a deleted file
-//! outside the first limit and the limit on removing a device, and why nothing that a device
-//! keeping these obligations holds unsent, holds back or keeps as its own names one outside the
-//! limits. Take a deletion under a retirement at `through` = t, sent by a device whose state was
-//! exactly the changes through t and did not refer to the file. Every device that counts has
-//! reported [`Settled`] at or above t.
+//! outside the first limit, the limit on removing a device and the limit on two databases acting as
+//! one device, and why nothing that a device keeping these obligations holds unsent, holds back or
+//! keeps as its own names one outside the limits. Take a deletion under a retirement at `through` =
+//! t, sent by a device whose state was exactly the changes through t and did not refer to the file.
+//! Every device that counts has reported [`Settled`] at or above t.
 //!
 //! Changes. Every set of changes through a position at or above t holds the changes through t, so
 //! one that refers to the file holds a change past t that sets a reference to it. If that change
@@ -287,10 +283,11 @@
 //!
 //! Rows held back. Take a device that counts, and its first report at or above t. A file named by a
 //! row it held back when it claimed before that report was claimed then, at a head at or past the
-//! report and so at or above t, which voids the retirement. A row it began to hold back later shows
-//! the row as it was in the device's state at the moment holding began, a state after that report
-//! and so at or past t, which, for a device that never skipped an envelope, refers to the file only
-//! through a change of the kind above.
+//! report and so at or above t, which voids the retirement. None begins to be held back between
+//! that claim and the report, since the device merges nothing in between. A row it began to hold
+//! back after the report shows the row as it was in the device's state at the moment holding began,
+//! a state after that report and so at or past t, which, for a device that never skipped an
+//! envelope, refers to the file only through a change of the kind above.
 //!
 //! Values kept as its own. Such a value is unsent until the device sends it. One the device kept
 //! before its first report at or above t was claimed before that report, which voids the retirement
@@ -325,21 +322,29 @@
 //! - after a server begins to offer blobs again, or forgets an id's claims, every retirement
 //!   through its floor is void, so deletion resumes only once the log has grown past the floor and
 //!   a device retires the file again.
-//! - a device that never reports [`Settled`] holds back every deletion until it is removed.
+//! - a device that never reports [`Settled`] holds back every deletion until it is removed. A
+//!   device running a version of the application from before files existed never reports, so it
+//!   does the same until it is upgraded or removed.
+//! - a library whose blob records the server has bounded, and whose records are all of complete
+//!   blobs, refuses every claim that needs a new record with [`ErrorCode::LibraryFull`]. A device
+//!   whose claiming append was so refused sends the envelope plainly and must claim its ids before
+//!   it next reports [`Settled`]; that claim needs the same records and is refused too, so the
+//!   device does not settle, and no retirement through a position above its last report can take
+//!   effect. The same holds for a device whose row held back or value kept as its own names a file
+//!   the server has no record for. Deletion stays safe but stops: it goes on only through
+//!   retirements already pending at or below that device's last report, whose deletions free
+//!   records and so can let its claim succeed, or once the device is removed, with the limit on
+//!   removing a device.
+//! - if every device has skipped an envelope, none retires, and nothing is deleted until one joins
+//!   again with a fresh state.
 //! - removing a device gives up the guarantee for the files named by envelopes it appended without
-//!   their claims and had not yet claimed, because it sent an append plainly after the server began
-//!   to offer [`Capabilities::blobs`], having read the capability before, or because its claiming
-//!   append was refused with [`ErrorCode::LibraryFull`] and it sent the envelope plainly: the
-//!   server no longer waits for its report, and nothing else voids a retirement of such a file, so
-//!   the file can be deleted while the log refers to it. Another device that holds such a file can
-//!   make it available again by sending a change that sets a reference to it, with its claim, and
-//!   uploading the file if the server lacks it.
-//! - while any device runs a version from before a field was marked as naming files, and that
-//!   version writes the field or retires, the guarantee does not hold for the files that field
-//!   names: it can send references in the field without their claims, and it can retire while
-//!   judging the log without the field, so a file the log refers to can be deleted. Even a version
-//!   that neither writes the field nor retires can show, in rows it holds back, a file that is
-//!   rightly deleted.
+//!   their claims and had not yet claimed, because it had read [`Capabilities::blobs`] as false and
+//!   sent an envelope plainly after the server began to offer it, or because its claiming append
+//!   was refused with [`ErrorCode::LibraryFull`] and it sent the envelope plainly: the server no
+//!   longer waits for its report, and nothing else voids a retirement of such a file, so the file
+//!   can be deleted while the log refers to it. Another device that holds such a file can make it
+//!   available again by sending a change that sets a reference to it, with its claim, and uploading
+//!   the file if the server lacks it.
 //! - a device that skipped an envelope may settle, and can then show a file that the skipped
 //!   envelope replaced and that was rightly deleted; fetching it answers
 //!   [`ErrorCode::BlobNotFound`], and a change it makes from that value names a missing file.
@@ -727,9 +732,10 @@ pub struct DeviceRecord {
     pub member_proof: Option<ListedMemberProof>,
     /// Removed through [`REMOVE_DEVICE_PATH`]: the server refuses its requests, and it no longer
     /// holds back the deletion of retired blobs. That gives up the guarantee for the files named by
-    /// envelopes it appended without their claims and had not yet claimed, having sent them plainly
-    /// after the server began to offer blobs or after a claiming append was refused; see [Deleting
-    /// files](self#deleting-files).
+    /// envelopes it appended without their claims and had not yet claimed, because it had read
+    /// [`Capabilities::blobs`] as false and sent an envelope plainly after the server began to
+    /// offer it, or because its claiming append was refused with [`ErrorCode::LibraryFull`] and it
+    /// sent the envelope plainly; see [Deleting files](self#deleting-files).
     #[serde(default, skip_serializing_if = "is_false")]
     pub removed: bool,
     /// Unix seconds of the device's last accepted request, possibly coarse.

@@ -278,12 +278,14 @@ pub struct RetireBlobs {
 }
 
 /// The sender has dealt with every envelope through sequence number `seq`, by merging it or by
-/// skipping it and recording that it did, has claimed every file that a row it holds back or a
-/// value it keeps as its own names, and has nothing unsent, such a value counting as sent once its
-/// file is claimed. A device that skipped an envelope may settle, but never retires, since its
-/// state is not the changes through any position. A server keeps the greatest it was told, and
-/// keeps it when a removed device is restored; a `seq` above the library's head is
-/// [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
+/// skipping it and recording that it did, and has nothing unsent; a value it keeps as its own
+/// counts as sent once the file it names, if any, is claimed. After dealing with those envelopes
+/// and before this report, it claimed at [`BLOBS_CLAIM_PATH`](super::BLOBS_CLAIM_PATH) every file
+/// that a row it holds back or a value it keeps as its own names, having already claimed the ids of
+/// every envelope it appended plainly, and merged nothing since. A device that skipped an envelope
+/// may settle, but never retires with that state, since it is not the changes through any position.
+/// A server keeps the greatest it was told, and keeps it when a removed device is restored; a `seq`
+/// above the library's head is [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settled {
     pub seq: u64,
@@ -319,9 +321,8 @@ pub struct Entitlement {
 ///
 /// Removing a device gives up the guarantee of [the module documentation](super#deleting-files) for
 /// the files named by envelopes it appended without their claims and had not yet claimed, because
-/// it sent an append plainly after the server began to offer
-/// [`Capabilities::blobs`](super::Capabilities::blobs), having read the capability before, or
-/// because its claiming append was refused with
+/// it had read [`Capabilities::blobs`](super::Capabilities::blobs) as false and sent an envelope
+/// plainly after the server began to offer it, or because its claiming append was refused with
 /// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and it sent the envelope plainly: such
 /// a file can be deleted while the log refers to it. Another device that holds such a file can make
 /// it available again by sending a change that sets a reference to it, with its claim, and
