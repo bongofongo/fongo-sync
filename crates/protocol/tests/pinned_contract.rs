@@ -469,6 +469,14 @@ fn a_claiming_append_has_this_body() {
         envelope,
     };
     assert_eq!(hex(&empty.encode()), ["00", &envelope_hex()].concat());
+    let many = ClaimingAppend {
+        ids: (0..130u8).map(|i| BlobId([i; 32])).collect(),
+        envelope: empty.envelope,
+    };
+    let bytes = many.encode();
+    let ids: String = (0..130u8).map(|i| hex(&[i; 32])).collect();
+    assert_eq!(hex(&bytes), ["8201", &ids, &envelope_hex()].concat());
+    assert_eq!(ClaimingAppend::decode(&bytes), Ok(many));
 }
 
 /// An empty batch sealed by `device()` for `LIBRARY` at epoch 0 with nonce `[5; 24]`: format,
