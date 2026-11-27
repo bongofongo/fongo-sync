@@ -113,8 +113,7 @@ pub async fn fingerprint(
 /// that device to resolve too; of a field's history only the change that wins on this device is
 /// sent, so the earliest change to an entity may be lost, which can change what
 /// [`Replica::made`] answers for it elsewhere; and which entities were found to be one is not
-/// sent, since the kernel keeps no clock for it, but every device finds it again from the
-/// entities' identities.
+/// sent, since the kernel keeps no clock for it.
 ///
 /// The other resolutions: leave the fault stored, and the device stays stopped while local edits
 /// gather; or rebuild the device from the server, giving up what it holds that the server lost:

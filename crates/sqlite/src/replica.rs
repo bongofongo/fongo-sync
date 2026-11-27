@@ -1731,7 +1731,7 @@ impl Replica {
     /// so where it was the earliest of an entity's changes in a collection, the entity's first
     /// clock is later on a replica that has only what this sends, which can change what
     /// [`Replica::made`] answers there. That two entities are one is kept with no clock and is not
-    /// sent; a replica finds it again from their identities.
+    /// sent.
     pub async fn resend(&self, conn: &mut SqliteConnection) -> Result<usize> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
