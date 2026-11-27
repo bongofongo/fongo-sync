@@ -21,8 +21,8 @@
 //! uploads of it are one file; not its content, its hash or its true size.
 //!
 //! [`api`] holds the routes that upload a file in chunks or whole, read it back, ask which files
-//! a server holds, and let devices claim and retire files so that a server can delete those
-//! nothing refers to. This crate defines the format and the messages; no client or server for
+//! a server holds, and let devices claim and retire files so that a server can delete those the
+//! log no longer refers to. This crate defines the format and the messages; no client or server for
 //! them exists in this repository yet.
 //!
 //! # What a device relies on the server for

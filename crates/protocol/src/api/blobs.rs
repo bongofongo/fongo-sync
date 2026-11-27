@@ -204,8 +204,8 @@ impl BlobDigest {
 /// against [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids), and not against
 /// [`Capabilities::max_batch_bytes`](super::Capabilities::max_batch_bytes).
 ///
-/// The ids tell the server which envelope, and so which device and when, refers to which blob
-/// ids; not what the files are.
+/// The ids tell the server which envelope, and so which device and when, sets references to which
+/// blob ids; not what the files are.
 ///
 /// Bytes: a LEB128 count, that many 32-byte blob ids, then the envelope exactly as
 /// [`BATCHES_PATH`](super::BATCHES_PATH) takes it.
@@ -265,10 +265,12 @@ pub struct MissingBlobs {
     pub missing: Vec<BlobId>,
 }
 
-/// Marks complete blobs as referred to by no change through log position `through`, by the rules
-/// in [the module documentation](super#deleting-files). Ids the server does not hold complete are
-/// ignored. A server keeps the earliest retirement of an id that is not void, so sending one again
-/// never restarts the wait.
+/// Marks complete blobs as ones the changes through log position `through` do not refer to, by the
+/// rules in [the module documentation](super#deleting-files): the sender's state is exactly those
+/// changes, with nothing merged beyond them, nothing unsent but values it keeps as its own and no
+/// envelope of its own in the log past the last it pulled. Ids the server does not hold complete
+/// are ignored. A server keeps the earliest retirement of an id that is not void, so sending one
+/// again never restarts the wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireBlobs {
     pub through: u64,
@@ -276,9 +278,11 @@ pub struct RetireBlobs {
 }
 
 /// The sender has dealt with every envelope through sequence number `seq`, by merging it or by
-/// skipping it and recording that it did, and has nothing unsent. A device that skipped an
-/// envelope may settle, but never retires through it. A server keeps the greatest it was told,
-/// and keeps it when a removed device is restored; a `seq` above the library's head is
+/// skipping it and recording that it did, has claimed every file that a row it holds back or a
+/// value it keeps as its own names, and has nothing unsent, such a value counting as sent once its
+/// file is claimed. A device that skipped an envelope may settle, but never retires, since its
+/// state is not the changes through any position. A server keeps the greatest it was told, and
+/// keeps it when a removed device is restored; a `seq` above the library's head is
 /// [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settled {
