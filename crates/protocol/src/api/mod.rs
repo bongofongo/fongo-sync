@@ -145,6 +145,14 @@
 //! changed its data without recording them, shows that value in place of the winner until the
 //! device sends it as a change. The rules below cover both.
 //!
+//! A reference is a blob value that begins with a reference format byte and decodes as a reference
+//! in that format; this crate writes and reads format [`FILE_REF_FORMAT`](crate::FILE_REF_FORMAT)
+//! ([`FileRef::decode`](crate::FileRef::decode) refuses any other), and a later format may name
+//! files too. For a device, a value has the form of a reference when it begins with a format byte
+//! the device knows and decodes as a reference in that format. A value it cannot decode, because it
+//! begins with a format byte the device does not know or is malformed, may still name a file, and
+//! the device cannot tell which.
+//!
 //! On a build that settles clock ties by value, a winner is a function of the set of changes and is
 //! one of its values, the same on every replica, with no condition on clocks: of two changes to one
 //! field at one clock, which a database restored from a backup or a copy of a database can write,
@@ -156,7 +164,9 @@
 //! clock, which is the field's winner wherever the field names files. A file field is such a field,
 //! a plain field that is never a key field of a natural collection, so it is not one of the two
 //! cases where such a replica keeps too few values (aliases, and key fields of natural
-//! collections). So a replica never keeps a value that the retiring device's winner replaced.
+//! collections). So a replica never misses a winner: for a collection it lacked it never keeps a
+//! value that the retiring device's winner replaced, and for a field it lacked any replaced value
+//! it keeps besides the winner only makes it retire less.
 //!
 //! The guarantee below holds under these conditions:
 //!
@@ -173,6 +183,13 @@
 //!   clock in every version that declares it and is never a key field of a natural collection: the
 //!   definition and the treatment of rewritten key fields differ. A registry must not mark a key
 //!   field.
+//! - a reference in a format later than [`FILE_REF_FORMAT`](crate::FILE_REF_FORMAT) is written only
+//!   once every device of the library that can still retire reads that format; until then a device
+//!   writes references in format [`FILE_REF_FORMAT`](crate::FILE_REF_FORMAT). A value in a later
+//!   format, held in a field the device's version marks as naming files, is one the device knows it
+//!   cannot decode, and the obligations keep it from retiring; held in a field or collection its
+//!   version does not declare, it cannot be told from data at all, so that case rests on this
+//!   condition alone.
 //! - each device key is used by one database. Two databases on one key, such as a copy of a
 //!   database or a backup restored while the database it was taken from went on, are one device to
 //!   the server; see the limits.
@@ -229,12 +246,16 @@
 //!   files with its claim. When it judges what a set of changes refers to, it counts every field
 //!   its version marks as naming files, and, since a later version may declare a field its own does
 //!   not know, it counts as referring to a file every value it holds, in a field or a collection
-//!   its version does not declare, that has the form of a reference to that file. It retires only
-//!   if its state keeps, for every field and collection of every change it merged, declared by its
-//!   version or not, at least the value that wins by clock, so that it can judge what the changes
-//!   refer to; a device that drops the changes or the winning values of fields or collections its
-//!   version does not declare never retires. A version from before files existed claims, settles
-//!   and retires nothing; the limits say what that costs.
+//!   its version does not declare, that has the form of a reference to that file. A device that
+//!   holds, as the winner of a field its version marks as naming files, or in a row it holds back
+//!   or a value it keeps as its own in such a field, a value it cannot decode as a reference does
+//!   not retire while it holds it, since it cannot tell which file the value names, and it never
+//!   sends a change that sets such a field to a value it cannot decode, since it could not claim
+//!   the file. It retires only if its state keeps, for every field and collection of every change
+//!   it merged, declared by its version or not, at least the value that wins by clock, so that it
+//!   can judge what the changes refer to; a device that drops the changes or the winning values of
+//!   fields or collections its version does not declare never retires. A version from before files
+//!   existed claims, settles and retires nothing; the limits say what that costs.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -352,8 +373,9 @@
 //!   the limit on removing a device.
 //! - if every device has skipped an envelope, none retires, and nothing is deleted until one has a
 //!   state that has merged every envelope, built as the obligations say. Where some envelope can be
-//!   merged by no device, such as one that is damaged or forged, no device ever retires again and
-//!   nothing more is deleted in that library.
+//!   merged by no device, such as one that is damaged or forged, no device ever retires again, so
+//!   nothing more is deleted in that library once the retirements the server already holds have
+//!   taken effect after their wait.
 //! - removing a device gives up the guarantee for the files named by envelopes it appended without
 //!   their claims and had not yet claimed, because it had read [`Capabilities::blobs`] as false and
 //!   sent an envelope plainly after the server began to offer it, or because its claiming append
@@ -369,6 +391,10 @@
 //!   one the application wrote while the device was applying merged changes and not recording its
 //!   own, is outside the guarantee: no claim protects the file it names, which can be deleted, and
 //!   a change later made from it names a missing file.
+//! - if a reference is written in a later format while a device that can still retire does not read
+//!   that format, and that device holds the value in a field or collection its version does not
+//!   declare, it takes the value for data and can retire the file the value names while the log
+//!   refers to it, against the conditions above.
 //! - two databases that act as one device, against the conditions above, can lose a file: the
 //!   [`Settled`] one reports can stand for unsent changes the other holds. Such a change that sets
 //!   a reference to a file and is sent after the file's deletion finds it missing, as in the first
