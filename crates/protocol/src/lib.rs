@@ -69,21 +69,26 @@
 //! id can make such a hand-over for a key of their own, so one relayed through the server lets
 //! the server have its own key vouched for.
 //!
-//! What a valid proof gives: whoever registered that key and wrap key held the secret at the
-//! time. What it does not give: that the device still holds the secret or is still wanted, that
-//! it holds the private halves of the keys named (the wrap key's own signature shows that of the
-//! device key), or anything against a holder of the secret, who can make a proof for any key. A
-//! server can drop a proof, so that a device that registered one shows none; it cannot make one,
-//! or move one to another key or wrap key. Absent and invalid proofs are told apart only so that
-//! an application can tell a device registered without a proof from a forgery: an absent proof is
-//! also exactly what a key the server planted looks like, so it gives no assurance at all and must
-//! never be treated more leniently than an invalid one when deciding who receives a secret. A
-//! device listed without a proof never gains one under that key while it is listed, since adding
-//! a listed key again changes nothing. It is recognised only after it joins again under a new
-//! device key with a server that keeps proofs, or after someone removes it and its key is added
-//! again, since a restored key takes the proof its request carries. A record whose proof is not
-//! 64 hex digits still parses, and its proof checks as invalid; a request carrying one does not
-//! parse.
+//! What a valid proof gives: whoever registered that key and wrap key held the secret at the time.
+//! What it does not give: that the device still holds the secret or is still wanted, that it holds
+//! the private halves of the keys named (the wrap key's own signature shows that of the device
+//! key), or anything against a holder of the secret, who can make a proof for any key. A server can
+//! drop a proof, so that a device that registered one shows none; it cannot make one, or move one
+//! to another key or wrap key. Absent and invalid proofs are told apart only so that an application
+//! can tell a device registered without a proof from a forgery: an absent proof is also exactly
+//! what a key the server planted looks like, so it gives no assurance at all and must never be
+//! treated more leniently than an invalid one when deciding who receives a secret. A device listed
+//! without a proof never gains one under that key while it is listed, since adding a listed key
+//! again changes nothing. It is recognised only after it joins again under a new device key with a
+//! server that keeps proofs, or after someone removes it and its key is added again, since a
+//! restored key takes the proof its request carries. Each way has a cost under the rules for
+//! [deleting files](api#deleting-files). Under a new key, the old key's record stays listed and
+//! goes on counting for deletion with its last settled position until it is removed, so the old key
+//! should then be removed. While a key is removed, the guarantee is given up for files named by
+//! envelopes it sent plainly and had not yet claimed; once it is restored, its unsent changes, rows
+//! held back and values it keeps as its own can name files deleted meanwhile. A record whose proof
+//! is not 64 hex digits still parses, and its proof checks as invalid; a request carrying one does
+//! not parse.
 //!
 //! # Limits of version 1
 //!

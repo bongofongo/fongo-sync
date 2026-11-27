@@ -26,13 +26,18 @@ pub struct MemberProof(pub [u8; 32]);
 pub enum MemberCheck {
     /// The proof checks against this secret, for the record's key and wrap key.
     Valid,
-    /// The record carries no proof: registered by a build that made none, by the recovery key,
-    /// with the proof dropped by the server, or planted by the server, which is exactly what a key
-    /// of its own looks like. It gives no assurance at all, and must never be treated more
-    /// leniently than [`MemberCheck::Invalid`] when deciding who receives a secret; it is told
-    /// apart only so that an application can tell a device registered without a proof from a
-    /// forgery. Such a device gains a proof only by joining again under a new device key, or by
-    /// being removed and its key added again; adding its key while it is listed changes nothing.
+    /// The record carries no proof: registered by a build that made none, by the recovery key, with
+    /// the proof dropped by the server, or planted by the server, which is exactly what a key of
+    /// its own looks like. It gives no assurance at all, and must never be treated more leniently
+    /// than [`MemberCheck::Invalid`] when deciding who receives a secret; it is told apart only so
+    /// that an application can tell a device registered without a proof from a forgery. Such a
+    /// device gains a proof only by joining again under a new device key, or by being removed and
+    /// its key added again; adding its key while it is listed changes nothing. Under a new key, the
+    /// old key's record goes on counting for [deleting files](crate::api#deleting-files) with its
+    /// last settled position until it is removed, so the old key should then be removed. Removal
+    /// gives up that guarantee, while the key is removed, for files named by envelopes it sent
+    /// plainly and had not yet claimed; once it is restored, its unsent changes, rows held back and
+    /// values it keeps as its own can name files deleted meanwhile.
     Absent,
     /// The proof does not check: made under another secret, or for another key or wrap key.
     Invalid,
