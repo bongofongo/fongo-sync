@@ -10,8 +10,8 @@ use fongo_sync_client::protocol::{
     LibraryKeys, ListedMemberProof, MemberCheck, SigningKey, WrapKey, WrapSecret,
 };
 use fongo_sync_client::{
-    Credentials, Error, Method, Registered, Request, add_device, create_library_with,
-    join_library_with,
+    Credentials, Error, Method, Registered, Request, add_device, create_library,
+    create_library_with, join_library, join_library_with,
 };
 use support::{Peer, Server, assert_converged, now};
 
@@ -286,14 +286,14 @@ async fn a_key_registered_with_another_wrap_key_is_reported_and_left_as_it_was()
     let rewrapped = Credentials::new(joined.library().clone(), joined.device().clone(), 0)
         .with_wrap_secret(WrapSecret::from_bytes(&[0x42; 32]));
     match join_library_with(&server, &rewrapped, now).await {
-        Err(Error::RegisteredOtherwise) => {}
+        Err(Error::RegisteredOtherwise { .. }) => {}
         other => panic!("expected the other registration to be reported, got {other:?}"),
     }
     assert_eq!(record(&server, &joined), before);
     let unwrapped = Credentials::new(joined.library().clone(), joined.device().clone(), 0);
     assert!(matches!(
         join_library_with(&server, &unwrapped, now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { .. })
     ));
     assert_eq!(record(&server, &joined), before);
 
@@ -302,7 +302,7 @@ async fn a_key_registered_with_another_wrap_key_is_reported_and_left_as_it_was()
     let first = record(&server, &made);
     assert!(matches!(
         create_library_with(&server, &recreated, now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { .. })
     ));
     assert_eq!(record(&server, &made), first);
     join_library_with(&server, &joined, now).await.unwrap();
@@ -321,15 +321,111 @@ async fn a_repeat_after_the_server_dropped_the_proof_succeeds_and_says_so() {
         }
     });
     let again = create_library_with(&server, &made, now).await.unwrap();
-    assert!(!again.proof_kept);
+    assert!(again.wrap_kept && !again.proof_kept);
     server.with(|s| {
         for device in &mut s.libraries.get_mut(&made.library_id()).unwrap().devices {
             device.wrap = None;
         }
     });
+    let bare = create_library_with(&server, &made, now).await.unwrap();
+    assert!(!bare.wrap_kept && !bare.proof_kept);
+    let other = Credentials::for_new_device(made.library().clone()).unwrap();
+    let foreign = other.device_offer().unwrap().wrap;
+    server.with(|s| {
+        for device in &mut s.libraries.get_mut(&made.library_id()).unwrap().devices {
+            if !device.recovery {
+                device.wrap = Some(foreign);
+            }
+        }
+    });
     assert!(matches!(
         create_library_with(&server, &made, now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { credentials: None })
+    ));
+}
+
+#[tokio::test]
+async fn a_server_that_keeps_neither_wrap_keys_nor_proofs_registers_without_them() {
+    let server = Server::new();
+    server.with(|s| {
+        s.stored_wrap = Some(None);
+        s.stored_proof = Some(None);
+    });
+    let bare = |registered: Registered| !registered.wrap_kept && !registered.proof_kept;
+    let made = Credentials::for_new_library().unwrap();
+    assert!(bare(
+        create_library_with(&server, &made, now).await.unwrap()
+    ));
+    assert!(bare(
+        create_library_with(&server, &made, now).await.unwrap()
+    ));
+    let joined = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
+    assert!(bare(
+        join_library_with(&server, &joined, now).await.unwrap()
+    ));
+    assert!(bare(
+        join_library_with(&server, &joined, now).await.unwrap()
+    ));
+    let added = Credentials::for_new_device(made.library().clone()).unwrap();
+    let offer = added.device_offer().unwrap();
+    assert!(bare(add_device(&server, &made, &offer, now).await.unwrap()));
+    let wrapped = create_library(&server, now).await.unwrap();
+    let rejoined = join_library(&server, &wrapped.recovery_code(), now)
+        .await
+        .unwrap();
+    assert_eq!(rejoined.library_id(), wrapped.library_id());
+
+    assert_eq!(server.with(|s| s.libraries.len()), 2);
+    assert_eq!(records(&server, &made).len(), 4);
+    for credentials in [&made, &joined, &added] {
+        let listed = record(&server, credentials);
+        assert!(listed.wrap.is_none());
+        assert_eq!(made.check_member(&listed), MemberCheck::Absent);
+    }
+    let mut peers = [
+        Peer::new(made).await,
+        Peer::new(joined).await,
+        Peer::new(added).await,
+    ];
+    peers[2]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[2].sync(&server).await.unwrap();
+    peers[0].sync(&server).await.unwrap();
+    peers[1].sync(&server).await.unwrap();
+    assert_eq!(assert_converged(&mut peers).await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_one_call_forms_hand_back_credentials_registered_otherwise() {
+    let server = Server::new();
+    let stranger = Credentials::for_new_library().unwrap();
+    let foreign = stranger.device_offer().unwrap().wrap;
+    server.with(|s| s.stored_wrap = Some(Some(foreign)));
+    let made = match create_library(&server, now).await {
+        Err(Error::RegisteredOtherwise {
+            credentials: Some(credentials),
+        }) => *credentials,
+        other => panic!("expected the credentials back, got {other:?}"),
+    };
+    assert!(server.with(|s| s.libraries.contains_key(&made.library_id())));
+    let listed = record(&server, &made);
+    assert_eq!(listed.public_key, made.device().verifying_key());
+
+    let joined = match join_library(&server, &made.recovery_code(), now).await {
+        Err(Error::RegisteredOtherwise {
+            credentials: Some(credentials),
+        }) => *credentials,
+        other => panic!("expected the credentials back, got {other:?}"),
+    };
+    assert_eq!(joined.library_id(), made.library_id());
+    assert_eq!(
+        record(&server, &joined).public_key,
+        joined.device().verifying_key()
+    );
+    assert!(matches!(
+        join_library_with(&server, &joined, now).await,
+        Err(Error::RegisteredOtherwise { credentials: None })
     ));
 }
 
@@ -383,17 +479,17 @@ async fn a_server_that_lists_an_unreadable_proof_is_reported() {
     let made = Credentials::for_new_library().unwrap();
     assert!(matches!(
         create_library_with(&server, &made, now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { .. })
     ));
     let joined = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
     assert!(matches!(
         join_library_with(&server, &joined, now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { .. })
     ));
     let added = Credentials::for_new_device(made.library().clone()).unwrap();
     assert!(matches!(
         add_device(&server, &made, &added.device_offer().unwrap(), now).await,
-        Err(Error::RegisteredOtherwise)
+        Err(Error::RegisteredOtherwise { .. })
     ));
     assert_eq!(
         made.check_member(&record(&server, &joined)),

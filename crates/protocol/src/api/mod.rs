@@ -545,8 +545,9 @@ fn wrap_message(library: LibraryId, device: &VerifyingKey, wrap_key: &WrapKey) -
 /// library or by its recovery key.
 ///
 /// A key already listed and not removed is accepted and changes nothing, its stored wrap key and
-/// membership proof included, so a device can repeat an add whose answer it lost; a removed one is
-/// restored.
+/// membership proof included, so a device can repeat an add whose answer it lost. A removed one is
+/// restored, taking the wrap key and membership proof this request carries, or none if it
+/// carries none; a wrap key whose proof does not verify is refused as for a new key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawAddDevice")]
 pub struct AddDevice {

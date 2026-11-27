@@ -63,7 +63,11 @@
 //! and a build that knows nothing of it ignores it. A device that is to seal a new secret to the
 //! others can then seal only to records whose proof checks
 //! ([`api::DeviceRecord::check_member_proof`]), so that a server that lists a key of its own is
-//! not handed the secret.
+//! not handed the secret. That holds only while every proof is made by a holder of the secret for
+//! a key it got over a channel the server cannot alter. A device that adds another makes the
+//! proof itself, for the key and wrap key the new device hands it; anyone who knows the library
+//! id can make such a hand-over for a key of their own, so one relayed through the server lets
+//! the server have its own key vouched for.
 //!
 //! What a valid proof gives: whoever registered that key and wrap key held the secret at the
 //! time. What it does not give: that the device still holds the secret or is still wanted, that

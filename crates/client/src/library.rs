@@ -22,7 +22,7 @@ use crate::transport::{Method, Transport};
 ///
 /// Fails with [`Error::RegisteredOtherwise`] when the server lists the device with another wrap
 /// key, or with a membership proof other than the one these credentials make; a listing without
-/// a proof is a success, reported in [`Registered::proof_kept`].
+/// either is a success, reported in [`Registered`].
 ///
 /// `now` gives the current unix time in seconds, for request timestamps.
 pub async fn create_library_with<T: Transport>(
@@ -107,15 +107,18 @@ async fn created_before<T: Transport, N: Fn() -> u64 + Sync>(
 /// The credentials exist only in the returned value, so if the call fails after the server
 /// acted on it, as when the response is lost, the library is left on the server with no device
 /// that can reach it, and a new call makes another. Use [`create_library_with`], storing the
-/// credentials first, where that matters. Nor does it report whether the server kept the
-/// membership proof ([`Registered::proof_kept`]).
+/// credentials first, where that matters. It does not report whether the server kept the wrap
+/// key and membership proof ([`Registered`]). When the library was made but lists the device
+/// otherwise, the error, [`Error::RegisteredOtherwise`], carries the credentials.
 pub async fn create_library<T: Transport>(
     transport: &T,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<Credentials, Error> {
     let credentials = Credentials::for_new_library()?;
-    create_library_with(transport, &credentials, now).await?;
-    Ok(credentials)
+    match create_library_with(transport, &credentials, now).await {
+        Ok(_) => Ok(credentials),
+        Err(error) => Err(keeping(credentials)(error)),
+    }
 }
 
 /// Adds `credentials`' device to its library, made by [`Credentials::for_recovery_code`]: the
@@ -129,7 +132,7 @@ pub async fn create_library<T: Transport>(
 ///
 /// Fails with [`Error::RegisteredOtherwise`] when the key is already listed with another wrap key
 /// or a membership proof other than the one these credentials make; the listing is then left as
-/// it was. A listing without a proof is a success, reported in [`Registered::proof_kept`].
+/// it was. A listing without a wrap key or proof is a success, reported in [`Registered`].
 pub async fn join_library_with<T: Transport>(
     transport: &T,
     credentials: &Credentials,
@@ -156,24 +159,31 @@ pub async fn join_library_with<T: Transport>(
 /// The credentials exist only in the returned value, so if the call fails after the server
 /// acted on it, as when the response is lost, the library keeps a device slot whose key nobody
 /// holds, and a new call takes another. Use [`join_library_with`], storing the credentials first,
-/// where that matters. Nor does it report whether the server kept the membership proof
-/// ([`Registered::proof_kept`]).
+/// where that matters. It does not report whether the server kept the wrap key and membership
+/// proof ([`Registered`]). When the device was added but is listed otherwise, the error,
+/// [`Error::RegisteredOtherwise`], carries the credentials.
 pub async fn join_library<T: Transport>(
     transport: &T,
     recovery_code: &str,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<Credentials, Error> {
     let credentials = Credentials::for_recovery_code(recovery_code)?;
-    join_library_with(transport, &credentials, now).await?;
-    Ok(credentials)
+    match join_library_with(transport, &credentials, now).await {
+        Ok(_) => Ok(credentials),
+        Err(error) => Err(keeping(credentials)(error)),
+    }
 }
 
 /// What a new device hands to a device already in the library so that it can add it with
 /// [`add_device`]: the new device's public key and its wrap key signed by that key for the
 /// library. The new device makes it with [`Credentials::device_offer`].
 ///
-/// It holds no secret. It travels as [`DeviceOffer::to_bytes`], however the application moves
-/// data between the two devices; the adding device checks the signature before it sends anything.
+/// It holds no secret, but it must reach the adding device over a channel the server cannot
+/// alter, as the recovery code must: anyone who knows the library id can make a valid offer for a
+/// key of their own, and [`add_device`] vouches for it with a valid membership proof. An
+/// application that relays offers through the sync server lets the server have a key of its own
+/// added, and later sent a new library secret. It travels as [`DeviceOffer::to_bytes`]; the
+/// adding device checks the signature before it sends anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceOffer {
     pub device_key: VerifyingKey,
@@ -217,10 +227,13 @@ impl DeviceOffer {
 /// [`Credentials::for_new_device`] and stores them, then hands over
 /// [`Credentials::device_offer`]; this device adds it, after which the new device syncs.
 ///
+/// The offer must come from the new device over a channel the server cannot alter: this device
+/// vouches for whatever key the offer names, as [`DeviceOffer`] explains.
+///
 /// Fails with [`Error::WrapKeyNotSigned`], sending nothing, unless the offer's wrap key is signed
 /// by its device key for this library. A repeat after a lost response is accepted and changes
 /// nothing; [`Error::RegisteredOtherwise`] says the key is listed with another wrap key or proof.
-/// A listing without a proof is a success, reported in [`Registered::proof_kept`].
+/// A listing without a wrap key or proof is a success, reported in [`Registered`].
 pub async fn add_device<T: Transport>(
     transport: &T,
     credentials: &Credentials,
@@ -276,40 +289,65 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
     )
 }
 
-/// What a registration that succeeded left on the server.
+/// What a registration that succeeded left on the server. A server built before wrap keys or
+/// membership proofs drops what it does not know, and the device is registered all the same.
+///
+/// - Both true: the device is listed with the wrap key and membership proof it sent.
+/// - `wrap_kept` true, `proof_kept` false: listed with its wrap key but no proof. The device can
+///   sync, but cannot be recognised as a member when the library's secret is changed until a
+///   server that keeps proofs lists it with one.
+/// - Both false: listed with neither. The device can sync, but cannot be sent a new secret. A
+///   proof over a wrap key the record lacks shows nothing, so `proof_kept` is false whenever
+///   `wrap_kept` is.
+///
+/// Adding a listed key again changes nothing, so it does not add what was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Registered {
-    /// Whether the server lists the device with the membership proof it sent. When false, the
-    /// server dropped it, as one built before membership proofs does: the device is registered
-    /// with its wrap key and can sync, but cannot be recognised as a member when the library's
-    /// secret is changed until a server that keeps proofs lists it with one, and adding its key
-    /// again does not add one, since re-adding a listed key changes nothing.
+    /// Whether the server lists the device with the wrap key it sent.
+    pub wrap_kept: bool,
+    /// Whether the server lists the device with its wrap key and the membership proof it sent.
     pub proof_kept: bool,
 }
 
-/// What the listed record of `key` says of the registration: the wrap key must be the one sent,
-/// and the membership proof the one sent or none.
+/// What the listed record of `key` says of the registration: a wrap key and proof, where listed,
+/// must be the ones sent.
 fn registered_as(
     devices: &Devices,
     key: &VerifyingKey,
     wrap: Option<&SignedWrapKey>,
     proof: Option<MemberProof>,
 ) -> Result<Registered, Error> {
+    let otherwise = || Error::RegisteredOtherwise { credentials: None };
     let record = devices
         .devices
         .iter()
         .find(|d| d.public_key == *key && !d.recovery && !d.removed)
-        .ok_or(Error::RegisteredOtherwise)?;
-    if record.wrap.as_ref() != wrap {
-        return Err(Error::RegisteredOtherwise);
-    }
-    match (record.member_proof, proof) {
-        (None, Some(_)) => Ok(Registered { proof_kept: false }),
-        (listed, sent) if listed == sent.map(ListedMemberProof::from) => {
-            Ok(Registered { proof_kept: true })
-        }
-        _ => Err(Error::RegisteredOtherwise),
+        .ok_or_else(otherwise)?;
+    let wrap_kept = match (record.wrap.as_ref(), wrap) {
+        (None, Some(_)) => false,
+        (listed, sent) if listed == sent => true,
+        _ => return Err(otherwise()),
+    };
+    let proof_kept = match (record.member_proof, proof) {
+        (None, Some(_)) => false,
+        (listed, sent) if listed == sent.map(ListedMemberProof::from) => true,
+        _ => return Err(otherwise()),
+    };
+    Ok(Registered {
+        wrap_kept,
+        proof_kept: wrap_kept && proof_kept,
+    })
+}
+
+/// Hands the credentials back with [`Error::RegisteredOtherwise`], which comes once the server
+/// has acted.
+fn keeping(credentials: Credentials) -> impl FnOnce(Error) -> Error {
+    move |error| match error {
+        Error::RegisteredOtherwise { .. } => Error::RegisteredOtherwise {
+            credentials: Some(Box::new(credentials)),
+        },
+        error => error,
     }
 }
 

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use fongo_sync_client::protocol::api::{
     AddDevice, Appended, BatchPage, Capabilities, CreateLibrary, DeviceRecord, Devices, ErrorBody,
-    ErrorCode, ReadBatches, Route, StoredBatch,
+    ErrorCode, ReadBatches, Route, SignedWrapKey, StoredBatch,
 };
 use fongo_sync_client::protocol::{
     BATCH_FORMAT, DeviceId, Envelope, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE,
@@ -75,6 +75,8 @@ pub struct State {
     /// Stores this as every registered device's membership proof in place of the one sent, as a
     /// server that drops or mangles the field would.
     pub stored_proof: Option<Option<ListedMemberProof>>,
+    /// Stores this as every registered device's wrap key in place of the one sent.
+    pub stored_wrap: Option<Option<SignedWrapKey>>,
 }
 
 pub struct Server {
@@ -145,6 +147,7 @@ impl Server {
                 stale_devices: false,
                 hidden: Vec::new(),
                 stored_proof: None,
+                stored_wrap: None,
             }),
         }
     }
@@ -417,7 +420,7 @@ impl State {
                     DeviceRecord {
                         public_key: create.device_key,
                         recovery: false,
-                        wrap: create.wrap,
+                        wrap: self.stored_wrap.unwrap_or(create.wrap),
                         member_proof: self
                             .stored_proof
                             .unwrap_or(create.member_proof.map(Into::into)),
@@ -463,7 +466,7 @@ impl State {
                 let record = DeviceRecord {
                     public_key: add.device_key,
                     recovery: false,
-                    wrap: add.wrap,
+                    wrap: self.stored_wrap.unwrap_or(add.wrap),
                     member_proof: self
                         .stored_proof
                         .unwrap_or(add.member_proof.map(Into::into)),
