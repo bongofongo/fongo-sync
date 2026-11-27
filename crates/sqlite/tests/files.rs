@@ -956,7 +956,7 @@ async fn one_content_held_at_two_sizes_is_one_file() {
 
 /// Rows found by a stepped install under an older registry are adopted as a whole install would
 /// adopt them under the current one: a value that is not a reference in a field now naming files
-/// is refused, and the references adopted are reported.
+/// is adopted as data, and the references adopted are reported.
 #[tokio::test]
 async fn rows_found_under_an_older_registry_are_checked_and_reported_under_the_current_one() {
     let older = Registry::new(vec![
@@ -999,15 +999,8 @@ async fn rows_found_under_an_older_registry_are_checked_and_reported_under_the_c
             ])
             .unwrap(),
         );
-        let stepped = newer.install_step(&mut c, 1).await;
-        if bad {
-            assert!(
-                matches!(stepped, Err(Error::NotAFile { .. })),
-                "{stepped:?}"
-            );
-            continue;
-        }
-        let mut added = stepped.unwrap().files.added;
+        // A value that is not a reference is adopted as data, as a whole install adopts it.
+        let mut added = newer.install_step(&mut c, 1).await.unwrap().files.added;
         let mut more = true;
         while more {
             let step = newer.collect_step(&mut c, 1).await.unwrap();
@@ -1016,7 +1009,8 @@ async fn rows_found_under_an_older_registry_are_checked_and_reported_under_the_c
         }
         added.sort_by_key(|f| f.encode());
         // The first row was adopted under the older registry, before `cover` named files.
-        let mut expected: Vec<FileRef> = (1..6u8).map(file).collect();
+        let last = if bad { 5 } else { 6 };
+        let mut expected: Vec<FileRef> = (1..last).map(file).collect();
         expected.sort_by_key(|f| f.encode());
         assert_eq!(added, expected);
     }
@@ -1217,4 +1211,140 @@ async fn nothing_pending_holds_only_when_the_state_is_what_was_merged() {
         .await
         .unwrap();
     assert!(replica.nothing_pending(&mut a).await.unwrap());
+}
+
+/// Rows already there when they are adopted are adopted as data whatever their file fields
+/// hold, by a whole install and by one in steps alike: a value that is not a reference names no
+/// file. Only a write the application makes afterwards is refused, and correcting it clears it.
+#[tokio::test]
+async fn found_rows_are_adopted_whatever_their_file_fields_hold() {
+    for stepped in [false, true] {
+        let world = World::new(19);
+        let mut c = world.connect(0).await;
+        run(
+            &mut c,
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, cover BLOB)",
+        )
+        .await;
+        let replica = Replica::new(
+            Registry::new(vec![
+                Collection::minted("books", "books", "id")
+                    .field("title")
+                    .file("cover"),
+            ])
+            .unwrap(),
+        );
+        for i in 0..6u8 {
+            with_file(
+                &mut c,
+                "INSERT INTO books (title, cover) VALUES ('t', ?1)",
+                file(i),
+            )
+            .await;
+        }
+        run(&mut c, "UPDATE books SET cover = X'0102' WHERE id = 5").await;
+        if stepped {
+            assert!(replica.install_step(&mut c, 1).await.unwrap().more);
+            while replica.collect_step(&mut c, 1).await.unwrap().more {}
+        } else {
+            replica.install(&mut c).await.unwrap();
+        }
+        let out = sent(&replica, &mut c).await;
+        assert!(
+            out.iter()
+                .any(|ch| ch.field == "cover" && ch.value == Value::Blob(vec![1, 2])),
+            "stepped {stepped}: {out:?}"
+        );
+        assert!(
+            !refers(&replica, &mut c, file(4)).await,
+            "row 5 no longer holds it"
+        );
+        // The application's own write of the same kind is refused, and its correction taken.
+        run(&mut c, "UPDATE books SET cover = X'0103' WHERE id = 4").await;
+        assert!(matches!(
+            replica.collect(&mut c).await,
+            Err(Error::NotAFile { .. })
+        ));
+        run(&mut c, "UPDATE books SET cover = NULL WHERE id = 4").await;
+        replica.collect(&mut c).await.unwrap();
+        assert!(!replica.nothing_pending(&mut c).await.unwrap());
+    }
+}
+
+/// A refused write is always cleared by correcting or deleting the row, whatever happened
+/// between: a suspend and resume, an uninstall and install, or a write made while suspended.
+#[tokio::test]
+async fn a_refused_write_is_cleared_by_correcting_or_deleting_the_row() {
+    let replica = Replica::new(registry(1));
+    let bad = "UPDATE books SET cover = X'0102' WHERE id = 1";
+    for path in 0..5 {
+        let world = World::new(20);
+        let mut a = database(&world, 0, &replica).await;
+        run(&mut a, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+        replica.collect(&mut a).await.unwrap();
+        sent(&replica, &mut a).await;
+        if path == 4 {
+            replica.suspend(&mut a).await.unwrap();
+            run(&mut a, bad).await;
+            let resumed = replica
+                .resume(&mut a, fongo_sync_sqlite::Resume::Send)
+                .await;
+            assert!(
+                matches!(resumed, Err(Error::NotAFile { .. })),
+                "{resumed:?}"
+            );
+            run(&mut a, "UPDATE books SET cover = NULL WHERE id = 1").await;
+            replica
+                .resume(&mut a, fongo_sync_sqlite::Resume::Send)
+                .await
+                .unwrap();
+            assert!(
+                sent(&replica, &mut a)
+                    .await
+                    .iter()
+                    .all(|c| c.field != "cover")
+            );
+            continue;
+        }
+        run(&mut a, bad).await;
+        assert!(matches!(
+            replica.collect_step(&mut a, 10).await,
+            Err(Error::NotAFile { .. })
+        ));
+        match path {
+            0 => run(&mut a, "UPDATE books SET cover = NULL WHERE id = 1").await,
+            1 => run(&mut a, "DELETE FROM books WHERE id = 1").await,
+            2 => {
+                replica.suspend(&mut a).await.unwrap();
+                replica
+                    .resume(&mut a, fongo_sync_sqlite::Resume::Send)
+                    .await
+                    .unwrap_err();
+                replica.suspend(&mut a).await.unwrap();
+                with_file(&mut a, "UPDATE books SET cover = ?1 WHERE id = 1", file(1)).await;
+                replica
+                    .resume(&mut a, fongo_sync_sqlite::Resume::Send)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                // Installed again, the row is found and adopted as data.
+                replica.uninstall(&mut a).await.unwrap();
+                replica.install(&mut a).await.unwrap();
+            }
+        }
+        replica.collect(&mut a).await.unwrap();
+        replica.apply(&mut a, &[]).await.unwrap();
+        replica.collect_step(&mut a, 10).await.unwrap();
+        replica.suspend(&mut a).await.unwrap();
+        replica
+            .resume(&mut a, fongo_sync_sqlite::Resume::Send)
+            .await
+            .unwrap();
+        sent(&replica, &mut a).await;
+        assert!(
+            replica.nothing_pending(&mut a).await.unwrap(),
+            "path {path}"
+        );
+    }
 }

@@ -10,8 +10,11 @@ pub enum Error {
     Registry(String),
     /// The application wrote a value other than an encoded
     /// [`FileRef`](fongo_sync_protocol::FileRef) or NULL to a field that names files
-    /// ([`crate::Collection::file`]). Nothing was collected; the write stays to be collected
-    /// once the row holds a reference or NULL there. `key` is the row's, when it has one.
+    /// ([`crate::Collection::file`]), and a collect, or the collect an apply or a resume begins
+    /// with, met the write. Nothing was collected; the write stays to be collected, and once the
+    /// row at `key` holds a reference or NULL there, or is removed, the next call takes it.
+    /// Values adopted from rows already there at an install, and values from elsewhere, are
+    /// never refused.
     #[error(
         "`{collection}.{field}` names files, and a row holds a value that is not a file reference"
     )]

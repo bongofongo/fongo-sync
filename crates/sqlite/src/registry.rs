@@ -177,16 +177,19 @@ impl Collection {
 
     /// A field that names a file stored beside the changes, holding an encoded [`FileRef`]
     /// ([`FileRef::encode`]) or NULL. It merges as a plain field merged by clock does, and the
-    /// changes carry it as an ordinary blob. A collect refuses a local write of anything else
-    /// with [`Error::NotAFile`]; a value from elsewhere that is not a reference is kept and shown
-    /// as any value is, and names no file. A file field is not part of a natural key, whose
+    /// changes carry it as an ordinary blob. Every change this build collects from a write of
+    /// the application's to the field is a reference or NULL: a collect refuses any other value
+    /// the application wrote with [`Error::NotAFile`], until it corrects or removes the row.
+    /// Values adopted from rows already there when a collection or field is first installed, and
+    /// values from elsewhere, may be anything: they are kept and shown as any value is, and name
+    /// a file only if they are references. A file field is not part of a natural key, whose
     /// entries are kept otherwise than by their winner, nor of a set of fields that change
     /// together, which a write to any of its fields records whole, and does not report conflicts.
     ///
-    /// Once a version of an application marks a field as naming files, every later version keeps
-    /// it so, merged by clock: a replica that does not know the field counts what it holds of it
-    /// as last-writer-wins, and it can be relied on only while that is what the field is. See
-    /// [`crate::Replica::refers`].
+    /// A field marked as naming files must be marked so in every version of the application that
+    /// writes it, merged by clock, never part of a key, and never unmarked: a replica that does
+    /// not know the field counts what it holds of it as last-writer-wins, and it can be relied on
+    /// only while that is what the field is. See [`crate::Replica::refers`].
     pub fn file(mut self, name: &str) -> Collection {
         self.fields.push(Field {
             name: name.into(),
@@ -273,6 +276,17 @@ impl Registry {
             if let Some(name) = names.iter().find(|n| !is_identifier(n)) {
                 return bad(format!(
                     "`{name}` in `{}` is not a plain identifier",
+                    c.name
+                ));
+            }
+            let tables = std::iter::once(c.table.as_str())
+                .chain(c.local_dependents.iter().map(|(t, _)| t.as_str()));
+            if let Some(table) = tables
+                .into_iter()
+                .find(|t| t.to_ascii_lowercase().starts_with("fongo_"))
+            {
+                return bad(format!(
+                    "table `{table}` of `{}`: names beginning `fongo_` are reserved to the sync kernel",
                     c.name
                 ));
             }

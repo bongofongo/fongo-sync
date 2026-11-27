@@ -48,8 +48,10 @@ reference may own its row, which then goes with its target. A collection can als
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 - fields that name files (`Collection::file`), holding a `FileRef` from `fongo-sync-protocol` or
-  NULL. They merge as plain fields merged by clock; a collect refuses a local write of anything
-  else. See [Files](#files).
+  NULL. They merge as plain fields merged by clock. A collect refuses a write of the
+  application's of anything else, until the row is corrected or removed; values adopted from
+  rows already there, and values from elsewhere, are kept whatever they are and name a file only
+  if they are references. See [Files](#files).
 
 When two replicas each make a row that is valid alone and together break a rule of the
 application's own, such as a partial unique index, the kernel holds one of them back and the
@@ -115,6 +117,9 @@ capture is suspended, `install`, `collect`, `apply` and their bounded forms fail
 `Error::Suspended`, so an application that ends while suspended calls `resume` when it opens
 again, and `Replica::suspended` says whether it must. When capture is intact, `resume` is
 `install`. `uninstall` removes everything the kernel added, and the client's tables with it.
+Names beginning `fongo_` are reserved to the kernel and its client, for tables, indexes and
+triggers; only the kernel's own objects are ever dropped (see the crate documentation of
+`fongo-sync-sqlite`), and a registry naming a table so is refused.
 
 Each call that writes, made with no transaction open, takes SQLite's write lock with its first
 statement and so waits for another connection's write in the busy handler; made inside the

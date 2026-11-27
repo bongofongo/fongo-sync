@@ -56,42 +56,63 @@ pub fn referred(registry: &Registry, changes: &[Change]) -> Files {
     winners.values().filter_map(|(v, _)| bytes(v)).collect()
 }
 
-/// Pages through `files` `limit` at a time, requiring each reference once and in order, and one
-/// answer of whether it is declared for every reference to one content.
+/// Pages through `files` `limit` at a time, requiring the values held listed once each and in
+/// order, with one answer of whether it is declared for every reference to one content, then
+/// what rows held back show, all declared. The answer for a content is whether either run
+/// declares it.
 pub async fn listed(
     conn: &mut SqliteConnection,
     replica: &Replica,
     limit: usize,
 ) -> Result<BTreeMap<ContentHash, bool>, String> {
     let mut out: BTreeMap<ContentHash, bool> = BTreeMap::new();
+    let mut held: BTreeSet<ContentHash> = BTreeSet::new();
     let mut from: Option<FilesFrom> = None;
     let mut last: Option<Vec<u8>> = None;
+    let mut values = true;
     loop {
         let page = replica
             .files(conn, from.as_ref(), limit)
             .await
             .map_err(|e| e.to_string())?;
-        if page.files.len() > limit {
-            return Err(format!("a page of {limit} held {}", page.files.len()));
-        }
-        for r in &page.files {
-            let b = r.file.encode();
-            if last.as_ref().is_some_and(|l| *l >= b) {
-                return Err("files listed out of order or twice".into());
+        if page.held_back {
+            values = false;
+            for r in &page.files {
+                if !r.declared {
+                    return Err("a row held back listed as not declared".into());
+                }
+                held.insert(r.file.hash);
             }
-            last = Some(b.clone());
-            if out
-                .insert(r.file.hash, r.declared)
-                .is_some_and(|d| d != r.declared)
-            {
-                return Err("two references to one content listed as declared and not".into());
+        } else {
+            if !values {
+                return Err("values listed after rows held back".into());
+            }
+            if page.files.len() > limit {
+                return Err(format!("a page of {limit} held {}", page.files.len()));
+            }
+            for r in &page.files {
+                let b = r.file.encode();
+                if last.as_ref().is_some_and(|l| *l >= b) {
+                    return Err("files listed out of order or twice".into());
+                }
+                last = Some(b.clone());
+                if out
+                    .insert(r.file.hash, r.declared)
+                    .is_some_and(|d| d != r.declared)
+                {
+                    return Err("two references to one content listed as declared and not".into());
+                }
             }
         }
         match page.next {
             Some(next) => from = Some(next),
-            None => return Ok(out),
+            None => break,
         }
     }
+    for hash in held {
+        out.insert(hash, true);
+    }
+    Ok(out)
 }
 
 /// The files in fields marked as naming files of the rows at `keys` of each collection.

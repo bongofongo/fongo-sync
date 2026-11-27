@@ -509,6 +509,11 @@ impl Replica {
                     None => None,
                 };
                 let recorded = plan::record(&self.schema, &name, &found, old.as_ref(), new, clock);
+                // Rows already there when adopted are taken as they are; only a write is refused.
+                if item.recorded.is_none() && item.at > 0 {
+                    let image = item.mapped.as_ref().map(|m| &m.image);
+                    self.only_files(cx, &item.key, image, &recorded)?;
+                }
                 if let (Some(_), Some(t)) = (item.keeps, &old) {
                     let members = if t.live.is_empty() {
                         t.members.clone()

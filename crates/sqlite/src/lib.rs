@@ -36,9 +36,21 @@
 //!   `uninstall` and refused by every other call ([`Error::Corrupt`]).
 //! - With no kernel tables, `install`, `install_step` and `resume` install, `suspend` does
 //!   nothing, `uncollected_rows` answers 0 and [`installed`] false; every other call but
-//!   `uninstall` refuses ([`Error::NotInstalled`]). `uninstall` removes every table and trigger
-//!   whose name begins `fongo_`, the client's own `fongo_client_` tables among them, which
-//!   alone do not count as the kernel's tables.
+//!   `uninstall` refuses ([`Error::NotInstalled`]). An install that finds no kernel tables
+//!   first removes the client's own `fongo_client_` tables, which alone do not count as the
+//!   kernel's and describe a state that is gone; `uninstall` removes them with the kernel's.
+//!
+//! # Reserved names
+//!
+//! Names beginning `fongo_`, in any case, are reserved to the kernel and its client, for tables,
+//! indexes and triggers; a registry naming such a table is refused. What the kernel does to
+//! objects so named: `install`, `install_step`, `resume`, `suspend` and `uninstall` drop the
+//! capture triggers, those named `fongo_<collection>_ai`, `_au` or `_ad` whose body marks rows
+//! in `fongo_dirty`; `uninstall` drops the tables any layout of the kernel made (from
+//! `fongo_alias` to `fongo_shadow`, a fixed list) and those whose names begin exactly
+//! `fongo_client_`; a first install drops the latter. Every call reads the kernel's objects
+//! from the schema by name. Nothing else so named is touched, but an application's object
+//! named as one of the kernel's would be taken for it.
 //! - While capture is suspended (a suspend is recorded, or a collection that was installed
 //!   lacks a trigger on its table; see [`Replica::resume`]), `install`, `install_step`,
 //!   `collect`, `collect_step`, `apply`, `purge_step` and `uncollected_rows` refuse
@@ -55,8 +67,11 @@
 //!
 //! # Files
 //!
-//! A field declared with [`Collection::file`] holds an encoded [`FileRef`] or NULL; merging treats
-//! it as a plain field merged by clock. The kernel answers, from the changes it holds, what the
+//! A field declared with [`Collection::file`] names a file with an encoded [`FileRef`]; merging
+//! treats it as a plain field merged by clock. Every change this build collects from a write of
+//! the application's to such a field is a reference or NULL ([`Error::NotAFile`] otherwise);
+//! values adopted from rows already there and values from elsewhere may be anything, and name a
+//! file only if they are references. The kernel answers, from the changes it holds, what the
 //! protocol's rules for deleting files (`fongo_sync_protocol::api`, "Deleting files") ask of a
 //! device. A server names a file by its content hash alone, so every answer is about a
 //! [`ContentHash`]: a content is referred to while any value held names it, at any size.

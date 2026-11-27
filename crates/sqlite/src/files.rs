@@ -48,12 +48,23 @@ pub struct Referred {
 
 /// Where a page of [`Replica::files`] ended, to ask for the next.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilesFrom(Vec<u8>);
+pub struct FilesFrom(Run);
+
+/// The two runs of [`Replica::files`]: values held past an encoding, then rows held back past an
+/// entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Run {
+    Values(Vec<u8>),
+    Held(Option<(String, Gid)>),
+}
 
 /// A page of [`Replica::files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilePage {
     pub files: Vec<Referred>,
+    /// Whether the page lists what rows held back show, by entity, rather than values held, in
+    /// the order of their encoded bytes.
+    pub held_back: bool,
     /// Where to ask for the next page; `None` once there are no more.
     pub next: Option<FilesFrom>,
 }
@@ -277,9 +288,17 @@ impl Replica {
         Ok(())
     }
 
-    /// Refuses local changes that put anything but a file reference or NULL in a field the
-    /// operation's registry declares as naming files.
-    pub(crate) fn only_files(&self, cx: &Ctx, changes: &[Change]) -> Result<()> {
+    /// Refuses the changes collected from a write of the application's to the row at `key` that
+    /// put in a field the operation's registry declares as naming files anything but a reference
+    /// or NULL, unless the row's image already held that value: one adopted or from elsewhere,
+    /// which the application did not write.
+    pub(crate) fn only_files(
+        &self,
+        cx: &Ctx,
+        key: &str,
+        image: Option<&fongo_sync_core::model::Row>,
+        changes: &[Change],
+    ) -> Result<()> {
         let Some(watch) = &cx.files else {
             return Ok(());
         };
@@ -287,14 +306,12 @@ impl Replica {
             if watch.names_files(change)
                 && change.value != Value::Null
                 && file_of(&change.value).is_none()
+                && image.and_then(|i| i.get(&change.field)) != Some(&change.value)
             {
                 return Err(Error::NotAFile {
                     collection: change.collection.clone(),
                     field: change.field.clone(),
-                    key: rows_of(cx.db, &change.collection, change.gid)?
-                        .into_iter()
-                        .next()
-                        .map(|(k, _)| k),
+                    key: Some(key.to_string()),
                 });
             }
         }
@@ -370,19 +387,24 @@ impl Replica {
         Ok(out)
     }
 
-    /// Every reference the changes this replica holds may refer to, in pages of at most `limit`,
-    /// in the order of their encoded bytes, each once; see [`Replica::refers`] for what counts.
-    /// One content held at two sizes is listed twice, next to each other: whether it is referred
-    /// to is a question about its hash. `from` is the [`FilePage::next`] of the page before, `None`
-    /// for the first.
+    /// Every reference this replica's state may refer to, in pages of at most `limit`; see
+    /// [`Replica::refers`] for what counts. `from` is the [`FilePage::next`] of the page before,
+    /// `None` for the first.
     ///
-    /// A page reads at most `limit` values from each of the indexes of values held and fields kept
-    /// as this replica's own that may name files, starting at `from`, so each page costs the same
-    /// wherever it starts; looks each content it returns up in every field declared as naming
-    /// files; and reads every row held back, keeping at most `limit` of what they show. The pages
-    /// are not a snapshot: a page reflects the state when it is read, and what was written
-    /// between pages may be listed or missed. A read that writes nothing. It answers while
-    /// capture is suspended, when what the application wrote meanwhile is not known: see
+    /// The listing comes in two runs. First the values held and the fields kept as this
+    /// replica's own, in the order of their encoded bytes, each once: one content held at two
+    /// sizes is listed twice, next to each other, since whether it is referred to is a question
+    /// about its hash, and [`Referred::declared`] counts a declared field or a field kept as its
+    /// own. Then the references rows held back show ([`FilePage::held_back`]), by entity, all
+    /// declared; a reference may be in both runs. A page of the first run reads at most `limit`
+    /// values from each index of values that may name files, starting at `from`, so it costs
+    /// the same wherever it starts, and looks each content it returns up in every field declared
+    /// as naming files; a page of the second reads about `limit` entities held back and their
+    /// rows, more where one entity's rows show more files than that. Nothing is read whole.
+    ///
+    /// The pages are not a snapshot: a page reflects the state when it is read, and what was
+    /// written between pages may be listed or missed. A read that writes nothing. It answers
+    /// while capture is suspended, when what the application wrote meanwhile is not known: see
     /// [`Replica::nothing_pending`].
     pub async fn files(
         &self,
@@ -400,7 +422,14 @@ impl Replica {
     }
 
     fn files_in(&self, db: &Db, from: Option<&FilesFrom>, limit: usize) -> Result<FilePage> {
-        let after = from.map(|f| f.0.clone()).unwrap_or_default();
+        match from.map(|f| &f.0) {
+            None => self.values_page(db, Vec::new(), limit),
+            Some(Run::Values(after)) => self.values_page(db, after.clone(), limit),
+            Some(Run::Held(after)) => self.held_page(db, after.as_ref(), limit),
+        }
+    }
+
+    fn values_page(&self, db: &Db, after: Vec<u8>, limit: usize) -> Result<FilePage> {
         let n = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
         // Each source is read up to `limit` values: past the least last value of one that had
@@ -456,17 +485,6 @@ impl Replica {
             .collect();
         cut(pinned.into_iter().map(|(r, _)| r).collect(), &mut kept);
         candidates.extend(kept.into_iter().filter(|b| named.contains(b)));
-        // Of the rows held back, only the least `limit` past the cursor are kept.
-        let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
-        self.held_back(db, |b| {
-            if b > after {
-                held.insert(b);
-                if held.len() > limit {
-                    held.pop_last();
-                }
-            }
-        })?;
-        candidates.extend(held);
         let mut page = FilePage::default();
         let mut last: Option<Vec<u8>> = None;
         let mut stopped = false;
@@ -483,27 +501,68 @@ impl Replica {
             }
             last = Some(bytes);
         }
-        let asked: BTreeSet<ContentHash> = page.files.iter().map(|r| r.file.hash).collect();
-        let mut held_shown = BTreeSet::new();
-        self.held_back(db, |b| {
-            if let Ok(f) = FileRef::decode(&b)
-                && asked.contains(&f.hash)
-            {
-                held_shown.insert(f.hash);
-            }
-        })?;
         let fields = self.registry.file_fields();
         for r in &mut page.files {
             let hash = r.file.hash;
-            r.declared = held_shown.contains(&hash)
-                || declared_holds(db, fields.clone(), &hash)?
-                || self.pinned_holds(db, &hash)?;
+            r.declared =
+                declared_holds(db, fields.clone(), &hash)? || self.pinned_holds(db, &hash)?;
         }
-        page.next = match (stopped, bound) {
-            (true, _) => last.map(FilesFrom),
-            (false, Some(bound)) => Some(FilesFrom(bound)),
-            (false, None) => None,
+        page.next = Some(FilesFrom(match (stopped, bound) {
+            (true, _) => Run::Values(last.unwrap_or(after)),
+            (false, Some(bound)) => Run::Values(bound),
+            (false, None) => Run::Held(None),
+        }));
+        Ok(page)
+    }
+
+    fn held_page(&self, db: &Db, after: Option<&(String, Gid)>, limit: usize) -> Result<FilePage> {
+        let mut page = FilePage {
+            held_back: true,
+            ..FilePage::default()
         };
+        let entities = match after {
+            None => db.query(
+                "SELECT collection, gid FROM fongo_held ORDER BY collection, gid LIMIT ?1",
+                &[Value::Int(i64::try_from(limit).unwrap_or(i64::MAX))],
+            )?,
+            Some((collection, gid)) => db.query(
+                "SELECT collection, gid FROM fongo_held WHERE (collection, gid) > (?1, ?2)
+                  ORDER BY collection, gid LIMIT ?3",
+                &[
+                    Value::Text(collection.clone()),
+                    Value::Ref(*gid),
+                    Value::Int(i64::try_from(limit).unwrap_or(i64::MAX)),
+                ],
+            )?,
+        };
+        let mut last = None;
+        for r in &entities {
+            let (name, gid) = (as_text(&r[0])?, as_gid(&r[1])?);
+            last = Some((name.to_string(), gid));
+            let Some(idx) = self.registry.index(name) else {
+                continue;
+            };
+            let c = self.collection(idx);
+            let mut seen = BTreeSet::new();
+            for (key, _) in rows_of(db, name, gid)? {
+                if let Some(row) = read_row(db, c, &key)? {
+                    for f in c.fields.iter().filter(|f| matches!(f.kind, Kind::File)) {
+                        if let Some(file) = row.get(&f.name).and_then(file_of) {
+                            seen.insert(file.encode());
+                        }
+                    }
+                }
+            }
+            page.files.extend(seen.iter().filter_map(|b| {
+                FileRef::decode(b).ok().map(|file| Referred {
+                    file,
+                    declared: true,
+                })
+            }));
+        }
+        page.next = (entities.len() == limit)
+            .then(|| last.map(|l| FilesFrom(Run::Held(Some(l)))))
+            .flatten();
         Ok(page)
     }
 
@@ -593,12 +652,14 @@ impl Replica {
         .await
     }
 
-    /// Whether this replica's state is exactly the changes it has merged with nothing of its
-    /// own pending: capture is not suspended, no row is written and not yet collected, no row a
-    /// first install in steps found waits to be adopted, and the outbox is empty. A device may
-    /// retire a file only while this holds, with `through` the last envelope it has merged, its
-    /// own included; [`Replica::refers`] then answers about exactly the changes through it. A
-    /// few indexed reads; a read that writes nothing.
+    /// Whether nothing of this replica's own is pending: capture is not suspended, no row is
+    /// written and not yet collected, no row a first install in steps found waits to be adopted,
+    /// and the outbox is empty. Rows held back and fields kept as this replica's own may remain:
+    /// they are not changes, [`Replica::refers`] counts their files, and a device claims them
+    /// ([`Replica::files_to_claim`]). A device may retire a file only while this holds, with
+    /// `through` the last envelope it has merged, its own included; the changes [`Replica::refers`]
+    /// answers about are then exactly those through it. A few indexed reads; a read that writes
+    /// nothing.
     pub async fn nothing_pending(&self, conn: &mut SqliteConnection) -> Result<bool> {
         with_db(conn, |db| {
             db.atomically(|db| {
@@ -633,8 +694,10 @@ impl Replica {
     /// group shows no row and none of whose group's members has a row here, held back or given
     /// up. Such a member never shows again, so neither does its NULL: a group shows only the
     /// fields of its live members, a member whose own deletion wins is not live while that
-    /// deletion wins, and only making a row writes a member's deletion back to 0, which for a
-    /// minted collection makes a new entity. A row deleted only with its owner, which no change
+    /// deletion wins, and no change this crate writes sets a member's deletion back to 0 but the
+    /// making of a row, which for a minted collection is a new entity. A change from elsewhere
+    /// that sets a cleared member's deletion back to 0 at a later clock, which no build of this
+    /// crate writes, brings its row back with its file fields NULL. A row deleted only with its owner, which no change
     /// deleted itself, is not cleared. Natural collections are not cleared at all: a row made
     /// again at the same key anywhere is the same entity again, which a clearing could empty.
     /// Their deleted rows keep their files; an application that wants them gone clears a file

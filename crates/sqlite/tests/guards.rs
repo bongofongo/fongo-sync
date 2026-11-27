@@ -1593,3 +1593,74 @@ async fn a_found_row_that_waits_keeps_the_oldest_clock_through_a_resume() {
         assert_eq!(adopted(Some(lose)).await, installed, "lost by hand: {lose}");
     }
 }
+
+/// Names beginning `fongo_` are the kernel's and its client's, but only its own objects are
+/// touched: an application's tables and triggers of such names, and tables whose names merely
+/// look like the client's, survive a first install, a suspend and resume, and an uninstall. A
+/// collection on a table so named is refused.
+#[tokio::test]
+async fn only_the_kernels_own_objects_are_touched() {
+    let world = World::new(30);
+    let mut c = database(&world, 0).await;
+    for sql in [
+        "CREATE TABLE fongo_cache (k TEXT, v TEXT)",
+        "INSERT INTO fongo_cache VALUES ('reading list', 'Middlemarch')",
+        "CREATE TABLE Fongo_Archive (k TEXT)",
+        "INSERT INTO Fongo_Archive VALUES ('kept')",
+        "CREATE TABLE fongo_clientele (k TEXT)",
+        "CREATE TABLE fongoXclient_y (k TEXT)",
+        "CREATE TABLE audit (title TEXT)",
+        "CREATE TRIGGER fongo_audit_ai AFTER INSERT ON books BEGIN
+            INSERT INTO audit VALUES (NEW.title); END",
+        "CREATE TABLE fongo_client_state (library BLOB PRIMARY KEY)",
+    ] {
+        run(&mut c, sql).await;
+    }
+    let replica = Replica::new(registry());
+    let theirs = async |c: &mut SqliteConnection| -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT type || ' ' || name FROM sqlite_master
+              WHERE name IN ('fongo_cache', 'Fongo_Archive', 'fongo_clientele', 'fongoXclient_y',
+                             'fongo_audit_ai', 'fongo_client_state')
+              ORDER BY name",
+        )
+        .fetch_all(c)
+        .await
+        .unwrap()
+    };
+    let mine = [
+        "table Fongo_Archive",
+        "table fongoXclient_y",
+        "trigger fongo_audit_ai",
+        "table fongo_cache",
+        "table fongo_clientele",
+    ];
+    replica.install(&mut c).await.unwrap();
+    // The client's tables, left without the kernel's, are gone; the application's stay.
+    assert_eq!(theirs(&mut c).await, mine);
+    run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+    replica.collect(&mut c).await.unwrap();
+    replica.suspend(&mut c).await.unwrap();
+    replica.resume(&mut c, Resume::Send).await.unwrap();
+    replica.install(&mut c).await.unwrap();
+    run(&mut c, "INSERT INTO books (title) VALUES ('Romola')").await;
+    let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(audited, 2, "the application's trigger still runs");
+    replica.uninstall(&mut c).await.unwrap();
+    assert_eq!(theirs(&mut c).await, mine);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM fongo_cache")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    let named = Registry::new(vec![
+        Collection::minted("books", "fongo_books", "id").field("title"),
+    ]);
+    match named {
+        Err(Error::Registry(message)) => assert!(message.contains("reserved"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}

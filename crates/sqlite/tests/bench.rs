@@ -774,6 +774,19 @@ async fn questions_about_files_with_rows_held_back() {
     let started = Instant::now();
     replica.files(&mut b, None, 1000).await.unwrap();
     table.time("files, one page of 1,000", started);
+    let (started, mut from, mut pages) = (Instant::now(), None, 0);
+    loop {
+        let page = replica.files(&mut b, from.as_ref(), 100).await.unwrap();
+        pages += 1;
+        match page.next {
+            Some(next) => from = Some(next),
+            None => break,
+        }
+    }
+    table.time(
+        &format!("files, every page of 100 ({pages} pages)"),
+        started,
+    );
     let started = Instant::now();
     let claimed = replica.files_to_claim(&mut b).await.unwrap();
     table.time("files_to_claim", started);

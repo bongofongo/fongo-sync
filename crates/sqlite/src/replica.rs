@@ -296,15 +296,60 @@ fn set_aside(db: &Db, collection: &str) -> Result<()> {
     Ok(())
 }
 
-/// Drops every object of a type the kernel made: its triggers, or its tables.
+/// Every table any layout of the kernel has made. Names beginning `fongo_` are reserved to the
+/// kernel and its client, but only these, the client's, and the capture triggers are touched.
+const EVER_MADE: &[&str] = &[
+    "fongo_alias",
+    "fongo_alias_pairs",
+    "fongo_bases",
+    "fongo_claims",
+    "fongo_deviations",
+    "fongo_dirty",
+    "fongo_foreign",
+    "fongo_found",
+    "fongo_held",
+    "fongo_ids",
+    "fongo_leftover",
+    "fongo_meta",
+    "fongo_outbox",
+    "fongo_pending",
+    "fongo_pins",
+    "fongo_shadow",
+];
+
+/// The prefix of the client's own tables, matched exactly.
+const CLIENT: &str = "fongo_client_";
+
+/// Whether an object of the schema is one the kernel made: a table of [`EVER_MADE`], one of the
+/// client's (with `client`), or a capture trigger, named `fongo_<collection>_ai`, `_au` or `_ad`
+/// and marking rows in `fongo_dirty`.
+fn made_here(kind: &str, name: &str, sql: &str, client: bool) -> bool {
+    match kind {
+        "table" => EVER_MADE.contains(&name) || (client && name.starts_with(CLIENT)),
+        _ => {
+            name.starts_with("fongo_")
+                && ["_ai", "_au", "_ad"].iter().any(|s| name.ends_with(s))
+                && sql.contains("INTO fongo_dirty")
+        }
+    }
+}
+
+/// Drops every object of a type the kernel made, its capture triggers or its tables and the
+/// client's, and nothing else.
 fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
+    drop_made(db, kind, |name, sql| made_here(kind, name, sql, true))
+}
+
+fn drop_made(db: &Db, kind: &str, made: impl Fn(&str, &str) -> bool) -> Result<()> {
     let names = db.query(
-        "SELECT name FROM sqlite_master WHERE type = ?1 AND name LIKE 'fongo!_%' ESCAPE '!'",
+        "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = ?1 AND name LIKE 'fongo%'",
         &[Value::Text(kind.into())],
     )?;
     for row in names {
-        let name = quoted(as_text(&row[0])?);
-        db.exec(&format!("DROP {kind} IF EXISTS {name}"), &[])?;
+        let name = as_text(&row[0])?;
+        if made(name, as_text(&row[1])?) {
+            db.exec(&format!("DROP {kind} IF EXISTS {}", quoted(name)), &[])?;
+        }
     }
     Ok(())
 }
@@ -647,9 +692,6 @@ impl Replica {
         if changes.is_empty() {
             return Ok(Ok(BTreeSet::new()));
         }
-        if local {
-            self.only_files(cx, changes)?;
-        }
         let ev = self.evaluator();
         let facts = Facts { db: cx.db };
         let affected = ev.affected(&facts, changes);
@@ -945,9 +987,9 @@ impl Replica {
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
     /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
-    /// layouts 3 and 4 are upgraded in place. Where there are no kernel tables, any table whose
-    /// name begins `fongo_`, such as the client's, is removed first: it describes a state that
-    /// is gone. Refuses with [`Error::Suspended`] while capture is
+    /// layouts 3 and 4 are upgraded in place. Where there are no kernel tables, the client's own
+    /// tables (named `fongo_client_...`) are removed first: they describe a state that is gone.
+    /// Refuses with [`Error::Suspended`] while capture is
     /// suspended: only [`Replica::resume`] puts the triggers back then, having compared the
     /// tables with what the kernel last saw of them.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
@@ -1020,7 +1062,7 @@ impl Replica {
         }
         // The client's tables, left without the kernel's, describe a state that is gone.
         if kernel.state == State::Absent {
-            drop_kernel(db, "table")?;
+            drop_made(db, "table", |name, _| name.starts_with(CLIENT))?;
         }
         for sql in TABLES {
             db.exec(sql, &[])?;
@@ -1638,8 +1680,9 @@ impl Replica {
         db.check()
     }
 
-    /// Removes the triggers and every table the kernel keeps, leaving the application's own.
-    /// Installing again afterwards is a fresh join: every row becomes a new entity, so syncing
+    /// Removes the capture triggers, every table any layout of the kernel made and the client's
+    /// tables (`fongo_client_...`), leaving the application's own, even those whose names begin
+    /// `fongo_`. Installing again afterwards is a fresh join: every row becomes a new entity, so syncing
     /// with replicas that knew the old ones gives two copies of each row that has no identity.
     /// Ends a suspension with the rest. Removes tables of an earlier layout too, whatever it
     /// was, but refuses those of a later one ([`Error::NewerLayout`]), which may hold what this
