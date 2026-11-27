@@ -23,7 +23,7 @@ use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
-use crate::store::{Facts, LAYOUT, SUSPENDED, State, TABLES, as_clock, capture, state};
+use crate::store::{Facts, Kernel, LAYOUT, SUSPENDED, State, TABLES, as_clock, read, state};
 use crate::tables::{self, NOW, every_row, read_row};
 
 /// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
@@ -32,7 +32,9 @@ pub enum Resume {
     /// They are the application's edits, sent like any other.
     Send,
     /// They are this replica's own baseline: not sent, and kept in the row until this replica or
-    /// another next writes the field.
+    /// another next writes the field. A row whose write the triggers captured before capture
+    /// stopped, and no collect took, is the application's edit instead: it is sent, with all it
+    /// differs by, also what changed in it while capture was off.
     Baseline,
 }
 
@@ -838,9 +840,9 @@ impl Replica {
     ) -> Result<Collected> {
         // Only a resume compares the tables whose capture was off with the images; an install
         // would put the triggers back over rows written meanwhile, unrecorded.
-        let (laid, lost) = capture(db)?;
-        let lost = self.lost(&lost);
-        let resuming = match laid {
+        let kernel = read(db)?;
+        let lost = self.lost(&kernel);
+        let resuming = match kernel.state {
             State::Current { suspended: true } => Some((resuming.ok_or(Error::Suspended)?, None)),
             State::Current { suspended: false } | State::Older(_) if !lost.is_empty() => {
                 Some((resuming.ok_or(Error::Suspended)?, Some(lost)))
@@ -1191,23 +1193,30 @@ impl Replica {
     }
 
     /// Whether capture is suspended, as [`Replica::resume`] defines it: a suspend is recorded,
-    /// or a collection that was installed lacks a trigger. Fails as every other call does where
-    /// the kernel's tables are missing or of another layout.
+    /// or a collection that was installed lacks a trigger on its table. Answers too on a layout
+    /// that [`Replica::resume`] upgrades, changing nothing. Fails as every other call does where
+    /// the kernel's tables are missing or of a layout this build cannot upgrade.
     pub async fn suspended(&self, conn: &mut SqliteConnection) -> Result<bool> {
         with_db(conn, |db| {
             db.atomically(|db| {
-                let (laid, lost) = capture(db)?;
-                Ok(laid.current()? || !self.lost(&lost).is_empty())
+                let kernel = read(db)?;
+                if !matches!(kernel.state, State::Older(_)) {
+                    kernel.state.current()?;
+                }
+                Ok(kernel.flagged || !self.lost(&kernel).is_empty())
             })
         })
         .await
     }
 
-    /// The collections of the registry among `names`.
-    fn lost(&self, names: &[String]) -> BTreeSet<usize> {
-        names
+    /// The collections of the registry whose capture [`Kernel::lost`] finds lost.
+    fn lost(&self, kernel: &Kernel) -> BTreeSet<usize> {
+        self.registry
+            .collections()
             .iter()
-            .filter_map(|n| self.registry.index(n))
+            .enumerate()
+            .filter(|(_, c)| kernel.lost(&c.name, &c.table))
+            .map(|(idx, _)| idx)
             .collect()
     }
 
@@ -1215,14 +1224,14 @@ impl Replica {
     /// suspended, and every collection ever adopted with its triggers in place; or there are
     /// none, which it returns for the caller to decide.
     fn ready(&self, db: &Db) -> Result<State> {
-        let (laid, lost) = capture(db)?;
-        if laid == State::Absent {
-            return Ok(laid);
+        let kernel = read(db)?;
+        if kernel.state == State::Absent {
+            return Ok(kernel.state);
         }
-        if laid.current()? || !self.lost(&lost).is_empty() {
+        if kernel.state.current()? || !self.lost(&kernel).is_empty() {
             return Err(Error::Suspended);
         }
-        Ok(laid)
+        Ok(kernel.state)
     }
 
     /// Puts the triggers back after [`Replica::suspend`], installing again so that collections
@@ -1237,11 +1246,13 @@ impl Replica {
     /// many; collecting with [`Replica::collect_step`] before suspending leaves it only those.
     ///
     /// Capture is suspended when a suspend is recorded, or when a collection of the registry
-    /// that was installed lacks any of its triggers: a build that recorded no suspension left
-    /// them dropped, or the application rebuilt the collection's table, which drops its
-    /// triggers with it. Without a record, only the tables of those collections are compared.
-    /// When capture is intact, `resume` is [`Replica::install`]: rows written since the last
-    /// collect are edits like any other, whichever `how`.
+    /// that was installed lacks any of its triggers on its table: a build that recorded no
+    /// suspension left them dropped, the application rebuilt the collection's table, which drops
+    /// its triggers with it, or renamed the table away, which takes them along. Without a
+    /// record, only the tables of those collections are compared. Every trigger of the kernel's
+    /// is laid again, on the registry's tables, so one taken along to another table captures
+    /// nothing more there. When capture is intact, `resume` is [`Replica::install`]: rows
+    /// written since the last collect are edits like any other, whichever `how`.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| self.install_in(db, Some(how), None).map(|_| ()))
@@ -1301,8 +1312,13 @@ impl Replica {
                 if changed.is_empty() {
                     continue;
                 }
+                // A marked row holds an edit the triggers captured, which no baseline takes.
+                let captured = marked_at(db, &c.name, &key)?.is_some();
                 match how {
                     Resume::Send => {
+                        mark(&c.name, &key, false)?;
+                    }
+                    Resume::Baseline if captured => {
                         mark(&c.name, &key, false)?;
                     }
                     Resume::Baseline => {
@@ -2153,13 +2169,9 @@ impl Replica {
                 .map_or(gid, |t| t.canonical);
             out.held.push((collection, canonical));
         }
-        let found = if adopt::laid(db)? {
-            " UNION SELECT collection, key FROM fongo_found WHERE batch >= 0"
-        } else {
-            ""
-        };
         for r in db.query(
-            &format!("SELECT collection, key FROM fongo_dirty{found}"),
+            "SELECT collection, key FROM fongo_dirty
+             UNION SELECT collection, key FROM fongo_found WHERE batch >= 0",
             &[],
         )? {
             out.uncollected

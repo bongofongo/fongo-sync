@@ -494,6 +494,7 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
         Laid::Newer => refused("NewerLayout { found: 5, known: 4 }"),
         Laid::Older => match call {
             Install | InstallStep | Resume | Uninstall => ok(false),
+            Suspended => ("Ok(false)".into(), true),
             _ => refused("OlderLayout { found: 3, known: 4 }"),
         },
         Laid::Unknown => match call {
@@ -967,4 +968,149 @@ async fn capture_never_laid_is_not_taken_for_lost() {
     books.install(&mut c).await.unwrap();
     assert!(!books.suspended(&mut c).await.unwrap());
     books.collect(&mut c).await.unwrap();
+}
+
+/// How many changes sent set `field` to `value`.
+fn sent_times(changes: &[Change], field: &str, value: &str) -> usize {
+    changes
+        .iter()
+        .filter(|c| c.field == field && c.value == Value::Text(value.into()))
+        .count()
+}
+
+/// A migration that renames a synced table away, keeps it, and fills a new table of the name
+/// takes the capture triggers along to the old table: capture of the collection is lost, so an
+/// install is refused, and a resume lays the triggers on the new table, sends or keeps what the
+/// migration changed as asked, once, and captures nothing written to the old table after.
+#[tokio::test]
+async fn a_table_renamed_away_and_kept_is_resumed() {
+    for how in [Resume::Send, Resume::Baseline] {
+        let world = World::new(14);
+        let mut c = database(&world, 0).await;
+        let replica = Replica::new(registry());
+        replica.install(&mut c).await.unwrap();
+        run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+        replica.collect(&mut c).await.unwrap();
+        sent(&replica, &mut c).await;
+        for sql in [
+            "PRAGMA foreign_keys = OFF",
+            "ALTER TABLE books RENAME TO books_old",
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE, year INTEGER)",
+            "INSERT INTO books (id, title, isbn) SELECT id, upper(title), isbn FROM books_old",
+            "PRAGMA foreign_keys = ON",
+        ] {
+            run(&mut c, sql).await;
+        }
+        assert!(replica.suspended(&mut c).await.unwrap(), "{how:?}");
+        let installed = replica.install(&mut c).await;
+        assert!(
+            matches!(installed, Err(Error::Suspended)),
+            "{how:?}: {installed:?}"
+        );
+        replica.resume(&mut c, how).await.unwrap();
+        replica.collect(&mut c).await.unwrap();
+        let out = sent(&replica, &mut c).await;
+        let inspection = replica.inspect(&mut c).await.unwrap();
+        match how {
+            Resume::Send => assert_eq!(sent_times(&out, "title", "MIDDLEMARCH"), 1, "{out:?}"),
+            Resume::Baseline => {
+                assert_eq!(sent_times(&out, "title", "MIDDLEMARCH"), 0, "{out:?}");
+                assert!(pinned(&inspection, "title"), "{inspection:?}");
+            }
+        }
+        run(&mut c, "UPDATE books_old SET title = 'stale'").await;
+        replica.collect(&mut c).await.unwrap();
+        assert!(sent(&replica, &mut c).await.is_empty(), "{how:?}");
+        assert_eq!(replica.uncollected_rows(&mut c, 10).await.unwrap(), 0);
+        run(&mut c, "UPDATE books SET title = 'Romola'").await;
+        replica.collect(&mut c).await.unwrap();
+        assert_eq!(
+            sent_times(&sent(&replica, &mut c).await, "title", "Romola"),
+            1
+        );
+    }
+}
+
+/// An edit the triggers captured and no collect took, then capture suspended or one trigger
+/// lost: a resume that keeps what changed meanwhile as a baseline still sends the captured edit,
+/// once, and pins nothing of it; a field changed only while capture was off is pinned.
+#[tokio::test]
+async fn a_captured_edit_is_sent_on_a_baseline_resume() {
+    for suspend in [true, false] {
+        let world = World::new(15);
+        let mut c = database(&world, 0).await;
+        let replica = Replica::new(registry());
+        replica.install(&mut c).await.unwrap();
+        run(
+            &mut c,
+            "INSERT INTO books (title) VALUES ('Middlemarch'), ('Felix Holt')",
+        )
+        .await;
+        replica.collect(&mut c).await.unwrap();
+        sent(&replica, &mut c).await;
+        run(&mut c, "UPDATE books SET title = 'Romola' WHERE id = 1").await;
+        if suspend {
+            replica.suspend(&mut c).await.unwrap();
+        } else {
+            drop_triggers(&mut c, "fongo_books_au").await;
+        }
+        run(&mut c, "UPDATE books SET title = 'quiet' WHERE id = 2").await;
+        replica.resume(&mut c, Resume::Baseline).await.unwrap();
+        replica.collect(&mut c).await.unwrap();
+        let out = sent(&replica, &mut c).await;
+        let inspection = replica.inspect(&mut c).await.unwrap();
+        let at = if suspend {
+            "suspended"
+        } else {
+            "a trigger lost"
+        };
+        assert_eq!(sent_times(&out, "title", "Romola"), 1, "{at}: {out:?}");
+        assert_eq!(sent_times(&out, "title", "quiet"), 0, "{at}: {out:?}");
+        assert_eq!(
+            inspection.pinned,
+            [("books".to_string(), "[2]".to_string(), "title".to_string())],
+            "{at}"
+        );
+    }
+}
+
+/// A captured edit to one field and a change to another made while suspended: a baseline resume
+/// sends the row's whole difference, the safe side, and pins nothing of it.
+#[tokio::test]
+async fn a_captured_row_changed_again_while_suspended_is_sent_whole() {
+    let world = World::new(16);
+    let mut c = database(&world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(
+        &mut c,
+        "INSERT INTO books (title, isbn) VALUES ('Middlemarch', 'x')",
+    )
+    .await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    run(&mut c, "UPDATE books SET title = 'Romola'").await;
+    replica.suspend(&mut c).await.unwrap();
+    run(&mut c, "UPDATE books SET isbn = 'y'").await;
+    replica.resume(&mut c, Resume::Baseline).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    let out = sent(&replica, &mut c).await;
+    assert_eq!(sent_times(&out, "title", "Romola"), 1, "{out:?}");
+    assert_eq!(sent_times(&out, "isbn", "y"), 1, "{out:?}");
+    assert!(replica.inspect(&mut c).await.unwrap().pinned.is_empty());
+}
+
+/// On layout 3, which recorded no suspension, `suspended` answers from the triggers, changing
+/// nothing.
+#[tokio::test]
+async fn suspended_answers_on_an_older_layout() {
+    for lose in [false, true] {
+        let (mut c, replica) = laid(Laid::Older).await;
+        if lose {
+            drop_triggers(&mut c, "fongo_notes%").await;
+        }
+        let before = dump(&mut c).await;
+        assert_eq!(replica.suspended(&mut c).await.unwrap(), lose);
+        assert_eq!(dump(&mut c).await, before);
+    }
 }

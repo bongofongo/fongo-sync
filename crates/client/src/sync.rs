@@ -285,7 +285,8 @@ pub struct SyncReport {
 /// writing anything.
 ///
 /// It needs the kernel installed, of the layout this build uses, with capture running: it asks
-/// [`Replica::suspended`] next, before reaching the server, and otherwise fails with
+/// [`fongo_sync_sqlite::installed`] and [`Replica::suspended`] next, before reaching the server,
+/// and otherwise fails with
 /// [`Error::Database`] carrying the kernel's refusal, such as
 /// [`fongo_sync_sqlite::Error::Suspended`] after a suspend that no resume has ended.
 ///
@@ -530,6 +531,9 @@ async fn run<T: Transport, A: Apply>(
     settles: bool,
 ) -> Result<SyncReport, Error> {
     check_connection(conn).await?;
+    if !fongo_sync_sqlite::installed(conn).await? {
+        return Err(fongo_sync_sqlite::Error::NotInstalled.into());
+    }
     if replica.suspended(conn).await? {
         return Err(fongo_sync_sqlite::Error::Suspended.into());
     }

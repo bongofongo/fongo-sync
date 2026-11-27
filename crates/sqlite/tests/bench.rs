@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fongo_sync_sqlite::core::{Change, DELETED, Gid, Hlc, Value};
-use fongo_sync_sqlite::{Collection, Registry, Replica};
+use fongo_sync_sqlite::{COLLECT_ROWS, Collection, Registry, Replica};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, SqliteConnection};
 use support::statements::Statements;
@@ -510,5 +510,60 @@ async fn timings() {
     println!("\n{:<60} {:>12}", "operation", "ms");
     for (what, took) in &table.0 {
         println!("{what:<60} {:>12.1}", took.as_secs_f64() * 1000.0);
+    }
+}
+
+/// What a call that finds nothing to do costs, in a schema of the kernel's tables alone and in
+/// one with 1,500 more objects, in time and in SQLite's work (units of 64 instructions): every
+/// call reads the kernel's tables and triggers from the schema. `make bench` prints it.
+#[tokio::test]
+#[ignore = "a benchmark: make bench"]
+async fn idle_calls_in_a_large_schema() {
+    const CALLS: u32 = 500;
+    println!("\n{:<60} {:>12} {:>12}", "idle call", "ms", "work");
+    for extra in [0, 500] {
+        let replica = Replica::new(registry());
+        let mut c = database().await;
+        for i in 0..extra {
+            run(
+                &mut c,
+                &format!("CREATE TABLE extra_{i} (id INTEGER PRIMARY KEY, v TEXT)"),
+            )
+            .await;
+            run(
+                &mut c,
+                &format!("CREATE INDEX extra_{i}_v ON extra_{i} (v)"),
+            )
+            .await;
+            run(
+                &mut c,
+                &format!(
+                    "CREATE TRIGGER extra_{i}_t AFTER INSERT ON extra_{i} BEGIN SELECT 1; END"
+                ),
+            )
+            .await;
+        }
+        replica.install(&mut c).await.unwrap();
+        let work = count_work(&mut c).await;
+        for what in ["collect", "collect_step", "apply of nothing", "outbox"] {
+            work.store(0, Ordering::Relaxed);
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                match what {
+                    "collect" => drop(replica.collect(&mut c).await.unwrap()),
+                    "collect_step" => {
+                        drop(replica.collect_step(&mut c, COLLECT_ROWS).await.unwrap())
+                    }
+                    "apply of nothing" => drop(replica.apply(&mut c, &[]).await.unwrap()),
+                    _ => drop(replica.outbox(&mut c, 10).await.unwrap()),
+                }
+            }
+            let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(CALLS);
+            let done = work.load(Ordering::Relaxed) / u64::from(CALLS);
+            println!(
+                "{:<60} {each:>12.3} {done:>12}",
+                format!("{what}, {} more objects", 3 * extra)
+            );
+        }
     }
 }

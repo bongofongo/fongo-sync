@@ -28,9 +28,10 @@ as a whole install at that moment would adopt them; what the application writes 
 collected after them as its edits. The kernel's tables are of layout 4: a build that knows only
 layout 3 refuses to install over them, and this one upgrades layout 3 in place at its next
 install. Every call reads the layout first: this build refuses tables of a later layout in every
-call, and layout 3 in every call but `install`, `install_step`, `resume` and `uninstall`; with
-no kernel tables, a call that needs them fails with `Error::NotInstalled`, and with some of them
-missing every call but `uninstall` fails with `Error::Corrupt`.
+call, and layout 3 in every call but `install`, `install_step`, `resume`, `uninstall` and
+`Replica::suspended`; with no kernel tables, a call that needs them fails with
+`Error::NotInstalled`, and with some of them missing every call but `uninstall` fails with
+`Error::Corrupt`.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are
@@ -63,9 +64,11 @@ waits for it needs its own way on.
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
 the application asks. Suspending in the middle of a first install in steps adopts the rest of what
 it found first, in one transaction. The suspension is recorded in the database until `resume`.
-Capture also counts as suspended when a collection that was installed lacks any of its triggers,
-as when a build that recorded no suspension dropped them or the application rebuilt the table;
-`resume` then compares only those collections' tables. While capture is suspended, `install`,
+Capture also counts as suspended when a collection that was installed lacks any of its triggers
+on its table, as when a build that recorded no suspension dropped them, or the application
+rebuilt the table or renamed it away; `resume` then compares only those collections' tables.
+With `Resume::Baseline`, a row whose edit the triggers captured before capture stopped is still
+sent as an edit. While capture is suspended, `install`,
 `collect`, `apply` and their bounded forms fail with `Error::Suspended`, so an application that
 ends while suspended calls `resume` when it opens again, and `Replica::suspended` says whether
 it must. When capture is intact, `resume` is `install`. `uninstall` removes everything the kernel

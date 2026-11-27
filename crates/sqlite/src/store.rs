@@ -1,13 +1,13 @@
 //! The facts `fongo_sync_core::source` describes, kept in the kernel's tables and read back
 //! through the indexed questions of [`Source`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::model::Schema;
 use fongo_sync_core::source::{Alias, Body, Claim, Entry, Fact, Slot, Source, keep};
 use fongo_sync_core::{Gid, Hlc, Value};
 
-use crate::db::{Db, as_gid, as_int, as_text, loaded, stored};
+use crate::db::{Db, as_gid, as_text, loaded, stored};
 use crate::error::{Error, Result};
 
 /// The kernel's own tables. Layout 4: facts as `source::admit` keeps them, a row image and the
@@ -54,8 +54,8 @@ use crate::error::{Error, Result};
 /// way: a build of layout 3 refuses to install over layout 4, as over any layout it does not
 /// know. Such a build calling `collect` or `apply` without installing first is not refused, and
 /// would leave records waiting unadopted; an application installs at every open. This build
-/// refuses every call on a later layout, and every call but an install, a resume or an uninstall
-/// on layout 3.
+/// refuses every call on a later layout, and every call but an install, a resume, an uninstall
+/// or asking whether capture is suspended on layout 3.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.
@@ -221,86 +221,121 @@ pub(crate) fn kernel_tables() -> impl Iterator<Item = &'static str> {
 /// The table layout 4 added to layout 3.
 const ADDED: &str = "fongo_found";
 
-/// Reads [`State`] in one statement: an indexed read of `fongo_meta` and a count of the kernel's
-/// tables in the schema. With `capture`, the same statement also names each collection ever
-/// adopted whose three capture triggers are not all there, as [`capture`] returns them.
-fn read(db: &Db, capture: bool) -> Result<(State, Vec<String>)> {
-    let names = kernel_tables()
-        .filter(|t| *t != ADDED)
-        .map(|t| format!("'{t}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let lost = if capture {
-        "UNION ALL
-         SELECT 'lost', substr(key, 9) FROM fongo_meta
-          WHERE key > 'adopted:' AND key < 'adopted;'
-            AND (SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
-                 'fongo_' || substr(key, 9) || '_ai', 'fongo_' || substr(key, 9) || '_au',
-                 'fongo_' || substr(key, 9) || '_ad')) < 3"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT key, value FROM fongo_meta WHERE key IN ('layout', '{SUSPENDED}')
+/// The suffixes of the three triggers that capture a collection's writes, named
+/// `fongo_<collection>_<suffix>`.
+const CAPTURE: [&str; 3] = ["ai", "au", "ad"];
+
+/// What [`read`] finds of the kernel in the database.
+pub(crate) struct Kernel {
+    pub state: State,
+    /// Whether a suspension is recorded, whatever the layout.
+    pub flagged: bool,
+    /// The collections ever adopted.
+    adopted: BTreeSet<String>,
+    /// The kernel's triggers, by name, with the table each is on.
+    triggers: BTreeMap<String, String>,
+}
+
+impl Kernel {
+    /// Whether `collection` was adopted and lacks any of its capture triggers on `table`: a
+    /// suspend dropped them, or a build that recorded none, or the application rebuilt the
+    /// table, or renamed it away and took them along.
+    pub(crate) fn lost(&self, collection: &str, table: &str) -> bool {
+        self.adopted.contains(collection)
+            && CAPTURE.iter().any(|suffix| {
+                !self
+                    .triggers
+                    .get(&format!("fongo_{collection}_{suffix}"))
+                    .is_some_and(|on| on.eq_ignore_ascii_case(table))
+            })
+    }
+}
+
+/// Reads [`Kernel`] in one statement: indexed reads of `fongo_meta` and one pass over the
+/// schema for the kernel's tables and triggers.
+pub(crate) fn read(db: &Db) -> Result<Kernel> {
+    let rows = match db.query(
+        "SELECT 'meta', key, value FROM fongo_meta WHERE key IN ('layout', 'suspended')
          UNION ALL
-         SELECT 'tables', count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({names})
+         SELECT 'meta', key, value FROM fongo_meta WHERE key > 'adopted:' AND key < 'adopted;'
          UNION ALL
-         SELECT 'added', count(*) FROM sqlite_master WHERE type = 'table' AND name = '{ADDED}'
-         {lost}"
-    );
-    let rows = match db.query(&sql, &[]) {
+         SELECT type, name, tbl_name FROM sqlite_master
+          WHERE type IN ('table', 'trigger') AND name LIKE 'fongo!_%' ESCAPE '!'",
+        &[],
+    ) {
         Ok(rows) => rows,
         Err(e) => {
-            let found = db.query(
-                &format!(
-                    "SELECT sum(name = 'fongo_meta'), count(*) FROM sqlite_master
-                      WHERE type = 'table' AND name IN ({names}, '{ADDED}')"
-                ),
+            let tables = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fongo!_%' ESCAPE '!'",
                 &[],
             )?;
-            return match found.first().map(|r| (&r[0], &r[1])) {
-                Some((Value::Int(1), _)) => Err(e),
-                Some((_, Value::Int(0))) => Ok((State::Absent, Vec::new())),
-                _ => Ok((State::Partial, Vec::new())),
+            let mut there = BTreeSet::new();
+            for r in &tables {
+                there.insert(as_text(&r[0])?.to_string());
+            }
+            if there.contains("fongo_meta") {
+                return Err(e);
+            }
+            let state = if kernel_tables().any(|t| there.contains(t)) {
+                State::Partial
+            } else {
+                State::Absent
             };
+            return Ok(Kernel {
+                state,
+                flagged: false,
+                adopted: BTreeSet::new(),
+                triggers: BTreeMap::new(),
+            });
         }
     };
-    let core = i64::try_from(kernel_tables().filter(|t| *t != ADDED).count()).unwrap_or(0);
-    let (mut layout, mut suspended, mut tables, mut added) = (None, false, 0, 0);
-    let mut lost = Vec::new();
+    let (mut layout, mut flagged) = (None, false);
+    let mut adopted = BTreeSet::new();
+    let mut tables = BTreeSet::new();
+    let mut triggers = BTreeMap::new();
     for r in rows {
+        let name = as_text(&r[1])?;
         match as_text(&r[0])? {
-            "layout" => layout = Some(r[1].clone()),
-            SUSPENDED => suspended = true,
-            "tables" => tables = as_int(&r[1])?,
-            "added" => added = as_int(&r[1])?,
-            "lost" => lost.push(as_text(&r[1])?.to_string()),
-            _ => {}
+            "meta" if name == "layout" => layout = Some(r[2].clone()),
+            "meta" if name == SUSPENDED => flagged = true,
+            "meta" => {
+                if let Some(collection) = name.strip_prefix("adopted:") {
+                    adopted.insert(collection.to_string());
+                }
+            }
+            "table" => {
+                tables.insert(name.to_string());
+            }
+            _ => {
+                triggers.insert(name.to_string(), as_text(&r[2])?.to_string());
+            }
         }
     }
+    let core = kernel_tables()
+        .filter(|t| *t != ADDED)
+        .all(|t| tables.contains(t));
     let state = match layout {
-        Some(Value::Int(LAYOUT)) if tables == core && added == 1 => State::Current { suspended },
+        Some(Value::Int(LAYOUT)) if core && tables.contains(ADDED) => {
+            State::Current { suspended: flagged }
+        }
         Some(Value::Int(LAYOUT)) => State::Partial,
         Some(Value::Int(found)) if found > LAYOUT => State::Newer(found),
-        Some(Value::Int(found)) if UPGRADES.contains(&found) && tables == core => {
-            State::Older(found)
-        }
+        Some(Value::Int(found)) if UPGRADES.contains(&found) && core => State::Older(found),
         Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Partial,
         Some(Value::Int(found)) => State::Unknown(Some(found)),
         _ => State::Unknown(None),
     };
-    Ok((state, lost))
+    Ok(Kernel {
+        state,
+        flagged,
+        adopted,
+        triggers,
+    })
 }
 
 /// [`State`], read in one statement.
 pub(crate) fn state(db: &Db) -> Result<State> {
-    Ok(read(db, false)?.0)
-}
-
-/// [`State`], and the collections ever adopted whose capture triggers are not all there: dropped
-/// by a suspend, or with their table when an application rebuilt it.
-pub(crate) fn capture(db: &Db) -> Result<(State, Vec<String>)> {
-    read(db, true)
+    Ok(read(db)?.state)
 }
 
 pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {

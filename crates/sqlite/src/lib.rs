@@ -27,8 +27,9 @@
 //!
 //! - Tables of a later layout than this build's are refused by every call
 //!   ([`Error::NewerLayout`]).
-//! - Tables of layout 3 are upgraded by `install`, `install_step` and `resume`, and removed by
-//!   `uninstall`; every other call refuses them ([`Error::OlderLayout`]).
+//! - Tables of layout 3 are upgraded by `install`, `install_step` and `resume`, removed by
+//!   `uninstall`, and read by `suspended`; every other call refuses them
+//!   ([`Error::OlderLayout`]).
 //! - Tables of any other layout, or that record none, are removed by `uninstall` and refused by
 //!   every other call ([`Error::UnknownLayout`]).
 //! - Kernel tables some of which are missing, `fongo_meta` among them, are removed by
@@ -38,9 +39,9 @@
 //!   call refuses ([`Error::NotInstalled`]). The client's own `fongo_client_` tables are not
 //!   the kernel's.
 //! - While capture is suspended (a suspend is recorded, or a collection that was installed
-//!   lacks a trigger; see [`Replica::resume`]), `install`, `install_step`, `collect`,
-//!   `collect_step`, `apply` and `uncollected_rows` refuse ([`Error::Suspended`]); the reads,
-//!   `acknowledge` and `release_bases` answer as at any other time.
+//!   lacks a trigger on its table; see [`Replica::resume`]), `install`, `install_step`,
+//!   `collect`, `collect_step`, `apply` and `uncollected_rows` refuse ([`Error::Suspended`]);
+//!   the reads, `acknowledge` and `release_bases` answer as at any other time.
 //!
 //! Every call that writes, called with no transaction open, takes SQLite's write lock with its
 //! first statement, so while another connection writes it waits in the busy handler. Called
