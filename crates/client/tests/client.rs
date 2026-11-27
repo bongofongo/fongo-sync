@@ -14,8 +14,8 @@ use fongo_sync_client::protocol::{
 use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_client::sqlite::{Conflict, Held, Replica};
 use fongo_sync_client::{
-    Blocked, Credentials, Error, Method, Refusal, Request, Response, Transport, TransportError,
-    add_device, create_library, join_library, sync, worth_syncing,
+    Blocked, Credentials, Error, LogFault, Method, Refusal, Request, Response, Transport,
+    TransportError, add_device, create_library, join_library, sync, worth_syncing,
 };
 use sqlx::SqliteConnection;
 use support::{Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch, settle};
@@ -643,6 +643,17 @@ async fn endless_junk_pages_end_the_call_with_progress_kept_and_more_reported() 
         assert_eq!(a.cursor().await, cursor + report.refused_total as u64);
         cursor = a.cursor().await;
     }
+    // The server then places this device's append at 1, a position it served other bytes at.
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    let found = sync(&mut a.conn, &a.replica, &junk, &a.credentials, now).await;
+    assert!(
+        matches!(
+            found,
+            Err(Error::LogFault(LogFault::Reused { seq: 1, furthest })) if furthest > cursor
+        ),
+        "{found:?}"
+    );
+    assert_eq!(server.log(a.credentials.library_id()).len(), 1);
 }
 
 #[tokio::test]

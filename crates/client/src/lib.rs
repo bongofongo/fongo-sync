@@ -24,18 +24,26 @@
 //!
 //! # A log that is not the one read before
 //!
-//! The server's log only grows, and a device keeps what it read of it: so each sync first reads
-//! again the envelope at its cursor and compares it with the digest it kept, checks that each
-//! envelope it appended is where the server placed it, and that the server places a new append
-//! after everything it has read. A server restored from a backup, or one that rewrote or dropped
-//! envelopes, fails one of these, and the sync stops with [`Error::LogFault`] before applying,
-//! sending or settling anything more, as does every sync after it until the application resolves
-//! the fault, with [`resend_all`] or by rebuilding the device. Reading the envelope at the cursor
-//! costs that envelope's bytes in the first page of each sync, and no request more.
+//! The server's log only grows, and the bytes at a position never change, so a device keeps what
+//! it read of it: each sync first reads again the envelope at its cursor and compares it with the
+//! digest it kept, checks that each envelope it appended is where the server placed it, and reads
+//! back the envelope at a position the server answers an append with when that position is one it
+//! has already read. A server restored from a backup, or one that rewrote envelopes at the cursor
+//! or dropped ones it acknowledged, fails one of these, and the sync stops with
+//! [`Error::LogFault`] before applying, sealing or settling anything more, as does every sync after
+//! it until the application resolves the fault, with [`resend_all`] or by rebuilding the device.
+//!
+//! Reading the envelope at the cursor costs that envelope's bytes in every sync, up to the largest
+//! envelope the server accepts, as no route serves a digest in place of the bytes. It takes the
+//! first place in the first page, so a sync whose new envelopes fill whole pages reads one page
+//! more: with pages of `p` envelopes and `n` new ones, `n` at least 1, it reads `(n + 1) / p`
+//! pages rounded up in place of `n / p`. The first sync after tables of layout 2 are upgraded also reads the log up to the
+//! cursor once, to make a fingerprint.
 //!
 //! What cannot be detected this way: a rollback to a point after the last envelope this device read
-//! or appended, which leaves it nothing to miss; a server withholding the newest envelopes, which
-//! looks like nothing new; a server keeping separate logs for different devices, where no envelope
+//! or appended, which leaves it nothing to miss; an envelope rewritten behind the cursor, which no
+//! sync reads again, though another device reading the log anew has another fingerprint; a server
+//! withholding the newest envelopes, which looks like nothing new; a server keeping separate logs for different devices, where no envelope
 //! crosses between them; and, on a device that never read the lost part, the loss itself, until a
 //! device that read it syncs and finds the fault. Two devices comparing their [`fingerprint`]s at
 //! one position out of band find a split.
@@ -77,7 +85,7 @@ pub use credentials::{
     CREDENTIALS_FORMAT, CREDENTIALS_FORMAT_WITHOUT_WRAP, Credentials, CredentialsError,
 };
 pub use error::Error;
-pub use fault::{Fingerprint, LogFault, fault, fingerprint, resend_all};
+pub use fault::{Fingerprint, LogFault, fingerprint, log_fault, resend_all};
 pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
 pub use library::{

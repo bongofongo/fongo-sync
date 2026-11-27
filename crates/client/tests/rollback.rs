@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
-    Apply, Error, LogFault, Method, Pace, create_library, fault, fingerprint, join_library,
+    Apply, Error, LogFault, Method, Pace, create_library, fingerprint, join_library, log_fault,
     resend_all, sync, sync_with,
 };
 use sha2::{Digest, Sha256};
@@ -60,7 +60,7 @@ async fn outbox_len(peer: &mut Peer) -> usize {
 }
 
 async fn stored(peer: &mut Peer) -> Option<LogFault> {
-    fault(&mut peer.conn, peer.credentials.library_id())
+    log_fault(&mut peer.conn, peer.credentials.library_id())
         .await
         .unwrap()
 }
@@ -913,4 +913,253 @@ async fn reading_the_log_again_after_a_resend_reports_no_conflict_again() {
         rows.iter().any(|r| r.contains("setting unsent=x")),
         "{rows:#?}"
     );
+}
+
+/// A damaged envelope is refused and the cursor moves onto it; the server then puts the bytes as
+/// first written back in its place. Bytes once served never change, so the repair is a rewrite.
+#[tokio::test]
+async fn bytes_repaired_in_place_at_the_cursor_are_a_rewrite() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    send(&mut b, &server, "b0").await;
+    let good = server.log(id)[0].clone();
+    let mut damaged = good.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    server.replace(id, 1, damaged);
+    assert_eq!(a.sync(&server).await.unwrap().refused_total, 1);
+    assert_eq!(a.cursor().await, 1);
+    server.replace(id, 1, good);
+    stays_stopped_after_finding(&mut a, &server, LogFault::Rewritten { seq: 1 }).await;
+}
+
+/// An envelope behind every device's cursor is rewritten: no sync finds it, and only a device
+/// that reads the log anew has another fingerprint at the same position.
+#[tokio::test]
+async fn a_rewrite_behind_the_cursor_goes_unseen_but_in_a_new_devices_fingerprint() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for key in ["b0", "b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    a.sync(&server).await.unwrap();
+    let other = server.log(id)[2].clone();
+    server.replace(id, 1, other);
+    send(&mut b, &server, "b4").await;
+    a.sync(&server).await.unwrap();
+    assert_eq!(stored(&mut a).await, None);
+    assert_eq!(stored(&mut b).await, None);
+    let mut c = another(&server, &a).await;
+    c.sync(&server).await.unwrap();
+    let ours = fingerprint(&mut a.conn, id).await.unwrap();
+    let theirs = fingerprint(&mut c.conn, id).await.unwrap();
+    assert_eq!(ours.seq, theirs.seq);
+    assert_ne!(ours.digest, theirs.digest);
+    assert_ne!(a.settings().await, c.settings().await);
+}
+
+fn page_reads(server: &Server, from: usize) -> usize {
+    server.with(|s| {
+        s.requests[from..]
+            .iter()
+            .filter(|(m, t)| *m == Method::Get && t.contains("/batches"))
+            .count()
+    })
+}
+
+/// What reading the envelope at the cursor costs: its bytes in every sync, whatever its size, and
+/// one page read more where the new envelopes fill whole pages.
+#[tokio::test]
+async fn the_anchor_costs_its_bytes_and_a_page_where_new_envelopes_fill_pages() {
+    for page in [1u32, 4, 256] {
+        let server = Server::new();
+        server.with(|s| s.caps.max_page_batches = Some(page));
+        let [mut a, mut b] = pair(&server).await;
+        let id = a.credentials.library_id();
+        b.run("INSERT INTO settings VALUES ('big', hex(randomblob(100000)))")
+            .await;
+        b.sync(&server).await.unwrap();
+        a.sync(&server).await.unwrap();
+        let anchor = server.log(id)[0].len();
+        assert!(anchor > 200_000);
+        let pages = format!("/v1/libraries/{}/batches", id.to_hex());
+        let from = server.with(|s| s.requests.len());
+        a.sync(&server).await.unwrap();
+        assert_eq!(page_reads(&server, from), 1, "page {page}");
+        let bytes = server.bytes_since(from, &pages);
+        assert!(
+            (anchor..anchor + 64).contains(&bytes),
+            "page {page}: {bytes} bytes"
+        );
+        for new in [1usize, 4] {
+            for k in 0..new {
+                send(&mut b, &server, &format!("n{new}{k}")).await;
+            }
+            let from = server.with(|s| s.requests.len());
+            a.sync(&server).await.unwrap();
+            let without = new.div_ceil(page as usize);
+            let with = (new + 1).div_ceil(page as usize);
+            assert_eq!(page_reads(&server, from), with, "page {page}, {new} new");
+            assert!(with <= without + 1);
+        }
+    }
+}
+
+/// An append whose request the sync had given to the transport when another connection stored a
+/// fault reaches the server; the sync then fails with the fault and acknowledges nothing.
+#[tokio::test]
+async fn an_append_given_to_the_transport_before_a_fault_is_stored_still_reaches_the_server() {
+    let dir = scratch("append-on-its-way");
+    let path = dir.join("x.db");
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let mut b = Peer::new(
+        join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut x = Peer::new_at(&path, made.clone()).await;
+    let mut y = Peer::open(&path, made).await;
+    let id = x.credentials.library_id();
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    x.sync(&server).await.unwrap();
+    x.run("INSERT INTO settings VALUES ('x', 'x')").await;
+    let hold = server.hold_if(is_append, false);
+    let mut held = Box::pin(sync(&mut x.conn, &x.replica, &server, &x.credentials, now));
+    tokio::select! {
+        _ = &mut held => panic!("the append was not held"),
+        () = hold.reached() => {}
+    }
+    server.roll_back(id, 1);
+    assert!(matches!(y.sync(&server).await, Err(Error::LogFault(_))));
+    hold.release();
+    assert!(matches!(held.await, Err(Error::LogFault(_))));
+    assert_eq!(server.log(id).len(), 2);
+    assert_eq!(outbox_len(&mut x).await, 3);
+}
+
+fn reads_after(request: &fongo_sync_client::Request, after: u64) -> bool {
+    is_read(request)
+        && fongo_sync_client::protocol::api::Route::parse(&request.target)
+            .and_then(|(_, query)| {
+                fongo_sync_client::protocol::api::ReadBatches::parse_query(query.unwrap_or("")).ok()
+            })
+            .is_some_and(|read| read.after == after)
+}
+
+/// A sync looking for its recorded envelope in the log when another connection stores a fault
+/// does not append it.
+#[tokio::test]
+async fn a_recorded_envelope_is_not_appended_once_another_connection_stores_a_fault() {
+    let dir = scratch("recorded-not-sent");
+    let path = dir.join("x.db");
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let mut b = Peer::new(
+        join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut x = Peer::new_at(&path, made.clone()).await;
+    let mut y = Peer::open(&path, made).await;
+    let id = x.credentials.library_id();
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    x.sync(&server).await.unwrap();
+    x.run("INSERT INTO settings VALUES ('x', 'x')").await;
+    server.fail_if(is_append);
+    assert!(matches!(x.sync(&server).await, Err(Error::Transport(_))));
+    server.behave();
+    // An envelope of a later format stops the pull, so the sync looks for its recorded envelope.
+    let keys = x.credentials.library().clone();
+    let later = support::seal_as(
+        fongo_sync_client::protocol::ENVELOPE_FORMAT + 1,
+        b"later",
+        &keys,
+        0,
+        b.credentials.device(),
+        [7; 24],
+    );
+    server.inject(id, later);
+    let hold = server.hold_if(|r| reads_after(r, 3), false);
+    let mut held = Box::pin(sync(&mut x.conn, &x.replica, &server, &x.credentials, now));
+    tokio::select! {
+        _ = &mut held => panic!("the look for the recorded envelope was not held"),
+        () = hold.reached() => {}
+    }
+    server.roll_back(id, 1);
+    assert!(matches!(y.sync(&server).await, Err(Error::LogFault(_))));
+    let appends = server.count(Method::Post, "/v1/libraries");
+    hold.release();
+    assert!(matches!(held.await, Err(Error::LogFault(_))));
+    assert_eq!(server.count(Method::Post, "/v1/libraries"), appends);
+    assert_eq!(server.log(id).len(), 1);
+}
+
+/// Two faults rest on what the server served one sync: one not stored, because writing it failed,
+/// is not found again by a server that then serves the log honestly.
+#[tokio::test]
+async fn reuse_and_divergence_not_stored_are_not_found_again() {
+    let crash = "CREATE TEMP TRIGGER crash BEFORE UPDATE OF fault_kind ON fongo_client_state
+                 WHEN NEW.fault_kind IS NOT NULL BEGIN SELECT RAISE(ABORT, 'crash'); END";
+    // Reuse: the answer names other bytes; the next sync finds the envelope where it landed.
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    a.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('a', 'x')").await;
+    a.run(crash).await;
+    let wrong = AnswersAt {
+        server: &server,
+        at: 2,
+    };
+    let failed = sync(&mut a.conn, &a.replica, &wrong, &a.credentials, now).await;
+    assert!(matches!(failed, Err(Error::Database(_))), "{failed:?}");
+    a.run("DROP TRIGGER temp.crash").await;
+    a.sync(&server).await.unwrap();
+    assert_eq!(stored(&mut a).await, None);
+    assert_eq!(outbox_len(&mut a).await, 0);
+
+    // Divergence: the sync that read the other log stores nothing and reads the log again.
+    let dir = scratch("divergence-lost");
+    let path = dir.join("x.db");
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let mut b = Peer::new(
+        join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut x = Peer::new_at(&path, made.clone()).await;
+    let mut y = Peer::open(&path, made).await;
+    let id = x.credentials.library_id();
+    x.sync(&server).await.unwrap();
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    let other = server.log(id)[0].clone();
+    x.run(crash).await;
+    let hold = server.hold_if(is_read, true);
+    let first = x.sync(&server);
+    let second = async {
+        hold.reached().await;
+        server.replace(id, 2, other);
+        y.sync(&server).await.unwrap();
+        hold.release();
+    };
+    let (failed, ()) = tokio::join!(first, second);
+    assert!(matches!(failed, Err(Error::Database(_))), "{failed:?}");
+    x.run("DROP TRIGGER temp.crash").await;
+    x.sync(&server).await.unwrap();
+    assert_eq!(stored(&mut x).await, None);
 }
