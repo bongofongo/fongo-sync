@@ -645,3 +645,68 @@ async fn a_pull_keeps_a_step_past_recorded_after_it_began() {
     );
     assert_eq!(a.cursor().await, 5);
 }
+
+/// Waits at the first gap between transactions until told to go on.
+struct ParkFirst {
+    parked: Option<oneshot::Sender<()>>,
+    go: Option<oneshot::Receiver<()>>,
+}
+
+impl Apply for ParkFirst {
+    async fn between(&mut self, _: &mut SqliteConnection) -> Result<(), Error> {
+        if let Some(parked) = self.parked.take() {
+            parked.send(()).unwrap();
+            self.go.take().unwrap().await.unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// A sync loads the envelope another sync is sending, and its pull ends before that envelope is
+/// stored; the other sync then appends it and is acknowledged. The first must not append the same
+/// bytes again: on a server that stores an identical envelope again, that would be a copy.
+#[tokio::test]
+async fn a_sync_does_not_append_again_an_envelope_another_acknowledged_meanwhile() {
+    let dir = scratch("loaded-acknowledged");
+    let server = Server::new();
+    server.with(|s| s.store_again = true);
+    let (mut a, mut b, _z) = devices(&dir, &server).await;
+    write_some(&mut a).await;
+    let library = a.credentials.library().id;
+    let before = server.log(library).len();
+
+    let hold = server.hold_if(is_append, false);
+    let mut sending = Box::pin(sync(&mut a.conn, &a.replica, &server, &a.credentials, now));
+    tokio::select! {
+        _ = &mut sending => panic!("the append was never held"),
+        () = hold.reached() => {}
+    }
+    let (parked, on_parked) = oneshot::channel();
+    let (go, on_go) = oneshot::channel();
+    let mut park = ParkFirst {
+        parked: Some(parked),
+        go: Some(on_go),
+    };
+    let mut loaded = Box::pin(sync_with(
+        &mut b.conn,
+        &b.replica,
+        &server,
+        &b.credentials,
+        now,
+        &mut park,
+    ));
+    tokio::select! {
+        _ = &mut loaded => panic!("the second sync never parked"),
+        _ = on_parked => {}
+    }
+    hold.release();
+    sending.await.unwrap();
+    go.send(()).unwrap();
+    let report = loaded.await.unwrap();
+    assert_eq!(
+        server.log(library).len(),
+        before + 1,
+        "the envelope was appended twice"
+    );
+    assert_eq!(report.sent, 0);
+}
