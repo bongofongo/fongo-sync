@@ -4,8 +4,9 @@
 //! landed, with a digest of it, until it reads the log past it. No secret is stored here.
 //!
 //! The tables are of layout 2, recorded in `fongo_client_meta`. Layout 1 kept no record of its
-//! layout; it is upgraded in place. Its builds read the columns `through` and `envelope`, which
-//! layout 2 renames, so they fail at their first read of these tables instead of running on them.
+//! layout; it is upgraded in place. A sync of a layout-1 build on these tables asks the server for
+//! its capabilities, adds a row with cursor 0 for a library that has none, and then fails reading
+//! the column `through`, which layout 2 renames, before it reads the log or writes anything else.
 
 use fongo_sync_protocol::LibraryId;
 use sha2::{Digest, Sha256};
@@ -396,8 +397,10 @@ pub(crate) async fn clear_passing(
 /// does not go back for them. Offer it only on the user's say, for an envelope no build is
 /// expected to read, such as one whose bytes were damaged.
 ///
-/// Until a sync steps past, each sync reads the envelope again, so a copy the server repairs is
-/// read as usual; bytes other than those named are never stepped past.
+/// It applies to a stop of every [`crate::Unknown`] kind. The next sync still reads the envelope
+/// first: if it can now read it, because the server holds repaired bytes there or this device has
+/// since learned the key of its epoch, it applies it and steps past nothing. Bytes other than
+/// those named are never stepped past.
 pub async fn step_past(
     conn: &mut SqliteConnection,
     library: LibraryId,

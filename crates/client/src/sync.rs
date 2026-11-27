@@ -24,6 +24,8 @@ use crate::transport::{Method, Transport};
 const DEFAULT_PAGE: u32 = 256;
 /// Pages read in one call; [`SyncReport::more`] says when the log held more.
 const MAX_PAGES: usize = 1_000;
+/// Envelopes read to look for a recorded envelope whose append was not answered.
+const LOOK_FOR: u32 = 16;
 /// Refusals listed in [`SyncReport::refused`]; [`SyncReport::refused_total`] counts them all.
 const REFUSALS_LISTED: usize = 100;
 /// The encoded size of a batch of one change with an empty collection and field and a null value.
@@ -204,7 +206,8 @@ pub enum Unknown {
 /// An envelope no build will ever read, such as one damaged in the server's storage, stops every
 /// device of the library for good. [`crate::step_past`], called with [`Newer::seq`] and
 /// [`Newer::digest`], lets the next sync skip it and read on, giving up its changes on this
-/// device; it is for the application to offer, and only on the user's say.
+/// device; it is for the application to offer, and only on the user's say. It applies to a stop
+/// of every [`Unknown`] kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Newer {
@@ -215,6 +218,18 @@ pub struct Newer {
     pub unknown: Unknown,
     /// A SHA-256 of the envelope's bytes, which [`crate::step_past`] takes.
     pub digest: [u8; 32],
+}
+
+impl Newer {
+    /// A report of a stop, as an application's own tests may need one.
+    pub fn new(seq: u64, device: Option<DeviceId>, unknown: Unknown, digest: [u8; 32]) -> Newer {
+        Newer {
+            seq,
+            device,
+            unknown,
+            digest,
+        }
+    }
 }
 
 /// One envelope skipped and never applied. It does not stop the sync, and the cursor moves past
@@ -319,13 +334,17 @@ pub struct SyncReport {
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
 /// stops between the two, whether or not the server stored the envelope, the next sync appends
 /// the same recorded bytes again before anything new, unless it finds them in the log: by its
-/// pull, or, when the pull stopped before the end of the log, by reading the log after the head it
-/// knew when it recorded them, comparing bytes only. Found, they are not sent again.
+/// pull, or, when the pull stopped before the end of the log, among the 16 envelopes after the
+/// head it knew when it recorded them, comparing bytes only. Found, they are not sent again.
 ///
-/// A copy of an envelope can still reach the log: when the recorded bytes are not within the
-/// pages one call reads, or from a server that stores an identical envelope twice of its own
-/// accord. Every device applies the copy idempotently, and this device takes the first copy it
-/// reads as where its envelope landed, whichever copy the server named. Changes are not re-sealed
+/// A copy of an envelope can still reach the log: when the recorded envelope landed further on
+/// than that, as when other devices appended meanwhile or the pull that preceded it stopped short
+/// of the head, or from a server that stores an identical envelope twice of its own accord. Every
+/// device applies the copy idempotently, and this device takes the first copy it reads as where
+/// its envelope landed, whichever copy the server named. That holds for envelopes this build
+/// appended; an append recorded by a build whose tables were of layout 1 carries no digest, so a
+/// copy such a build left in the log can still have a remote change between the copies reported
+/// once as a conflict with this device's edit. Changes are not re-sealed
 /// into a second, different envelope, with one exception: when the server refuses the recorded
 /// envelope itself, as too large or not one it accepts, the record is dropped and its changes,
 /// still in the outbox because they were never acknowledged, are sealed afresh under the server's
@@ -1160,17 +1179,15 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             let landed = pull
                 .sending
                 .take_if(|sending| sending.envelope == batch.envelope);
-            let passing = pull.passing.is_some_and(|(seq, digest)| {
-                seq == batch.seq && digest == state::digest(&batch.envelope)
-            });
-            let opened = if passing {
-                Opened::Refused(Refused {
-                    seq: batch.seq,
-                    device: Envelope::decode(&batch.envelope).ok().map(|e| e.device),
-                    reason: Refusal::SteppedPast,
-                })
-            } else {
-                keys.open(rpc, batch).await?
+            let opened = match keys.open(rpc, batch).await? {
+                Opened::Newer(newer) if pull.passing == Some((newer.seq, newer.digest)) => {
+                    Opened::Refused(Refused {
+                        seq: batch.seq,
+                        device: newer.device,
+                        reason: Refusal::SteppedPast,
+                    })
+                }
+                opened => opened,
             };
             if let Opened::Changes(changes) = &opened
                 && !pull.held.is_empty()
@@ -1239,44 +1256,36 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     Ok(())
 }
 
-/// Where `envelope` is in the log after `after`, comparing bytes only, reading at most as many pages
-/// as a pull; `None` when it is not there, or not within those pages.
+/// Where `envelope` is among the next few envelopes in the log after `after`, comparing bytes
+/// only; `None` when it is not among them.
 async fn find<T: Transport, N: Fn() -> u64 + Sync>(
     rpc: &Rpc<'_, T, N>,
     credentials: &Credentials,
     limit: u32,
-    mut after: u64,
+    after: u64,
     envelope: &[u8],
 ) -> Result<Option<u64>, Error> {
-    let library = credentials.library_id();
-    for _ in 0..MAX_PAGES {
-        let query = ReadBatches {
-            after,
-            limit: Some(limit),
-        };
-        let body = rpc
-            .call(
-                Method::Get,
-                query.target(library),
-                Body::Empty,
-                Some(credentials.device()),
-            )
-            .await?;
-        let page = BatchPage::decode(&body)
-            .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
-        check_page(&page, after, limit)?;
-        if let Some(batch) = page.batches.iter().find(|b| b.envelope == envelope) {
-            return Ok(Some(batch.seq));
-        }
-        let Some(last) = page.batches.last() else {
-            return Ok(None);
-        };
-        if !page.more {
-            return Ok(None);
-        }
-        after = last.seq;
-    }
-    Ok(None)
+    let limit = limit.min(LOOK_FOR);
+    let query = ReadBatches {
+        after,
+        limit: Some(limit),
+    };
+    let body = rpc
+        .call(
+            Method::Get,
+            query.target(credentials.library_id()),
+            Body::Empty,
+            Some(credentials.device()),
+        )
+        .await?;
+    let page = BatchPage::decode(&body)
+        .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
+    check_page(&page, after, limit)?;
+    Ok(page
+        .batches
+        .iter()
+        .find(|b| b.envelope == envelope)
+        .map(|b| b.seq))
 }
 
 /// Refuses a page that does not continue the log from `after` one sequence number at a time, or

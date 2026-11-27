@@ -900,3 +900,65 @@ async fn an_envelope_stepped_past_stays_skipped_after_a_build_that_reads_it() {
     assert_eq!(report.received, 0);
     assert_eq!(a.settings().await, Vec::<String>::new());
 }
+
+#[tokio::test]
+async fn an_append_that_failed_while_stopped_costs_one_short_page_to_look_for() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(256));
+    let [mut a, b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    let id = keys.id;
+    let junk = b"\x02 damaged in storage".to_vec();
+    server.inject(id, junk);
+    for n in 0..1_000 {
+        let mut changes = setting(&format!("big{n}"));
+        changes[1].value = Value::Text("x".repeat(4_000));
+        server.inject(
+            id,
+            seal(&changes, &keys, 0, b.credentials.device(), nonce()),
+        );
+    }
+    a.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    let mut once = true;
+    server.fail_if(move |r| r.method == Method::Post && std::mem::take(&mut once));
+    assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+
+    let from = server.with(|s| s.requests.len());
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.newer.map(|n| n.seq), Some(1));
+    assert!(report.sent > 0);
+    let requests: Vec<(Method, String)> = server.with(|s| s.requests[from..].to_vec());
+    let bytes = server.bytes_since(from, &batches_path(id));
+    let reads = requests.iter().filter(|(m, _)| *m == Method::Get).count();
+    assert!(
+        reads <= 3 && bytes < 100_000,
+        "{bytes} bytes in {} requests: {requests:?}",
+        requests.len()
+    );
+    assert_no_envelope_twice(&server, id);
+}
+
+#[tokio::test]
+async fn a_step_past_an_envelope_this_device_has_since_learned_to_read_reads_it() {
+    let server = Server::new();
+    let [mut a, b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    let id = keys.id;
+    let later = (LATER_KEY.write)(&setting("later"), &keys, b.credentials.device());
+    server.inject(id, later.clone());
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.newer.map(|n| n.unknown), Some(Unknown::Epoch(1)));
+    step_past(&mut a, 1, digest(&later)).await.unwrap();
+
+    // The device learns the key of the later epoch before its next sync.
+    let rotated = LibraryKeys::new(id, [0x77; 32]);
+    a.credentials = Credentials::new(rotated, a.credentials.device().clone(), 1);
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(
+        (report.newer, report.refused_total),
+        (None, 0),
+        "{report:#?}"
+    );
+    assert_eq!(a.settings().await, ["later=later"]);
+}

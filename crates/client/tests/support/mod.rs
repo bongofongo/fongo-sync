@@ -51,6 +51,8 @@ pub struct State {
     pub store_again: bool,
     /// Loses the response to each request it returns true for, once handled.
     lose_if: Option<Lose>,
+    /// Fails each request it returns true for before it reaches the server.
+    fail_if: Option<Lose>,
     counted: usize,
     /// The n-th request from when it was set never reaches the server.
     fail_at: Option<usize>,
@@ -128,6 +130,7 @@ impl Server {
                 answered: Vec::new(),
                 store_again: false,
                 lose_if: None,
+                fail_if: None,
                 counted: 0,
                 fail_at: None,
                 lose_at: None,
@@ -192,6 +195,10 @@ impl Server {
         self.with(|s| s.lose_if = Some(Box::new(f)));
     }
 
+    pub fn fail_if(&self, f: impl FnMut(&Request) -> bool + Send + 'static) {
+        self.with(|s| s.fail_if = Some(Box::new(f)));
+    }
+
     /// Bytes of the bodies answering requests to targets starting with `path`, from request
     /// number `from` on.
     pub fn bytes_since(&self, from: usize, path: &str) -> usize {
@@ -217,6 +224,7 @@ impl Server {
             s.tamper = None;
             s.respond = None;
             s.lose_if = None;
+            s.fail_if = None;
             s.store_again = false;
             s.stale_devices = false;
             s.hidden.clear();
@@ -301,7 +309,8 @@ impl Server {
         let mut state = self.state.lock().unwrap();
         state.counted += 1;
         let n = state.counted;
-        if state.fail_at == Some(n) {
+        let fail = state.fail_if.as_mut().is_some_and(|f| f(&request));
+        if state.fail_at == Some(n) || fail {
             return Some(Err(TransportError::new("connection refused")));
         }
         if state.hang_at == Some((n, false)) {

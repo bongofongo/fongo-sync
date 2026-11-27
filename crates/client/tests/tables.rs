@@ -101,7 +101,9 @@ async fn tables_of_layout_one_are_upgraded_in_place_and_a_build_of_it_then_fails
     assert_eq!(server.log(id).len(), 3);
     assert_eq!(a.cursor().await, 3);
 
-    // What a build of layout 1 reads and writes first now fails, before it reaches the log.
+    // A layout-1 build's sync asks for capabilities and adds a row for a library that has none,
+    // then reads these columns, and would later write them; both now fail, so it stops at the
+    // read, before it reads the log or writes anything else.
     for sql in [
         "SELECT cursor, through, envelope FROM fongo_client_state WHERE library = ?",
         "UPDATE fongo_client_state SET through = NULL, envelope = NULL WHERE library = ?",
