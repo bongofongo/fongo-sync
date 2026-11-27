@@ -106,7 +106,9 @@ this yet.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
-does not hold yet, applies the rest, then seals and appends the outbox. It refuses, before reading
+does not hold yet, stops at one a later version of the protocol may have written and reports it,
+so that the application can ask for an update and nothing is skipped, applies the rest, then seals
+and appends the outbox. It refuses, before reading
 or writing anything, a database whose capture is suspended or whose kernel tables are missing or
 of another layout. Credentials stay with the application; the client stores only its cursor,
 the envelope it is sending and where its recent envelopes landed, in tables of its own.

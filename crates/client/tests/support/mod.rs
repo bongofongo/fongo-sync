@@ -1,5 +1,6 @@
 //! An in-memory sync server that follows the protocol closely enough to drive the client, and can
-//! be told to misbehave; and replicas over in-memory SQLite to sync through it.
+//! be told to misbehave; replicas over in-memory SQLite to sync through it; and a writer of
+//! envelopes in formats this build does not read.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -10,9 +11,9 @@ use fongo_sync_client::protocol::api::{
     ErrorCode, ReadBatches, Route, StoredBatch,
 };
 use fongo_sync_client::protocol::{
-    DeviceId, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, LibraryId,
-    LibraryKeys, PROTOCOL_VERSION, RequestAuth, VerifyingKey, open, verify_envelope,
-    verify_request,
+    BATCH_FORMAT, DeviceId, Envelope, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE,
+    HEADER_TIMESTAMP, LibraryId, LibraryKeys, PROTOCOL_VERSION, RequestAuth, SigningKey,
+    VerifyingKey, encode_batch, open, verify_envelope, verify_request,
 };
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Collection, Registry, Replica};
@@ -200,6 +201,12 @@ impl Server {
     /// Appends bytes to a library's log without any of the checks an append gets.
     pub fn inject(&self, library: LibraryId, envelope: Vec<u8>) {
         self.with(|s| s.libraries.get_mut(&library).unwrap().log.push(envelope));
+    }
+
+    /// Puts other bytes at `seq` in a library's log, as a server read by a build that understands
+    /// what was stored there would serve it.
+    pub fn replace(&self, library: LibraryId, seq: u64, envelope: Vec<u8>) {
+        self.with(|s| s.libraries.get_mut(&library).unwrap().log[seq as usize - 1] = envelope);
     }
 
     /// Lists a key as a device without any request.
@@ -706,4 +713,104 @@ pub fn assert_no_change_sent_twice(server: &Server, keys: &LibraryKeys) {
         );
         assert!(seen.insert(key), "sent twice: {change:?}");
     }
+}
+
+/// Seals `plaintext` as the protocol seals a batch, writing `format` as the envelope's format in
+/// its bytes, its signature and its associated data: what a version that kept the layout but
+/// wrote that format would send. With `ENVELOPE_FORMAT` and `encode_batch`'s output it is
+/// exactly what `seal` writes.
+pub fn seal_as(
+    format: u8,
+    plaintext: &[u8],
+    keys: &LibraryKeys,
+    epoch: u32,
+    device: &SigningKey,
+    nonce: [u8; 24],
+) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+
+    let mut info = b"fongo-sync/v1/batch-key".to_vec();
+    info.extend_from_slice(&epoch.to_be_bytes());
+    let mut key = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(&keys.id.0), keys.secret())
+        .expand(&info, &mut key)
+        .unwrap();
+    let device_id = DeviceId::of(&device.verifying_key());
+    let mut aad = b"fongo-sync/v1/batch\0".to_vec();
+    aad.push(format);
+    aad.extend_from_slice(&keys.id.0);
+    aad.extend_from_slice(&device_id.0);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    let ciphertext = chacha20poly1305::XChaCha20Poly1305::new(&key.into())
+        .encrypt(
+            chacha20poly1305::XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+    let mut out = vec![format];
+    out.extend_from_slice(&keys.id.0);
+    out.extend_from_slice(&device_id.0);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&nonce);
+    put_varint(&mut out, ciphertext.len() as u64);
+    out.extend_from_slice(&ciphertext);
+    sign_unsigned(out, device)
+}
+
+/// Appends to an envelope's unsigned bytes `device`'s signature over them.
+fn sign_unsigned(mut unsigned: Vec<u8>, device: &SigningKey) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+
+    let mut message = b"fongo-sync/v1/envelope\0".to_vec();
+    message.extend_from_slice(&unsigned);
+    unsigned.extend_from_slice(&device.sign(&message).to_bytes());
+    unsigned
+}
+
+/// `envelope` signed again by `device`, so that what was changed in it is all that is wrong.
+pub fn re_signed(envelope: &Envelope, device: &SigningKey) -> Vec<u8> {
+    let bytes = envelope.encode();
+    sign_unsigned(bytes[..bytes.len() - 64].to_vec(), device)
+}
+
+/// `encode_batch`'s bytes with another format and flags.
+pub fn batch_as(format: u8, flags: u8, changes: &[Change]) -> Vec<u8> {
+    let mut bytes = encode_batch(changes);
+    bytes[0] = format;
+    bytes[1] = flags;
+    bytes
+}
+
+/// A batch of `changes` in the current format, but with the first change's value written as
+/// `tag` followed by `payload`, as a version with a type of value this build lacks would.
+pub fn batch_with_value(changes: &[Change], tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![BATCH_FORMAT, 0];
+    put_varint(&mut out, changes.len() as u64);
+    let first = &changes[0];
+    put_varint(&mut out, first.collection.len() as u64);
+    out.extend_from_slice(first.collection.as_bytes());
+    out.extend_from_slice(&first.gid.0);
+    put_varint(&mut out, first.field.len() as u64);
+    out.extend_from_slice(first.field.as_bytes());
+    out.push(tag);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&first.clock.wall_ms.to_be_bytes());
+    out.extend_from_slice(&first.clock.counter.to_be_bytes());
+    out.extend_from_slice(&first.clock.node.0);
+    for change in &changes[1..] {
+        // A batch of one change: format, flags and a count of 1, then the change.
+        out.extend_from_slice(&encode_batch(std::slice::from_ref(change))[3..]);
+    }
+    out
+}
+
+fn put_varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
 }

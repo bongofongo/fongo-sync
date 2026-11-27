@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod support;
 
 use std::future::Future;
@@ -403,7 +404,8 @@ async fn an_envelope_for_another_library_garbage_or_a_forgery_is_skipped_and_cou
         keys.id,
         sealed_by(&setting("elsewhere", 1), &elsewhere, b.credentials.device()),
     );
-    server.inject(keys.id, b"not an envelope".to_vec());
+    // Of the current format: junk of a later one stops the pull.
+    server.inject(keys.id, b"\x01not an envelope".to_vec());
     // A listed key whose holder lacks the library secret.
     let forger = generate_signing_key().unwrap();
     server.register(keys.id, forger.verifying_key());

@@ -7,7 +7,8 @@ use fongo_sync_protocol::api::{
     Appended, BatchPage, Devices, ErrorCode, ReadBatches, StoredBatch, batches_path, devices_path,
 };
 use fongo_sync_protocol::{
-    DeviceId, Envelope, EnvelopeError, VerifyingKey, encode_batch, open, random_nonce, seal,
+    BATCH_FORMAT, DecodeError, DeviceId, ENVELOPE_FORMAT, Envelope, EnvelopeError, VerifyingKey,
+    encode_batch, open, random_nonce, seal,
 };
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Value};
 use fongo_sync_sqlite::{Applied, COLLECT_ROWS, Collected, Conflict, Replica, Touched};
@@ -133,10 +134,13 @@ async fn pause(duration: Duration) {
     .await
 }
 
-/// Why an envelope from the server's log was skipped instead of applied.
+/// Why an envelope from the server's log was skipped instead of applied. An envelope this build
+/// cannot read because a later version may have written it is not skipped; see [`Newer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Refusal {
-    /// Not an envelope, or what it decrypts to is not a batch.
+    /// It does not decode as an envelope of the format this build writes, and does not name a
+    /// later format; or what it decrypts to does not decode as a batch, for a reason other than
+    /// those [`Unknown`] lists. Damaged, or written by no version.
     Malformed,
     /// It names another library.
     WrongLibrary,
@@ -148,8 +152,56 @@ pub enum Refusal {
     UnknownDevice,
     /// Its signature does not verify against the key of the device it names.
     BadSignature,
-    /// It does not decrypt under the library's key, so whoever wrote it lacks the library secret.
+    /// It does not decrypt under the library's key for its epoch, which is no later than this
+    /// device's ([`Credentials::epoch`]), so whoever wrote it lacks the library secret.
     Undecryptable,
+}
+
+/// What an envelope the pull stopped at holds that this build does not know. Each is what a later
+/// version of the protocol may write; each could also come from a writer that breaks the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Unknown {
+    /// The envelope's format is later than [`fongo_sync_protocol::ENVELOPE_FORMAT`]. Nothing
+    /// after the format byte is read, so nothing vouches for the envelope: any server can write
+    /// one.
+    EnvelopeFormat(u8),
+    /// It is sealed under a key epoch later than this device's ([`Credentials::epoch`]) and does
+    /// not decrypt under the key this build derives for that epoch: the library's key may have
+    /// changed. Its signature verified.
+    Epoch(u32),
+    /// The batch inside is of a format later than [`fongo_sync_protocol::BATCH_FORMAT`].
+    BatchFormat(u8),
+    /// The batch sets flags this build does not know.
+    BatchFlags(u8),
+    /// A value in the batch has a type tag this build does not know.
+    ValueTag(u8),
+}
+
+/// An envelope the pull stopped at because it may have been written by a later version of the
+/// protocol than this build speaks: skipping it could lose changes for good, so the cursor stays
+/// before it, nothing from it on is applied, and every later sync stops at it again until a
+/// build that reads it continues from there. Everything before it was applied, and the outbox is
+/// still sent. Tell the user that the library holds data from a newer version and this one needs
+/// an update.
+///
+/// A server can fabricate one of [`Unknown::EnvelopeFormat`], and one of [`Unknown::Epoch`] signed
+/// by a key it lists as a device, so a faulty or hostile server can keep a device stopped here;
+/// this report is how the application learns of it. The batch kinds are sealed under the
+/// library's key, so only a holder of the library secret writes them.
+///
+/// While a sync reports this, change notifications past the cursor still say a sync is worth
+/// running ([`crate::worth_syncing`]), but this build reads no further: a sync is then worth
+/// running only to send what this device writes. A sync that has nothing to send appends
+/// nothing, so syncing on each notification does not feed itself. Each sync reads one page of the
+/// log from this envelope on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Newer {
+    pub seq: u64,
+    /// The device the envelope names; `None` for [`Unknown::EnvelopeFormat`], whose layout this
+    /// build cannot read.
+    pub device: Option<DeviceId>,
+    pub unknown: Unknown,
 }
 
 /// One envelope skipped and never applied. It does not stop the sync, and the cursor moves past
@@ -201,6 +253,9 @@ pub struct SyncReport {
     /// Set when the pull stopped at an envelope from an unlisted signer. What came before it was
     /// applied and the outbox was still sent.
     pub blocked: Option<Blocked>,
+    /// Set when the pull stopped at an envelope a later version of the protocol may have written.
+    /// What came before it was applied and the outbox was still sent.
+    pub newer: Option<Newer>,
     /// The pull stopped after the most pages one call reads, with more waiting. Everything read
     /// was applied and the outbox was sent; call again to read on.
     pub more: bool,
@@ -233,6 +288,18 @@ pub struct SyncReport {
 ///
 /// Whatever is held is also applied before this returns an error, so a failure part-way keeps the
 /// progress made.
+///
+/// An envelope this build cannot read is either skipped or stopped at. One that is damaged or
+/// forged is skipped and listed in [`SyncReport::refused`]: it does not decode in the formats this
+/// build writes, names another library, is signed by the recovery key, fails its signature, does
+/// not decrypt at an epoch no later than this device's, or decrypts to a batch that does not
+/// decode for any reason but those below. One that a later version of the protocol may have
+/// written stops the pull, reported in [`SyncReport::newer`]: its envelope format is later than
+/// this build's; it does not decrypt at a later epoch than this device's; or the batch inside is
+/// of a later format, sets unknown flags or holds a value of an unknown type. The cursor stays
+/// before it, so a build that reads it continues from there and nothing is lost. Sending does not
+/// depend on reading: the outbox is still sent, and this device's own envelopes then land past
+/// the cursor and are read back, and the bases of its edits released, by a build that reads on.
 ///
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
@@ -414,7 +481,8 @@ pub trait Apply: Send {
     /// Called once in a sync whose pull read to the head of the log, after its last apply and
     /// before the outbox is sent, even when nothing was received. It is not called when the pull
     /// stopped with more waiting ([`SyncReport::more`]), stopped at an envelope it is blocked at
-    /// ([`SyncReport::blocked`]), or failed. By default it does nothing and returns `None`.
+    /// ([`SyncReport::blocked`]) or one a later version may have written ([`SyncReport::newer`]),
+    /// or failed. By default it does nothing and returns `None`.
     ///
     /// It runs in a transaction of its own, begun once the transaction that stored the cursor at
     /// the end of the pull has committed, so nothing it writes is atomic with the cursor. What it
@@ -594,9 +662,11 @@ async fn run<T: Transport, A: Apply>(
     };
     pulled.and(committed)?;
     cursor = pull.read;
-    report.head = cursor.max(report.blocked.map_or(0, |b| b.seq));
+    report.head = cursor
+        .max(report.blocked.map_or(0, |b| b.seq))
+        .max(report.newer.map_or(0, |n| n.seq));
 
-    if settles && report.blocked.is_none() && !report.more {
+    if settles && report.blocked.is_none() && report.newer.is_none() && !report.more {
         let (mut tx, began) = steps.begin(conn).await?;
         let settled = async {
             begin_watch(&mut tx).await?;
@@ -972,7 +1042,8 @@ impl Pull {
     }
 }
 
-/// Reads pages after `pull.read` until the log ends, an unlisted signer blocks, or the page limit.
+/// Reads pages after `pull.read` until the log ends, an unlisted signer blocks, an envelope a later
+/// version may have written stops it, or the page limit.
 /// Stores the cursor after each page unless changes are held to be applied together.
 async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     rpc: &Rpc<'_, T, N>,
@@ -1025,6 +1096,10 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
                         seq: batch.seq,
                         device,
                     });
+                    return Ok(());
+                }
+                Opened::Newer(newer) => {
+                    report.newer = Some(newer);
                     return Ok(());
                 }
             }
@@ -1095,6 +1170,7 @@ enum Opened {
     Refused(Refused),
     /// Signed by a device the list lacks even fetched afresh.
     Unlisted(DeviceId),
+    Newer(Newer),
 }
 
 enum Signer {
@@ -1114,7 +1190,8 @@ impl<'a> Keys<'a> {
         }
     }
 
-    /// The changes in one stored envelope, its refusal, or that its signer is unlisted.
+    /// The changes in one stored envelope, its refusal, that its signer is unlisted, or what in it
+    /// a later version may have written.
     async fn open<T: Transport, N: Fn() -> u64 + Sync>(
         &mut self,
         rpc: &Rpc<'_, T, N>,
@@ -1127,8 +1204,19 @@ impl<'a> Keys<'a> {
                 reason,
             }))
         };
-        let Ok(envelope) = Envelope::decode(&batch.envelope) else {
-            return refuse(None, Refusal::Malformed);
+        let newer = |device, unknown| {
+            Ok(Opened::Newer(Newer {
+                seq: batch.seq,
+                device,
+                unknown,
+            }))
+        };
+        let envelope = match Envelope::decode(&batch.envelope) {
+            Ok(envelope) => envelope,
+            Err(DecodeError::UnsupportedVersion(format)) if format > ENVELOPE_FORMAT => {
+                return newer(None, Unknown::EnvelopeFormat(format));
+            }
+            Err(_) => return refuse(None, Refusal::Malformed),
         };
         let device = envelope.device;
         if envelope.library != self.credentials.library_id() {
@@ -1141,7 +1229,10 @@ impl<'a> Keys<'a> {
         };
         match open(&batch.envelope, self.credentials.library(), |_| Some(key)) {
             Ok(opened) => Ok(Opened::Changes(opened.changes)),
-            Err(error) => refuse(Some(device), refusal(error)),
+            Err(error) => match later(&error, envelope.epoch, self.credentials.epoch()) {
+                Some(unknown) => newer(Some(device), unknown),
+                None => refuse(Some(device), refusal(error)),
+            },
         }
     }
 
@@ -1204,6 +1295,25 @@ fn refuses_the_envelope(code: ErrorCode) -> bool {
             | ErrorCode::EnvelopeWrongDevice
             | ErrorCode::EnvelopeBadSignature
     )
+}
+
+/// What in an envelope that decoded, verified and then failed to open a later version of the
+/// protocol may have written, as opposed to damage or forgery. A batch is sealed under the
+/// library's key, so what fails to decode in it was written by a holder of the secret; an unknown
+/// version, flag or value tag there counts as later, the rest as malformed. A batch that fails to
+/// decrypt counts as later only at an epoch above `mine`.
+fn later(error: &EnvelopeError, epoch: u32, mine: u32) -> Option<Unknown> {
+    match *error {
+        EnvelopeError::Decrypt if epoch > mine => Some(Unknown::Epoch(epoch)),
+        EnvelopeError::Batch(DecodeError::UnsupportedVersion(format)) if format > BATCH_FORMAT => {
+            Some(Unknown::BatchFormat(format))
+        }
+        EnvelopeError::Batch(DecodeError::UnsupportedFlags(flags)) => {
+            Some(Unknown::BatchFlags(flags))
+        }
+        EnvelopeError::Batch(DecodeError::UnknownValueTag(tag)) => Some(Unknown::ValueTag(tag)),
+        _ => None,
+    }
 }
 
 fn refusal(error: EnvelopeError) -> Refusal {

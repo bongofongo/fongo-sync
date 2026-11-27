@@ -3,6 +3,10 @@
 //! [`sync_with`] lets the application do work of its own in the transaction of each apply, and
 //! once a pull has read the whole log.
 //!
+//! What a sync cannot read it skips only when it is damaged or forged. An envelope a later version
+//! of the protocol may have written stops the pull where it is, and [`SyncReport::newer`] says so,
+//! so that the application can ask for an update; a build that reads it continues from there.
+//!
 //! The crate picks no HTTP client and no async runtime. An application implements [`Transport`]
 //! over whatever HTTP client it uses; every request and response is plain bytes and headers, and
 //! every future this crate returns is `Send`.
@@ -43,7 +47,7 @@ pub use library::{add_device, create_library, join_library};
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::cursor;
 pub use sync::{
-    Apply, Blocked, Pace, Refusal, Refused, SyncReport, check_connection, merge_applied, sync,
-    sync_with,
+    Apply, Blocked, Newer, Pace, Refusal, Refused, SyncReport, Unknown, check_connection,
+    merge_applied, sync, sync_with,
 };
 pub use transport::{Method, Request, Response, Transport, TransportError};

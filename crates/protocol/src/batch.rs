@@ -14,6 +14,9 @@ const MIN_CHANGE_LEN: usize = 1 + 16 + 1 + 1 + 8 + 4 + 16;
 /// collection, the gid, the field, the value, and the clock's wall time (u64), counter (u32) and
 /// node. Text and blobs are a LEB128 length then bytes; integers are big-endian. A value is a tag
 /// (0 null, 1 int, 2 real, 3 text, 4 blob, 5 ref) then its 8 bytes, text, blob or 16-byte gid.
+///
+/// A later version may write a later format, set flags or add tags. A reader meeting one cannot
+/// tell what the batch holds, and should not take it as damaged and skip it.
 pub fn encode_batch(changes: &[Change]) -> Vec<u8> {
     let mut out = vec![BATCH_FORMAT, 0];
     put_varint(&mut out, changes.len() as u64);
