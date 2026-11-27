@@ -728,6 +728,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn padme_holds_its_properties(n in any::<u64>(), m in any::<u64>()) {
             match padme(n) {
@@ -806,6 +808,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn sealed_files_open_to_their_bytes(
             len in 0usize..3000,
@@ -1042,6 +1046,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn different_bytes_under_one_reference_never_share_a_nonce(
             a in proptest::collection::vec(any::<u8>(), 64),
@@ -1162,6 +1168,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn decoding_arbitrary_references_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
             if let Ok(file) = FileRef::decode(&bytes) {

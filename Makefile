@@ -21,12 +21,15 @@ test:
 wasm:
 	cargo build -p fongo-sync-protocol --target wasm32-unknown-unknown --locked
 
-# The long runs: the property test at thousands of cases and the exhaustive test at larger
+# The long runs: the core's property tests on a new seed and its work and simulation suites at
+# more cases, the adapter's property test at thousands of cases and the exhaustive test at larger
 # bounds, optimised, each run whatever the others found. `make deep SEED=n` repeats a run;
 # every case is a function of the seed.
 SEED ?= $(shell date +%s)
 deep:
 	@echo "make deep SEED=$(SEED)"; status=0; \
+	PROPTEST_RNG_SEED=$(SEED) FONGO_WORK_CASES=2000 FONGO_SIM_CASES=2000 \
+		cargo test --release --locked -p fongo-sync-core --all-features --tests || status=1; \
 	PROPTEST_RNG_SEED=$(SEED) PROPTEST_CASES=4000 \
 		cargo test --release --locked -p fongo-sync-sqlite --test property || status=1; \
 	EXHAUSTIVE_STEPS=4 EXHAUSTIVE_COPIED_EVERY=1 \

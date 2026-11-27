@@ -24,7 +24,8 @@
 //! `Limits::lookups` makes it undetermined beyond 512 items; `merged_teams_and_users` (√n teams
 //! and √n users merged, keyed by both) reads n.
 //!
-//! `FONGO_WORK_CASES` sets how many random cases run (default 200).
+//! `FONGO_WORK_CASES` sets how many random cases run (default 200), drawn from a fixed seed
+//! unless `PROPTEST_RNG_SEED` names another.
 
 #![cfg(feature = "work-counters")]
 
@@ -934,7 +935,7 @@ fn cases() -> u32 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases()))]
+    #![proptest_config(common::config(cases()))]
 
     #[test]
     fn affected_and_targets_work_within_their_bound_on_random_changes(seed in any::<u64>()) {

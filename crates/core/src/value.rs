@@ -413,7 +413,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(20_000))]
+        #![proptest_config(ProptestConfig { cases: 20_000, ..crate::proptest_config() })]
 
         #[test]
         fn an_integer_and_a_real_compare_as_the_exact_oracle_says(a in arb_int(), r in arb_real()) {

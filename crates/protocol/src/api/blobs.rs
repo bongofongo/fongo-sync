@@ -364,6 +364,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn a_valid_shape_is_the_layout_of_its_plaintext(size in any::<u64>(), chunks in 0u64..5000) {
             let info = BlobInfo { size, chunks };
@@ -511,6 +513,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn claiming_appends_round_trip(ids in proptest::collection::vec(any::<[u8; 32]>(), 0..5)) {
             let body = ClaimingAppend {

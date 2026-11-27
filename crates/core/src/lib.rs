@@ -23,3 +23,19 @@ mod work;
 pub use change::{ALIAS, Change, DELETED, State, Strategy, wins};
 pub use clock::{Clock, Hlc};
 pub use value::{Gid, Value};
+
+/// Settings for this crate's property tests: proptest's own, with the cases drawn from one fixed
+/// seed unless `PROPTEST_RNG_SEED` names another, and no failures kept in files between runs.
+#[cfg(test)]
+fn proptest_config() -> proptest::test_runner::Config {
+    let config = proptest::test_runner::Config::default();
+    let rng_seed = match std::env::var("PROPTEST_RNG_SEED") {
+        Ok(_) => config.rng_seed,
+        Err(_) => proptest::test_runner::RngSeed::Fixed(29),
+    };
+    proptest::test_runner::Config {
+        rng_seed,
+        failure_persistence: None,
+        ..config
+    }
+}

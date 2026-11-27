@@ -167,7 +167,7 @@ fn a_kept_value(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1500))]
+    #![proptest_config(common::config(1500))]
 
     /// Collecting an edit to a live row, merging what it records and evaluating again gives the
     /// row as edited, so nothing is written back. Likewise for deleting a row and for creating a
@@ -751,7 +751,7 @@ fn plan_law(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(3000))]
+    #![proptest_config(common::config(3000))]
 
     #[test]
     fn an_ordered_plan_keeps_every_constraint_at_every_step(
@@ -1184,7 +1184,7 @@ fn a_key_change_back_to_a_member_of_the_group_tombstones_only_the_others() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1500))]
+    #![proptest_config(common::config(1500))]
 
     /// Whatever the edits and whichever entity a row stood for and now stands for, `record`
     /// writes each field of each gid at most once.

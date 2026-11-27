@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::BTreeMap;
 
 use fongo_sync_core::model::FieldKind;
@@ -268,7 +270,7 @@ fn every_reference_is_live(schema: &Schema, view: &View) -> bool {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
+    #![proptest_config(common::config(1000))]
 
     #[test]
     fn any_delivery_order_gives_the_same_view(

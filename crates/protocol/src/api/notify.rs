@@ -45,6 +45,8 @@ mod tests {
     use super::*;
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn notifications_round_trip(seq in any::<u64>()) {
             let bytes = Notification { seq }.encode();

@@ -149,6 +149,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn any_code_round_trips(keys in arb_keys()) {
             let code = keys.recovery_code();

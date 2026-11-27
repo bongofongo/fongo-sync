@@ -70,3 +70,19 @@ pub use wire::DecodeError;
 /// The protocol version a server reports in [`api::Capabilities`]. It changes when any message,
 /// encoding or derivation in this crate changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Settings for this crate's property tests: proptest's own, with the cases drawn from one fixed
+/// seed unless `PROPTEST_RNG_SEED` names another, and no failures kept in files between runs.
+#[cfg(test)]
+fn proptest_config() -> proptest::test_runner::Config {
+    let config = proptest::test_runner::Config::default();
+    let rng_seed = match std::env::var("PROPTEST_RNG_SEED") {
+        Ok(_) => config.rng_seed,
+        Err(_) => proptest::test_runner::RngSeed::Fixed(29),
+    };
+    proptest::test_runner::Config {
+        rng_seed,
+        failure_persistence: None,
+        ..config
+    }
+}

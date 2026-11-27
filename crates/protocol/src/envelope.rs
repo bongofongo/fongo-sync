@@ -356,6 +356,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn any_batch_seals_and_opens(changes in arb_changes(), epoch in any::<u32>(), nonce in any::<[u8; 24]>()) {
             let bytes = seal(&changes, &library(), epoch, &device(), nonce);

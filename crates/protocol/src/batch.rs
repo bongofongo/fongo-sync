@@ -174,6 +174,8 @@ pub(crate) mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn any_batch_round_trips(changes in arb_changes()) {
             let bytes = encode_batch(&changes);
@@ -232,6 +234,8 @@ pub(crate) mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn every_proper_prefix_reports_truncation(changes in arb_changes()) {
             let bytes = encode_batch(&changes);

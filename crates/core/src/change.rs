@@ -168,6 +168,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn any_delivery_order_reaches_the_same_state(
             (changes, shuffled) in arb_changes().prop_flat_map(|c| (Just(c.clone()), Just(c).prop_shuffle()))
