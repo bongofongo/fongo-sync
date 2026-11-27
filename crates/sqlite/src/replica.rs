@@ -150,11 +150,16 @@ pub struct Held {
 
 /// A local edit not yet sent and a remote edit to the same field, neither made after seeing the
 /// other. The field's strategy has already chosen between them; the application may combine the
-/// two, for instance by a three-way merge of text, and write the result as a new edit. A remote
-/// change that carries the value the local edit replaced and loses to it is not reported: it is
-/// the field written again unchanged, by a write to another field of its set or by an upgrade
-/// that records the set again. One that carries another value is reported however it was made,
-/// so an upgrade's record of a value already reported is reported again.
+/// two, for instance by a three-way merge of text, and write the result as a new edit.
+///
+/// The remote edit is the latest by clock of those made elsewhere that an apply brings, later
+/// than the value the local edit replaced and than any reported before for that edit, whatever
+/// its value. So a remote edit that sets the field back to `base` is reported, with `remote`
+/// equal to `base`. So is the field written again unchanged, by a write to another field of its
+/// set or by an upgrade that records a redrawn set again (see [`Collection::together`]); such a
+/// report can come even where nobody else edited the field. A three-way merge of `base`,
+/// `local` and a `remote` equal to `base` gives `local` back, so these reports are harmless;
+/// `remote` equal to `base` is not an error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conflict {
     pub collection: String,
@@ -1974,21 +1979,21 @@ impl Replica {
             else {
                 continue;
             };
-            let Some(field) = c
+            if !c
                 .fields
                 .iter()
-                .find(|f| f.name == change.field && f.reports_conflicts)
-            else {
+                .any(|f| f.name == change.field && f.reports_conflicts)
+            {
                 continue;
-            };
+            }
             let members = match session.target(&c.name, change.gid) {
                 Ok(t) if !t.members.is_empty() => t.members,
                 _ => vec![change.gid],
             };
             for member in members {
                 let rows = db.query(
-                    "SELECT base_clock, local_clock, reported, base, base_is_ref, local, local_is_ref
-                       FROM fongo_bases WHERE collection = ?1 AND gid = ?2 AND field = ?3",
+                    "SELECT base_clock, local_clock, reported FROM fongo_bases
+                     WHERE collection = ?1 AND gid = ?2 AND field = ?3",
                     &[
                         Value::Text(c.name.clone()),
                         Value::Ref(member),
@@ -2005,19 +2010,6 @@ impl Replica {
                     })
                 };
                 if !after(&r[0])? || as_clock(&r[1])? == change.clock || !after(&r[2])? {
-                    continue;
-                }
-                // A change that carries the value the edit replaced and loses to it, such as a
-                // set written again with this field unchanged, edits nothing the edit has not.
-                if r[0] != Value::Null
-                    && same(&loaded(&r[3], &r[4])?, &change.value)
-                    && !wins(
-                        field.strategy,
-                        Some((&loaded(&r[5], &r[6])?, &as_clock(&r[1])?)),
-                        &change.value,
-                        &change.clock,
-                    )
-                {
                     continue;
                 }
                 let slot = (c.name.clone(), member, change.field.clone());

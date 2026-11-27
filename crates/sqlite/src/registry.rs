@@ -162,7 +162,9 @@ impl Collection {
     /// millisecond as that latest write, as is any part of that write still on its way, or it is
     /// older than that write and wrote a field of the new set that the write did not, which the
     /// new set hides anyway. Replicas that do this apart agree on one of their values. Sets
-    /// removed, narrowed or reordered send nothing.
+    /// removed, narrowed or reordered send nothing. A replica with an edit to a field of the
+    /// set that reports conflicts, not yet sent, is told of such a record as a
+    /// [`crate::Conflict`] whose remote value is the base, and keeps its edit.
     ///
     /// Adding a field to a set changes what the set means. Where a replica still on the old
     /// registry writes the set after another has recorded it again, the new field reads NULL on
