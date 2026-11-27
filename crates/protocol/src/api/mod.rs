@@ -171,7 +171,11 @@
 //!   a field is merged by clock in every version, is never a key field of a natural collection, and
 //!   once marked is never unmarked: the definition and the treatment of rewritten key fields
 //!   differ, and a device that does not count a field as naming files can send a reference in it
-//!   without its claim or retire what it names. A registry must not mark a key field.
+//!   without its claim or retire what it names. A registry must not mark a key field. So an
+//!   application marks a field as naming files from the first version that writes it, or, when it
+//!   marks a field that already exists, only once no device that can still append runs a version
+//!   from before the marking; how it ensures that is its own concern, and a removed device cannot
+//!   append.
 //! - each device key is used by one database. Two databases on one key, such as a copy of a
 //!   database or a backup restored while the database it was taken from went on, are one device to
 //!   the server; see the limits.
@@ -219,7 +223,8 @@
 //!   keeps as its own before each report. A device whose version cannot do this for a field does
 //!   not send a change to it, does not retire, and does not report [`Settled`] while a row it holds
 //!   back or a value it keeps as its own names a file in it. A version written before the field was
-//!   marked cannot know to do this; the limits say what that costs.
+//!   marked cannot know to do this; the conditions say when a field may be marked, and the limits
+//!   say what such a version costs when it runs anyway.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -322,14 +327,19 @@
 //!   a device retires the file again.
 //! - a device that never reports [`Settled`] holds back every deletion until it is removed.
 //! - removing a device gives up the guarantee for the files named by envelopes it appended without
-//!   their claims and had not yet claimed, because it read [`Capabilities::blobs`] as false or
-//!   because its claiming append was refused with [`ErrorCode::LibraryFull`]: the server no longer
-//!   waits for its report, and nothing else voids a retirement of such a file, so the file can be
-//!   deleted while the log refers to it. Another device that holds such a file can make it
-//!   available again by sending a change that sets a reference to it, with its claim, and uploading
-//!   the file if the server lacks it.
-//! - a device running a version from before a field was marked as naming files can show, in rows it
-//!   holds back, a file that is rightly deleted.
+//!   their claims and had not yet claimed, because it sent an append plainly after the server began
+//!   to offer [`Capabilities::blobs`], having read the capability before, or because its claiming
+//!   append was refused with [`ErrorCode::LibraryFull`] and it sent the envelope plainly: the
+//!   server no longer waits for its report, and nothing else voids a retirement of such a file, so
+//!   the file can be deleted while the log refers to it. Another device that holds such a file can
+//!   make it available again by sending a change that sets a reference to it, with its claim, and
+//!   uploading the file if the server lacks it.
+//! - while any device runs a version from before a field was marked as naming files, and that
+//!   version writes the field or retires, the guarantee does not hold for the files that field
+//!   names: it can send references in the field without their claims, and it can retire while
+//!   judging the log without the field, so a file the log refers to can be deleted. Even a version
+//!   that neither writes the field nor retires can show, in rows it holds back, a file that is
+//!   rightly deleted.
 //! - a device that skipped an envelope may settle, and can then show a file that the skipped
 //!   envelope replaced and that was rightly deleted; fetching it answers
 //!   [`ErrorCode::BlobNotFound`], and a change it makes from that value names a missing file.
@@ -717,7 +727,8 @@ pub struct DeviceRecord {
     pub member_proof: Option<ListedMemberProof>,
     /// Removed through [`REMOVE_DEVICE_PATH`]: the server refuses its requests, and it no longer
     /// holds back the deletion of retired blobs. That gives up the guarantee for the files named by
-    /// envelopes it appended without their claims and had not yet claimed; see [Deleting
+    /// envelopes it appended without their claims and had not yet claimed, having sent them plainly
+    /// after the server began to offer blobs or after a claiming append was refused; see [Deleting
     /// files](self#deleting-files).
     #[serde(default, skip_serializing_if = "is_false")]
     pub removed: bool,

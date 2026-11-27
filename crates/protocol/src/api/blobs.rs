@@ -317,12 +317,15 @@ pub struct Entitlement {
 /// id the library does not list, or a device already removed, changes nothing. Either way the
 /// answer is the device list; [`Devices::remove`](super::Devices::remove) does this to a list.
 ///
-/// Removing a device gives up the guarantee of [the module documentation](super#deleting-files)
-/// for the files named by envelopes it appended without their claims and had not yet claimed,
-/// because it read [`Capabilities::blobs`](super::Capabilities::blobs) as false or because its
-/// claiming append was refused: such a file can be deleted while the log refers to it. Another
-/// device that holds such a file can make it available again by sending a change that sets a
-/// reference to it, with its claim, and uploading the file if the server lacks it.
+/// Removing a device gives up the guarantee of [the module documentation](super#deleting-files) for
+/// the files named by envelopes it appended without their claims and had not yet claimed, because
+/// it sent an append plainly after the server began to offer
+/// [`Capabilities::blobs`](super::Capabilities::blobs), having read the capability before, or
+/// because its claiming append was refused with
+/// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and it sent the envelope plainly: such
+/// a file can be deleted while the log refers to it. Another device that holds such a file can make
+/// it available again by sending a change that sets a reference to it, with its claim, and
+/// uploading the file if the server lacks it.
 ///
 /// The server keeps the removed device's record, with its key, in the device list: a device stops
 /// reading the log at an envelope whose signer the list does not hold, so dropping the record would
