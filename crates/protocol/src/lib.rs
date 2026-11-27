@@ -63,7 +63,7 @@ pub use keys::{generate_signing_key, random_nonce, random_request_nonce};
 pub use recovery::RecoveryError;
 pub use request::{
     HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestAuth, RequestError,
-    sign_request, verify_request,
+    sign_request, sign_request_digest, verify_request, verify_request_digest,
 };
 pub use wire::DecodeError;
 
