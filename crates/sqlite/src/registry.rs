@@ -147,10 +147,28 @@ impl Collection {
     /// it whose part of that write has not arrived yet reads NULL. The exception is two writes
     /// at one clock, which two databases writing as one node make (see
     /// [`crate::SharedNode`]): each field then takes the greater of its two values, which can
-    /// mix the writes. The fields must be plain
-    /// fields merged by clock, not references nor part of the key. When a field joins a set
-    /// that already holds writes, each replica whose rows hold a value for the set records the
-    /// whole set again on install, and the newest of those wins.
+    /// mix the writes. The fields must be plain fields merged by clock, not references nor part
+    /// of the key.
+    ///
+    /// A registry that draws a set anew (adds a field to one, merges two, or groups fields
+    /// written apart) leaves the writes made before it holding only part of the new set. On
+    /// install, each replica records such a set again for every entity whose set is not whole:
+    /// each field with the value the merged changes hold, or for a field the registry has just
+    /// declared that nothing holds yet, the value in the row, at the clock just past the latest
+    /// write to the set this replica holds, carrying its own id; a set no change holds anything
+    /// of takes the clock of a found row. A held-back row's values and an edit not yet collected
+    /// are never sent this way: the edit is collected afterwards, as an edit. So an edit to the
+    /// set made elsewhere and not yet received still wins, unless it was made in the same
+    /// millisecond as that latest write, as is any part of that write still on its way, or it is
+    /// older than that write and wrote a field of the new set that the write did not, which the
+    /// new set hides anyway. Replicas that do this apart agree on one of their values. Sets
+    /// removed, narrowed or reordered send nothing.
+    ///
+    /// Adding a field to a set changes what the set means. Where a replica still on the old
+    /// registry writes the set after another has recorded it again, the new field reads NULL on
+    /// every upgraded replica until that one upgrades and records the set again with the value
+    /// it received, or its own if it received none; if the set is written on an upgraded replica
+    /// meanwhile, that write records the NULL and the value is gone.
     pub fn together(mut self, fields: &[&str]) -> Collection {
         self.together
             .push(fields.iter().map(|f| (*f).into()).collect());

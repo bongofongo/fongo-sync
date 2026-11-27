@@ -527,6 +527,45 @@ impl<'d> Ctx<'d> {
         *earliest = (*earliest).min(clock);
     }
 
+    /// The least reading of this replica's node later than `latest`, which no later reading of
+    /// its clock can equal. `None` past the last millisecond the clock observes.
+    pub(crate) fn successor(&mut self, latest: Hlc) -> Result<Option<Hlc>> {
+        let (mut wall_ms, mut counter) = match latest.counter.checked_add(1) {
+            Some(counter) => (latest.wall_ms, counter),
+            None => (latest.wall_ms.saturating_add(1), 0),
+        };
+        if wall_ms == 0 {
+            // Clocks at wall 0 are adoptions, numbered by `adopted_seq`.
+            let seq = match meta_get(self.db, "adopted_seq")? {
+                Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
+                _ => 0,
+            };
+            if let Some(seq) = seq.max(latest.counter).checked_add(1) {
+                meta_set(self.db, "adopted_seq", Value::Int(i64::from(seq)))?;
+                return Ok(Some(Hlc {
+                    wall_ms: 0,
+                    counter: seq,
+                    node: self.node,
+                }));
+            }
+            (wall_ms, counter) = (1, 0);
+        }
+        let next = Hlc {
+            wall_ms,
+            counter,
+            node: self.node,
+        };
+        let room = Hlc {
+            wall_ms: wall_ms.saturating_add(1),
+            ..next
+        };
+        if !room.encodable() {
+            return Ok(None);
+        }
+        self.clock.observe(&next);
+        Ok(Some(next))
+    }
+
     pub(crate) fn touch(&mut self, idx: usize, key: &str, gid: Gid, deleted: bool) {
         let first = self.touched.len();
         self.touched
@@ -1069,12 +1108,24 @@ impl Replica {
                 adopted.extend(changes);
                 set.extend(more);
             }
-            let regrouped = match was_together {
-                Some(was) => was != together,
-                None => !c.together.is_empty(),
+            let drawn: Vec<usize> = match &was_together {
+                Some(Value::Text(was)) => {
+                    let old: Vec<BTreeSet<&str>> = was
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.split('+').collect())
+                        .collect();
+                    (0..c.together.len())
+                        .filter(|&s| {
+                            !old.iter()
+                                .any(|o| c.together[s].iter().all(|f| o.contains(f.as_str())))
+                        })
+                        .collect()
+                }
+                _ => (0..c.together.len()).collect(),
             };
-            if regrouped {
-                let (changes, more) = self.complete_sets(&mut cx, idx)?;
+            if !drawn.is_empty() {
+                let (changes, more) = self.complete_sets(&mut cx, idx, &drawn, &added)?;
                 adopted.extend(changes);
                 set.extend(more);
             }
@@ -1147,15 +1198,24 @@ impl Replica {
                 continue;
             };
             let mut found = Vec::new();
-            // A field in a set is recorded with its set, never alone.
-            for f in added.iter().filter(|f| c.together_of(f).is_none()) {
+            let mut grouped = false;
+            for f in added {
                 let value = row.get(f).cloned().unwrap_or(Value::Null);
                 m.image.insert(f.clone(), value.clone());
-                if value != Value::Null {
+                if value == Value::Null {
+                    continue;
+                }
+                // A field in a set is recorded with its set, never alone.
+                if c.together_of(f).is_some() {
+                    grouped = true;
+                } else {
                     found.push(FieldEdit::Set(f.clone(), self.shared(db, c, f, &value)?));
                 }
             }
             self.write_image(db, &c.name, &key, &m.image)?;
+            if grouped {
+                set.insert((c.name.clone(), gid));
+            }
             if found.is_empty() {
                 continue;
             }
@@ -1185,72 +1245,97 @@ impl Replica {
         Ok((changes, set))
     }
 
-    /// After the sets of fields that change together are redrawn, writes made before hold only
-    /// some fields of a set, so the set never shows whole. Each row that holds a value for such a
-    /// set records the whole set afresh, and the newest of those wins.
-    fn complete_sets(&self, cx: &mut Ctx, idx: usize) -> Result<Recorded> {
+    /// After the sets `drawn` of fields that change together are drawn anew, writes made before
+    /// hold only some fields of such a set, so it would not show whole. Each group whose set is
+    /// not whole records it again with what its registers hold, and for a field the registry has
+    /// just `added` that no register holds, what the row holds. The clock is the one just past
+    /// the set's latest write on this replica, carrying this replica's node, so an edit made
+    /// elsewhere and not yet here still wins unless it was made in that write's millisecond;
+    /// a set no register holds anything of takes the adoption clock. Values a row holds back or
+    /// an edit not yet collected are never sent: the edit is collected afterwards, as an edit.
+    fn complete_sets(
+        &self,
+        cx: &mut Ctx,
+        idx: usize,
+        drawn: &[usize],
+        added: &[String],
+    ) -> Result<Recorded> {
         let c = self.collection(idx);
         let db = cx.db;
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut changes = Vec::new();
         let mut set = BTreeSet::new();
+        let mut done = BTreeSet::new();
         let mapped = db.query(
-            "SELECT key, gid FROM fongo_ids WHERE collection = ?1",
+            "SELECT key, gid FROM fongo_ids WHERE collection = ?1 ORDER BY key",
             &[Value::Text(c.name.clone())],
         )?;
         for r in mapped {
             let key = as_text(&r[0])?.to_string();
             let gid = as_gid(&r[1])?;
-            let (Some(row), Some(mut m)) = (read_row(db, c, &key)?, mapping(db, &c.name, &key)?)
-            else {
+            let Some(row) = read_row(db, c, &key)? else {
                 continue;
             };
             let Ok(target) = ev.target(&facts, &c.name, gid) else {
                 continue;
             };
+            // Two rows standing for one group would record two values at one clock.
+            if !done.insert(target.canonical) {
+                continue;
+            }
             let members = if target.live.is_empty() {
                 target.members.clone()
             } else {
                 target.live.clone()
             };
-            let mut found = Vec::new();
-            for fields in &c.together {
-                let mut clocks = Vec::new();
+            for &s in drawn {
+                let fields = &c.together[s];
+                let mut found = Vec::new();
+                let mut latest: Option<Hlc> = None;
+                let mut whole = true;
+                let mut fills = false;
                 for f in fields {
-                    clocks.push(
-                        facts
-                            .register(&self.schema, &c.name, &members, f)?
-                            .map(|(_, k)| k),
-                    );
-                }
-                let whole = clocks.iter().all(|k| *k == clocks[0]);
-                let empty = fields
-                    .iter()
-                    .all(|f| row.get(f).is_none_or(|v| *v == Value::Null));
-                if whole || empty {
-                    continue;
-                }
-                for f in fields {
-                    let value = row.get(f).cloned().unwrap_or(Value::Null);
-                    m.image.insert(f.clone(), value.clone());
+                    let held = facts.register(&self.schema, &c.name, &members, f)?;
+                    let unheld = held.is_none();
+                    let value = match held {
+                        Some((value, clock)) => {
+                            whole &= latest.is_none_or(|l| l == clock);
+                            latest = Some(latest.map_or(clock, |l| l.max(clock)));
+                            value
+                        }
+                        None if added.contains(f) => {
+                            let value = row.get(f).cloned().unwrap_or(Value::Null);
+                            self.shared(db, c, f, &value)?
+                        }
+                        None => Value::Null,
+                    };
+                    fills |= unheld && value != Value::Null;
                     found.push(FieldEdit::Set(f.clone(), value));
                 }
+                let empty = found
+                    .iter()
+                    .all(|e| matches!(e, FieldEdit::Set(_, Value::Null)));
+                if empty || (whole && !fills) {
+                    continue;
+                }
+                let clock = match latest {
+                    None => cx.adoption_clock()?,
+                    Some(latest) => match cx.successor(latest)? {
+                        Some(clock) => clock,
+                        None => continue,
+                    },
+                };
+                changes.extend(plan::record(
+                    &self.schema,
+                    &c.name,
+                    &found,
+                    Some(&target),
+                    None,
+                    clock,
+                ));
+                set.insert((c.name.clone(), gid));
             }
-            if found.is_empty() {
-                continue;
-            }
-            self.write_image(db, &c.name, &key, &m.image)?;
-            let clock = cx.clock.tick(cx.wall);
-            changes.extend(plan::record(
-                &self.schema,
-                &c.name,
-                &found,
-                Some(&target),
-                None,
-                clock,
-            ));
-            set.insert((c.name.clone(), gid));
         }
         db.check()?;
         Ok((changes, set))

@@ -2,9 +2,11 @@
 //! before each kernel step with how the previous step left them, and by triggers of the test's
 //! own that see a row made again at the same key or a field set back to what it held. A replica may send a field of an
 //! entity only when the application wrote that field of its row, or wrote any part of a set the
-//! field changes with, or made or removed the row; besides that it sends aliases, and what an
-//! install adopts. Anything else it sends is a value the application did not write, such as a
-//! field the kernel held back in a row and later took for an edit.
+//! field changes with, or made or removed the row; besides that it sends aliases, what an
+//! install adopts, and the sets an install completes after they are redrawn, at the clock just
+//! past the set's latest write, with the values its registers hold. Anything else it sends is a
+//! value the application did not write, such as a field the kernel held back in a row and later
+//! took for an edit.
 //!
 //! In the other direction, every value the application wrote must be sent, and once everything
 //! is exchanged, held in the merged state at the clock it was sent with or a later one
@@ -42,6 +44,8 @@ pub struct Writes {
     removed: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// Changes an install produced, which are not checked.
     adopted: Vec<Change>,
+    /// Before an install: the model of what the replica held, and the fields its rows held.
+    redraw: Option<(model::Merge, BTreeSet<(String, String)>)>,
     /// Cells the application changed, with the value it wrote, not yet seen in what was sent.
     owed: BTreeMap<(String, String, String), Value>,
     /// For a reference among them, the entity the row it names stood for when it was written.
@@ -74,6 +78,10 @@ async fn now(conn: &mut SqliteConnection, replica: &Replica) -> Rows {
         }
     }
     out
+}
+
+fn same(a: &Value, b: &Value) -> bool {
+    a.total_cmp(b) == std::cmp::Ordering::Equal
 }
 
 /// Whether a member is gone for good as far as `merge` knows: tombstoned, or not live while
@@ -214,9 +222,11 @@ impl Writes {
             }
             let mut touched = BTreeSet::new();
             for f in &c.fields {
+                // A field the registry has just declared holds what it held before: no write.
                 if old.is_none_or(|old| {
-                    old.get(&f.name).unwrap_or(&Value::Null)
-                        != values.get(&f.name).unwrap_or(&Value::Null)
+                    old.contains_key(&f.name)
+                        && old.get(&f.name).unwrap_or(&Value::Null)
+                            != values.get(&f.name).unwrap_or(&Value::Null)
                 }) {
                     touched.insert(f.name.clone());
                 }
@@ -461,10 +471,116 @@ impl Writes {
     ) -> usize {
         self.before(conn, replica, taken).await;
         // Before the first install there is no outbox.
-        replica
+        let outbox = replica
             .outbox(conn, u32::MAX)
             .await
-            .map_or(0, |outbox| outbox.changes.len())
+            .map_or(Vec::new(), |outbox| outbox.changes);
+        let mut held = taken.to_vec();
+        held.extend(outbox.iter().cloned());
+        let declared = self
+            .after
+            .iter()
+            .flat_map(|((c, _), row)| row.keys().map(move |f| (c.clone(), f.clone())))
+            .collect();
+        let merge = model::merge(&replica.registry().model_schema(), &held);
+        self.redraw = Some((merge, declared));
+        outbox.len()
+    }
+
+    /// Of an install's changes, those it may send unchecked: adoptions, which take the adoption
+    /// clock, and changes to fields outside any set, as before; a change to a field of a set
+    /// only where it completes the set as a redraw must. Anything else is checked as a write of
+    /// the application's.
+    fn vouched(&mut self, replica: &Replica, made: Vec<Change>) {
+        let registry = replica.registry();
+        let Some((merge, declared)) = self.redraw.take() else {
+            self.adopted.extend(made);
+            return;
+        };
+        let group = |gid: &Gid| -> Vec<&model::Entity> {
+            let Some(e) = merge.entities.get(gid) else {
+                return Vec::new();
+            };
+            let members: Vec<&model::Entity> = merge
+                .entities
+                .values()
+                .filter(|m| m.collection == e.collection && m.canonical == e.canonical)
+                .collect();
+            let live: Vec<&model::Entity> = members.iter().copied().filter(|m| m.live).collect();
+            if live.is_empty() { members } else { live }
+        };
+        let winner = |members: &[&model::Entity], f: &str| {
+            members
+                .iter()
+                .filter_map(|m| m.registers.get(f))
+                .fold(None, |best: Option<&(Value, _)>, e| match best {
+                    Some(b) if b.1 >= e.1 => Some(b),
+                    _ => Some(e),
+                })
+                .cloned()
+        };
+        // The rows of each group, by collection and canonical gid, as the install found them.
+        let mut rows: BTreeMap<(String, Gid), Vec<&BTreeMap<String, Value>>> = BTreeMap::new();
+        for (at, row) in &self.found {
+            if let Some(e) = self.latest.get(at).and_then(|g| merge.entities.get(g)) {
+                rows.entry((at.0.clone(), e.canonical))
+                    .or_default()
+                    .push(row);
+            }
+        }
+        for change in made {
+            let set = registry
+                .collections()
+                .iter()
+                .find(|c| c.name == change.collection)
+                .and_then(|c| c.together.iter().find(|s| s.contains(&change.field)));
+            let Some(set) = set.filter(|_| change.clock.wall_ms != 0) else {
+                self.adopted.push(change);
+                continue;
+            };
+            let members = group(&change.gid);
+            let latest = set
+                .iter()
+                .filter_map(|f| winner(&members, f).map(|(_, k)| k))
+                .max();
+            let next = latest.map(|k| match k.counter.checked_add(1) {
+                Some(counter) => (k.wall_ms, counter),
+                None => (k.wall_ms + 1, 0),
+            });
+            let value = match winner(&members, &change.field) {
+                Some((v, _)) => same(&v, &change.value),
+                None if declared.contains(&(change.collection.clone(), change.field.clone())) => {
+                    change.value == Value::Null
+                }
+                None => members.first().is_some_and(|m| {
+                    rows.get(&(change.collection.clone(), m.canonical))
+                        .into_iter()
+                        .flatten()
+                        .any(|row| {
+                            same(
+                                row.get(&change.field).unwrap_or(&Value::Null),
+                                &change.value,
+                            )
+                        })
+                }),
+            };
+            if value && next == Some((change.clock.wall_ms, change.clock.counter)) {
+                self.adopted.push(change);
+            }
+        }
+        // A field new to the registry in a set its group already holds a value for takes that
+        // value: what the row held for it is not sent.
+        self.owed.retain(|(c, k, f), _| {
+            let grouped = registry
+                .collections()
+                .iter()
+                .any(|x| x.name == *c && x.together.iter().any(|s| s.contains(f)));
+            let held = self
+                .latest
+                .get(&(c.clone(), k.clone()))
+                .is_some_and(|g| winner(&group(g), f).is_some());
+            declared.contains(&(c.clone(), f.clone())) || !grouped || !held
+        });
     }
 
     /// After an install: what it added to the outbox past `waiting` is its own.
@@ -475,8 +591,7 @@ impl Writes {
         waiting: usize,
     ) {
         let outbox = replica.outbox(conn, u32::MAX).await.unwrap();
-        self.adopted
-            .extend(outbox.changes.into_iter().skip(waiting));
+        self.vouched(replica, outbox.changes.into_iter().skip(waiting).collect());
         self.after(conn, replica).await;
         self.gone_with_install();
     }
@@ -511,8 +626,7 @@ impl Writes {
         waiting: usize,
     ) {
         let outbox = replica.outbox(conn, u32::MAX).await.unwrap();
-        self.adopted
-            .extend(outbox.changes.into_iter().skip(waiting));
+        self.vouched(replica, outbox.changes.into_iter().skip(waiting).collect());
         self.after_step(conn, replica).await;
         self.gone_with_install();
     }

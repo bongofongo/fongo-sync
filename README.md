@@ -48,6 +48,17 @@ reference may own its row, which then goes with its target. A collection can als
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
 
+A set of fields that change together should hold only fields a person edits as one decision. A
+write to any field of a set records the whole set at one clock, so a field the application writes
+itself, such as one derived from others or rewritten after a sync, records the person's fields
+with it, and that write beats an edit to them made concurrently on another device. Keep such
+fields out of a set with fields a person edits: sync them as plain fields, or keep them out of
+the registry and derive them on each device. Adding a field to an existing set changes what the
+set means: an upgrade records the set again without beating edits made elsewhere, but where a
+device still on the old version writes the set first, the new field reads NULL until that device
+upgrades, and a write to the set meanwhile loses the value. `Collection::together` sets out what
+an upgrade sends.
+
 When two replicas each make a row that is valid alone and together break a rule of the
 application's own, such as a partial unique index, the kernel holds one of them back and the
 application settles it. `Replica::made` says which replica made an entity and

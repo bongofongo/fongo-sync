@@ -4,6 +4,8 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Hlc, Value};
 use fongo_sync_sqlite::{Collection, Registry, Resume};
 use support::peer::{Peer, later, make, same_everywhere, settle};
@@ -798,6 +800,563 @@ async fn a_field_that_joins_a_set_already_written_is_recorded_with_it() {
     assert_eq!(
         same_everywhere(&mut peers, RATED_ROWS).await,
         ["one done 7"]
+    );
+}
+
+// A set redrawn by an upgrade is completed at a clock just past its latest write, with the
+// values the replica's registers hold, so an edit made elsewhere and not yet pulled still wins.
+
+const WIDE: &[&str] = &[
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT,
+                                             finished INTEGER, rating INTEGER)",
+];
+
+fn paired() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .together(&["status", "finished"]),
+    ])
+    .unwrap()
+}
+
+fn widened() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .field("rating")
+            .together(&["status", "finished", "rating"]),
+    ])
+    .unwrap()
+}
+
+fn reordered() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .together(&["finished", "status"]),
+    ])
+    .unwrap()
+}
+
+const WIDE_ROWS: &str = "SELECT title || ' ' || COALESCE(status, '-') || ' '
+                                || COALESCE(finished, '-') || ' ' || COALESCE(rating, '-')
+                           FROM books ORDER BY 1";
+
+#[tokio::test]
+async fn widening_a_set_keeps_an_edit_the_installer_has_not_pulled() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished, rating) VALUES ('one', 'reading', 1, 4)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    upgrade(&mut peers[0], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[1].lines(WIDE_ROWS).await, ["one done 2 -"]);
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one done 2 4"]
+    );
+}
+
+#[tokio::test]
+async fn replicas_that_widen_a_set_apart_agree_and_keep_an_older_replicas_edit() {
+    let mut hub = Vec::new();
+    let mut peers = make(3, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished) VALUES ('one', 'reading', 1)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[2]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[2].push(&mut hub).await;
+    later();
+    peers[0].run("UPDATE books SET rating = 4").await;
+    upgrade(&mut peers[0], widened()).await;
+    peers[0].push(&mut hub).await;
+    later();
+    peers[1].run("UPDATE books SET rating = 5").await;
+    upgrade(&mut peers[1], widened()).await;
+    peers[1].push(&mut hub).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[2], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    let rows = same_everywhere(&mut peers, WIDE_ROWS).await;
+    assert!(
+        rows == ["one done 2 4"] || rows == ["one done 2 5"],
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn grouping_fields_written_apart_keeps_an_edit_the_installer_has_not_pulled() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, RATED, after).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished) VALUES ('one', 'reading', 1)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[0].run("UPDATE books SET status = 'started'").await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1].run("UPDATE books SET finished = 2").await;
+    peers[1].push(&mut hub).await;
+    later();
+    upgrade(&mut peers[0], grouped()).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], grouped()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, RATED_ROWS).await,
+        ["one started 2"]
+    );
+}
+
+#[tokio::test]
+async fn redrawing_sets_leaves_a_partly_arrived_write_alone() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, RATED, grouped).await;
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('one')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    let sent = peers[0].push(&mut hub).await;
+    let half: Vec<Change> = sent.into_iter().filter(|c| c.field == "finished").collect();
+    peers[1].apply(&half).await;
+    upgrade(&mut peers[1], reordered()).await;
+    let sent = peers[1].push(&mut hub).await;
+    assert!(
+        sent.iter()
+            .all(|c| c.field != "status" && c.field != "finished"),
+        "{sent:#?}"
+    );
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, RATED_ROWS).await,
+        ["one done 2"]
+    );
+}
+
+#[tokio::test]
+async fn a_redraw_sends_what_the_merge_holds_not_what_a_held_row_holds() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished) VALUES ('one', 'reading', 1)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    peers[1]
+        .run(
+            "CREATE TRIGGER refuse AFTER UPDATE OF status ON books WHEN NEW.status = 'lost'
+             BEGIN SELECT json('{'); END",
+        )
+        .await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'lost', finished = 9")
+        .await;
+    peers[0].push(&mut hub).await;
+    let applied = peers[1].pull(&hub).await;
+    assert_eq!(applied.waiting, 1, "{:#?}", applied.held);
+    peers[1].run("UPDATE books SET rating = 3").await;
+    later();
+    upgrade(&mut peers[1], widened()).await;
+    let sent = peers[1].push(&mut hub).await;
+    assert!(
+        sent.iter()
+            .all(|c| c.value != Value::Text("reading".into())),
+        "{sent:#?}"
+    );
+    peers[0].pull(&hub).await;
+    assert_eq!(peers[0].lines(WIDE_ROWS).await, ["one lost 9 -"]);
+    upgrade(&mut peers[0], widened()).await;
+    peers[1].run("DROP TRIGGER refuse").await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one lost 9 3"]
+    );
+}
+
+#[tokio::test]
+async fn an_edit_not_yet_collected_when_a_set_is_widened_is_sent_after_as_an_edit() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished) VALUES ('one', 'reading', 1)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'dropped', finished = NULL, rating = 4")
+        .await;
+    upgrade(&mut peers[0], widened()).await;
+    let sent = peers[0].push(&mut hub).await;
+    let status: Vec<(&Value, Hlc)> = sent
+        .iter()
+        .filter(|c| c.field == "status")
+        .map(|c| (&c.value, c.clock))
+        .collect();
+    assert_eq!(status.len(), 2, "{sent:#?}");
+    assert_eq!(*status[0].0, Value::Text("reading".into()));
+    assert_eq!(*status[1].0, Value::Text("dropped".into()));
+    assert!(status[0].1 < status[1].1);
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one dropped - 4"]
+    );
+}
+
+#[tokio::test]
+async fn a_completion_may_share_a_clock_with_another_row_written_in_its_millisecond() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title) VALUES ('one'), ('two')")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'reading', finished = 1, rating = 4")
+        .await;
+    let written = peers[0].push(&mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2 WHERE title = 'two'")
+        .await;
+    peers[1].push(&mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    let completed = peers[0].push(&mut hub).await;
+    // Both rows were written in one millisecond, at successive clocks of one node: the first
+    // row's set is completed at the second's clock.
+    let clocks: BTreeSet<Hlc> = written.iter().map(|c| c.clock).collect();
+    assert_eq!(clocks.len(), 2, "{written:#?}");
+    assert!(
+        completed.iter().any(|c| clocks.contains(&c.clock)),
+        "{completed:#?}"
+    );
+    later();
+    peers[0]
+        .run("UPDATE books SET title = 'one!' WHERE title = 'one'")
+        .await;
+    let edited = peers[0].push(&mut hub).await;
+    assert!(
+        edited
+            .iter()
+            .all(|e| completed.iter().all(|c| c.clock < e.clock))
+    );
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one! reading 1 4", "two done 2 4"]
+    );
+}
+
+#[tokio::test]
+async fn widening_after_a_downgrade_keeps_an_edit_the_installer_has_not_pulled() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished, rating) VALUES ('one', 'reading', 1, 4)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[0], paired()).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'paused', finished = NULL, rating = 5")
+        .await;
+    peers[1].push(&mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one paused - 5"]
+    );
+}
+
+const WIDER: &[&str] = &[
+    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT,
+                                              finished INTEGER, rating INTEGER, note TEXT)",
+];
+
+fn wider() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .field("rating")
+            .field("note")
+            .together(&["status", "finished", "rating", "note"]),
+    ])
+    .unwrap()
+}
+
+fn noted() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .field("rating")
+            .field("note")
+            .together(&["status", "finished"])
+            .together(&["rating", "note"]),
+    ])
+    .unwrap()
+}
+
+const WIDER_ROWS: &str = "SELECT title || ' ' || COALESCE(status, '-') || ' '
+                                 || COALESCE(finished, '-') || ' ' || COALESCE(rating, '-')
+                                 || ' ' || COALESCE(note, '-')
+                            FROM books ORDER BY 1";
+
+#[tokio::test]
+async fn a_second_redraw_keeps_an_edit_the_installer_has_not_pulled() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDER, paired).await;
+    peers[0]
+        .run(
+            "INSERT INTO books (title, status, finished, rating, note)
+             VALUES ('one', 'reading', 1, 4, 'n')",
+        )
+        .await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    upgrade(&mut peers[0], wider()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[0].lines(WIDER_ROWS).await, ["one done 2 - -"]);
+    upgrade(&mut peers[1], wider()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDER_ROWS).await,
+        ["one done 2 4 n"]
+    );
+}
+
+#[tokio::test]
+async fn a_set_made_only_of_new_fields_is_adopted_from_the_rows() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDER, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status) VALUES ('one', 'reading'), ('two', NULL)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    peers[0]
+        .run("UPDATE books SET rating = 4, note = 'n' WHERE title = 'one'")
+        .await;
+    upgrade(&mut peers[0], noted()).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], noted()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDER_ROWS).await,
+        ["one reading - 4 n", "two - - - -"]
+    );
+}
+
+#[tokio::test]
+async fn a_stepped_install_widens_a_set_without_beating_an_edit_it_has_not_pulled() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run(
+            "INSERT INTO books (title, status, finished, rating)
+             VALUES ('one', 'reading', 1, 4), ('two', 'reading', 1, 5), ('three', NULL, NULL, 6)",
+        )
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2 WHERE title = 'one'")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET title = title || '!' WHERE title <> 'one'")
+        .await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'done', finished = 3 WHERE title = 'two!'")
+        .await;
+    peers[0].upgrade_in_steps(widened(), 1).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one done 2 4", "three! - - 6", "two! done 3 5"]
+    );
+}
+
+#[tokio::test]
+async fn a_set_widened_on_resuming_keeps_an_edit_the_installer_has_not_pulled() {
+    for how in [Resume::Send, Resume::Baseline] {
+        let mut hub = Vec::new();
+        let mut peers = make(2, WIDE, paired).await;
+        peers[0]
+            .run(
+                "INSERT INTO books (title, status, finished)
+                 VALUES ('one', 'reading', 1), ('two', 'reading', 1)",
+            )
+            .await;
+        settle(&mut peers, &mut hub).await;
+        later();
+        peers[1]
+            .run("UPDATE books SET status = 'done', finished = 2 WHERE title = 'one'")
+            .await;
+        peers[1].push(&mut hub).await;
+        later();
+        peers[0].suspend().await;
+        peers[0]
+            .run("UPDATE books SET status = 'dropped', finished = NULL WHERE title = 'two'")
+            .await;
+        peers[0].run("UPDATE books SET rating = 4").await;
+        peers[0].replica = fongo_sync_sqlite::Replica::new(widened());
+        peers[0].resume(how).await;
+        settle(&mut peers, &mut hub).await;
+        upgrade(&mut peers[1], widened()).await;
+        settle(&mut peers, &mut hub).await;
+        if how == Resume::Send {
+            assert_eq!(
+                same_everywhere(&mut peers, WIDE_ROWS).await,
+                ["one done 2 4", "two dropped - 4"]
+            );
+            continue;
+        }
+        // The baseline stays in the row it was written to, and only there.
+        for (peer, two) in peers.iter_mut().zip(["two dropped - 4", "two reading 1 4"]) {
+            peer.settled().await;
+            assert_eq!(peer.lines(WIDE_ROWS).await, ["one done 2 4", two]);
+        }
+    }
+}
+
+const SHARED: &[&str] = &["CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT,
+                                               isbn TEXT UNIQUE, status TEXT, finished INTEGER,
+                                               rating INTEGER)"];
+
+fn shared(set: &[&str]) -> Registry {
+    let mut books = Collection::minted("books", "books", "id")
+        .field("title")
+        .field("isbn")
+        .field("status")
+        .field("finished");
+    if set.contains(&"rating") {
+        books = books.field("rating");
+    }
+    Registry::new(vec![books.together(set).identity(&["isbn"])]).unwrap()
+}
+
+#[tokio::test]
+async fn a_merged_group_widens_its_set_without_beating_an_edit_the_installer_has_not_pulled() {
+    let (old, new) = (
+        || shared(&["status", "finished"]),
+        || shared(&["status", "finished", "rating"]),
+    );
+    let mut hub = Vec::new();
+    let mut peers = make(2, SHARED, old).await;
+    peers[0]
+        .run("INSERT INTO books (title, isbn, status, finished) VALUES ('one', 'i', 'reading', 1)")
+        .await;
+    peers[0].push(&mut hub).await;
+    later();
+    peers[1]
+        .run("INSERT INTO books (title, isbn, status, finished) VALUES ('uno', 'i', 'started', 3)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[0].int("SELECT count(*) FROM books").await, 1);
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[1].push(&mut hub).await;
+    later();
+    peers[0].run("UPDATE books SET rating = 4").await;
+    upgrade(&mut peers[0], new()).await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], new()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["uno done 2 4"]
+    );
+}
+
+/// Accepted, and stated with `Collection::together`: where a replica still on the old registry
+/// wrote the set after the redraw's clock, the field the set gained reads NULL until that replica
+/// upgrades; a write to the set meanwhile records that NULL, and the value adopted is gone.
+#[tokio::test]
+async fn a_value_a_set_gains_is_lost_to_an_edit_made_before_every_replica_upgrades() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished, rating) VALUES ('one', 'reading', 1, 4)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(peers[0].lines(WIDE_ROWS).await, ["one done 2 -"]);
+    later();
+    peers[0].run("UPDATE books SET finished = 3").await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[1], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one done 3 -"]
     );
 }
 
