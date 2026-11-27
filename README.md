@@ -159,6 +159,10 @@ free long enough for a writer waiting in SQLite's busy handler to take it. `Appl
 each step of collecting in the client's transaction, as `Apply::apply` runs each apply, and is told
 what the step wrote; `Apply::between`, called in each gap between transactions, lets an
 application send its own writers through, and `Apply::pace` sets the bounds.
+Syncs may also run at once on several connections to one database: each seals and records what
+it sends in one transaction, so no two seal the same changes, and none erases what another
+recorded as being sent or where another's pull stopped. One that starts while another's envelope
+is in flight cannot tell it from one a crash left, and appends the same bytes again.
 
 Not yet here: a server, an HTTP transport, and blob transfer.
 
