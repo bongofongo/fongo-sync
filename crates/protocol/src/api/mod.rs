@@ -271,7 +271,7 @@ pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
 use crate::keys::{DeviceId, LibraryId, LibraryKeys, WrapKey};
-use crate::member::{MemberCheck, MemberProof};
+use crate::member::{ListedMemberProof, MemberCheck, MemberProof};
 use crate::wire::{DecodeError, Reader, put_blob, put_varint};
 
 /// `GET`: [`Capabilities`].
@@ -610,10 +610,10 @@ pub struct DeviceRecord {
     /// The wrap key the device registered, if any.
     #[serde(flatten)]
     pub wrap: Option<SignedWrapKey>,
-    /// The [`MemberProof`] the device registered, if any, as the server received it; see
+    /// The [`MemberProof`] the device registered, if any, as the server listed it; see
     /// [`DeviceRecord::check_member_proof`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member_proof: Option<MemberProof>,
+    pub member_proof: Option<ListedMemberProof>,
     /// Removed through [`REMOVE_DEVICE_PATH`]: the server refuses its requests, and it no longer
     /// holds back the deletion of retired blobs.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -638,7 +638,8 @@ impl DeviceRecord {
     pub fn check_member_proof(&self, keys: &LibraryKeys) -> MemberCheck {
         match &self.member_proof {
             None => MemberCheck::Absent,
-            Some(proof) => {
+            Some(ListedMemberProof::Unreadable) => MemberCheck::Invalid,
+            Some(ListedMemberProof::Readable(proof)) => {
                 let wrap = self.wrap.as_ref().map(|wrap| &wrap.wrap_key);
                 if keys.verify_member_proof(&self.public_key, wrap, proof) {
                     MemberCheck::Valid
@@ -699,7 +700,7 @@ struct RawDeviceRecord {
     #[serde(default)]
     wrap_proof: Option<ProofHex>,
     #[serde(default)]
-    member_proof: Option<MemberProof>,
+    member_proof: Option<ListedMemberProof>,
     #[serde(default)]
     removed: Option<bool>,
     #[serde(default)]
@@ -958,7 +959,7 @@ mod tests {
             public_key: device.verifying_key(),
             recovery: false,
             wrap: add.wrap,
-            member_proof: add.member_proof,
+            member_proof: add.member_proof.map(ListedMemberProof::from),
             removed: false,
             last_seen: None,
         };
@@ -995,6 +996,42 @@ mod tests {
         assert_ne!(other_add.member_proof, add.member_proof);
         assert_ne!(elsewhere_add.member_proof, add.member_proof);
         assert!(add.member_proof.is_some() && add.verify_wrap(keys.id));
+    }
+
+    #[test]
+    fn a_listed_proof_that_is_not_hex_checks_as_invalid_and_spares_the_list() {
+        let keys = LibraryKeys::new(LibraryId([3; 16]), [7; 32]);
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let key_hex = crate::hex::encode(device.verifying_key().as_bytes());
+        let good = AddDevice::new(device.verifying_key()).with_member_proof(&keys);
+        let good_hex = good.member_proof.unwrap().to_hex();
+        for (proof, expected) in [
+            (json!("zz"), MemberCheck::Invalid),
+            (json!(good_hex[..62]), MemberCheck::Invalid),
+            (json!(7), MemberCheck::Invalid),
+            (json!({"proof": good_hex}), MemberCheck::Invalid),
+            (json!(null), MemberCheck::Absent),
+            (json!(good_hex), MemberCheck::Valid),
+        ] {
+            let list: Devices = serde_json::from_value(json!({"devices": [
+                {"public_key": key_hex, "recovery": false, "member_proof": proof},
+                {"public_key": key_hex, "recovery": true},
+            ]}))
+            .unwrap();
+            assert_eq!(
+                list.devices[0].check_member_proof(&keys),
+                expected,
+                "{proof}"
+            );
+            let again = serde_json::to_value(&list.devices[0]).unwrap();
+            let back: DeviceRecord = serde_json::from_value(again).unwrap();
+            assert_eq!(back, list.devices[0]);
+            if expected == MemberCheck::Invalid {
+                assert_eq!(back.member_proof, Some(ListedMemberProof::Unreadable));
+                let request = json!({"device_key": key_hex, "member_proof": proof});
+                assert!(serde_json::from_value::<AddDevice>(request).is_err());
+            }
+        }
     }
 
     #[test]

@@ -702,7 +702,7 @@ fn the_member_proof_macs_the_documented_bytes() {
         public_key: device,
         recovery: false,
         wrap: create.wrap,
-        member_proof: Some(MemberProof::from_hex(expected[0]).unwrap()),
+        member_proof: Some(MemberProof::from_hex(expected[0]).unwrap().into()),
         removed: false,
         last_seen: None,
     };
@@ -724,7 +724,7 @@ fn the_member_proof_macs_the_documented_bytes() {
 #[test]
 fn a_wrap_key_is_the_x25519_public_key_of_its_secret() {
     let secret = WrapSecret::from_bytes(
-        <[u8; 32]>::try_from(
+        &<[u8; 32]>::try_from(
             &hex_bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")[..],
         )
         .unwrap(),

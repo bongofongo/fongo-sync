@@ -264,6 +264,18 @@ impl Server {
         });
     }
 
+    /// Marks a listed key removed, as a removal would, without any request.
+    pub fn mark_removed(&self, library: LibraryId, key: VerifyingKey) {
+        self.with(|s| {
+            let devices = &mut s.libraries.get_mut(&library).unwrap().devices;
+            let record = devices
+                .iter_mut()
+                .find(|d| d.public_key == key)
+                .expect("the key is listed");
+            record.removed = true;
+        });
+    }
+
     /// Every change in the log, opened with the library's keys.
     pub fn changes(&self, keys: &LibraryKeys) -> Vec<Change> {
         self.with(|s| {
@@ -402,7 +414,7 @@ impl State {
                         public_key: create.device_key,
                         recovery: false,
                         wrap: create.wrap,
-                        member_proof: create.member_proof,
+                        member_proof: create.member_proof.map(Into::into),
                         removed: false,
                         last_seen: None,
                     },
@@ -446,20 +458,26 @@ impl State {
                     public_key: add.device_key,
                     recovery: false,
                     wrap: add.wrap,
-                    member_proof: add.member_proof,
+                    member_proof: add.member_proof.map(Into::into),
                     removed: false,
                     last_seen: None,
                 };
-                if !library
+                let live = library
                     .devices
                     .iter()
-                    .any(|d| d.public_key == record.public_key)
+                    .filter(|d| !d.recovery && !d.removed)
+                    .count();
+                let full = max.is_some_and(|max| live >= max as usize);
+                match library
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.public_key == record.public_key)
                 {
-                    let count = library.devices.iter().filter(|d| !d.recovery).count();
-                    if max.is_some_and(|max| count >= max as usize) {
-                        return Err(ErrorCode::DeviceLimit);
-                    }
-                    library.devices.push(record);
+                    Some(listed) if !listed.removed => {}
+                    Some(_) if full => return Err(ErrorCode::DeviceLimit),
+                    Some(listed) => *listed = record,
+                    None if full => return Err(ErrorCode::DeviceLimit),
+                    None => library.devices.push(record),
                 }
                 Ok(json(
                     200,

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fongo_sync_protocol::api::DeviceRecord;
+use fongo_sync_protocol::api::{DeviceRecord, SignedWrapKey};
 use fongo_sync_protocol::{
     DeviceId, LibraryId, LibraryKeys, MemberCheck, SigningKey, WrapKey, WrapSecret,
     generate_signing_key,
@@ -9,9 +9,11 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::Error;
+use crate::library::DeviceOffer;
 
 /// The format [`Credentials::to_bytes`] writes for credentials with a wrap secret.
-/// [`Credentials::from_bytes`] reads it and [`CREDENTIALS_FORMAT_WITHOUT_WRAP`].
+/// [`Credentials::from_bytes`] reads it and [`CREDENTIALS_FORMAT_WITHOUT_WRAP`]. A build from
+/// before wrap secrets cannot read it.
 pub const CREDENTIALS_FORMAT: u8 = 2;
 
 /// The format of credentials without a wrap secret, the only one builds before wrap secrets
@@ -68,17 +70,20 @@ impl Credentials {
     /// secret, epoch 0. Store them before [`crate::create_library_with`] registers them.
     pub fn for_new_library() -> Result<Credentials, Error> {
         let library = LibraryKeys::generate().map_err(|_| Error::Randomness)?;
-        Credentials::for_library(library)
+        Credentials::for_new_device(library)
     }
 
     /// Credentials for a new device of the library whose recovery code this is: its keys, a
     /// random device key and wrap secret, epoch 0. Store them before [`crate::join_library_with`]
     /// registers them.
     pub fn for_recovery_code(recovery_code: &str) -> Result<Credentials, Error> {
-        Credentials::for_library(LibraryKeys::from_recovery_code(recovery_code)?)
+        Credentials::for_new_device(LibraryKeys::from_recovery_code(recovery_code)?)
     }
 
-    fn for_library(library: LibraryKeys) -> Result<Credentials, Error> {
+    /// Credentials for a new device of a library whose keys the application handed over: a random
+    /// device key and wrap secret, epoch 0. Store them, then give a device already in the library
+    /// [`Credentials::device_offer`] to add with [`crate::add_device`].
+    pub fn for_new_device(library: LibraryKeys) -> Result<Credentials, Error> {
         let device = generate_signing_key().map_err(|_| Error::Randomness)?;
         let wrap = WrapSecret::generate().map_err(|_| Error::Randomness)?;
         Ok(Credentials::new(library, device, 0).with_wrap_secret(wrap))
@@ -118,6 +123,17 @@ impl Credentials {
 
     pub fn wrap_secret(&self) -> Option<&WrapSecret> {
         self.wrap.as_ref()
+    }
+
+    /// What another device of the library needs to add this one with [`crate::add_device`]: this
+    /// device's public key and its wrap key, signed by its key for the library. `None` without a
+    /// wrap secret.
+    pub fn device_offer(&self) -> Option<DeviceOffer> {
+        let wrap = self.wrap_key()?;
+        Some(DeviceOffer {
+            device_key: self.device.verifying_key(),
+            wrap: SignedWrapKey::new(self.library.id, &self.device, wrap),
+        })
     }
 
     /// The public half of the wrap secret, which creating or joining registers.
@@ -185,7 +201,7 @@ impl Credentials {
         let wrap = (format == CREDENTIALS_FORMAT).then(|| {
             let mut wrap = Zeroizing::new([0u8; 32]);
             wrap.copy_from_slice(&bytes[85..]);
-            WrapSecret::from_bytes(*wrap)
+            WrapSecret::from_bytes(&wrap)
         });
         Ok(Credentials {
             library: LibraryKeys::new(LibraryId(id), *secret),
@@ -220,7 +236,7 @@ mod tests {
     }
 
     fn wrapped() -> Credentials {
-        credentials().with_wrap_secret(WrapSecret::from_bytes([0x7c; 32]))
+        credentials().with_wrap_secret(WrapSecret::from_bytes(&[0x7c; 32]))
     }
 
     #[test]

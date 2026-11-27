@@ -54,19 +54,6 @@
 //! they are hints, nor on anything a server reports about a library (`last_seen`, its status) for
 //! the library's content.
 //!
-//! # Limits of version 1
-//!
-//! - The library secret cannot be rotated. A device can be removed through
-//!   [`api::RemoveDevice`]: the server then refuses its requests and no longer waits for it before
-//!   deleting files. That is an act of the server only, and does not exclude a holder of the
-//!   secret: they can derive the recovery key and add a device again, and can read anything
-//!   sealed under the secret that they obtain. Excluding one needs a new secret delivered to the
-//!   remaining devices, which is future work; a device may register a [`WrapKey`] for it now,
-//!   which nothing in this version uses. Each wrap key is signed by its device's key, but the
-//!   device list as a whole is still taken from the server, which can add or leave out a key.
-//!   A device may also register a [`MemberProof`], which shows that whoever registered it held
-//!   the library secret then; see [Membership proofs](#membership-proofs).
-//!
 //! # Membership proofs
 //!
 //! [`api::CreateLibrary`] and [`api::AddDevice`] may carry a `member_proof`: an HMAC-SHA256, under
@@ -84,7 +71,22 @@
 //! device key), or anything against a holder of the secret, who can make a proof for any key. A
 //! server can drop a proof, so that a device that registered one shows none; it cannot make one,
 //! or move one to another key or wrap key. Absent and invalid proofs are told apart, so that
-//! devices registered before proofs existed can be treated otherwise than forged ones.
+//! devices registered before proofs existed can be treated otherwise than forged ones. A record
+//! whose proof is not 64 hex digits still parses, and its proof checks as invalid; a request
+//! carrying one does not parse.
+//!
+//! # Limits of version 1
+//!
+//! - The library secret cannot be rotated. A device can be removed through
+//!   [`api::RemoveDevice`]: the server then refuses its requests and no longer waits for it before
+//!   deleting files. That is an act of the server only, and does not exclude a holder of the
+//!   secret: they can derive the recovery key and add a device again, and can read anything
+//!   sealed under the secret that they obtain. Excluding one needs a new secret delivered to the
+//!   remaining devices, which is future work; a device may register a [`WrapKey`] for it now,
+//!   which nothing in this version uses. Each wrap key is signed by its device's key, but the
+//!   device list as a whole is still taken from the server, which can add or leave out a key.
+//!   A device may also register a [`MemberProof`], which shows that whoever registered it held
+//!   the library secret then; see [Membership proofs](#membership-proofs).
 //! - Every key epoch's key derives from the one library secret, so a new epoch does not exclude
 //!   anyone who held the secret. The protocol sets no server-side rules for epochs: a server
 //!   neither checks nor orders them.
@@ -112,7 +114,7 @@ pub use file::{
 pub use keys::{DeviceId, FileKeyRoot, FileNameKey, LibraryId, LibraryKeys, WrapKey, WrapSecret};
 #[cfg(feature = "rand")]
 pub use keys::{generate_signing_key, random_nonce, random_request_nonce};
-pub use member::{MemberCheck, MemberProof};
+pub use member::{ListedMemberProof, MemberCheck, MemberProof};
 pub use recovery::RecoveryError;
 pub use request::{
     HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestAuth, RequestError,

@@ -1,7 +1,9 @@
 use fongo_sync_protocol::api::{
-    AddDevice, CreateLibrary, Devices, ErrorCode, LIBRARIES_PATH, devices_path,
+    AddDevice, CreateLibrary, Devices, ErrorCode, LIBRARIES_PATH, SignedWrapKey, devices_path,
 };
-use fongo_sync_protocol::{LibraryKeys, SigningKey, VerifyingKey};
+use fongo_sync_protocol::{
+    LibraryKeys, ListedMemberProof, MemberProof, SigningKey, VerifyingKey, WrapKey,
+};
 
 use crate::credentials::Credentials;
 use crate::error::Error;
@@ -17,6 +19,9 @@ use crate::transport::{Method, Transport};
 /// was lost, call it again with the same credentials: a library this device key already created
 /// with this recovery key counts as created. The server refuses a request without a timestamp
 /// near its clock, so a repeat must come with a current `now`.
+///
+/// Fails with [`Error::RegisteredOtherwise`] when the server lists the device with another wrap
+/// key or membership proof than these credentials make.
 ///
 /// `now` gives the current unix time in seconds, for request timestamps.
 pub async fn create_library_with<T: Transport>(
@@ -54,8 +59,8 @@ pub async fn create_library_with<T: Transport>(
                 ..
             },
         ) => match created_before(&rpc, library, device, &recovery).await {
-            Ok(true) => return Ok(()),
-            Ok(false) | Err(Error::Server { .. }) => return Err(exists),
+            Ok(Some(devices)) => devices,
+            Ok(None) | Err(Error::Server { .. }) => return Err(exists),
             Err(error) => return Err(error),
         },
         Err(error) => return Err(error),
@@ -65,17 +70,22 @@ pub async fn create_library_with<T: Transport>(
             "the new library's device list lacks its device or recovery key",
         ));
     }
-    Ok(())
+    registered_as(
+        &devices,
+        &request.device_key,
+        request.wrap.as_ref(),
+        request.member_proof,
+    )
 }
 
-/// Whether the library's device list, read with `device`'s key, holds that key and `recovery` as
-/// its recovery key: that is, whether an earlier create with these keys took effect.
+/// The library's device list, read with `device`'s key, if it holds that key and `recovery` as
+/// its recovery key: that is, if an earlier create with these keys took effect.
 async fn created_before<T: Transport, N: Fn() -> u64 + Sync>(
     rpc: &Rpc<'_, T, N>,
     library: &LibraryKeys,
     device: &SigningKey,
     recovery: &VerifyingKey,
-) -> Result<bool, Error> {
+) -> Result<Option<Devices>, Error> {
     let response = rpc
         .call(
             Method::Get,
@@ -85,7 +95,9 @@ async fn created_before<T: Transport, N: Fn() -> u64 + Sync>(
         )
         .await?;
     let devices: Devices = json(&response, "the device list is not the documented JSON")?;
-    Ok(lists(&devices, &device.verifying_key(), false) && lists(&devices, recovery, true))
+    let created =
+        lists(&devices, &device.verifying_key(), false) && lists(&devices, recovery, true);
+    Ok(created.then_some(devices))
 }
 
 /// Makes credentials with [`Credentials::for_new_library`] and registers them with
@@ -109,7 +121,12 @@ pub async fn create_library<T: Transport>(
 ///
 /// Store the credentials before calling. If the call fails with no answer, call it again with the
 /// same credentials: a key already listed is accepted and changes nothing, and a key the library
-/// removed is restored.
+/// removed is restored. Because of that, an application told that this device was removed
+/// ([`ErrorCode::DeviceRemoved`]) must not repeat this call in a loop: on a server that follows
+/// the protocol, the repeat brings the device back.
+///
+/// Fails with [`Error::RegisteredOtherwise`] when the key is already listed with another wrap key
+/// or membership proof than these credentials make; the listing is then left as it was.
 pub async fn join_library_with<T: Transport>(
     transport: &T,
     credentials: &Credentials,
@@ -147,27 +164,82 @@ pub async fn join_library<T: Transport>(
     Ok(credentials)
 }
 
-/// Adds another device's public key to the library, signed by this device, with no wrap key and
-/// no membership proof. The new device also needs the library's keys, which the application hands
-/// over itself; it then builds its credentials with [`Credentials::new`].
+/// What a new device hands to a device already in the library so that it can add it with
+/// [`add_device`]: the new device's public key and its wrap key signed by that key for the
+/// library. The new device makes it with [`Credentials::device_offer`].
+///
+/// It holds no secret. It travels as [`DeviceOffer::to_bytes`], however the application moves
+/// data between the two devices; the adding device checks the signature before it sends anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceOffer {
+    pub device_key: VerifyingKey,
+    pub wrap: SignedWrapKey,
+}
+
+impl DeviceOffer {
+    /// The length of [`DeviceOffer::to_bytes`].
+    pub const LEN: usize = 32 + 32 + 64;
+
+    /// The device key, the wrap key and the wrap key's signature: 128 bytes.
+    pub fn to_bytes(&self) -> [u8; DeviceOffer::LEN] {
+        let mut out = [0u8; DeviceOffer::LEN];
+        out[..32].copy_from_slice(self.device_key.as_bytes());
+        out[32..64].copy_from_slice(&self.wrap.wrap_key.0);
+        out[64..].copy_from_slice(&self.wrap.wrap_proof.to_bytes());
+        out
+    }
+
+    /// Reads what [`DeviceOffer::to_bytes`] wrote; `None` unless it is 128 bytes holding a valid
+    /// Ed25519 public key. The signature is checked by [`add_device`], against the library.
+    pub fn from_bytes(bytes: &[u8]) -> Option<DeviceOffer> {
+        let bytes: &[u8; DeviceOffer::LEN] = bytes.try_into().ok()?;
+        let device_key = VerifyingKey::from_bytes(bytes[..32].try_into().ok()?).ok()?;
+        let wrap_key = WrapKey(bytes[32..64].try_into().ok()?);
+        let wrap_proof = fongo_sync_protocol::Signature::from_bytes(bytes[64..].try_into().ok()?);
+        Some(DeviceOffer {
+            device_key,
+            wrap: SignedWrapKey {
+                wrap_key,
+                wrap_proof,
+            },
+        })
+    }
+}
+
+/// Adds another device to the library, signed by this device: the key and wrap key `offer`
+/// names, with a membership proof made from this device's secret.
+///
+/// The new device first gets the library's keys from the application, makes its credentials with
+/// [`Credentials::for_new_device`] and stores them, then hands over
+/// [`Credentials::device_offer`]; this device adds it, after which the new device syncs.
+///
+/// Fails with [`Error::WrapKeyNotSigned`], sending nothing, unless the offer's wrap key is signed
+/// by its device key for this library. A repeat after a lost response is accepted and changes
+/// nothing; [`Error::RegisteredOtherwise`] says the key is listed with another wrap key or proof.
 pub async fn add_device<T: Transport>(
     transport: &T,
     credentials: &Credentials,
-    device_key: &VerifyingKey,
+    offer: &DeviceOffer,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<(), Error> {
+    if !offer
+        .wrap
+        .verify(credentials.library_id(), &offer.device_key)
+    {
+        return Err(Error::WrapKeyNotSigned);
+    }
     let rpc = Rpc {
         transport,
         now: &now,
     };
     rpc.capabilities().await?;
-    post_device(
-        &rpc,
-        credentials.library(),
-        credentials.device(),
-        &AddDevice::new(*device_key),
-    )
-    .await
+    let request = AddDevice {
+        device_key: offer.device_key,
+        wrap: Some(offer.wrap),
+        member_proof: None,
+    }
+    .with_member_proof(credentials.library());
+    post_device(&rpc, credentials.library(), credentials.device(), &request).await
 }
 
 async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
@@ -191,7 +263,34 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
             "the device list lacks the device just added",
         ));
     }
-    Ok(())
+    registered_as(
+        &devices,
+        &request.device_key,
+        request.wrap.as_ref(),
+        request.member_proof,
+    )
+}
+
+/// Whether the listed record of `key` carries exactly the wrap key and membership proof this
+/// device sent.
+fn registered_as(
+    devices: &Devices,
+    key: &VerifyingKey,
+    wrap: Option<&SignedWrapKey>,
+    proof: Option<MemberProof>,
+) -> Result<(), Error> {
+    let same = devices.devices.iter().any(|d| {
+        d.public_key == *key
+            && !d.recovery
+            && !d.removed
+            && d.wrap.as_ref() == wrap
+            && d.member_proof == proof.map(ListedMemberProof::from)
+    });
+    if same {
+        Ok(())
+    } else {
+        Err(Error::RegisteredOtherwise)
+    }
 }
 
 fn lists(devices: &Devices, key: &VerifyingKey, recovery: bool) -> bool {

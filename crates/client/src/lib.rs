@@ -26,6 +26,9 @@
 //! it gives an answer. Each registers the device's wrap key and a membership proof, which another
 //! device checks with [`Credentials::check_member`]. [`create_library`] and [`join_library`] do
 //! both steps in one call and return the credentials, which a lost response loses.
+//! A device can also be added by another: the new device makes its credentials from the library's
+//! keys with [`Credentials::for_new_device`], stores them and hands over
+//! [`Credentials::device_offer`], which the other passes to [`add_device`].
 //!
 //! Native targets only: keys and nonces come from the operating system.
 //!
@@ -56,7 +59,7 @@ pub use error::Error;
 pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
 pub use library::{
-    add_device, create_library, create_library_with, join_library, join_library_with,
+    DeviceOffer, add_device, create_library, create_library_with, join_library, join_library_with,
 };
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::{cursor, step_past};

@@ -109,8 +109,8 @@ impl<'de> serde::Deserialize<'de> for WrapKey {
 pub struct WrapSecret([u8; 32]);
 
 impl WrapSecret {
-    pub fn from_bytes(bytes: [u8; 32]) -> WrapSecret {
-        WrapSecret(bytes)
+    pub fn from_bytes(bytes: &[u8; 32]) -> WrapSecret {
+        WrapSecret(*bytes)
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {

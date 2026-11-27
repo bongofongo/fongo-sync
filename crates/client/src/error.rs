@@ -40,6 +40,17 @@ pub enum Error {
     /// nothing can be sent until it is raised.
     #[error("the server accepts envelopes of at most {max} bytes, smaller than any envelope")]
     MaxBatchTooSmall { max: u64 },
+    /// The key is listed in the library, but with another wrap key or membership proof than the
+    /// one these credentials hold or the request carried: registered earlier with other
+    /// credentials for the same key, or changed or dropped by the server. The device can sync, but
+    /// must not count on receiving a new library secret sealed to its wrap key. Nothing was
+    /// changed.
+    #[error("this device's key is registered with another wrap key or membership proof")]
+    RegisteredOtherwise,
+    /// The wrap key offered for a new device is not signed by that device's key for this
+    /// library. Nothing was sent.
+    #[error("the new device's wrap key is not signed by its key for this library")]
+    WrapKeyNotSigned,
     #[error("recovery code: {0}")]
     RecoveryCode(#[from] RecoveryError),
     #[error("the operating system's randomness source failed")]

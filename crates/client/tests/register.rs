@@ -6,9 +6,9 @@
 mod support;
 
 use fongo_sync_client::protocol::api::{DeviceRecord, ErrorCode, LIBRARIES_PATH};
-use fongo_sync_client::protocol::{LibraryKeys, MemberCheck, SigningKey, WrapKey};
+use fongo_sync_client::protocol::{LibraryKeys, MemberCheck, SigningKey, WrapKey, WrapSecret};
 use fongo_sync_client::{
-    Credentials, Error, Method, Request, create_library_with, join_library_with,
+    Credentials, Error, Method, Request, add_device, create_library_with, join_library_with,
 };
 use support::{Peer, Server, assert_converged, now};
 
@@ -173,4 +173,151 @@ async fn a_server_that_drops_the_proof_leaves_it_absent() {
         made.check_member(&record(&server, &joined)),
         MemberCheck::Absent
     );
+}
+
+#[tokio::test]
+async fn a_device_added_by_another_registers_its_own_wrap_key_and_a_proof() {
+    let server = Server::new();
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    let added = Credentials::for_new_device(made.library().clone()).unwrap();
+    let offer = added.device_offer().unwrap();
+    add_device(&server, &made, &offer, now).await.unwrap();
+    add_device(&server, &made, &offer, now).await.unwrap();
+
+    let listed = record(&server, &added);
+    assert_eq!(records(&server, &made).len(), 3);
+    assert!(listed.verify_wrap(made.library_id()));
+    assert_eq!(listed.wrap.unwrap().wrap_key, added.wrap_key().unwrap());
+    assert_eq!(made.check_member(&listed), MemberCheck::Valid);
+    assert_eq!(added.check_member(&listed), MemberCheck::Valid);
+
+    let back = fongo_sync_client::DeviceOffer::from_bytes(&offer.to_bytes()).unwrap();
+    assert_eq!(back, offer);
+    let mut peers = [Peer::new(made).await, Peer::new(added).await];
+    peers[1]
+        .run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    peers[1].sync(&server).await.unwrap();
+    peers[0].sync(&server).await.unwrap();
+    assert_eq!(assert_converged(&mut peers).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_offer_whose_wrap_key_its_device_did_not_sign_is_refused_before_it_is_sent() {
+    let server = Server::new();
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    let added = Credentials::for_new_device(made.library().clone()).unwrap();
+    let elsewhere = Credentials::for_new_library().unwrap();
+    let mut forged = added.device_offer().unwrap();
+    forged.wrap.wrap_key = WrapKey([1; 32]);
+    let foreign = Credentials::for_new_device(elsewhere.library().clone())
+        .unwrap()
+        .device_offer()
+        .unwrap();
+    let before = server.count(Method::Post, "/v1/libraries/");
+    for offer in [forged, foreign] {
+        match add_device(&server, &made, &offer, now).await {
+            Err(Error::WrapKeyNotSigned) => {}
+            other => panic!("expected the offer to be refused, got {other:?}"),
+        }
+    }
+    assert_eq!(server.count(Method::Post, "/v1/libraries/"), before);
+    assert_eq!(records(&server, &made).len(), 2);
+    assert!(
+        Credentials::new(made.library().clone(), SigningKey::from_bytes(&[9; 32]), 0)
+            .device_offer()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_join_retried_after_the_device_was_removed_restores_it() {
+    let server = Server::new();
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    let joined = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
+    join_library_with(&server, &joined, now).await.unwrap();
+    server.mark_removed(made.library_id(), joined.device().verifying_key());
+    assert!(record(&server, &joined).removed);
+
+    join_library_with(&server, &joined, now).await.unwrap();
+    let restored = record(&server, &joined);
+    assert!(!restored.removed);
+    assert_eq!(records(&server, &made).len(), 3);
+    assert_eq!(made.check_member(&restored), MemberCheck::Valid);
+}
+
+#[tokio::test]
+async fn a_removed_device_is_restored_only_into_a_free_slot() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_devices = Some(2));
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    let joined = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
+    join_library_with(&server, &joined, now).await.unwrap();
+    server.mark_removed(made.library_id(), joined.device().verifying_key());
+    let third = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
+    join_library_with(&server, &third, now).await.unwrap();
+
+    match join_library_with(&server, &joined, now).await {
+        Err(Error::Server {
+            code: ErrorCode::DeviceLimit,
+            ..
+        }) => {}
+        other => panic!("expected device_limit, got {other:?}"),
+    }
+    assert!(record(&server, &joined).removed);
+}
+
+#[tokio::test]
+async fn a_key_registered_with_another_wrap_key_is_reported_and_left_as_it_was() {
+    let server = Server::new();
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    let joined = Credentials::for_recovery_code(&made.recovery_code()).unwrap();
+    join_library_with(&server, &joined, now).await.unwrap();
+    let before = record(&server, &joined);
+
+    let rewrapped = Credentials::new(joined.library().clone(), joined.device().clone(), 0)
+        .with_wrap_secret(WrapSecret::from_bytes(&[0x42; 32]));
+    match join_library_with(&server, &rewrapped, now).await {
+        Err(Error::RegisteredOtherwise) => {}
+        other => panic!("expected the other registration to be reported, got {other:?}"),
+    }
+    assert_eq!(record(&server, &joined), before);
+    let unwrapped = Credentials::new(joined.library().clone(), joined.device().clone(), 0);
+    assert!(matches!(
+        join_library_with(&server, &unwrapped, now).await,
+        Err(Error::RegisteredOtherwise)
+    ));
+    assert_eq!(record(&server, &joined), before);
+
+    let recreated = Credentials::new(made.library().clone(), made.device().clone(), 0)
+        .with_wrap_secret(WrapSecret::from_bytes(&[0x43; 32]));
+    let first = record(&server, &made);
+    assert!(matches!(
+        create_library_with(&server, &recreated, now).await,
+        Err(Error::RegisteredOtherwise)
+    ));
+    assert_eq!(record(&server, &made), first);
+    join_library_with(&server, &joined, now).await.unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_that_drops_the_wrap_key_or_proof_on_registering_is_reported() {
+    let server = Server::new();
+    let made = Credentials::for_new_library().unwrap();
+    create_library_with(&server, &made, now).await.unwrap();
+    server.with(|s| {
+        for device in &mut s.libraries.get_mut(&made.library_id()).unwrap().devices {
+            device.member_proof = None;
+        }
+    });
+    assert!(matches!(
+        create_library_with(&server, &made, now).await,
+        Err(Error::RegisteredOtherwise)
+    ));
 }

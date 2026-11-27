@@ -33,6 +33,46 @@ pub enum MemberCheck {
     Invalid,
 }
 
+/// A [`DeviceRecord`](crate::api::DeviceRecord)'s `member_proof` as a server listed it. A record
+/// is read leniently, so that one malformed proof does not make the whole device list unreadable:
+/// anything but 64 hex digits is [`ListedMemberProof::Unreadable`], which checks as
+/// [`MemberCheck::Invalid`] and is written back as an empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListedMemberProof {
+    Readable(MemberProof),
+    Unreadable,
+}
+
+impl From<MemberProof> for ListedMemberProof {
+    fn from(proof: MemberProof) -> ListedMemberProof {
+        ListedMemberProof::Readable(proof)
+    }
+}
+
+impl serde::Serialize for ListedMemberProof {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ListedMemberProof::Readable(proof) => proof.serialize(s),
+            ListedMemberProof::Unreadable => s.serialize_str(""),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ListedMemberProof {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<ListedMemberProof, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Lenient {
+            Readable(MemberProof),
+            Unreadable(serde::de::IgnoredAny),
+        }
+        Ok(match Lenient::deserialize(d)? {
+            Lenient::Readable(proof) => ListedMemberProof::Readable(proof),
+            Lenient::Unreadable(_) => ListedMemberProof::Unreadable,
+        })
+    }
+}
+
 impl MemberProof {
     /// Lowercase hex, 64 characters.
     pub fn to_hex(&self) -> String {
