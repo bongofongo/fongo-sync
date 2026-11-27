@@ -13,7 +13,7 @@
 //!
 //! The blob routes, [`SETTLED_PATH`], [`STATUS_PATH`], [`ENTITLEMENT_PATH`] and
 //! [`REMOVE_DEVICE_PATH`] are for devices only: the recovery key is refused with
-//! [`ErrorCode::Forbidden`]. A removed device is refused on every route with
+//! [`ErrorCode::Forbidden`]. A removed device is refused on every authenticated route with
 //! [`ErrorCode::DeviceRemoved`], an append of an envelope the server already holds included. That
 //! answer comes only once the request's signature verifies, so a request that does not verify is
 //! refused for that, and only the holder of a key learns that it was removed.
@@ -29,8 +29,9 @@
 //! before it was removed, and stores the wrap key the request carries; a request that carries
 //! none may leave the restored record without one.
 //!
-//! A [`DeviceRecord`]'s `last_seen` is the start of the hour, a multiple of 3600, in which the key
-//! last made a request that authenticated; a request refused after authenticating, such as one
+//! A [`DeviceRecord`]'s `last_seen`, documented there as the time of the last accepted request, is
+//! more precisely the start of the hour, a multiple of 3600, in which the key last made a request
+//! that authenticated; a request refused after authenticating, such as one
 //! from a removed device, may still move it.
 //!
 //! Whether a server checks a wrap key's proof before it finds the key already listed is not
@@ -173,12 +174,15 @@
 //!   back count as referring. Only the changes through `through` count: its own envelopes appended
 //!   after `through` are in its local state but not in that set. A device that skipped, refused or
 //!   stepped past any envelope at or below `through` has not merged it, and does not retire.
-//! - reports [`Settled`] `seq` only when it has dealt with every envelope through `seq`, by
-//!   merging it or by skipping it and recording that it did, and has nothing unsent. Before each
-//!   such report it claims at [`BLOBS_CLAIM_PATH`] every file that a row it holds back names: that
-//!   claim is recorded at a head at or past `seq`, so it voids any retirement the report could
-//!   otherwise let through. A device that skipped an envelope may still settle, since the
-//!   guarantee uses its report only for having nothing unsent and for the claim before it.
+//! - reports [`Settled`] `seq` only when it has dealt with every envelope through `seq`, by merging
+//!   it or by skipping it and recording that it did, and has nothing unsent. Before each such
+//!   report, and after it has dealt with every envelope through `seq`, it claims at
+//!   [`BLOBS_CLAIM_PATH`] every file named by a row it holds back at that point, and it merges
+//!   nothing between that claim and the report: it never reports a `seq` above the position it had
+//!   dealt with when it claimed. The claim is then recorded at a head at or past `seq`, so it voids
+//!   any retirement the report could otherwise let through. A device that skipped an envelope may
+//!   still settle, since the guarantee uses its report only for having nothing unsent and for the
+//!   claim before it.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -216,7 +220,9 @@
 //! yet appended, and its device has not settled since making it: a device claims what it appended
 //! without claims before it next settles, and a device holding unsent changes does not settle.
 //! Every device that counts has settled at or above `through`, so that device made the change after
-//! settling.
+//! settling. A row a device holds back is not in the log, but the file it names was claimed after
+//! that device had dealt with every envelope through its report and before the report, at a head at
+//! or past it, so every retirement that report lets through is void.
 //!
 //! The limits:
 //!
@@ -237,6 +243,9 @@
 //!   through its floor is void, so deletion resumes only once the log has grown past the floor and
 //!   a device retires the file again.
 //! - a device that never reports [`Settled`] holds back every deletion until it is removed.
+//! - a device that skipped an envelope may settle, and can then show a file that the skipped
+//!   envelope replaced and that was rightly deleted; fetching it answers
+//!   [`ErrorCode::BlobNotFound`].
 //! - two databases that act as one device, against the conditions above, can lose a file: the
 //!   [`Settled`] one reports can stand for unsent changes the other holds. Such a change that
 //!   refers to a file and is sent after the file's deletion finds it missing, as in the first
@@ -471,10 +480,13 @@ fn proof_message(library: LibraryId, device: &VerifyingKey, recovery: &Verifying
 /// can check that the device chose it and not whoever passed it on. In JSON it is the two fields
 /// `wrap_key` and `wrap_proof` of the message that carries it, both or neither.
 ///
-/// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's
-/// public key and the wrap key. A server refuses a wrap key whose proof does not verify, with
-/// [`ErrorCode::InvalidProof`]. The proof carries no counter, so a server can present any wrap key
-/// a device ever signed for the library; replacing a wrap key will need a new label or a counter.
+/// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's public
+/// key and the wrap key. A server refuses, with [`ErrorCode::InvalidProof`], a wrap key whose proof
+/// does not verify in a request that would store it; for a key already listed, whether the proof is
+/// checked before the server finds the key listed is not settled (see [the module
+/// documentation](self#devices)). The proof carries no counter, so a server can present any wrap
+/// key a device ever signed for the library; replacing a wrap key will need a new label or a
+/// counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SignedWrapKey {
     pub wrap_key: WrapKey,

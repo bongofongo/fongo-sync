@@ -313,6 +313,10 @@ pub struct Entitlement {
 /// id the library does not list, or a device already removed, changes nothing. Either way the
 /// answer is the device list; [`Devices::remove`](super::Devices::remove) does this to a list.
 ///
+/// The server keeps the removed device's record, with its key, in the device list: a device stops
+/// reading the log at an envelope whose signer the list does not hold, so dropping the record would
+/// stop every device at that signer's envelopes. This version has no way to drop one.
+///
 /// Removal does not lock anyone out: whoever holds the library secret can derive the recovery
 /// key and add a device again, and can read whatever they obtain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

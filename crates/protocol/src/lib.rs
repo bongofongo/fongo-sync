@@ -41,7 +41,8 @@
 //!   gaps, the number in [`api::Appended`] is the one the envelope is read back at, and the head a
 //!   server reports or checks against is its log's.
 //! - the device list: which keys' envelopes and requests a library accepts, as the limits below
-//!   say.
+//!   say, with every key that signed an envelope in the log kept listed, removed ones included,
+//!   since a device stops reading at an envelope whose signer the list does not hold.
 //! - deleting files only by the rules in [`api`]. A file deleted early is unavailable, not altered.
 //!
 //! A client can observe one kind of failure: a page whose numbers do not run on from its cursor
