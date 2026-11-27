@@ -71,7 +71,8 @@ by depending on it.
 The protocol also defines how files travel beside the changes. A change names a file by its
 content hash and size, as an ordinary blob value; the server stores the file under an HMAC of
 that hash keyed from the library secret, as padded chunks each sealed under a key derived from the
-secret and the hash, so the same file seals to the same bytes on every device of a library. It
+secret and the hash, with each chunk's nonce derived from the chunk itself, so the same file
+seals to the same bytes on every device of a library and different bytes never share a nonce. It
 defines the routes to upload and read such files, to ask which a server holds, and to claim and
 retire them so that a server deletes a file only once every device not removed has settled past
 the point where nothing referred to it. It also defines removing a device: the server then refuses that

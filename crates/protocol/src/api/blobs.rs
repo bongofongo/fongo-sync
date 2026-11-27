@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::file::{BlobId, FileLayout, SEALED_CHUNK_LEN, padme};
+use sha2::{Digest, Sha256};
+
+use crate::file::{BlobId, CHUNK_OVERHEAD, FileLayout, SEALED_CHUNK_LEN, SealedChunk, padme};
+use crate::hex::serde_digest;
 use crate::keys::DeviceId;
 
-const TAG_LEN: u64 = 16;
+const OVERHEAD: u64 = CHUNK_OVERHEAD as u64;
 
 /// A blob's stored shape: `size`, the total of its stored chunks' bytes, and `chunks`, how many
 /// there are. The body that begins an upload at [`BLOB_PATH`](super::BLOB_PATH) and the answer
@@ -19,8 +22,9 @@ pub struct BlobInfo {
 
 impl BlobInfo {
     /// Whether some file is stored as `chunks` chunks totalling `size` bytes: every chunk but the
-    /// last is [`SEALED_CHUNK_LEN`] bytes, the last is a tag and at least one byte (only an empty
-    /// file has a chunk of just a tag), and the plaintext total is its own [`padme`].
+    /// last is [`SEALED_CHUNK_LEN`] bytes, the last is a nonce, a tag and at least one byte between
+    /// them (only an empty file has a chunk of just a nonce and a tag), and the plaintext total is
+    /// its own [`padme`].
     pub fn is_valid(&self) -> bool {
         self.last_chunk_len().is_some()
     }
@@ -43,14 +47,14 @@ impl BlobInfo {
             .checked_mul(SEALED_CHUNK_LEN as u64)?;
         let last = self.size.checked_sub(full)?;
         let least = if self.chunks == 1 {
-            TAG_LEN
+            OVERHEAD
         } else {
-            TAG_LEN + 1
+            OVERHEAD + 1
         };
         if !(least..=SEALED_CHUNK_LEN as u64).contains(&last) {
             return None;
         }
-        let plain = self.size - self.chunks * TAG_LEN;
+        let plain = self.size - self.chunks * OVERHEAD;
         (padme(plain) == Some(plain)).then_some(last)
     }
 }
@@ -64,12 +68,47 @@ impl From<FileLayout> for BlobInfo {
     }
 }
 
-/// The answer to beginning an upload: whether the blob is already complete, and the indexes of
-/// the chunks the server holds, in increasing order.
+/// The answer to beginning an upload: whether the blob is already complete, and the chunks the
+/// server holds, by increasing index.
+///
+/// Until a blob is complete, a server replaces a chunk when the same index is uploaded again; once
+/// it is complete, nothing about it changes. A device resuming an upload skips a chunk only when
+/// the server's hash of it equals [`SealedChunk::sha256`] of the chunk this device sealed for that
+/// index ([`HaveChunk::holds`]), and uploads every other chunk again. Sealing is deterministic and
+/// each chunk has one stored form, so a device that completes a blob this way has checked every
+/// chunk against its own copy of the file.
+///
+/// What this does not cover: a device that completes a blob with the wrong content, by intent or
+/// through a bug, leaves that content hash unreadable, since this version has no way to replace a
+/// complete blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobState {
     pub complete: bool,
-    pub have: Vec<u64>,
+    pub have: Vec<HaveChunk>,
+}
+
+/// A chunk a server holds: its index and SHA-256 of its stored bytes, computed by the server, as
+/// 64 lowercase hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HaveChunk {
+    pub n: u64,
+    #[serde(with = "serde_digest")]
+    pub sha256: [u8; 32],
+}
+
+impl HaveChunk {
+    /// What a server reports for `stored`, the bytes it holds as chunk `n`.
+    pub fn of(n: u64, stored: &[u8]) -> HaveChunk {
+        HaveChunk {
+            n,
+            sha256: Sha256::digest(stored).into(),
+        }
+    }
+
+    /// Whether the server holds exactly `chunk`, so that uploading it again can be skipped.
+    pub fn holds(&self, chunk: &SealedChunk) -> bool {
+        self.n == chunk.index && self.sha256 == chunk.sha256()
+    }
 }
 
 /// The body of a query or a claim. A query takes at most
@@ -113,7 +152,9 @@ pub struct Settled {
 }
 
 /// Whether the library is entitled to the service, the stored bytes counted against it, and its
-/// allowance if it has one.
+/// allowance if it has one. `used_bytes` and `allowance_bytes` count stored blob bytes, complete
+/// or not; envelope bytes are not counted here, and are bounded by
+/// [`Capabilities::max_library_bytes`](super::Capabilities::max_library_bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryStatus {
     pub entitled: bool,
@@ -174,11 +215,11 @@ mod tests {
     fn other_shapes_are_not() {
         for (size, chunks) in [
             (0, 0),
-            (15, 1),
-            (16 + 9, 1),
+            (39, 1),
+            (40 + 9, 1),
             (SEALED + 1, 1),
-            (SEALED + 16, 2),
-            (SEALED - 1 + 16 + 4, 2),
+            (SEALED + 40, 2),
+            (SEALED - 1 + 40 + 4, 2),
             (u64::MAX, u64::MAX),
             (u64::MAX, 2),
         ] {
@@ -186,20 +227,12 @@ mod tests {
             assert!(!info.is_valid(), "{size} {chunks}");
             assert_eq!(info.stored_chunk_len(0), None);
         }
-        assert!(
-            BlobInfo {
-                size: 16,
-                chunks: 1
-            }
-            .is_valid()
-        );
-        assert!(
-            BlobInfo {
-                size: 16 + 10,
-                chunks: 1
-            }
-            .is_valid()
-        );
+        for size in [40, 40 + 10] {
+            let info = BlobInfo { size, chunks: 1 };
+            assert!(info.is_valid());
+            assert_eq!(info.stored_chunk_len(0), Some(size));
+            assert_eq!(info.stored_chunk_len(u64::MAX), None);
+        }
     }
 
     proptest! {
@@ -208,7 +241,7 @@ mod tests {
             let info = BlobInfo { size, chunks };
             let _ = info.stored_chunk_len(size);
             if info.is_valid() {
-                let layout = FileRef { hash: ContentHash([0; 32]), size: size - 16 * chunks }
+                let layout = FileRef { hash: ContentHash([0; 32]), size: size - 40 * chunks }
                     .layout()
                     .unwrap();
                 prop_assert_eq!(BlobInfo::from(layout), info);
@@ -239,10 +272,13 @@ mod tests {
             (
                 serde_json::to_value(BlobState {
                     complete: false,
-                    have: vec![0, 2],
+                    have: vec![HaveChunk {
+                        n: 2,
+                        sha256: [0xab; 32],
+                    }],
                 })
                 .unwrap(),
-                json!({"complete": false, "have": [0, 2]}),
+                json!({"complete": false, "have": [{"n": 2, "sha256": hex}]}),
             ),
             (
                 serde_json::to_value(BlobIds { ids: vec![id] }).unwrap(),
@@ -293,5 +329,26 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert!(serde_json::from_value::<BlobIds>(json!({ "ids": [hex.to_uppercase()] })).is_err());
+        assert!(
+            serde_json::from_value::<HaveChunk>(json!({"n": 0, "sha256": hex.to_uppercase()}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<HaveChunk>(json!({"n": 0, "sha256": "ab"})).is_err());
+    }
+
+    #[test]
+    fn a_server_reports_what_a_sealer_compares() {
+        let bytes = vec![7u8; 100];
+        let keys = crate::LibraryKeys::new(crate::LibraryId([1; 16]), [2; 32]);
+        let mut sealer = crate::FileSealer::new(&keys, FileRef::of(&bytes)).unwrap();
+        sealer.feed(&bytes).unwrap();
+        let chunk = sealer.next_chunk().unwrap().unwrap();
+        let have = HaveChunk::of(0, &chunk.bytes);
+        assert_eq!(have.sha256, <[u8; 32]>::from(Sha256::digest(&chunk.bytes)));
+        assert!(have.holds(&chunk));
+        let mut other = chunk.bytes.clone();
+        other[0] ^= 1;
+        assert!(!HaveChunk::of(0, &other).holds(&chunk));
+        assert!(!HaveChunk::of(1, &chunk.bytes).holds(&chunk));
     }
 }

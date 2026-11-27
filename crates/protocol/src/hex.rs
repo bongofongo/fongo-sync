@@ -62,3 +62,26 @@ pub(crate) mod serde_sig {
             .ok_or_else(|| D::Error::custom("expected 128 hex digits"))
     }
 }
+
+/// Serde for a 32-byte digest as exactly 64 lowercase hex digits.
+pub(crate) mod serde_digest {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(crate) fn serialize<S: Serializer>(digest: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::encode(digest))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+        super::decode_lower(&text)
+            .ok_or_else(|| D::Error::custom("expected 64 lowercase hex digits"))
+    }
+}
+
+/// Like [`decode_array`], but only lowercase digits.
+pub(crate) fn decode_lower<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    decode_array(text)
+}

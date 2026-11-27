@@ -6,6 +6,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::keys::{FileKey, FileKeyRoot, FileNameKey, LibraryKeys};
 use crate::wire::{DecodeError, Reader, put_varint};
@@ -16,13 +17,20 @@ pub const FILE_REF_FORMAT: u8 = 1;
 /// Plaintext bytes in every chunk of a file's stream but the last.
 pub const FILE_CHUNK_LEN: usize = 4_194_304;
 
-/// Stored bytes of every chunk but the last: [`FILE_CHUNK_LEN`] and a 16-byte tag.
-pub const SEALED_CHUNK_LEN: usize = FILE_CHUNK_LEN + TAG_LEN;
+/// Stored bytes of every chunk but the last: a 24-byte nonce, [`FILE_CHUNK_LEN`] bytes of
+/// ciphertext and a 16-byte tag.
+pub const SEALED_CHUNK_LEN: usize = FILE_CHUNK_LEN + CHUNK_OVERHEAD;
 
+/// Stored bytes a chunk adds to its plaintext: its nonce and its tag.
+pub(crate) const CHUNK_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
+
+const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const FILE_KEY_INFO: &[u8] = b"fongo-sync/v1/file-key";
-const AEAD_LABEL: &[u8] = b"fongo-sync/v1/file\0";
-const AAD_LEN: usize = 19 + 32 + 8 + 8;
+const CHUNK_KEY_INFO: &[u8] = b"fongo-sync/v1/file-chunk-key";
+const NONCE_KEY_INFO: &[u8] = b"fongo-sync/v1/file-nonce-key";
+const AD_LABEL: &[u8] = b"fongo-sync/v1/file\0";
+const AD_LEN: usize = 19 + 32 + 8 + 8 + 8 + 1;
 
 /// SHA-256 of a file's bytes. It travels only inside encrypted batches; the server never sees it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -54,10 +62,7 @@ impl BlobId {
 
     /// `None` unless `text` is exactly 64 lowercase hex digits.
     pub fn from_hex(text: &str) -> Option<BlobId> {
-        if !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return None;
-        }
-        crate::hex::decode_array(text).map(BlobId)
+        crate::hex::decode_lower(text).map(BlobId)
     }
 }
 
@@ -211,7 +216,7 @@ pub fn padme(len: u64) -> Option<u64> {
 
 /// How a file of a given size is stored: its bytes and then zeros up to [`padme`] of its size,
 /// cut into chunks of [`FILE_CHUNK_LEN`] bytes (the last may be shorter; an empty file is one
-/// empty chunk), each stored with a 16-byte tag.
+/// empty chunk), each stored with a 24-byte nonce before it and a 16-byte tag after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileLayout {
     size: u64,
@@ -249,7 +254,7 @@ impl FileLayout {
         self.chunks
     }
 
-    /// The total of every stored chunk's length: the padded size and 16 bytes per chunk.
+    /// The total of every stored chunk's length: the padded size and 40 bytes per chunk.
     pub fn stored_size(&self) -> u64 {
         self.checked_stored_size()
             .expect("checked when the layout was made")
@@ -257,12 +262,12 @@ impl FileLayout {
 
     /// The stored length of chunk `index`, or `None` when the file has no such chunk.
     pub fn stored_chunk_len(&self, index: u64) -> Option<u64> {
-        (index < self.chunks).then(|| self.plain_len(index) as u64 + TAG_LEN as u64)
+        (index < self.chunks).then(|| (self.plain_len(index) + CHUNK_OVERHEAD) as u64)
     }
 
     fn checked_stored_size(&self) -> Option<u64> {
         self.chunks
-            .checked_mul(TAG_LEN as u64)?
+            .checked_mul(CHUNK_OVERHEAD as u64)?
             .checked_add(self.padded)
     }
 
@@ -310,12 +315,21 @@ pub enum FileError {
     Incomplete,
 }
 
-/// The cipher, name and layout of one file, shared by sealing and opening.
+/// The keys, name and layout of one file, shared by sealing and opening.
+///
+/// Chunk `n` is sealed with XChaCha20-Poly1305 under the chunk key, with associated data
+/// `fongo-sync/v1/file` and a zero byte, the blob id, the chunk count and the true size (u64
+/// big-endian each), `n` (u64 big-endian) and 1 for the last chunk or 0 for any other. Its nonce
+/// is synthetic: the first 24 bytes of HMAC-SHA256 under the nonce key of the associated data
+/// followed by the chunk's padded plaintext. Both keys are HKDF-Expand of the file key as the
+/// pseudorandom key, with infos `fongo-sync/v1/file-chunk-key` and `fongo-sync/v1/file-nonce-key`.
+/// The stored chunk is the nonce, the ciphertext and the tag.
 struct Stream {
     cipher: XChaCha20Poly1305,
+    nonce_key: Hmac<Sha256>,
     id: BlobId,
     layout: FileLayout,
-    aad: [u8; AAD_LEN],
+    size: u64,
 }
 
 impl Stream {
@@ -323,33 +337,60 @@ impl Stream {
         let layout = FileLayout::new(file.size, chunk)?;
         let id = keys.file_name_key().blob_id(&file.hash);
         let key = keys.file_key_root().file_key(&file.hash);
-        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-        let mut aad = [0u8; AAD_LEN];
-        let (label, rest) = aad.split_at_mut(AEAD_LABEL.len());
-        label.copy_from_slice(AEAD_LABEL);
-        rest[..32].copy_from_slice(&id.0);
-        rest[32..40].copy_from_slice(&layout.chunks.to_be_bytes());
-        rest[40..].copy_from_slice(&file.size.to_be_bytes());
+        let expand = Hkdf::<Sha256>::from_prk(key.as_bytes())
+            .expect("32 bytes is a valid HKDF-SHA256 pseudorandom key");
+        let mut chunk_key = [0u8; 32];
+        let mut nonce_key = [0u8; 32];
+        expand
+            .expand(CHUNK_KEY_INFO, &mut chunk_key)
+            .and_then(|()| expand.expand(NONCE_KEY_INFO, &mut nonce_key))
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        let cipher = XChaCha20Poly1305::new(&chunk_key.into());
+        let mac = <Hmac<Sha256> as Mac>::new_from_slice(&nonce_key)
+            .expect("HMAC takes a key of any length");
+        chunk_key.zeroize();
+        nonce_key.zeroize();
         Ok(Stream {
             cipher,
+            nonce_key: mac,
             id,
             layout,
-            aad,
+            size: file.size,
         })
     }
 
-    fn nonce(&self, index: u64) -> XNonce {
-        let mut nonce = [0u8; 24];
-        nonce[15..23].copy_from_slice(&index.to_be_bytes());
-        nonce[23] = u8::from(index + 1 == self.layout.chunks);
-        nonce.into()
+    fn associated_data(&self, index: u64) -> [u8; AD_LEN] {
+        let mut ad = [0u8; AD_LEN];
+        let (label, rest) = ad.split_at_mut(AD_LABEL.len());
+        label.copy_from_slice(AD_LABEL);
+        rest[..32].copy_from_slice(&self.id.0);
+        rest[32..40].copy_from_slice(&self.layout.chunks.to_be_bytes());
+        rest[40..48].copy_from_slice(&self.size.to_be_bytes());
+        rest[48..56].copy_from_slice(&index.to_be_bytes());
+        rest[56] = u8::from(index + 1 == self.layout.chunks);
+        ad
     }
 
-    /// Encrypts the chunk's plaintext in `buf` and appends its tag.
+    fn nonce_mac(&self, ad: &[u8], plain: &[u8]) -> Hmac<Sha256> {
+        let mut mac = self.nonce_key.clone();
+        mac.update(ad);
+        mac.update(plain);
+        mac
+    }
+
+    /// Seals `buf`, which holds [`NONCE_LEN`] bytes of room and then the chunk's padded
+    /// plaintext, into the stored chunk.
     fn seal(&self, index: u64, buf: &mut Vec<u8>) {
+        self.seal_with(&self.associated_data(index), buf);
+    }
+
+    fn seal_with(&self, ad: &[u8], buf: &mut Vec<u8>) {
+        let (nonce, plain) = buf.split_at_mut(NONCE_LEN);
+        let digest = self.nonce_mac(ad, plain).finalize().into_bytes();
+        nonce.copy_from_slice(&digest[..NONCE_LEN]);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(&self.nonce(index), &self.aad, buf)
+            .encrypt_in_place_detached(XNonce::from_slice(nonce), ad, plain)
             .expect("a chunk is far below XChaCha20-Poly1305's length limit");
         buf.extend_from_slice(&tag);
     }
@@ -362,18 +403,36 @@ pub struct SealedChunk {
     pub bytes: Vec<u8>,
 }
 
+impl SealedChunk {
+    /// SHA-256 of the stored bytes, to compare with what a server reports it holds for this
+    /// index ([`HaveChunk`](crate::api::HaveChunk)).
+    pub fn sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.bytes).into()
+    }
+}
+
+/// Room for a nonce, then a chunk of `plain` bytes and its tag.
+fn chunk_buffer(plain: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(plain + CHUNK_OVERHEAD);
+    buf.resize(NONCE_LEN, 0);
+    buf
+}
+
 /// Seals a file whose [`FileRef`] is already known, from its bytes given in pieces of any size,
 /// into its chunks in order.
 ///
 /// The key and the name both come from the content hash, so the bytes are read twice: once by a
 /// [`FileHasher`] for the reference, then here. Two sealers given the same library and bytes
-/// produce the same chunks, so any device can resume or finish another's upload.
+/// produce the same chunks, so any device can resume or finish another's upload. Each chunk's
+/// nonce is derived from the chunk itself, so different bytes sealed under one reference never
+/// share a nonce.
 ///
 /// The sealer checks the bytes against the reference and gives out no chunk that holds the end of
 /// the file until they match: a file that changed after it was hashed is
 /// [`FileError::HashMismatch`] or [`FileError::SizeMismatch`], and never a different file under
-/// the reference's name. Chunks it gave out before that are under the wrong content and must not
-/// be completed; the upload cannot be, since its last chunk is never given out.
+/// the reference's name. Chunks it gave out before that hold the wrong content; the upload cannot
+/// be completed from them, since its last chunk is never given out, and a device that resumes it
+/// uploads again every chunk whose stored hash is not that of the chunk it sealed.
 ///
 /// It holds one chunk at a time.
 pub struct FileSealer {
@@ -394,7 +453,7 @@ impl FileSealer {
 
     fn with_chunk(keys: &LibraryKeys, file: FileRef, chunk: u64) -> Result<FileSealer, FileError> {
         let stream = Stream::new(keys, &file, chunk)?;
-        let buf = Vec::with_capacity(stream.layout.plain_len(0) + TAG_LEN);
+        let buf = chunk_buffer(stream.layout.plain_len(0));
         Ok(FileSealer {
             stream,
             file,
@@ -429,7 +488,7 @@ impl FileSealer {
         if self.index == self.stream.layout.chunks {
             return Ok(0);
         }
-        let room = self.stream.layout.plain_len(self.index) - self.buf.len();
+        let room = self.stream.layout.plain_len(self.index) + NONCE_LEN - self.buf.len();
         let take = room.min(data.len());
         self.buf.extend_from_slice(&data[..take]);
         self.hasher.update(&data[..take]);
@@ -456,19 +515,19 @@ impl FileSealer {
                 }
                 self.verified = true;
             }
-            self.buf.resize(want, 0);
+            self.buf.resize(NONCE_LEN + want, 0);
         }
-        if self.buf.len() < want {
+        if self.buf.len() < NONCE_LEN + want {
             return Ok(None);
         }
         let index = self.index;
         self.index += 1;
         let next = if self.index < layout.chunks {
-            layout.plain_len(self.index) + TAG_LEN
+            chunk_buffer(layout.plain_len(self.index))
         } else {
-            0
+            Vec::new()
         };
-        let mut bytes = std::mem::replace(&mut self.buf, Vec::with_capacity(next));
+        let mut bytes = std::mem::replace(&mut self.buf, next);
         self.stream.seal(index, &mut bytes);
         Ok(Some(SealedChunk { index, bytes }))
     }
@@ -496,7 +555,8 @@ impl FileSealer {
 /// Opens the chunks of one file, in any order.
 ///
 /// Each chunk is authenticated as chunk `index` of this file: one moved, cut, extended, sealed
-/// for another file or another library, or with its padding changed does not open. That does not
+/// for another file or another library, with its padding changed, or with any nonce but the one
+/// its plaintext gives, does not open. A chunk therefore has exactly one stored form. That does not
 /// prove the file: a key holder could seal other bytes under the reference. Before trusting the
 /// file, check it against the reference with a [`FileHasher`]: feed it each opened chunk in
 /// index order as it is written, or, for chunks fetched out of order, rehash the assembled file.
@@ -541,16 +601,22 @@ impl FileOpener {
                 actual: stored.len() as u64,
             });
         }
-        let (ciphertext, tag) = stored.split_at(stored.len() - TAG_LEN);
+        let (nonce, rest) = stored.split_at(NONCE_LEN);
+        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
+        let ad = self.stream.associated_data(index);
         let mut buf = ciphertext.to_vec();
         self.stream
             .cipher
             .decrypt_in_place_detached(
-                &self.stream.nonce(index),
-                &self.stream.aad,
+                XNonce::from_slice(nonce),
+                &ad,
                 &mut buf,
                 Tag::from_slice(tag),
             )
+            .map_err(|_| FileError::DoesNotOpen { index })?;
+        self.stream
+            .nonce_mac(&ad, &buf)
+            .verify_truncated_left(nonce)
             .map_err(|_| FileError::DoesNotOpen { index })?;
         let data = layout.data_len(index);
         if buf[data..].iter().any(|&b| b != 0) {
@@ -685,11 +751,11 @@ mod tests {
     fn layouts_add_up() {
         let chunk = FILE_CHUNK_LEN as u64;
         for (size, chunks, last) in [
-            (0, 1, 16),
-            (1, 1, 17),
-            (chunk, 1, chunk + 16),
-            (chunk + 1, 2, (1 << 17) + 16),
-            ((1 << 28) + chunk, 66, chunk + 16),
+            (0, 1, 40),
+            (1, 1, 41),
+            (chunk, 1, chunk + 40),
+            (chunk + 1, 2, (1 << 17) + 40),
+            ((1 << 28) + chunk, 66, chunk + 40),
         ] {
             let layout = FileRef {
                 hash: ContentHash([0; 32]),
@@ -704,7 +770,7 @@ mod tests {
                 .map(|i| layout.stored_chunk_len(i).unwrap())
                 .sum();
             assert_eq!(total, layout.stored_size());
-            assert_eq!(layout.stored_size(), layout.padded_size() + 16 * chunks);
+            assert_eq!(layout.stored_size(), layout.padded_size() + 40 * chunks);
         }
         let huge = FileRef {
             hash: ContentHash([0; 32]),
@@ -925,29 +991,109 @@ mod tests {
         let stream = Stream::new(&keys(), &file, 64).unwrap();
         let opener = FileOpener::with_chunk(&keys(), file, 64).unwrap();
 
-        let mut flagged = chunks[1][..64].to_vec();
-        let plain = opener.open(1, &chunks[1]).unwrap();
-        flagged.copy_from_slice(&plain);
-        let mut nonce: [u8; 24] = stream.nonce(1).into();
-        nonce[23] = 1;
-        let tag = stream
-            .cipher
-            .encrypt_in_place_detached(&nonce.into(), &stream.aad, &mut flagged)
-            .unwrap();
-        flagged.extend_from_slice(&tag);
+        let mut ad = stream.associated_data(1);
+        ad[AD_LEN - 1] = 1;
+        let mut flagged = chunk_buffer(64);
+        flagged.extend_from_slice(&opener.open(1, &chunks[1]).unwrap());
+        stream.seal_with(&ad, &mut flagged);
         assert_eq!(
             opener.open(1, &flagged),
             Err(FileError::DoesNotOpen { index: 1 })
         );
 
-        let mut tail = bytes[128..].to_vec();
-        tail.resize(opener.layout().plain_len(2), 0);
+        let mut tail = chunk_buffer(32);
+        tail.extend_from_slice(&bytes[128..]);
+        tail.resize(NONCE_LEN + opener.layout().plain_len(2), 0);
         *tail.last_mut().unwrap() = 1;
         stream.seal(2, &mut tail);
         assert_eq!(
             opener.open(2, &tail),
             Err(FileError::BadPadding { index: 2 })
         );
+    }
+
+    #[test]
+    fn a_chunk_has_one_stored_form() {
+        let (_, file, chunks) = small();
+        let stream = Stream::new(&keys(), &file, 64).unwrap();
+        let opener = FileOpener::with_chunk(&keys(), file, 64).unwrap();
+        let plain = opener.open(0, &chunks[0]).unwrap();
+        let ad = stream.associated_data(0);
+        for chosen in [[0u8; 24], [0xff; 24], {
+            let mut n = [0u8; 24];
+            n.copy_from_slice(&chunks[0][..24]);
+            n[0] ^= 1;
+            n
+        }] {
+            let mut forged = chosen.to_vec();
+            let mut body = plain.clone();
+            let tag = stream
+                .cipher
+                .encrypt_in_place_detached(XNonce::from_slice(&chosen), &ad, &mut body)
+                .unwrap();
+            forged.extend_from_slice(&body);
+            forged.extend_from_slice(&tag);
+            assert_eq!(
+                opener.open(0, &forged),
+                Err(FileError::DoesNotOpen { index: 0 })
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn different_bytes_under_one_reference_never_share_a_nonce(
+            a in proptest::collection::vec(any::<u8>(), 64),
+            b in proptest::collection::vec(any::<u8>(), 64),
+            index in 0u64..3,
+        ) {
+            let (_, file, _) = small();
+            let stream = Stream::new(&keys(), &file, 64).unwrap();
+            let sealed = |plain: &[u8]| {
+                let mut buf = chunk_buffer(64);
+                buf.extend_from_slice(plain);
+                stream.seal(index, &mut buf);
+                buf
+            };
+            let (x, y) = (sealed(&a), sealed(&b));
+            prop_assert_eq!(a == b, x[..NONCE_LEN] == y[..NONCE_LEN]);
+            prop_assert_eq!(x.clone(), sealed(&a));
+        }
+
+        #[test]
+        fn a_file_changed_after_hashing_seals_its_changed_chunks_under_new_nonces(
+            at in 0usize..150,
+        ) {
+            let bytes = content(150, 9);
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            let honest = seal_with(&keys(), &bytes, 64, &[usize::MAX]);
+            let mut sealer = FileSealer::with_chunk(&keys(), FileRef::of(&bytes), 64).unwrap();
+            let mut rest = &changed[..];
+            let mut out = Vec::new();
+            while !rest.is_empty() {
+                let took = sealer.feed(rest).unwrap();
+                rest = &rest[took..];
+                while let Ok(Some(c)) = sealer.next_chunk() {
+                    out.push(c.bytes);
+                }
+            }
+            prop_assert_eq!(sealer.next_chunk(), Err(FileError::HashMismatch));
+            for (i, c) in out.iter().enumerate() {
+                let same = (i * 64..(i + 1) * 64).contains(&at);
+                prop_assert_eq!(c[..NONCE_LEN] == honest[i][..NONCE_LEN], !same);
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunk_hash_is_that_of_its_stored_bytes() {
+        let (_, _, chunks) = small();
+        let chunk = SealedChunk {
+            index: 0,
+            bytes: chunks[0].clone(),
+        };
+        assert_eq!(chunk.sha256(), <[u8; 32]>::from(Sha256::digest(&chunks[0])));
     }
 
     #[test]

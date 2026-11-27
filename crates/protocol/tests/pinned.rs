@@ -126,7 +126,6 @@ fn the_existing_json_messages_do_not_drift() {
         max_page_batches: Some(4),
         max_page_bytes: Some(5),
         max_blob_bytes: None,
-        max_blobs_bytes: None,
         max_query_ids: None,
         blob_wait_days: None,
         blob_incomplete_days: None,
@@ -144,7 +143,7 @@ fn the_existing_json_messages_do_not_drift() {
     let record = |public_key, recovery| DeviceRecord {
         public_key,
         recovery,
-        wrap_key: None,
+        wrap: None,
         removed: false,
         last_seen: None,
     };
@@ -158,11 +157,7 @@ fn the_existing_json_messages_do_not_drift() {
         serde_json::to_string(&caps).unwrap(),
         serde_json::to_string(&caps_least).unwrap(),
         serde_json::to_string(&CreateLibrary::new(LibraryId([1; 16]), &device, recovery)).unwrap(),
-        serde_json::to_string(&AddDevice {
-            device_key: recovery,
-            wrap_key: None,
-        })
-        .unwrap(),
+        serde_json::to_string(&AddDevice::new(recovery)).unwrap(),
         serde_json::to_string(&devices).unwrap(),
         serde_json::to_string(&Appended { seq: 9 }).unwrap(),
         serde_json::to_string(&ReadBatches {
@@ -223,25 +218,30 @@ fn the_create_library_proof_signs_the_documented_bytes() {
             .is_ok()
     );
 
-    message.extend_from_slice(b"fongo-sync/v1/create-library/wrap-key\0");
-    message.extend_from_slice(&[6; 32]);
     let wrapped =
         CreateLibrary::with_wrap_key(LibraryId([1; 16]), &device, recovery, WrapKey([6; 32]));
+    assert_eq!(wrapped.proof, plain.proof);
+    let mut wrap_message = b"fongo-sync/v1/wrap-key\0".to_vec();
+    wrap_message.extend_from_slice(&[1; 16]);
+    wrap_message.extend_from_slice(device.verifying_key().as_bytes());
+    wrap_message.extend_from_slice(&[6; 32]);
+    let wrap = wrapped.wrap.unwrap();
     assert!(
         device
             .verifying_key()
-            .verify_strict(&message, &wrapped.proof)
+            .verify_strict(&wrap_message, &wrap.wrap_proof)
             .is_ok()
     );
     assert_eq!(
         serde_json::to_string(&wrapped).unwrap(),
         format!(
-            r#"{{"library":"{}","device_key":"{}","recovery_key":"{}","proof":"{}","wrap_key":"{}"}}"#,
+            r#"{{"library":"{}","device_key":"{}","recovery_key":"{}","proof":"{}","wrap_key":"{}","wrap_proof":"{}"}}"#,
             "01".repeat(16),
             hex(device.verifying_key().as_bytes()),
             hex(recovery.as_bytes()),
-            "d4cb82ee441d47724a08ee550fe42e641883d6cfe79baff9733ed55d0eeeb52dedbf2f45cba44b9050ff4b500b6722dc836890c37e0550b0f33d6875711e3f03",
+            "d45269cc2a61d30863f364c738afb608d66c66bbb2f14ff0016dd82909c5b78666725ac138b3314ee28eb2a7be93c252242fcc7f3d554948110b1e6c156b4c0d",
             "06".repeat(32),
+            "924c4bdf5afe54d7c40d93340b62f477cffa57f44f8b9d38c553a6fab65d1ad149804a24060e419a284ebbbd6068907ab4b7224378f8e1367bbd3015ec2dae07",
         )
     );
 }
@@ -469,26 +469,41 @@ fn sealed_files_are_laid_out_as_documented() {
 
         let id = keys().file_name_key().blob_id(&file.hash);
         let key = keys().file_key_root().file_key(&file.hash);
-        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-        let mut aad = b"fongo-sync/v1/file\0".to_vec();
-        aad.extend_from_slice(&id.0);
-        aad.extend_from_slice(&(count as u64).to_be_bytes());
-        aad.extend_from_slice(&(len as u64).to_be_bytes());
+        let expand = Hkdf::<Sha256>::from_prk(key.as_bytes()).unwrap();
+        let mut chunk_key = [0u8; 32];
+        let mut nonce_key = [0u8; 32];
+        expand
+            .expand(b"fongo-sync/v1/file-chunk-key", &mut chunk_key)
+            .unwrap();
+        expand
+            .expand(b"fongo-sync/v1/file-nonce-key", &mut nonce_key)
+            .unwrap();
+        let cipher = XChaCha20Poly1305::new(&chunk_key.into());
         for (i, chunk) in chunks.iter().enumerate() {
-            let mut nonce = [0u8; 24];
-            nonce[15..23].copy_from_slice(&(i as u64).to_be_bytes());
-            nonce[23] = u8::from(i + 1 == count);
-            let plain = cipher
-                .decrypt(
-                    &nonce.into(),
-                    Payload {
-                        msg: chunk,
-                        aad: &aad,
-                    },
-                )
-                .unwrap();
-            let end = ((i + 1) * FILE_CHUNK_LEN).min(padded);
-            assert!(plain == stream[i * FILE_CHUNK_LEN..end], "{len} {i}");
+            let mut ad = b"fongo-sync/v1/file\0".to_vec();
+            ad.extend_from_slice(&id.0);
+            ad.extend_from_slice(&(count as u64).to_be_bytes());
+            ad.extend_from_slice(&(len as u64).to_be_bytes());
+            ad.extend_from_slice(&(i as u64).to_be_bytes());
+            ad.push(u8::from(i + 1 == count));
+            let plain = &stream[i * FILE_CHUNK_LEN..((i + 1) * FILE_CHUNK_LEN).min(padded)];
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&nonce_key).unwrap();
+            mac.update(&ad);
+            mac.update(plain);
+            let nonce: [u8; 24] = mac.finalize().into_bytes()[..24].try_into().unwrap();
+            let mut expected = nonce.to_vec();
+            expected.extend_from_slice(
+                &cipher
+                    .encrypt(
+                        &nonce.into(),
+                        Payload {
+                            msg: plain,
+                            aad: &ad,
+                        },
+                    )
+                    .unwrap(),
+            );
+            assert!(*chunk == expected, "{len} {i}");
         }
     }
 }
@@ -505,8 +520,8 @@ fn sealed_files_do_not_drift() {
     assert_eq!(
         [hex(&empty_chunk.bytes), hex(&one_chunk.bytes)],
         [
-            "e9f6bd88d5cc5794ac528884eac98d8f",
-            "429801e7e8f103e960ad8a8832f0855404"
+            "adb9437db2337e05900410183d351fdddd20bc2b8c965b09d798134fdf02a8de86bc87451ef20492",
+            "92b27b0bec6230e7d8fdec944c93023876b677ebee2588ada9ee4f14070f625d06d80e180b60c55a77"
         ]
     );
 
@@ -527,28 +542,28 @@ fn sealed_files_do_not_drift() {
             "a117210941a0b00dcb2d8577e680d84b6fa0eaf760d2afc654c953b9859d54fa",
             1,
             SEALED_CHUNK_LEN,
-            "9550abf52bcd1ba85bec1551e9d4b528b01df34d3b87472f1272161977a7555f",
+            "d579bf5038e467d3fc4c32f3057157ec00a342cb434bd8bfafb860d841103dd8",
         ),
         (
             chunk + 1,
             "f4711f6bc42a8dc6520e30e306743855a82c7bdecd6e7d3edfb04b6f4524f7bd",
             2,
-            (1 << 17) + 16,
-            "58643820bde31fecfa28d328167649506685f3d23d49afe47dc80b9d2b69c50e",
+            (1 << 17) + 40,
+            "1f77c3f4d8892c8aa1c26501a02dbebad29cc64bd2b98eb99c963c4d07be82a6",
         ),
         (
             2 * chunk,
             "bdf23837181f5808331800c1ae2b4f7d7a839536b10d58491471c50dde23833a",
             2,
             SEALED_CHUNK_LEN,
-            "1c5b81ad8859b7f2fa7cdebc5f34d50344e1273ce29bf54ca25f8a97bd8cad60",
+            "c72dd9ae6c956234dde0d2c9f3966d737b816644f75be62820c971fd0f1f1648",
         ),
         (
             (1 << 28) + chunk,
             "134a54cfa16d26cea723c333ee7b2f17835dbe255de356bc26c1c162e44365b8",
             66,
             SEALED_CHUNK_LEN,
-            "c11e3bd371a254deade93c9035e76f540516aa4be268b3261f3e94996187ccf8",
+            "2e4dac283fb51660446cfb119d3af81cbb848d5361a2a88bfadccbdbf1e6fa0f",
         ),
     ];
     let actual = sealed

@@ -14,8 +14,9 @@
 //! under a key derived from the library secret. Its bytes, padded with zeros to [`padme`] of its
 //! size, are cut into chunks of [`FILE_CHUNK_LEN`] bytes and each chunk is sealed with
 //! XChaCha20-Poly1305 under a key derived from the library secret and the hash, by
-//! [`FileSealer`], and opened by [`FileOpener`]. One content therefore seals to the same bytes on
-//! every device of a library. The server learns each file's padded size, which requests touch it
+//! [`FileSealer`], and opened by [`FileOpener`]. Each chunk's nonce is derived from the chunk
+//! itself, so one content seals to the same bytes on every device of a library, a chunk has one
+//! stored form, and different bytes never share a nonce. The server learns each file's padded size, which requests touch it
 //! and that two uploads of it are one file; not its content, its hash or its true size.
 //!
 //! [`api`] holds the routes that upload a file in chunks or whole, read it back, ask which files
@@ -31,7 +32,8 @@
 //!   secret: they can derive the recovery key and add a device again, and can read anything
 //!   sealed under the secret that they obtain. Excluding one needs a new secret delivered to the
 //!   remaining devices, which is future work; a device may register a [`WrapKey`] for it now,
-//!   which nothing in this version uses.
+//!   which nothing in this version uses. Each wrap key is signed by its device's key, but the
+//!   device list as a whole is still taken from the server, which can add or leave out a key.
 //! - Every key epoch's key derives from the one library secret, so a new epoch does not exclude
 //!   anyone who held the secret. The protocol sets no server-side rules for epochs: a server
 //!   neither checks nor orders them.

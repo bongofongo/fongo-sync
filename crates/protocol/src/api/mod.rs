@@ -22,8 +22,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 pub use blobs::{
-    BlobIds, BlobInfo, BlobState, CompleteBlobs, Entitlement, LibraryStatus, MissingBlobs,
-    RemoveDevice, RetireBlobs, Settled,
+    BlobIds, BlobInfo, BlobState, CompleteBlobs, Entitlement, HaveChunk, LibraryStatus,
+    MissingBlobs, RemoveDevice, RetireBlobs, Settled,
 };
 pub use error::{ErrorBody, ErrorCode};
 pub use notify::{NOTIFICATION_FORMAT, Notification};
@@ -51,8 +51,9 @@ pub const NOTIFICATIONS_PATH: &str = "/v1/libraries/{library}/notifications";
 /// [`ErrorCode::BlobIncomplete`]. `{id}` is the [`BlobId`](crate::BlobId) in hex.
 pub const BLOB_PATH: &str = "/v1/libraries/{library}/blobs/{id}";
 /// `POST` one stored chunk (binary) of a begun blob, of the length [`BlobInfo::stored_chunk_len`]
-/// gives, answered with no body; idempotent. `GET`: the stored chunk (binary) of a complete blob.
-/// `{n}` is the chunk index in decimal.
+/// gives, answered with no body. Until the blob is complete it replaces whatever was stored at that
+/// index; see [`BlobState`]. `GET`: the stored chunk (binary) of a complete blob. `{n}` is the chunk
+/// index in decimal.
 pub const BLOB_CHUNK_PATH: &str = "/v1/libraries/{library}/blobs/{id}/chunks/{n}";
 /// `POST` with no body: [`BlobInfo`], or [`ErrorCode::BlobIncomplete`] unless every chunk is
 /// stored. From then on the blob is readable and never changes. Idempotent.
@@ -79,7 +80,7 @@ pub const REMOVE_DEVICE_PATH: &str = "/v1/libraries/{library}/devices/remove";
 pub const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 
 const PROOF_LABEL: &[u8] = b"fongo-sync/v1/create-library\0";
-const WRAP_KEY_PROOF_LABEL: &[u8] = b"fongo-sync/v1/create-library/wrap-key\0";
+const WRAP_PROOF_LABEL: &[u8] = b"fongo-sync/v1/wrap-key\0";
 const PAGE_FORMAT: u8 = 1;
 const PAGE_MORE: u8 = 1;
 
@@ -127,14 +128,11 @@ pub struct Capabilities {
     /// Largest blob accepted, in stored bytes ([`BlobInfo::size`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_blob_bytes: Option<u64>,
-    /// Largest total of stored blob bytes per library, complete or not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_blobs_bytes: Option<u64>,
     /// Most ids in one [`BlobIds`] sent to [`BLOBS_QUERY_PATH`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_ids: Option<u32>,
-    /// Days a retired blob is kept after every device not removed has settled past its
-    /// retirement.
+    /// Days a retired blob is kept at least, counted from its retirement. It is also kept until
+    /// every device not removed has settled past the retirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_wait_days: Option<u32>,
     /// Days without activity after which an incomplete upload may be dropped.
@@ -152,6 +150,7 @@ fn is_false(value: &bool) -> bool {
 /// Registers a library with its first device and its recovery key. The server must refuse an id
 /// already taken and a `proof` that does not verify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCreateLibrary")]
 pub struct CreateLibrary {
     pub library: LibraryId,
     #[serde(with = "serde_key")]
@@ -159,19 +158,15 @@ pub struct CreateLibrary {
     /// [`LibraryKeys::recovery_signing_key`](crate::LibraryKeys::recovery_signing_key)'s public half.
     #[serde(with = "serde_key")]
     pub recovery_key: VerifyingKey,
-    /// The device key's signature over the library id, both keys and the wrap key if there is one.
-    ///
-    /// Signed bytes: `fongo-sync/v1/create-library` and a zero byte, the library id, the device
-    /// key and the recovery key; with a wrap key, then `fongo-sync/v1/create-library/wrap-key`, a
-    /// zero byte and the wrap key. Without one they are what a server that knows no wrap keys
-    /// checks.
+    /// The device key's signature over `fongo-sync/v1/create-library` and a zero byte, the
+    /// library id, the device key and the recovery key.
     #[serde(with = "serde_sig")]
     pub proof: Signature,
-    /// The first device's [`WrapKey`], stored and returned in its [`DeviceRecord`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wrap_key: Option<WrapKey>,
-    /// An opaque token for the server's own policy. It is not covered by `proof`: whoever holds
-    /// it may present it, as with [`Entitlement`].
+    /// The first device's wrap key, stored and returned in its [`DeviceRecord`].
+    #[serde(flatten)]
+    pub wrap: Option<SignedWrapKey>,
+    /// An opaque token for the server's own policy. Nothing signs it: whoever holds it may
+    /// present it, as with [`Entitlement`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entitlement: Option<String>,
 }
@@ -182,71 +177,95 @@ impl CreateLibrary {
         device: &SigningKey,
         recovery_key: VerifyingKey,
     ) -> CreateLibrary {
-        CreateLibrary::signed(library, device, recovery_key, None)
+        let device_key = device.verifying_key();
+        CreateLibrary {
+            library,
+            device_key,
+            recovery_key,
+            proof: device.sign(&proof_message(library, &device_key, &recovery_key)),
+            wrap: None,
+            entitlement: None,
+        }
     }
 
-    /// A request that also registers the first device's wrap key, covered by `proof`.
+    /// A request that also registers the first device's wrap key, signed by the device key.
     pub fn with_wrap_key(
         library: LibraryId,
         device: &SigningKey,
         recovery_key: VerifyingKey,
         wrap_key: WrapKey,
     ) -> CreateLibrary {
-        CreateLibrary::signed(library, device, recovery_key, Some(wrap_key))
-    }
-
-    fn signed(
-        library: LibraryId,
-        device: &SigningKey,
-        recovery_key: VerifyingKey,
-        wrap_key: Option<WrapKey>,
-    ) -> CreateLibrary {
-        let device_key = device.verifying_key();
         CreateLibrary {
-            library,
-            device_key,
-            recovery_key,
-            proof: device.sign(&proof_message(
-                library,
-                &device_key,
-                &recovery_key,
-                wrap_key.as_ref(),
-            )),
-            wrap_key,
-            entitlement: None,
+            wrap: Some(SignedWrapKey::new(library, device, wrap_key)),
+            ..CreateLibrary::new(library, device, recovery_key)
         }
     }
 
-    /// Whether `proof` shows the caller holds `device_key`'s private half and chose `wrap_key`.
+    /// Whether `proof` shows the caller holds `device_key`'s private half.
     pub fn verify(&self) -> bool {
         self.device_key
             .verify_strict(
-                &proof_message(
-                    self.library,
-                    &self.device_key,
-                    &self.recovery_key,
-                    self.wrap_key.as_ref(),
-                ),
+                &proof_message(self.library, &self.device_key, &self.recovery_key),
                 &self.proof,
+            )
+            .is_ok()
+    }
+
+    /// Whether the request carries a wrap key that the device key signed for this library.
+    pub fn verify_wrap(&self) -> bool {
+        self.wrap
+            .as_ref()
+            .is_some_and(|wrap| wrap.verify(self.library, &self.device_key))
+    }
+}
+
+fn proof_message(library: LibraryId, device: &VerifyingKey, recovery: &VerifyingKey) -> Vec<u8> {
+    let mut out = PROOF_LABEL.to_vec();
+    out.extend_from_slice(&library.0);
+    out.extend_from_slice(device.as_bytes());
+    out.extend_from_slice(recovery.as_bytes());
+    out
+}
+
+/// A device's [`WrapKey`] with the device key's signature over it, so that any device shown it
+/// can check that the device chose it and not whoever passed it on. In JSON it is the two fields
+/// `wrap_key` and `wrap_proof` of the message that carries it, both or neither.
+///
+/// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's
+/// public key and the wrap key. A server refuses a wrap key whose proof does not verify, with
+/// [`ErrorCode::InvalidProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SignedWrapKey {
+    pub wrap_key: WrapKey,
+    #[serde(with = "serde_sig")]
+    pub wrap_proof: Signature,
+}
+
+impl SignedWrapKey {
+    /// `wrap_key`, signed by `device` for `library`.
+    pub fn new(library: LibraryId, device: &SigningKey, wrap_key: WrapKey) -> SignedWrapKey {
+        SignedWrapKey {
+            wrap_key,
+            wrap_proof: device.sign(&wrap_message(library, &device.verifying_key(), &wrap_key)),
+        }
+    }
+
+    /// Whether `device_key` signed this wrap key for `library`.
+    pub fn verify(&self, library: LibraryId, device_key: &VerifyingKey) -> bool {
+        device_key
+            .verify_strict(
+                &wrap_message(library, device_key, &self.wrap_key),
+                &self.wrap_proof,
             )
             .is_ok()
     }
 }
 
-fn proof_message(
-    library: LibraryId,
-    device: &VerifyingKey,
-    recovery: &VerifyingKey,
-    wrap_key: Option<&WrapKey>,
-) -> Vec<u8> {
-    let mut out = PROOF_LABEL.to_vec();
+fn wrap_message(library: LibraryId, device: &VerifyingKey, wrap_key: &WrapKey) -> Vec<u8> {
+    let mut out = WRAP_PROOF_LABEL.to_vec();
     out.extend_from_slice(&library.0);
     out.extend_from_slice(device.as_bytes());
-    out.extend_from_slice(recovery.as_bytes());
-    if let Some(wrap_key) = wrap_key {
-        out.extend_from_slice(WRAP_KEY_PROOF_LABEL);
-        out.extend_from_slice(&wrap_key.0);
-    }
+    out.extend_from_slice(&wrap_key.0);
     out
 }
 
@@ -256,24 +275,52 @@ fn proof_message(
 /// A key already listed and not removed is accepted and changes nothing; a removed one is
 /// restored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAddDevice")]
 pub struct AddDevice {
     #[serde(with = "serde_key")]
     pub device_key: VerifyingKey,
-    /// The new device's [`WrapKey`], stored and returned in its [`DeviceRecord`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wrap_key: Option<WrapKey>,
+    /// The new device's wrap key, signed by the new device's key, stored and returned in its
+    /// [`DeviceRecord`].
+    #[serde(flatten)]
+    pub wrap: Option<SignedWrapKey>,
+}
+
+impl AddDevice {
+    pub fn new(device_key: VerifyingKey) -> AddDevice {
+        AddDevice {
+            device_key,
+            wrap: None,
+        }
+    }
+
+    /// Adds `device` to `library` with its wrap key. A device that adds another without its
+    /// signing key takes the [`SignedWrapKey`] the new device made and sets `wrap` itself.
+    pub fn with_wrap_key(library: LibraryId, device: &SigningKey, wrap_key: WrapKey) -> AddDevice {
+        AddDevice {
+            device_key: device.verifying_key(),
+            wrap: Some(SignedWrapKey::new(library, device, wrap_key)),
+        }
+    }
+
+    /// Whether the request carries a wrap key that the new device's key signed for `library`.
+    pub fn verify_wrap(&self, library: LibraryId) -> bool {
+        self.wrap
+            .as_ref()
+            .is_some_and(|wrap| wrap.verify(library, &self.device_key))
+    }
 }
 
 /// One key the library knows. Its device id is [`DeviceId::of`](crate::DeviceId::of) the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawDeviceRecord")]
 pub struct DeviceRecord {
     #[serde(with = "serde_key")]
     pub public_key: VerifyingKey,
     /// The library's recovery key: it may authenticate requests but never signs envelopes.
     pub recovery: bool,
-    /// The wrap key the device was registered with, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wrap_key: Option<WrapKey>,
+    /// The wrap key the device registered, if any.
+    #[serde(flatten)]
+    pub wrap: Option<SignedWrapKey>,
     /// Removed through [`REMOVE_DEVICE_PATH`]: the server refuses its requests, and it no longer
     /// holds back the deletion of retired blobs.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -281,6 +328,121 @@ pub struct DeviceRecord {
     /// Unix seconds of the device's last accepted request, possibly coarse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
+}
+
+impl DeviceRecord {
+    /// Whether the record carries a wrap key that its own key signed for `library`. The server
+    /// can drop a wrap key, but cannot put in one the device did not sign.
+    pub fn verify_wrap(&self, library: LibraryId) -> bool {
+        self.wrap
+            .as_ref()
+            .is_some_and(|wrap| wrap.verify(library, &self.public_key))
+    }
+}
+
+#[derive(Deserialize)]
+struct RawCreateLibrary {
+    library: LibraryId,
+    #[serde(with = "serde_key")]
+    device_key: VerifyingKey,
+    #[serde(with = "serde_key")]
+    recovery_key: VerifyingKey,
+    #[serde(with = "serde_sig")]
+    proof: Signature,
+    #[serde(default)]
+    wrap_key: Option<WrapKey>,
+    #[serde(default)]
+    wrap_proof: Option<ProofHex>,
+    #[serde(default)]
+    entitlement: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawAddDevice {
+    #[serde(with = "serde_key")]
+    device_key: VerifyingKey,
+    #[serde(default)]
+    wrap_key: Option<WrapKey>,
+    #[serde(default)]
+    wrap_proof: Option<ProofHex>,
+}
+
+#[derive(Deserialize)]
+struct RawDeviceRecord {
+    #[serde(with = "serde_key")]
+    public_key: VerifyingKey,
+    recovery: bool,
+    #[serde(default)]
+    wrap_key: Option<WrapKey>,
+    #[serde(default)]
+    wrap_proof: Option<ProofHex>,
+    #[serde(default)]
+    removed: bool,
+    #[serde(default)]
+    last_seen: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ProofHex(#[serde(with = "serde_sig")] Signature);
+
+/// Why a message was refused that carried a wrap key without its proof, or a proof without its
+/// key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("wrap_key and wrap_proof come together or not at all")]
+pub struct UnpairedWrapKey;
+
+fn pair(
+    wrap_key: Option<WrapKey>,
+    wrap_proof: Option<ProofHex>,
+) -> Result<Option<SignedWrapKey>, UnpairedWrapKey> {
+    match (wrap_key, wrap_proof) {
+        (None, None) => Ok(None),
+        (Some(wrap_key), Some(ProofHex(wrap_proof))) => Ok(Some(SignedWrapKey {
+            wrap_key,
+            wrap_proof,
+        })),
+        _ => Err(UnpairedWrapKey),
+    }
+}
+
+impl TryFrom<RawCreateLibrary> for CreateLibrary {
+    type Error = UnpairedWrapKey;
+
+    fn try_from(raw: RawCreateLibrary) -> Result<CreateLibrary, UnpairedWrapKey> {
+        Ok(CreateLibrary {
+            library: raw.library,
+            device_key: raw.device_key,
+            recovery_key: raw.recovery_key,
+            proof: raw.proof,
+            wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+            entitlement: raw.entitlement,
+        })
+    }
+}
+
+impl TryFrom<RawAddDevice> for AddDevice {
+    type Error = UnpairedWrapKey;
+
+    fn try_from(raw: RawAddDevice) -> Result<AddDevice, UnpairedWrapKey> {
+        Ok(AddDevice {
+            device_key: raw.device_key,
+            wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+        })
+    }
+}
+
+impl TryFrom<RawDeviceRecord> for DeviceRecord {
+    type Error = UnpairedWrapKey;
+
+    fn try_from(raw: RawDeviceRecord) -> Result<DeviceRecord, UnpairedWrapKey> {
+        Ok(DeviceRecord {
+            public_key: raw.public_key,
+            recovery: raw.recovery,
+            wrap: pair(raw.wrap_key, raw.wrap_proof)?,
+            removed: raw.removed,
+            last_seen: raw.last_seen,
+        })
+    }
 }
 
 /// Every key a library knows, in the order they were added.
@@ -390,32 +552,77 @@ mod tests {
         let mut entitled = request.clone();
         entitled.entitlement = Some("token".into());
         assert!(entitled.verify());
-        let mut wrapped = request;
-        wrapped.wrap_key = Some(WrapKey([5; 32]));
-        assert!(!wrapped.verify());
+        assert!(!request.verify_wrap());
     }
 
     #[test]
-    fn a_wrap_key_is_covered_by_the_proof() {
+    fn a_wrap_key_is_signed_by_its_device_and_leaves_the_proof_alone() {
         let device = SigningKey::from_bytes(&[1; 32]);
         let recovery = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let request =
-            CreateLibrary::with_wrap_key(LibraryId([3; 16]), &device, recovery, WrapKey([5; 32]));
-        assert!(request.verify());
-        let text = serde_json::to_string(&request).unwrap();
-        let back: CreateLibrary = serde_json::from_str(&text).unwrap();
-        assert!(back.verify());
-        assert_ne!(
+        let library = LibraryId([3; 16]);
+        let request = CreateLibrary::with_wrap_key(library, &device, recovery, WrapKey([5; 32]));
+        assert!(request.verify() && request.verify_wrap());
+        assert_eq!(
             request.proof,
-            CreateLibrary::new(LibraryId([3; 16]), &device, recovery).proof
+            CreateLibrary::new(library, &device, recovery).proof
         );
+        let back: CreateLibrary =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(back, request);
 
-        let mut stripped = request.clone();
-        stripped.wrap_key = None;
-        assert!(!stripped.verify());
-        let mut replaced = request;
-        replaced.wrap_key = Some(WrapKey([6; 32]));
-        assert!(!replaced.verify());
+        let wrap = request.wrap.unwrap();
+        let mut replaced = wrap;
+        replaced.wrap_key = WrapKey([6; 32]);
+        assert!(!replaced.verify(library, &device.verifying_key()));
+        assert!(!wrap.verify(LibraryId([4; 16]), &device.verifying_key()));
+        assert!(!wrap.verify(library, &recovery));
+
+        let add = AddDevice::with_wrap_key(library, &device, WrapKey([5; 32]));
+        assert!(add.verify_wrap(library) && !add.verify_wrap(LibraryId([4; 16])));
+        assert!(!AddDevice::new(device.verifying_key()).verify_wrap(library));
+        let record = DeviceRecord {
+            public_key: device.verifying_key(),
+            recovery: false,
+            wrap: add.wrap,
+            removed: false,
+            last_seen: None,
+        };
+        assert!(record.verify_wrap(library));
+        let impostor = DeviceRecord {
+            public_key: recovery,
+            ..record
+        };
+        assert!(!impostor.verify_wrap(library));
+    }
+
+    #[test]
+    fn a_wrap_key_without_its_proof_is_refused() {
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let key_hex = crate::hex::encode(device.verifying_key().as_bytes());
+        let add = AddDevice::with_wrap_key(LibraryId([3; 16]), &device, WrapKey([5; 32]));
+        let full = serde_json::to_value(&add).unwrap();
+        let proof = full["wrap_proof"].clone();
+        let wrap_key = "05".repeat(32);
+        for body in [
+            json!({"device_key": key_hex, "wrap_key": wrap_key}),
+            json!({"device_key": key_hex, "wrap_proof": proof}),
+        ] {
+            assert!(serde_json::from_value::<AddDevice>(body.clone()).is_err());
+            let mut record = body.clone();
+            record["public_key"] = record["device_key"].take();
+            record["recovery"] = json!(false);
+            assert!(serde_json::from_value::<DeviceRecord>(record).is_err());
+        }
+        let request = CreateLibrary::with_wrap_key(
+            LibraryId([3; 16]),
+            &device,
+            device.verifying_key(),
+            WrapKey([5; 32]),
+        );
+        let mut half = serde_json::to_value(&request).unwrap();
+        half.as_object_mut().unwrap().remove("wrap_proof");
+        assert!(serde_json::from_value::<CreateLibrary>(half).is_err());
+        assert_eq!(serde_json::from_value::<AddDevice>(full).unwrap(), add);
     }
 
     #[test]
@@ -431,7 +638,6 @@ mod tests {
             max_page_batches: Some(256),
             max_page_bytes: None,
             max_blob_bytes: None,
-            max_blobs_bytes: None,
             max_query_ids: None,
             blob_wait_days: None,
             blob_incomplete_days: None,
@@ -449,10 +655,7 @@ mod tests {
             })
         );
         let key = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let add = AddDevice {
-            device_key: key,
-            wrap_key: None,
-        };
+        let add = AddDevice::new(key);
         assert_eq!(
             serde_json::to_value(&add).unwrap(),
             json!({"device_key": crate::hex::encode(key.as_bytes())})
@@ -470,31 +673,30 @@ mod tests {
 
     #[test]
     fn the_new_fields_are_plain_and_optional() {
-        let key = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let key = device.verifying_key();
         let key_hex = crate::hex::encode(key.as_bytes());
+        let wrap = SignedWrapKey::new(LibraryId([3; 16]), &device, WrapKey([2; 32]));
         let record = DeviceRecord {
             public_key: key,
             recovery: false,
-            wrap_key: Some(WrapKey([2; 32])),
+            wrap: Some(wrap),
             removed: true,
             last_seen: Some(1_700_000_000),
         };
+        let text = serde_json::to_string(&record).unwrap();
         assert_eq!(
-            serde_json::to_value(&record).unwrap(),
-            json!({
-                "public_key": key_hex,
-                "recovery": false,
-                "wrap_key": "02".repeat(32),
-                "removed": true,
-                "last_seen": 1_700_000_000u64,
-            })
+            text,
+            format!(
+                r#"{{"public_key":"{key_hex}","recovery":false,"wrap_key":"{}","wrap_proof":"{}","removed":true,"last_seen":1700000000}}"#,
+                "02".repeat(32),
+                crate::hex::encode(&wrap.wrap_proof.to_bytes()),
+            )
         );
+        assert_eq!(serde_json::from_str::<DeviceRecord>(&text).unwrap(), record);
         let old: DeviceRecord =
             serde_json::from_value(json!({"public_key": key_hex, "recovery": true})).unwrap();
-        assert_eq!(
-            (old.wrap_key, old.removed, old.last_seen),
-            (None, false, None)
-        );
+        assert_eq!((old.wrap, old.removed, old.last_seen), (None, false, None));
 
         let caps: Capabilities = serde_json::from_value(json!({
             "protocol_version": 1,
@@ -502,7 +704,6 @@ mod tests {
             "notifications": false,
             "skew_secs": 300,
             "max_blob_bytes": 1,
-            "max_blobs_bytes": 2,
             "max_query_ids": 3,
             "blob_wait_days": 7,
             "blob_incomplete_days": 4,
@@ -513,32 +714,22 @@ mod tests {
         assert_eq!(
             (
                 caps.max_blob_bytes,
-                caps.max_blobs_bytes,
                 caps.max_query_ids,
                 caps.blob_wait_days,
                 caps.blob_incomplete_days,
                 caps.device_removal
             ),
-            (Some(1), Some(2), Some(3), Some(7), Some(4), true)
-        );
-        let add = AddDevice {
-            device_key: key,
-            wrap_key: Some(WrapKey([0xab; 32])),
-        };
-        assert_eq!(
-            serde_json::to_value(&add).unwrap(),
-            json!({"device_key": key_hex, "wrap_key": "ab".repeat(32)})
+            (Some(1), Some(3), Some(7), Some(4), true)
         );
         assert!(
-            serde_json::from_value::<AddDevice>(json!({"device_key": key_hex, "wrap_key": "ab"}))
+            serde_json::from_value::<AddDevice>(json!({"device_key": key_hex, "wrap_key": "ab", "wrap_proof": crate::hex::encode(&wrap.wrap_proof.to_bytes())}))
                 .is_err()
         );
-        let mut create =
-            CreateLibrary::new(LibraryId([3; 16]), &SigningKey::from_bytes(&[1; 32]), key);
+        let mut create = CreateLibrary::new(LibraryId([3; 16]), &device, key);
         create.entitlement = Some("token".into());
         let value = serde_json::to_value(&create).unwrap();
         assert_eq!(value["entitlement"], json!("token"));
-        assert!(value.get("wrap_key").is_none());
+        assert!(value.get("wrap_key").is_none() && value.get("wrap_proof").is_none());
     }
 
     #[test]

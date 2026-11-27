@@ -108,7 +108,6 @@ impl Server {
                     max_page_batches: Some(4),
                     max_page_bytes: None,
                     max_blob_bytes: None,
-                    max_blobs_bytes: None,
                     max_query_ids: None,
                     blob_wait_days: None,
                     blob_incomplete_days: None,
@@ -213,7 +212,7 @@ impl Server {
                 .push(DeviceRecord {
                     public_key: key,
                     recovery: false,
-                    wrap_key: None,
+                    wrap: None,
                     removed: false,
                     last_seen: None,
                 })
@@ -354,14 +353,14 @@ impl State {
                     DeviceRecord {
                         public_key: create.device_key,
                         recovery: false,
-                        wrap_key: None,
+                        wrap: None,
                         removed: false,
                         last_seen: None,
                     },
                     DeviceRecord {
                         public_key: create.recovery_key,
                         recovery: true,
-                        wrap_key: None,
+                        wrap: None,
                         removed: false,
                         last_seen: None,
                     },
@@ -393,7 +392,7 @@ impl State {
                 let record = DeviceRecord {
                     public_key: add.device_key,
                     recovery: false,
-                    wrap_key: None,
+                    wrap: None,
                     removed: false,
                     last_seen: None,
                 };
