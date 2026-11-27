@@ -238,9 +238,14 @@ impl Peer {
         self.writes.touched(&first.touched);
         let mut more = first.more;
         if more {
+            // A copy that adopts the found rows whole names the entity each is adopted as.
+            let (_, mut copy) = self.world.twin(self.n, &mut self.conn).await;
+            self.replica.collect(&mut copy).await.unwrap();
+            let ids = self.replica.inspect(&mut copy).await.unwrap().ids;
             self.writes
                 .installed_step(&mut self.conn, &self.replica, waiting)
                 .await;
+            self.writes.found_as(ids);
         } else {
             self.writes
                 .installed(&mut self.conn, &self.replica, waiting)
@@ -2351,4 +2356,49 @@ fn a_note_on_a_book_found_to_be_one_names_its_group_in_steps() {
 #[test]
 fn rows_a_first_install_in_steps_adopts_after_it_are_its_adoptions() {
     run_found(8319302663633078794, &[]).unwrap();
+}
+
+/// Found at 1,000 cases: the application deletes a found book between two steps of a first
+/// install, the step that adopts its record sends the delete as an edit, and another replica's
+/// book with the same ISBN takes its id before the delete is sent.
+#[test]
+fn a_found_book_deleted_between_install_steps_whose_id_a_merged_book_takes() {
+    use Op::*;
+    run_found(
+        2677807875068260434,
+        &[(0, Sync), (1, Deliver(3629807676055690660, false, false))],
+    )
+    .unwrap();
+}
+
+/// Found at 1,000 cases: as above, and a book the application makes takes the id.
+#[test]
+fn a_found_book_deleted_between_install_steps_whose_id_a_new_book_takes() {
+    use Op::*;
+    run_found(10050575674676084620, &[(0, AddBook(0, 0, 0))]).unwrap();
+}
+
+/// Worlds in which a replica installing in steps over a found book retitles it, gives it another
+/// ISBN or deletes it between steps, before the step that adopts it; a book made afterwards may
+/// take its id. Random scripts draw this only once in some thousands of cases.
+#[test]
+fn found_books_written_between_the_steps_of_a_first_install() {
+    use Op::*;
+    let script = [
+        (0, AddBook(0, 0, 0)),
+        (1, AddBook(0, 0, 0)),
+        (1, Sync),
+        (0, Sync),
+    ];
+    for seed in [0, 2, 10, 12, 13, 27, 49] {
+        run_found(seed, &script).unwrap();
+    }
+}
+
+/// A replica gives a found book another ISBN between the steps of its first install and then
+/// gives it back the one it was found with, before the step that adopts it: the adoption sends
+/// the value owed. Whether the book is still unadopted then depends on where steps end.
+#[test]
+fn a_found_book_whose_isbn_is_written_back_between_install_steps() {
+    run_found(8364741249218391914, &[]).unwrap();
 }

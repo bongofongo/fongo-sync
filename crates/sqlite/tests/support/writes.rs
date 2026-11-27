@@ -42,6 +42,11 @@ pub struct Writes {
     removed: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// Changes an install produced, which are not checked.
     adopted: Vec<Change>,
+    /// Rows a first install in steps found and has not adopted yet, as it found them: what the
+    /// application writes to one meanwhile is an edit against that.
+    recorded: Rows,
+    /// The entity each found row of a minted collection is adopted as.
+    found_as: BTreeMap<(String, String), Gid>,
     /// Cells the application changed, with the value it wrote, not yet seen in what was sent.
     owed: BTreeMap<(String, String, String), Value>,
     /// For a reference among them, the entity the row it names stood for when it was written.
@@ -292,7 +297,13 @@ impl Writes {
         };
         let canonical = |c: &str, g: Gid| *canon.get(&(c.to_string(), g)).unwrap_or(&g);
         for at in deleted {
-            let mut members = BTreeSet::new();
+            let mut members: BTreeSet<Gid> = self
+                .found_as
+                .get(&at)
+                .filter(|_| self.recorded.contains_key(&at))
+                .copied()
+                .into_iter()
+                .collect();
             if let Some(gid) = self.latest.get(&at)
                 && let Some(e) = merge.entities.get(gid)
             {
@@ -318,6 +329,7 @@ impl Writes {
             sqlx::query(sql).execute(&mut *conn).await.unwrap();
         }
         self.after = now(conn, replica).await;
+        self.recorded.clear();
         let keys: Vec<(String, String)> = self.after.keys().cloned().collect();
         for (collection, key) in keys {
             self.remember(conn, replica, &collection, &key).await;
@@ -344,7 +356,7 @@ impl Writes {
         let mut kept = BTreeSet::new();
         for key in keys {
             if marked.contains(&key) && self.found.get(&key) == current.get(&key) {
-                if let Some(row) = self.after.get(&key) {
+                if let Some(row) = self.after.get(&key).or(self.recorded.get(&key)) {
                     next.insert(key.clone(), row.clone());
                 }
                 kept.insert(key);
@@ -373,10 +385,18 @@ impl Writes {
             }
         }
         // What is owed of a row still to collect is its change since it was last collected,
-        // which the next kernel step's look at the tables works out again.
+        // which the next kernel step's look at the tables works out again; of a found row not
+        // yet adopted, the values it was found with, which its adoption sends.
         let of_kept = |c: &str, k: &str| kept.contains(&(c.to_string(), k.to_string()));
         self.owed.retain(|(c, k, _), _| !of_kept(c, k));
         self.named.retain(|(c, k, _), _| !of_kept(c, k));
+        self.recorded.retain(|at, _| kept.contains(at));
+        for ((c, k), row) in &self.recorded {
+            for (field, value) in row.iter().filter(|(_, v)| **v != Value::Null) {
+                self.owed
+                    .insert((c.clone(), k.clone(), field.clone()), value.clone());
+            }
+        }
         self.after = next;
         for (collection, key) in current.keys() {
             self.remember(conn, replica, collection, key).await;
@@ -460,11 +480,29 @@ impl Writes {
         taken: &[Change],
     ) -> usize {
         self.before(conn, replica, taken).await;
-        // Before the first install there is no outbox.
-        replica
-            .outbox(conn, u32::MAX)
-            .await
-            .map_or(0, |outbox| outbox.changes.len())
+        match replica.outbox(conn, u32::MAX).await {
+            Ok(outbox) => outbox.changes.len(),
+            // Before the first install there is no outbox, and what the tables hold was found, not written.
+            Err(_) => {
+                self.written.clear();
+                self.made.clear();
+                self.recorded = self.found.clone();
+                0
+            }
+        }
+    }
+
+    /// The entity each found row of a minted collection is adopted as, as (collection, key,
+    /// gid), read from a copy that adopted them whole: every step adopts a row as that.
+    pub fn found_as(&mut self, ids: Vec<(String, String, Gid)>) {
+        for (c, key, gid) in ids {
+            let at = (c, key);
+            if self.recorded.contains_key(&at) {
+                self.gids.entry(at.clone()).or_default().insert(gid);
+                self.latest.entry(at.clone()).or_insert(gid);
+                self.found_as.insert(at, gid);
+            }
+        }
     }
 
     /// After an install: what it added to the outbox past `waiting` is its own.
