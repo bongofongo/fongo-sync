@@ -583,3 +583,65 @@ fn syncs_on_threads_of_their_own_seal_each_change_once() {
         assert_no_change_sent_twice(&server, made.library());
     }
 }
+
+/// A sync whose pull began while one envelope was to be stepped past steps past it; the
+/// application then steps past a later one, which another sync stopped at; the first sync, which
+/// did not see that second step, stops at the later envelope. The second step must stay for the
+/// next sync.
+#[tokio::test]
+async fn a_pull_keeps_a_step_past_recorded_after_it_began() {
+    let dir = scratch("passing-survives");
+    let server = Server::new();
+    let (mut a, mut b, mut z) = devices(&dir, &server).await;
+    let library = z.credentials.library().clone();
+    let device = z.credentials.device().clone();
+    let later = |name: &str| {
+        seal_as(
+            ENVELOPE_FORMAT + 1,
+            &encode_batch(&setting(name)),
+            &library,
+            0,
+            &device,
+            random_nonce().unwrap(),
+        )
+    };
+    for year in 0..2 {
+        z.run(&format!(
+            "INSERT INTO books (title, year) VALUES ('Middlemarch', {year})"
+        ))
+        .await;
+        z.sync(&server).await.unwrap();
+    }
+    server.inject(library.id, later("theme"));
+    z.run("INSERT INTO books (title, year) VALUES ('Persuasion', 1817)")
+        .await;
+    z.sync(&server).await.unwrap();
+    server.inject(library.id, later("font"));
+    assert_eq!(server.log(library.id).len(), 5);
+
+    let first = a.sync(&server).await.unwrap().newer.unwrap();
+    assert_eq!(first.seq, 3);
+    step_past(&mut a.conn, library.id, first.seq, first.digest)
+        .await
+        .unwrap();
+    let hold = server.hold_if(|request| reads_after(request, 2), false);
+    let mut held = Box::pin(sync(&mut b.conn, &b.replica, &server, &b.credentials, now));
+    tokio::select! {
+        _ = &mut held => panic!("the read was never held"),
+        () = hold.reached() => {}
+    }
+    let second = a.sync(&server).await.unwrap().newer.unwrap();
+    assert_eq!(second.seq, 5);
+    step_past(&mut a.conn, library.id, second.seq, second.digest)
+        .await
+        .unwrap();
+    hold.release();
+    let report = held.await.unwrap();
+    assert_eq!(report.newer.map(|n| n.seq), Some(5));
+    let past = a.sync(&server).await.unwrap();
+    assert_eq!(
+        past.newer, None,
+        "the step past the later envelope was lost"
+    );
+    assert_eq!(a.cursor().await, 5);
+}
