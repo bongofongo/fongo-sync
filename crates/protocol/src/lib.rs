@@ -16,13 +16,40 @@
 //! XChaCha20-Poly1305 under a key derived from the library secret and the hash, by
 //! [`FileSealer`], and opened by [`FileOpener`]. Each chunk's nonce is derived from the chunk
 //! itself, so one content seals to the same bytes on every device of a library, a chunk has one
-//! stored form, and different bytes never share a nonce. The server learns each file's padded size, which requests touch it
-//! and that two uploads of it are one file; not its content, its hash or its true size.
+//! stored form, and different bytes never share a nonce. The server learns each file's padded
+//! size, which requests touch it, which envelopes and devices claim or retire it, and that two
+//! uploads of it are one file; not its content, its hash or its true size.
 //!
 //! [`api`] holds the routes that upload a file in chunks or whole, read it back, ask which files
 //! a server holds, and let devices claim and retire files so that a server can delete those
 //! nothing refers to. This crate defines the format and the messages; no client or server for
 //! them exists in this repository yet.
+//!
+//! # What a device relies on the server for
+//!
+//! Envelopes are sealed and signed, so a server can neither read a change nor forge or alter one:
+//! a device refuses an envelope whose signature does not verify under a key the device list
+//! holds. A file's chunks are sealed in the same way, and opening one checks it. A device relies on
+//! the server for the rest:
+//!
+//! - completeness: every envelope the server answered with a sequence number is kept, and is
+//!   returned to every device that reads past the one before it. A device never receives an
+//!   envelope that is dropped or withheld from it.
+//! - one log: every device reads the same envelope at each sequence number. Devices shown
+//!   different logs can diverge for good.
+//! - honest sequence numbers: each library's envelopes are numbered 1, 2, 3 and so on without
+//!   gaps, the number in [`api::Appended`] is the one the envelope is read back at, and the head a
+//!   server reports or checks against is its log's. A client can see a page whose numbers skip,
+//!   repeat or go back; it cannot see a log rolled back, or a number answered for an envelope that
+//!   is not read back there.
+//! - the device list: which keys' envelopes and requests a library accepts, as the limits below
+//!   say.
+//! - deleting files only by the rules in [`api`]. A file deleted early is unavailable, not altered.
+//!
+//! This version detects none of these failures. It does not rely on a server storing an identical
+//! envelope only once, since a copy is applied idempotently, nor on notifications arriving, since
+//! they are hints, nor on anything a server reports about a library (`last_seen`, its status) for
+//! the library's content.
 //!
 //! # Limits of version 1
 //!

@@ -121,8 +121,9 @@ application's own transaction, it relies on that transaction having been begun w
 What replicas must converge to is stated twice, once to run and once to prove; see
 [Verification](#verification).
 
-Devices exchange changes through a server that stores encrypted batches and learns nothing about
-their content: it sees a library id, a device id, a key epoch, a size and an arrival time.
+Devices exchange changes through a server that stores encrypted batches and cannot read them: of
+each it sees a library id, a device id, a key epoch, its exact size and an arrival time, and, once
+files travel, the stored names of the files the batch claims, though not what the files are.
 `fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
 by depending on it.
 
