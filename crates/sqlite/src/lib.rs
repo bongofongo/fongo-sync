@@ -82,5 +82,5 @@ pub use fongo_sync_core as core;
 pub use registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 pub use replica::{
     Applied, COLLECT_ROWS, Collected, Conflict, Held, Inspection, Made, Outbox, Replica, Resume,
-    Touched, installed,
+    SharedNode, Touched, installed,
 };

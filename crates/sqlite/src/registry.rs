@@ -144,7 +144,10 @@ impl Collection {
     /// Declares fields that only make sense together, such as a status and the dates that go
     /// with it. A write to any of them records all of them at one clock, and the newest such
     /// write wins as a whole, so merging never yields a combination no replica wrote; a field of
-    /// it whose part of that write has not arrived yet reads NULL. The fields must be plain
+    /// it whose part of that write has not arrived yet reads NULL. The exception is two writes
+    /// at one clock, which two databases writing as one node make (see
+    /// [`crate::SharedNode`]): each field then takes the greater of its two values, which can
+    /// mix the writes. The fields must be plain
     /// fields merged by clock, not references nor part of the key. When a field joins a set
     /// that already holds writes, each replica whose rows hold a value for the set records the
     /// whole set again on install, and the newest of those wins.

@@ -7,7 +7,10 @@
 //! `EXHAUSTIVE_STEPS` sets the script length (default 3) and `EXHAUSTIVE_REPLICAS` the number of
 //! replicas (default 2). `EXHAUSTIVE_SEEDS` runs each script under that many worlds, which order
 //! node ids differently (default 1). Each script and world collects whole or in bounded steps of
-//! one or two rows, by turns, and the model is checked after every step.
+//! one or two rows, by turns, and the model is checked after every step. Each script runs with
+//! every database alone with its node, where no apply may report a shared one; each in which
+//! replica 1 writes runs again, collecting whole, with replicas 0 and 1 copies of one database,
+//! whose writes share clocks.
 
 mod support;
 
@@ -239,7 +242,9 @@ impl Peer {
         support::midway(&mut self.conn, &self.replica, &self.taken).await
     }
 
-    async fn take(&mut self, batches: &[Vec<Change>], n: usize) -> Result<(), String> {
+    /// Takes batch `n`. With `alone`, no two databases share a node, so the apply must report
+    /// none.
+    async fn take(&mut self, batches: &[Vec<Change>], n: usize, alone: bool) -> Result<(), String> {
         self.has.resize(batches.len(), false);
         self.has[n] = true;
         self.taken.extend(batches[n].iter().cloned());
@@ -253,17 +258,48 @@ impl Peer {
             .unwrap();
         self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;
+        if alone && !applied.shared.is_empty() {
+            return Err(format!("an apply reports {:?}", applied.shared));
+        }
         support::midway(&mut self.conn, &self.replica, &self.taken).await
     }
 }
 
-async fn run(seed: u64, replicas: usize, script: &[Op], step: Option<usize>) -> Result<(), String> {
+/// Runs `script`. With `copied`, replica 0 first makes a shelf and sends it, and replica 1's
+/// database is then a copy of replica 0's, which issues the clocks replica 0 issues: with the
+/// clock held still from there on, the two give their writes the same clocks.
+async fn run(
+    seed: u64,
+    replicas: usize,
+    script: &[Op],
+    step: Option<usize>,
+    copied: bool,
+) -> Result<(), String> {
     let world = World::new(seed);
     let mut peers = Vec::new();
     for n in 0..replicas {
         peers.push(Peer::new(&world, n as u64, step).await);
     }
     let mut batches: Vec<Vec<Change>> = Vec::new();
+    if copied {
+        for sql in Write::MakeShelf.sql(0) {
+            let _ = sqlx::query(&sql).execute(&mut peers[0].conn).await;
+        }
+        peers[0].send(&mut batches).await?;
+        peers[0].has = vec![true];
+        world.hold(true);
+        let conn = world.copy(&mut peers[0].conn, replicas as u64).await;
+        let copy = Peer {
+            conn,
+            replica: peers[0].replica.clone(),
+            step,
+            taken: peers[0].taken.clone(),
+            has: vec![true],
+            writes: peers[0].writes.clone(),
+        };
+        peers[1] = copy;
+    }
+    let first = batches.len();
     for (step, op) in script.iter().enumerate() {
         let done = match *op {
             Op::Write(r, w) => {
@@ -272,7 +308,7 @@ async fn run(seed: u64, replicas: usize, script: &[Op], step: Option<usize>) -> 
                 }
                 peers[r].send(&mut batches).await
             }
-            Op::Take(r, n) => peers[r].take(&batches, n).await,
+            Op::Take(r, n) => peers[r].take(&batches, first + n, !copied).await,
         };
         done.map_err(|e| format!("after step {step}, {op:?}: {e}"))?;
     }
@@ -293,7 +329,7 @@ async fn run(seed: u64, replicas: usize, script: &[Op], step: Option<usize>) -> 
             };
             for n in order {
                 if !peer.has[n] {
-                    peer.take(&batches, n).await.map_err(|e| {
+                    peer.take(&batches, n, !copied).await.map_err(|e| {
                         format!("finishing, round {round}, replica {r} taking {n}: {e}")
                     })?;
                 }
@@ -325,10 +361,26 @@ fn setting(name: &str, default: usize) -> usize {
 
 #[test]
 fn every_short_script_agrees_with_the_model_at_every_step() {
+    every_short_script(false);
+}
+
+/// The scripts in which replica 1 writes, where replicas 0 and 1 are copies of one database, so
+/// that their writes share clocks and differ in value.
+#[test]
+fn every_short_script_over_a_copied_database_agrees_with_the_model_at_every_step() {
+    every_short_script(true);
+}
+
+fn every_short_script(copied: bool) {
     let replicas = setting("EXHAUSTIVE_REPLICAS", 2);
     let steps = setting("EXHAUSTIVE_STEPS", 3);
     let seeds = setting("EXHAUSTIVE_SEEDS", 1) as u64;
-    let all = Arc::new(scripts(replicas, steps));
+    let mut all = scripts(replicas, steps);
+    if copied {
+        // Only a write of replica 1's can share a clock with one of replica 0's.
+        all.retain(|s| s.iter().any(|op| matches!(op, Op::Write(1, _))));
+    }
+    let all = Arc::new(all);
     let next = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(Mutex::new(Vec::new()));
     let started = std::time::Instant::now();
@@ -344,8 +396,12 @@ fn every_short_script_agrees_with_the_model_at_every_step() {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(script) = all.get(i) else { break };
                     for seed in 0..seeds {
-                        let step = [None, Some(1), Some(2)][(i + seed as usize) % 3];
-                        if let Err(e) = runtime.block_on(run(seed, replicas, script, step)) {
+                        let step = match copied {
+                            false => [None, Some(1), Some(2)][(i + seed as usize) % 3],
+                            true => None,
+                        };
+                        let ran = runtime.block_on(run(seed, replicas, script, step, copied));
+                        if let Err(e) = ran {
                             failures.lock().unwrap().push((
                                 script.clone(),
                                 seed,

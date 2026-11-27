@@ -60,6 +60,31 @@ guarantees the maker or the latest writer ever acts: it may be gone, may no long
 collection, or may have uninstalled and installed again under a new id, so an application that
 waits for it needs its own way on.
 
+Every merge is a function of the set of changes seen, with no condition on clocks. A field merged
+by clock takes the change with the later clock and, of two at exactly one clock, the greater
+value; a field merged by greatest value takes the greater value and, of two equal ones, the later
+clock. Values have one total order: NULL, then numbers, then text, blobs and references, each by
+bytes. Numbers compare exactly as numbers, an integer just below a real of equal value, and two
+values are equal only when identical, so the integer 1 and the real 1.0 stay different values.
+
+Honest clocks never repeat. Two databases that write as one node do repeat them: a copied
+database file, or a backup restored over a database that went on without it. Each still converges
+with every other, but the kernel cannot tell their writes apart: both answer `Replica::made` and
+`Replica::written_here` for the other's entities, conflicts between their edits are not reported,
+and two writes at one clock to fields that change together can show a mix, each field taking the
+greater value. `Replica::apply` reports what it finds of this as `Applied::shared`, a list of
+`SharedNode`, which `fongo-sync-client` passes on in its sync report: a change carrying this
+database's own node that this database did not make, or two values written to one field at one
+clock by any node. The report is sound but not complete, it is not stored, and nothing is held
+back or refused for it.
+
+Builds before this rule kept whichever of two changes to one field at one clock arrived first,
+and compared an integer beyond 2^53 with a real near it by converting the integer to a real. On
+such changes an older build can show other values than this one, and nothing stops the two from
+syncing. A database that settled such a tie under the older rule keeps that answer after it
+upgrades, until it is given again the change it then discarded, as reading the log from its start
+again would.
+
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
 the application asks. Suspending in the middle of a first install in steps adopts the rest of what
@@ -168,7 +193,7 @@ What is tested against what (`crates/core/tests`):
 | `plan.rs` | recorded edits round-trip; `edits` never reports what an adapter wrote; `clashes` equals `model::unmerged_identities`; every step of an ordered plan keeps NOT NULL, unique and foreign-key constraints, and nothing is parked or stuck where no cycle forces it |
 | `scaling.rs` | the work of `affected` and `target` grows with what changed, not with what is stored, checked as a ratio between two sizes |
 | `work.rs` | counted work of `affected`, `target` and `order` stays within a stated bound over random schemas, batches and plans and a set of named hard shapes (needs the `work-counters` feature) |
-| `sim` | several replicas over tables with real constraints, random edits and partial, reordered, per-device, repeated delivery: rows equal `model::view` of what each replica merged after every step and once everything is delivered; no replica sends a value its application did not write, and every write an application made is in the merged state; also every short script over a small alphabet |
+| `sim` | several replicas over tables with real constraints, random edits and partial, reordered, per-device, repeated delivery, and replicas replaced by a copy of another's database or by a backup of their own, which issue clocks already issued: rows equal `model::view` of what each replica merged after every step and once everything is delivered; no replica sends a value its application did not write, and every write an application made is in the merged state, or lost a tie at its clock to a greater value; also every short script over a small alphabet |
 
 `FONGO_SIM_CASES` and `FONGO_EXHAUSTIVE_LENGTH` raise the volume of the last two.
 
@@ -180,12 +205,15 @@ One chain, each link checked against the one above it:
    under both strategies, a replica's state as a fold over the changes it received, alias groups,
    liveness through owners, and the view over several collections. `lean/FongoSync/Laws.lean` states every law in one
    place; the other files prove them. Among them: a replica's registers, groups and view do not
-   depend on the order changes arrive in or on duplicates, given that no two changes to one
-   register share a clock with different values (an example shows that condition is needed); the
+   depend on the order changes arrive in or on duplicates, with no condition on clocks; of two
+   changes to one register at one clock the greater value wins, and a register holds the greatest
+   of what it was given in the order its strategy names; the
    view depends on nothing but registers, the gids seen and the groups; which writes to a natural
    key field count depends only on the set of writes; and every `Clock::tick` is later than every
    reading issued or observed before it, for a clock that ignores observed readings in or past
    the last millisecond `Hlc::encode` holds and has not yet issued the last reading it holds.
+   The Lean values have no reals: that an integer and a real compare exactly is checked in Rust,
+   against a comparison of the two by integer arithmetic.
    `make lean` builds the proofs and fails if any law rests on an unproven step; `make check`
    includes it.
 2. **The reference model, in Rust.** `fongo_sync_core::model::view` states the same semantics in
@@ -209,7 +237,10 @@ One chain, each link checked against the one above it:
    every script up to a small length in `tests/exhaustive.rs`, both repeatable from a seed;
    `make deep` runs them longer; both, and `tests/differential.rs`, also collect in bounded
    steps of sizes each case picks, checking the model after every step, some on a clock that moves
-   only now and then, so that many writes share a millisecond. `tests/steps.rs` requires
+   only now and then, so that many writes share a millisecond, and with databases copied or
+   restored from a backup, whose writes share clocks; where no database is copied, no apply may
+   report a shared node. `tests/copies.rs` holds directed cases of those, and of what an apply
+   reports and must not report. `tests/steps.rs` requires
    collecting in steps to send, hold and show what one collect does, and `tests/placings.rs`
    what collects placed between the same writes do. `tests/departures.rs`
    holds the ways an earlier adapter was seen to depart from the model; `tests/crash.rs` stops an

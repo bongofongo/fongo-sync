@@ -273,7 +273,9 @@ pub struct SyncReport {
     /// sync still returns its report. `touched` lists keys in the order the sync
     /// first touched them, each key's entries together. Within a key it holds one entry per
     /// entity, that entity's last, in the order those entries came: the entities that left the
-    /// key come before the one it was left holding.
+    /// key come before the one it was left holding. `shared` lists each node some apply found
+    /// two databases writing as, such as a database restored from a backup and the one that
+    /// went on without it.
     pub applied: Applied,
     /// The first refusals, at most 100.
     pub refused: Vec<Refused>,
@@ -355,7 +357,9 @@ pub struct SyncReport {
 ///
 /// Envelopes this device signed are applied like any other: applying a change already held is a
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
-/// may not hold them. An append the server places right after the cursor moves the cursor past
+/// may not hold them. Such a database writes as the same node as the one it was copied from, and
+/// what an apply finds of that is reported in [`SyncReport::applied`] as
+/// [`fongo_sync_sqlite::SharedNode`]s; nothing is refused for it. An append the server places right after the cursor moves the cursor past
 /// it, so a device does not usually read back what it sent.
 ///
 /// # Other writers
@@ -1599,11 +1603,19 @@ fn varint_len(mut n: usize) -> usize {
 /// - `touched` lists keys in the order they were first touched, each key's entries together.
 ///   Within a key it holds one entry per entity, that entity's last, in the order those entries
 ///   came, so the entities that left a key come before the one it was left holding.
+/// - `shared` holds each node either reports, once, by node, with the earlier clock.
 pub fn merge_applied(into: &mut Applied, from: Applied) {
     into.accepted += from.accepted;
     into.waiting = from.waiting;
     into.held = from.held;
     merge_conflicts(&mut into.conflicts, from.conflicts);
+    for shared in from.shared {
+        match into.shared.iter_mut().find(|s| s.node == shared.node) {
+            Some(s) => s.clock = s.clock.min(shared.clock),
+            None => into.shared.push(shared),
+        }
+    }
+    into.shared.sort_by_key(|s| s.node);
     let mut keys: Vec<(String, String)> = Vec::new();
     let mut at: HashMap<(String, String), Vec<Touched>> = HashMap::new();
     for touched in std::mem::take(&mut into.touched)

@@ -49,12 +49,13 @@
 //! member of a merged group can show an older member's file again without any change naming it),
 //! which is why it is not the definition.
 //!
+//! A winner is a function of the set of changes and is one of its values, the same on every
+//! replica, with no condition on clocks: of two changes to one field at one clock, which a
+//! database restored from a backup or a copy of a database can write, the greater value wins on
+//! every replica. So a replica never keeps a value that the retiring device's winner replaced.
+//!
 //! The guarantee below holds under these conditions:
 //!
-//! - no two changes to one field share a clock with different values, the condition under which
-//!   replicas converge. A winner is then a function of the set of changes and one of its values,
-//!   the same on every replica. Without it a replica can keep a value that the retiring device's
-//!   winner replaced, for instance after a device restored from a backup reuses a clock.
 //! - every device that sends file references sends them through [`BATCHES_CLAIMING_PATH`]. A
 //!   server that stops offering [`Capabilities::blobs`] and offers it again voids every retirement
 //!   it holds when it resumes, since appends meanwhile carried no claims.
@@ -112,6 +113,11 @@
 //! - a retirement of an id that is not complete is ignored, so a blob completed later that nothing
 //!   refers to stays.
 //! - a device that never reports [`Settled`] holds back every deletion until it is removed.
+//! - two databases that act as one device, such as a copy of a database or a backup restored
+//!   while the database it was taken from went on, are one device to the server, so the
+//!   [`Settled`] one reports can stand for unsent changes the other holds. Such a change that
+//!   refers to a file and is sent after the file's deletion finds it missing, as in the first
+//!   limit.
 
 mod blobs;
 mod error;

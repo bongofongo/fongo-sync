@@ -197,8 +197,21 @@ async fn a_database_restored_from_a_backup_takes_back_what_the_device_sent_since
     b.sync(&server).await.unwrap();
 
     let mut restored = Peer::open(&backup, a.credentials.clone()).await;
+    let node = restored
+        .replica
+        .inspect(&mut restored.conn)
+        .await
+        .unwrap()
+        .node;
     let report = restored.sync(&server).await.unwrap();
     assert!(report.refused.is_empty(), "{report:#?}");
+    let shared: Vec<_> = report
+        .applied
+        .shared
+        .iter()
+        .map(|s| (Some(s.node), s.here))
+        .collect();
+    assert_eq!(shared, [(node, true)], "{report:#?}");
     assert_eq!(
         restored.settings().await,
         ["early=x", "later=x", "theirs=x"]
@@ -223,8 +236,11 @@ async fn two_databases_sharing_one_set_of_credentials_converge() {
         (0, "INSERT INTO settings VALUES ('three', 'x')"),
     ] {
         peers[who].run(sql).await;
-        peers[who].sync(&server).await.unwrap();
-        peers[(who + 2) % 3].sync(&server).await.unwrap();
+        for at in [who, (who + 2) % 3] {
+            let report = peers[at].sync(&server).await.unwrap();
+            // Each database has a node of its own, whatever credentials it shares.
+            assert!(report.applied.shared.is_empty(), "{report:#?}");
+        }
     }
     settle(&mut peers, &server).await;
     let state = assert_converged(&mut peers).await;
