@@ -625,7 +625,6 @@ impl Transport for EndlessJunk<'_> {
 async fn endless_junk_pages_end_the_call_with_progress_kept_and_more_reported() {
     let server = Server::new();
     let [mut a, _] = pair(&server).await;
-    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
     let junk = EndlessJunk { server: &server };
     let mut cursor = 0;
     for _ in 0..2 {
@@ -644,7 +643,6 @@ async fn endless_junk_pages_end_the_call_with_progress_kept_and_more_reported() 
         assert_eq!(a.cursor().await, cursor + report.refused_total as u64);
         cursor = a.cursor().await;
     }
-    assert_eq!(server.log(a.credentials.library_id()).len(), 1);
 }
 
 #[tokio::test]

@@ -68,6 +68,18 @@ pub enum Error {
     /// written by a later build. Nothing was read from the server or written.
     #[error("the sync client's tables are of layout {found}; this build knows layout {known}")]
     NewerClientTables { found: i64, known: i64 },
+    /// The server's log is not the one this device read or wrote. This sync stored the fault, or
+    /// found it stored, and applied, sent and acknowledged nothing past it; every sync fails so
+    /// until the application resolves it. See [`crate::LogFault`].
+    #[error("the server's log was rolled back, rewritten or lost an envelope: {0:?}")]
+    LogFault(crate::LogFault),
+    /// A fault was resolved, on another connection, while this sync ran: it wrote nothing after
+    /// that. Sync again.
+    #[error("a fault was resolved while this sync ran; sync again")]
+    ResolvedMeanwhile,
+    /// [`crate::resend_all`] was called with no fault stored. Nothing changed.
+    #[error("no fault in the server's log is stored to resolve")]
+    NoLogFault,
     /// [`crate::step_past`] was asked to step past an envelope the pull is not stopped at, or
     /// with other bytes than it stopped at. Nothing changed.
     #[error("the pull is not stopped at envelope {seq} with those bytes")]

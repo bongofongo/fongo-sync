@@ -1,21 +1,26 @@
 //! What the client keeps in the database, one row per library: its position in the server's log,
-//! the envelope it is about to append and the head it knew then, the envelope its pull last
-//! stopped at and one the application chose to step past; and where each envelope it appended
-//! landed, with a digest of it, until it reads the log past it. No secret is stored here.
+//! the digest of the envelope there and the log's fingerprint up to some position, the envelope it
+//! is about to append and the head it knew then, the envelope its pull last stopped at and one the
+//! application chose to step past, a fault found in the log and how many times one was resolved;
+//! where each envelope it appended landed, with a digest of it, until it reads the log past it;
+//! and where its latest appends that it has read past landed. No secret is stored here.
 //!
-//! The tables are of layout 2, recorded in `fongo_client_meta`. Layout 1 kept no record of its
-//! layout; it is upgraded in place. A sync of a layout-1 build on these tables asks the server for
-//! its capabilities, adds a row with cursor 0 for a library that has none, and then fails reading
-//! the column `through`, which layout 2 renames, before it reads the log or writes anything else.
+//! The tables are of layout 3, recorded in `fongo_client_meta`. Layouts 1 and 2 are upgraded in
+//! place, in one transaction. Layout 1 kept no record of its layout: a sync of a layout-1 build on
+//! these tables asks the server for its capabilities, adds a row with cursor 0 for a library that
+//! has none, and then fails reading the column `through`, which layout 2 renamed, before it reads
+//! the log or writes anything else. A build of layout 2 reads the layout first and refuses these
+//! tables with [`Error::NewerClientTables`].
 
 use fongo_sync_protocol::LibraryId;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::error::Error;
+use crate::fault::LogFault;
 
 /// The layout of the client's tables this build reads and writes.
-pub(crate) const LAYOUT: i64 = 2;
+pub(crate) const LAYOUT: i64 = 3;
 
 const META: &str = "CREATE TABLE IF NOT EXISTS fongo_client_meta (layout INTEGER NOT NULL)";
 
@@ -28,7 +33,15 @@ const STATE: &str = "CREATE TABLE IF NOT EXISTS fongo_client_state (
     stopped_seq INTEGER,
     stopped_digest BLOB,
     passing_seq INTEGER,
-    passing_digest BLOB)";
+    passing_digest BLOB,
+    anchor BLOB,
+    chain_seq INTEGER NOT NULL DEFAULT 0,
+    chain BLOB,
+    fault_kind INTEGER,
+    fault_seq INTEGER,
+    fault_other INTEGER,
+    resets INTEGER NOT NULL DEFAULT 0,
+    tracked_from INTEGER NOT NULL DEFAULT 0)";
 
 const APPENDED: &str = "CREATE TABLE IF NOT EXISTS fongo_client_appended (
     library BLOB NOT NULL,
@@ -37,14 +50,36 @@ const APPENDED: &str = "CREATE TABLE IF NOT EXISTS fongo_client_appended (
     digest BLOB,
     PRIMARY KEY (library, seq))";
 
+const PASSED: &str = "CREATE TABLE IF NOT EXISTS fongo_client_passed (
+    library BLOB NOT NULL,
+    seq INTEGER NOT NULL,
+    digest BLOB,
+    PRIMARY KEY (library, seq))";
+
 /// What layout 2 adds to layout 1's `fongo_client_state`, after renaming two of its columns.
-const ADDED_TO_STATE: [&str; 5] = [
-    "sending_after INTEGER",
-    "stopped_seq INTEGER",
-    "stopped_digest BLOB",
-    "passing_seq INTEGER",
-    "passing_digest BLOB",
+const ADDED_IN_TWO: [(&str, &str); 5] = [
+    ("sending_after", "INTEGER"),
+    ("stopped_seq", "INTEGER"),
+    ("stopped_digest", "BLOB"),
+    ("passing_seq", "INTEGER"),
+    ("passing_digest", "BLOB"),
 ];
+
+/// What layout 3 adds to layout 2's `fongo_client_state`.
+const ADDED_IN_THREE: [(&str, &str); 8] = [
+    ("anchor", "BLOB"),
+    ("chain_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("chain", "BLOB"),
+    ("fault_kind", "INTEGER"),
+    ("fault_seq", "INTEGER"),
+    ("fault_other", "INTEGER"),
+    ("resets", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracked_from", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// How many of this database's appends it keeps a record of once read past, so that an append
+/// answered with the place of an earlier copy of the same envelope is told from reuse.
+const PASSED_KEPT: i64 = 1_024;
 
 /// A SHA-256 of an envelope's bytes.
 pub(crate) type Digest32 = [u8; 32];
@@ -53,8 +88,36 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest32 {
     Sha256::digest(bytes).into()
 }
 
+const CHAIN_DOMAIN: &[u8] = b"fongo-sync/v1/log-chain\0";
+
+/// The fingerprint of an empty log: SHA-256 of the domain, a zero byte and the library id.
+pub(crate) fn chain_start(library: LibraryId) -> Digest32 {
+    let mut hash = Sha256::new();
+    hash.update(CHAIN_DOMAIN);
+    hash.update([0]);
+    hash.update(library.0);
+    hash.finalize().into()
+}
+
+/// The fingerprint through `seq`, from the one through `seq - 1` and the digest of the envelope
+/// at `seq`: SHA-256 of the domain, a one byte, the previous fingerprint, `seq` as eight
+/// big-endian bytes and the digest.
+pub(crate) fn chain_step(previous: Digest32, seq: u64, envelope: Digest32) -> Digest32 {
+    let mut hash = Sha256::new();
+    hash.update(CHAIN_DOMAIN);
+    hash.update([1]);
+    hash.update(previous);
+    hash.update(seq.to_be_bytes());
+    hash.update(envelope);
+    hash.finalize().into()
+}
+
 pub(crate) struct State {
     pub(crate) cursor: u64,
+    /// The digest of the envelope at the cursor, when known.
+    pub(crate) anchor: Option<Digest32>,
+    /// The log's fingerprint through a position at or before the cursor.
+    pub(crate) chain: (u64, Digest32),
     pub(crate) sending: Option<Sending>,
     /// Where this database's appends landed in the log, past the cursor, with the digest of each
     /// where it was recorded.
@@ -63,6 +126,9 @@ pub(crate) struct State {
     pub(crate) stopped: Option<(u64, Digest32)>,
     /// An envelope the application chose to step past.
     pub(crate) passing: Option<(u64, Digest32)>,
+    pub(crate) fault: Option<LogFault>,
+    /// How many times a fault was resolved; a sync that loaded another count writes nothing.
+    pub(crate) resets: i64,
 }
 
 /// An envelope recorded before it was appended, with the outbox position it covers and the head
@@ -96,6 +162,7 @@ enum Layout {
     None,
     /// Layout 1's tables, which record no layout.
     One,
+    Two,
     Current,
 }
 
@@ -132,6 +199,7 @@ async fn layout(conn: &mut SqliteConnection) -> Result<Layout, Error> {
         .await?;
     match found[..] {
         [] => Ok(Layout::None),
+        [2] => Ok(Layout::Two),
         [LAYOUT] => Ok(Layout::Current),
         [later] if later > LAYOUT => Err(Error::NewerClientTables {
             found: later,
@@ -146,12 +214,30 @@ pub(crate) async fn check(conn: &mut SqliteConnection) -> Result<(), Error> {
     layout(conn).await.map(|_| ())
 }
 
-/// Makes the client's tables of [`LAYOUT`], upgrading layout 1 in place, in one transaction.
+/// Adds each of `columns` that `table` lacks.
+async fn add_columns(
+    conn: &mut SqliteConnection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), Error> {
+    for (name, kind) in columns {
+        if !has_column(conn, table, name).await? {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {name} {kind}"))
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes the client's tables of [`LAYOUT`], upgrading layouts 1 and 2 in place, in one
+/// transaction.
 async fn prepare(conn: &mut SqliteConnection) -> Result<(), Error> {
     let mut tx = conn.begin().await?;
     // Written first, so the transaction holds the write lock before it looks.
     sqlx::query(META).execute(&mut *tx).await?;
-    if let Layout::None | Layout::One = layout(&mut tx).await? {
+    let found = layout(&mut tx).await?;
+    if let Layout::None | Layout::One = found {
         if has_column(&mut tx, "fongo_client_state", "through").await? {
             for sql in [
                 "ALTER TABLE fongo_client_state RENAME COLUMN through TO sending_through",
@@ -159,15 +245,8 @@ async fn prepare(conn: &mut SqliteConnection) -> Result<(), Error> {
             ] {
                 sqlx::query(sql).execute(&mut *tx).await?;
             }
-            for column in ADDED_TO_STATE {
-                sqlx::query(&format!(
-                    "ALTER TABLE fongo_client_state ADD COLUMN {column}"
-                ))
-                .execute(&mut *tx)
-                .await?;
-            }
+            add_columns(&mut tx, "fongo_client_state", &ADDED_IN_TWO).await?;
         }
-        sqlx::query(STATE).execute(&mut *tx).await?;
         if exists(&mut tx, "fongo_client_appended").await?
             && !has_column(&mut tx, "fongo_client_appended", "digest").await?
         {
@@ -175,7 +254,21 @@ async fn prepare(conn: &mut SqliteConnection) -> Result<(), Error> {
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query(APPENDED).execute(&mut *tx).await?;
+    }
+    if !matches!(found, Layout::Current) {
+        if exists(&mut tx, "fongo_client_state").await? {
+            add_columns(&mut tx, "fongo_client_state", &ADDED_IN_THREE).await?;
+            // Appends read past before now left no record, so none is known up to the cursor.
+            sqlx::query("UPDATE fongo_client_state SET tracked_from = cursor")
+                .execute(&mut *tx)
+                .await?;
+        }
+        for sql in [STATE, APPENDED, PASSED] {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM fongo_client_meta")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("INSERT INTO fongo_client_meta (layout) VALUES (?)")
             .bind(LAYOUT)
             .execute(&mut *tx)
@@ -183,6 +276,54 @@ async fn prepare(conn: &mut SqliteConnection) -> Result<(), Error> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// The stored fingerprint and its position; none stored at position 0 is the empty log's.
+fn chain_of(
+    library: LibraryId,
+    seq: i64,
+    chain: Option<Vec<u8>>,
+) -> Result<(u64, Digest32), Error> {
+    let seq = seq_of(seq)?;
+    match digest_of(chain)? {
+        Some(chain) => Ok((seq, chain)),
+        None if seq == 0 => Ok((0, chain_start(library))),
+        None => Err(corrupt("a fingerprint's position is stored without it")),
+    }
+}
+
+/// A stored fault, from its columns.
+fn fault_of(
+    kind: Option<i64>,
+    seq: Option<i64>,
+    other: Option<i64>,
+) -> Result<Option<LogFault>, Error> {
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let seq = seq_of(seq.ok_or_else(|| corrupt("a stored fault has no position"))?)?;
+    let other = other.map(seq_of).transpose()?;
+    Ok(Some(match (kind, other) {
+        (1, None) => LogFault::Behind { cursor: seq },
+        (2, None) => LogFault::Rewritten { seq },
+        (3, None) => LogFault::Diverged { seq },
+        (4, Some(read)) => LogFault::Reused { seq, read },
+        (5, None) => LogFault::AppendReplaced { seq },
+        (6, None) => LogFault::AppendMissing { seq },
+        _ => return Err(corrupt("a stored fault is of no kind this build knows")),
+    }))
+}
+
+/// A fault's columns: its kind, position and second number.
+fn fault_columns(fault: LogFault) -> (i64, u64, Option<u64>) {
+    match fault {
+        LogFault::Behind { cursor } => (1, cursor, None),
+        LogFault::Rewritten { seq } => (2, seq, None),
+        LogFault::Diverged { seq } => (3, seq, None),
+        LogFault::Reused { seq, read } => (4, seq, Some(read)),
+        LogFault::AppendReplaced { seq } => (5, seq, None),
+        LogFault::AppendMissing { seq } => (6, seq, None),
+    }
 }
 
 pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Result<State, Error> {
@@ -195,7 +336,8 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
         .await?;
     let row = sqlx::query(
         "SELECT cursor, sending_through, sending_envelope, sending_after, stopped_seq,
-                stopped_digest, passing_seq, passing_digest
+                stopped_digest, passing_seq, passing_digest, anchor, chain_seq, chain,
+                fault_kind, fault_seq, fault_other, resets
          FROM fongo_client_state WHERE library = ?",
     )
     .bind(&library.0[..])
@@ -213,6 +355,10 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
     };
     let stopped = mark(row.try_get(4)?, row.try_get(5)?)?;
     let passing = mark(row.try_get(6)?, row.try_get(7)?)?;
+    let anchor = digest_of(row.try_get(8)?)?;
+    let chain = chain_of(library, row.try_get(9)?, row.try_get(10)?)?;
+    let fault = fault_of(row.try_get(11)?, row.try_get(12)?, row.try_get(13)?)?;
+    let resets: i64 = row.try_get(14)?;
     let appended: Vec<(i64, Option<Vec<u8>>)> =
         sqlx::query_as("SELECT seq, digest FROM fongo_client_appended WHERE library = ?")
             .bind(&library.0[..])
@@ -220,6 +366,10 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
             .await?;
     Ok(State {
         cursor: u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))?,
+        anchor,
+        chain,
+        fault,
+        resets,
         sending: match (through, envelope) {
             (Some(through), Some(envelope)) => Some(Sending {
                 through,
@@ -237,18 +387,185 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
     })
 }
 
-/// Moves the cursor forward to `seq`; never back.
+/// Moves the cursor forward to `seq`, with the digest of the envelope there and, when known, the
+/// fingerprint through it, all in one statement; never back. Where another sync already stored
+/// `seq`, fails with [`LogFault::Diverged`] if it found another envelope there or another
+/// fingerprint, and otherwise fills in what it lacks.
 pub(crate) async fn advance(
     conn: &mut SqliteConnection,
     library: LibraryId,
     seq: u64,
+    anchor: Option<Digest32>,
+    chain: Option<Digest32>,
 ) -> Result<(), Error> {
-    sqlx::query("UPDATE fongo_client_state SET cursor = max(cursor, ?) WHERE library = ?")
-        .bind(as_i64(seq)?)
-        .bind(&library.0[..])
-        .execute(&mut *conn)
-        .await?;
+    let at = as_i64(seq)?;
+    let moved = sqlx::query(
+        "UPDATE fongo_client_state SET cursor = ?1, anchor = ?2,
+            chain_seq = CASE WHEN ?3 IS NULL THEN chain_seq ELSE ?1 END,
+            chain = CASE WHEN ?3 IS NULL THEN chain ELSE ?3 END
+         WHERE library = ?4 AND cursor < ?1",
+    )
+    .bind(at)
+    .bind(anchor.map(|a| a.to_vec()))
+    .bind(chain.map(|c| c.to_vec()))
+    .bind(&library.0[..])
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if moved == 1 {
+        return Ok(());
+    }
+    let row = sqlx::query(
+        "SELECT cursor, anchor, chain_seq, chain FROM fongo_client_state WHERE library = ?",
+    )
+    .bind(&library.0[..])
+    .fetch_one(&mut *conn)
+    .await?;
+    if row.try_get::<i64, _>(0)? != at {
+        return Ok(());
+    }
+    let stored_anchor = digest_of(row.try_get(1)?)?;
+    let (chain_seq, stored_chain) = chain_of(library, row.try_get(2)?, row.try_get(3)?)?;
+    let differs = |stored: Option<Digest32>, mine: Option<Digest32>| {
+        stored.zip(mine).is_some_and(|(s, m)| s != m)
+    };
+    if differs(stored_anchor, anchor) || (chain_seq == seq && differs(Some(stored_chain), chain)) {
+        return Err(Error::LogFault(LogFault::Diverged { seq }));
+    }
+    sqlx::query(
+        "UPDATE fongo_client_state SET anchor = coalesce(anchor, ?1),
+            chain = CASE WHEN ?2 IS NOT NULL AND chain_seq < ?3 THEN ?2 ELSE chain END,
+            chain_seq = CASE WHEN ?2 IS NOT NULL AND chain_seq < ?3 THEN ?3 ELSE chain_seq END
+         WHERE library = ?4 AND cursor = ?3",
+    )
+    .bind(anchor.map(|a| a.to_vec()))
+    .bind(chain.map(|c| c.to_vec()))
+    .bind(at)
+    .bind(&library.0[..])
+    .execute(&mut *conn)
+    .await?;
     Ok(())
+}
+
+/// Stores the fingerprint through `at`, hashed on from the one stored through `from`, unless
+/// another sync stored a fingerprint meanwhile; with `anchor`, the digest of the envelope at
+/// `at`, where `at` is the cursor and none is stored.
+pub(crate) async fn record_chain(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    from: u64,
+    at: u64,
+    chain: Digest32,
+    anchor: Option<Digest32>,
+) -> Result<(), Error> {
+    sqlx::query(
+        "UPDATE fongo_client_state SET chain_seq = ?1, chain = ?2,
+            anchor = CASE WHEN cursor = ?1 THEN coalesce(anchor, ?3) ELSE anchor END
+         WHERE library = ?4 AND chain_seq = ?5 AND cursor >= ?1",
+    )
+    .bind(as_i64(at)?)
+    .bind(&chain[..])
+    .bind(anchor.map(|a| a.to_vec()))
+    .bind(&library.0[..])
+    .bind(as_i64(from)?)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Fails with the stored fault, or with [`Error::ResolvedMeanwhile`] when a fault was resolved
+/// since the sync loaded `resets`.
+pub(crate) async fn check_turn(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    resets: i64,
+) -> Result<(), Error> {
+    let row = sqlx::query(
+        "SELECT fault_kind, fault_seq, fault_other, resets FROM fongo_client_state
+         WHERE library = ?",
+    )
+    .bind(&library.0[..])
+    .fetch_one(&mut *conn)
+    .await?;
+    if let Some(fault) = fault_of(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)? {
+        return Err(Error::LogFault(fault));
+    }
+    if row.try_get::<i64, _>(3)? != resets {
+        return Err(Error::ResolvedMeanwhile);
+    }
+    Ok(())
+}
+
+/// Stores `fault`, found by a sync that loaded `resets`, in a transaction of its own, unless a
+/// fault is stored already or one was resolved since; returns the fault stored.
+pub(crate) async fn record_fault(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    resets: i64,
+    fault: LogFault,
+) -> Result<LogFault, Error> {
+    let (kind, seq, other) = fault_columns(fault);
+    let mut tx = conn.begin().await?;
+    sqlx::query(
+        "UPDATE fongo_client_state SET fault_kind = ?1, fault_seq = ?2, fault_other = ?3
+         WHERE library = ?4 AND fault_kind IS NULL AND resets = ?5",
+    )
+    .bind(kind)
+    .bind(as_i64(seq)?)
+    .bind(other.map(as_i64).transpose()?)
+    .bind(&library.0[..])
+    .bind(resets)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT fault_kind, fault_seq, fault_other FROM fongo_client_state WHERE library = ?",
+    )
+    .bind(&library.0[..])
+    .fetch_one(&mut *tx)
+    .await?;
+    let stored = fault_of(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)?;
+    tx.commit().await?;
+    stored.ok_or(Error::ResolvedMeanwhile)
+}
+
+/// Whether an append of the envelope with `digest`, answered with `seq`, reuses a position: `seq`
+/// is at or before the stored cursor or a recorded append of this database, and no record says
+/// this envelope was there. Positions up to where records began cannot be told and pass.
+pub(crate) async fn reused(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    seq: u64,
+    digest: Digest32,
+) -> Result<Option<LogFault>, Error> {
+    let row = sqlx::query(
+        "SELECT max(cursor, coalesce((SELECT max(seq) FROM fongo_client_appended
+                                       WHERE library = ?1), 0)),
+                tracked_from
+         FROM fongo_client_state WHERE library = ?1",
+    )
+    .bind(&library.0[..])
+    .fetch_one(&mut *conn)
+    .await?;
+    let read = seq_of(row.try_get(0)?)?;
+    let tracked_from = seq_of(row.try_get(1)?)?;
+    if seq > read || seq <= tracked_from {
+        return Ok(None);
+    }
+    let at = as_i64(seq)?;
+    let there = sqlx::query(
+        "SELECT 1 FROM fongo_client_appended
+          WHERE library = ?1 AND seq = ?2 AND (digest IS NULL OR digest = ?3)
+         UNION ALL
+         SELECT 1 FROM fongo_client_passed
+          WHERE library = ?1 AND seq = ?2 AND (digest IS NULL OR digest = ?3)",
+    )
+    .bind(&library.0[..])
+    .bind(at)
+    .bind(&digest[..])
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some();
+    Ok((!there).then_some(LogFault::Reused { seq, read }))
 }
 
 /// Records that an envelope with `digest`, covering the outbox through `through`, landed at `seq`.
@@ -313,11 +630,41 @@ pub(crate) async fn read_past(
     .fetch_one(&mut *conn)
     .await?;
     if through.is_some() {
-        sqlx::query("DELETE FROM fongo_client_appended WHERE library = ? AND seq <= ?")
+        for sql in [
+            "INSERT OR REPLACE INTO fongo_client_passed (library, seq, digest)
+             SELECT library, seq, digest FROM fongo_client_appended
+              WHERE library = ?1 AND seq <= ?2",
+            "DELETE FROM fongo_client_appended WHERE library = ?1 AND seq <= ?2",
+        ] {
+            sqlx::query(sql)
+                .bind(&library.0[..])
+                .bind(read)
+                .execute(&mut *conn)
+                .await?;
+        }
+        let oldest_kept: Option<i64> = sqlx::query_scalar(
+            "SELECT seq FROM fongo_client_passed WHERE library = ?
+             ORDER BY seq DESC LIMIT 1 OFFSET ?",
+        )
+        .bind(&library.0[..])
+        .bind(PASSED_KEPT)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(forgotten) = oldest_kept {
+            sqlx::query(
+                "UPDATE fongo_client_state SET tracked_from = max(tracked_from, ?2)
+                 WHERE library = ?1",
+            )
             .bind(&library.0[..])
-            .bind(read)
+            .bind(forgotten)
             .execute(&mut *conn)
             .await?;
+            sqlx::query("DELETE FROM fongo_client_passed WHERE library = ? AND seq <= ?")
+                .bind(&library.0[..])
+                .bind(forgotten)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     Ok(through)
 }
@@ -397,6 +744,18 @@ pub(crate) async fn stored_cursor(
         .fetch_one(&mut *conn)
         .await?;
     u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))
+}
+
+/// The stored fingerprint and its position.
+pub(crate) async fn stored_chain(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<(u64, Digest32), Error> {
+    let row = sqlx::query("SELECT chain_seq, chain FROM fongo_client_state WHERE library = ?")
+        .bind(&library.0[..])
+        .fetch_one(&mut *conn)
+        .await?;
+    chain_of(library, row.try_get(0)?, row.try_get(1)?)
 }
 
 /// Records `sending` as being sent, unless an envelope already is.
@@ -537,6 +896,95 @@ pub async fn cursor(conn: &mut SqliteConnection, library: LibraryId) -> Result<u
     let cursor = read_cursor(&mut tx, library).await;
     tx.rollback().await?;
     u64::try_from(cursor?.unwrap_or(0)).map_err(|_| corrupt("the cursor is negative"))
+}
+
+/// The stored fault, read in one transaction; `None` with no client tables.
+pub(crate) async fn read_fault(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<Option<LogFault>, Error> {
+    let mut tx = conn.begin().await?;
+    let read = async {
+        if !matches!(layout(&mut tx).await?, Layout::Current) {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT fault_kind, fault_seq, fault_other FROM fongo_client_state WHERE library = ?",
+        )
+        .bind(&library.0[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+        match row {
+            Some(row) => fault_of(row.try_get(0)?, row.try_get(1)?, row.try_get(2)?),
+            None => Ok(None),
+        }
+    }
+    .await;
+    tx.rollback().await?;
+    read
+}
+
+/// The stored fingerprint and its position, read in one transaction; the empty log's with no
+/// client tables, and position 0 on tables of an earlier layout, which kept none.
+pub(crate) async fn read_chain(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<(u64, Digest32), Error> {
+    let mut tx = conn.begin().await?;
+    let read = async {
+        if !matches!(layout(&mut tx).await?, Layout::Current) {
+            return Ok((0, chain_start(library)));
+        }
+        let row = sqlx::query("SELECT chain_seq, chain FROM fongo_client_state WHERE library = ?")
+            .bind(&library.0[..])
+            .fetch_optional(&mut *tx)
+            .await?;
+        match row {
+            Some(row) => chain_of(library, row.try_get(0)?, row.try_get(1)?),
+            None => Ok((0, chain_start(library))),
+        }
+    }
+    .await;
+    tx.rollback().await?;
+    read
+}
+
+/// [`crate::resend_all`] once the connection is checked.
+pub(crate) async fn resend_all(
+    conn: &mut SqliteConnection,
+    replica: &fongo_sync_sqlite::Replica,
+    library: LibraryId,
+) -> Result<usize, Error> {
+    if !matches!(layout(conn).await?, Layout::Current) {
+        return Err(Error::NoLogFault);
+    }
+    let mut tx = conn.begin().await?;
+    let reset = sqlx::query(
+        "UPDATE fongo_client_state SET
+            cursor = 0, anchor = NULL, chain_seq = 0, chain = NULL,
+            sending_through = NULL, sending_envelope = NULL, sending_after = NULL,
+            stopped_seq = NULL, stopped_digest = NULL,
+            fault_kind = NULL, fault_seq = NULL, fault_other = NULL,
+            resets = resets + 1, tracked_from = 0
+         WHERE library = ? AND fault_kind IS NOT NULL",
+    )
+    .bind(&library.0[..])
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if reset != 1 {
+        tx.rollback().await?;
+        return Err(Error::NoLogFault);
+    }
+    for table in ["fongo_client_appended", "fongo_client_passed"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE library = ?"))
+            .bind(&library.0[..])
+            .execute(&mut *tx)
+            .await?;
+    }
+    let sent = replica.resend(&mut tx).await?;
+    tx.commit().await?;
+    Ok(sent)
 }
 
 async fn read_cursor(

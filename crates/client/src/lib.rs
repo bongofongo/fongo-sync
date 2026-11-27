@@ -15,10 +15,30 @@
 //! Secrets live in [`Credentials`], which the application keeps wherever it keeps secrets and
 //! passes in on each call. This crate never writes them to disk or to the database, and never
 //! logs them. What it does keep in the database, in its own `fongo_client_state`,
-//! `fongo_client_appended` and `fongo_client_meta` tables, is the position in the server's log, an
+//! `fongo_client_appended`, `fongo_client_passed` and `fongo_client_meta` tables, is the position
+//! in the server's log with the digest of the envelope there and the log's [`Fingerprint`], an
 //! envelope waiting to be sent, which is already encrypted, where the envelopes it appended landed
-//! in the log, where its pull stopped at an envelope it cannot read, and the layout of those
-//! tables. A build refuses tables of a later layout with [`Error::NewerClientTables`].
+//! in the log and digests of them, where its pull stopped at an envelope it cannot read, a
+//! [`LogFault`] found in the log, and the layout of those tables. A build refuses tables of a later
+//! layout with [`Error::NewerClientTables`].
+//!
+//! # A log that is not the one read before
+//!
+//! The server's log only grows, and a device keeps what it read of it: so each sync first reads
+//! again the envelope at its cursor and compares it with the digest it kept, checks that each
+//! envelope it appended is where the server placed it, and that the server places a new append
+//! after everything it has read. A server restored from a backup, or one that rewrote or dropped
+//! envelopes, fails one of these, and the sync stops with [`Error::LogFault`] before applying,
+//! sending or settling anything more, as does every sync after it until the application resolves
+//! the fault, with [`resend_all`] or by rebuilding the device. Reading the envelope at the cursor
+//! costs that envelope's bytes in the first page of each sync, and no request more.
+//!
+//! What cannot be detected this way: a rollback to a point after the last envelope this device read
+//! or appended, which leaves it nothing to miss; a server withholding the newest envelopes, which
+//! looks like nothing new; a server keeping separate logs for different devices, where no envelope
+//! crosses between them; and, on a device that never read the lost part, the loss itself, until a
+//! device that read it syncs and finds the fault. Two devices comparing their [`fingerprint`]s at
+//! one position out of band find a split.
 //!
 //! To create or join a library so that a lost response can be retried, make the credentials
 //! first ([`Credentials::for_new_library`], [`Credentials::for_recovery_code`]), store them, then
@@ -45,6 +65,7 @@
 
 mod credentials;
 mod error;
+mod fault;
 mod library;
 mod notify;
 mod rpc;
@@ -56,6 +77,7 @@ pub use credentials::{
     CREDENTIALS_FORMAT, CREDENTIALS_FORMAT_WITHOUT_WRAP, Credentials, CredentialsError,
 };
 pub use error::Error;
+pub use fault::{Fingerprint, LogFault, fault, fingerprint, resend_all};
 pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
 pub use library::{

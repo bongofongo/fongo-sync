@@ -293,6 +293,16 @@ impl Server {
         self.with(|s| s.libraries.get_mut(&library).unwrap().log[seq as usize - 1] = envelope);
     }
 
+    /// Keeps the first `len` envelopes of a library's log and drops the rest, as a server restored
+    /// from a backup would.
+    pub fn roll_back(&self, library: LibraryId, len: usize) {
+        self.with(|s| {
+            let log = &mut s.libraries.get_mut(&library).unwrap().log;
+            assert!(len <= log.len(), "the log is shorter than {len}");
+            log.truncate(len);
+        });
+    }
+
     /// Lists a key as a device without any request.
     pub fn register(&self, library: LibraryId, key: VerifyingKey) {
         self.with(|s| {

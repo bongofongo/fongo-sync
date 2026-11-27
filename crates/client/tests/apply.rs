@@ -141,7 +141,8 @@ fn copy_of(server: &Server) -> Server {
     copy
 }
 
-/// Every row of every table, the kernel's and the client's included.
+/// Every row of every table, the kernel's and the client's included. Digests of envelopes, which
+/// differ with each envelope's random nonce, show only whether they are there.
 async fn everything(conn: &mut SqliteConnection) -> Vec<String> {
     let tables: Vec<String> =
         sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -155,9 +156,15 @@ async fn everything(conn: &mut SqliteConnection) -> Vec<String> {
             .fetch_all(&mut *conn)
             .await
             .unwrap();
+        let digest = |c: &str| {
+            table.starts_with("fongo_client_") && ["anchor", "chain", "digest"].contains(&c)
+        };
         let row = columns
             .iter()
-            .map(|c| format!("quote(\"{c}\")"))
+            .map(|c| match digest(c) {
+                true => format!("iif(\"{c}\" IS NULL, 'NULL', 'digest')"),
+                false => format!("quote(\"{c}\")"),
+            })
             .collect::<Vec<_>>()
             .join(" || ',' || ");
         let mut rows: Vec<String> = sqlx::query_scalar(&format!("SELECT {row} FROM \"{table}\""))
