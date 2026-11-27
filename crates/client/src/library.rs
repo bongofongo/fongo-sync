@@ -21,14 +21,15 @@ use crate::transport::{Method, Transport};
 /// near its clock, so a repeat must come with a current `now`.
 ///
 /// Fails with [`Error::RegisteredOtherwise`] when the server lists the device with another wrap
-/// key or membership proof than these credentials make.
+/// key, or with a membership proof other than the one these credentials make; a listing without
+/// a proof is a success, reported in [`Registered::proof_kept`].
 ///
 /// `now` gives the current unix time in seconds, for request timestamps.
 pub async fn create_library_with<T: Transport>(
     transport: &T,
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
-) -> Result<(), Error> {
+) -> Result<Registered, Error> {
     let rpc = Rpc {
         transport,
         now: &now,
@@ -106,7 +107,8 @@ async fn created_before<T: Transport, N: Fn() -> u64 + Sync>(
 /// The credentials exist only in the returned value, so if the call fails after the server
 /// acted on it, as when the response is lost, the library is left on the server with no device
 /// that can reach it, and a new call makes another. Use [`create_library_with`], storing the
-/// credentials first, where that matters.
+/// credentials first, where that matters. Nor does it report whether the server kept the
+/// membership proof ([`Registered::proof_kept`]).
 pub async fn create_library<T: Transport>(
     transport: &T,
     now: impl Fn() -> u64 + Sync,
@@ -126,12 +128,13 @@ pub async fn create_library<T: Transport>(
 /// the protocol, the repeat brings the device back.
 ///
 /// Fails with [`Error::RegisteredOtherwise`] when the key is already listed with another wrap key
-/// or membership proof than these credentials make; the listing is then left as it was.
+/// or a membership proof other than the one these credentials make; the listing is then left as
+/// it was. A listing without a proof is a success, reported in [`Registered::proof_kept`].
 pub async fn join_library_with<T: Transport>(
     transport: &T,
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
-) -> Result<(), Error> {
+) -> Result<Registered, Error> {
     let rpc = Rpc {
         transport,
         now: &now,
@@ -153,7 +156,8 @@ pub async fn join_library_with<T: Transport>(
 /// The credentials exist only in the returned value, so if the call fails after the server
 /// acted on it, as when the response is lost, the library keeps a device slot whose key nobody
 /// holds, and a new call takes another. Use [`join_library_with`], storing the credentials first,
-/// where that matters.
+/// where that matters. Nor does it report whether the server kept the membership proof
+/// ([`Registered::proof_kept`]).
 pub async fn join_library<T: Transport>(
     transport: &T,
     recovery_code: &str,
@@ -216,12 +220,13 @@ impl DeviceOffer {
 /// Fails with [`Error::WrapKeyNotSigned`], sending nothing, unless the offer's wrap key is signed
 /// by its device key for this library. A repeat after a lost response is accepted and changes
 /// nothing; [`Error::RegisteredOtherwise`] says the key is listed with another wrap key or proof.
+/// A listing without a proof is a success, reported in [`Registered::proof_kept`].
 pub async fn add_device<T: Transport>(
     transport: &T,
     credentials: &Credentials,
     offer: &DeviceOffer,
     now: impl Fn() -> u64 + Sync,
-) -> Result<(), Error> {
+) -> Result<Registered, Error> {
     if !offer
         .wrap
         .verify(credentials.library_id(), &offer.device_key)
@@ -247,7 +252,7 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
     library: &LibraryKeys,
     signer: &SigningKey,
     request: &AddDevice,
-) -> Result<(), Error> {
+) -> Result<Registered, Error> {
     let body = serde_json::to_vec(request).expect("protocol messages serialise");
     let response = rpc
         .call(
@@ -271,25 +276,40 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
     )
 }
 
-/// Whether the listed record of `key` carries exactly the wrap key and membership proof this
-/// device sent.
+/// What a registration that succeeded left on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Registered {
+    /// Whether the server lists the device with the membership proof it sent. When false, the
+    /// server dropped it, as one built before membership proofs does: the device is registered
+    /// with its wrap key and can sync, but cannot be recognised as a member when the library's
+    /// secret is changed until a server that keeps proofs lists it with one, and adding its key
+    /// again does not add one, since re-adding a listed key changes nothing.
+    pub proof_kept: bool,
+}
+
+/// What the listed record of `key` says of the registration: the wrap key must be the one sent,
+/// and the membership proof the one sent or none.
 fn registered_as(
     devices: &Devices,
     key: &VerifyingKey,
     wrap: Option<&SignedWrapKey>,
     proof: Option<MemberProof>,
-) -> Result<(), Error> {
-    let same = devices.devices.iter().any(|d| {
-        d.public_key == *key
-            && !d.recovery
-            && !d.removed
-            && d.wrap.as_ref() == wrap
-            && d.member_proof == proof.map(ListedMemberProof::from)
-    });
-    if same {
-        Ok(())
-    } else {
-        Err(Error::RegisteredOtherwise)
+) -> Result<Registered, Error> {
+    let record = devices
+        .devices
+        .iter()
+        .find(|d| d.public_key == *key && !d.recovery && !d.removed)
+        .ok_or(Error::RegisteredOtherwise)?;
+    if record.wrap.as_ref() != wrap {
+        return Err(Error::RegisteredOtherwise);
+    }
+    match (record.member_proof, proof) {
+        (None, Some(_)) => Ok(Registered { proof_kept: false }),
+        (listed, sent) if listed == sent.map(ListedMemberProof::from) => {
+            Ok(Registered { proof_kept: true })
+        }
+        _ => Err(Error::RegisteredOtherwise),
     }
 }
 

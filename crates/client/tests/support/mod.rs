@@ -12,8 +12,8 @@ use fongo_sync_client::protocol::api::{
 };
 use fongo_sync_client::protocol::{
     BATCH_FORMAT, DeviceId, Envelope, HEADER_DEVICE, HEADER_NONCE, HEADER_SIGNATURE,
-    HEADER_TIMESTAMP, LibraryId, LibraryKeys, PROTOCOL_VERSION, RequestAuth, SigningKey,
-    VerifyingKey, encode_batch, open, verify_envelope, verify_request,
+    HEADER_TIMESTAMP, LibraryId, LibraryKeys, ListedMemberProof, PROTOCOL_VERSION, RequestAuth,
+    SigningKey, VerifyingKey, encode_batch, open, verify_envelope, verify_request,
 };
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Collection, Registry, Replica};
@@ -72,6 +72,9 @@ pub struct State {
     pub stale_devices: bool,
     /// Keys every device list leaves out.
     pub hidden: Vec<VerifyingKey>,
+    /// Stores this as every registered device's membership proof in place of the one sent, as a
+    /// server that drops or mangles the field would.
+    pub stored_proof: Option<Option<ListedMemberProof>>,
 }
 
 pub struct Server {
@@ -141,6 +144,7 @@ impl Server {
                 respond: None,
                 stale_devices: false,
                 hidden: Vec::new(),
+                stored_proof: None,
             }),
         }
     }
@@ -414,7 +418,9 @@ impl State {
                         public_key: create.device_key,
                         recovery: false,
                         wrap: create.wrap,
-                        member_proof: create.member_proof.map(Into::into),
+                        member_proof: self
+                            .stored_proof
+                            .unwrap_or(create.member_proof.map(Into::into)),
                         removed: false,
                         last_seen: None,
                     },
@@ -458,7 +464,9 @@ impl State {
                     public_key: add.device_key,
                     recovery: false,
                     wrap: add.wrap,
-                    member_proof: add.member_proof.map(Into::into),
+                    member_proof: self
+                        .stored_proof
+                        .unwrap_or(add.member_proof.map(Into::into)),
                     removed: false,
                     last_seen: None,
                 };

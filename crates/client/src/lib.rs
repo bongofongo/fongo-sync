@@ -59,7 +59,8 @@ pub use error::Error;
 pub use fongo_sync_protocol as protocol;
 pub use fongo_sync_sqlite as sqlite;
 pub use library::{
-    DeviceOffer, add_device, create_library, create_library_with, join_library, join_library_with,
+    DeviceOffer, Registered, add_device, create_library, create_library_with, join_library,
+    join_library_with,
 };
 pub use notify::{message_worth_syncing, worth_syncing};
 pub use state::{cursor, step_past};
