@@ -1,6 +1,4 @@
-use fongo_sync_protocol::api::{
-    AddDevice, CreateLibrary, DeviceRecord, Devices, LIBRARIES_PATH, devices_path,
-};
+use fongo_sync_protocol::api::{AddDevice, CreateLibrary, Devices, LIBRARIES_PATH, devices_path};
 use fongo_sync_protocol::{LibraryKeys, SigningKey, VerifyingKey, generate_signing_key};
 
 use crate::credentials::Credentials;
@@ -92,10 +90,8 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
     signer: &SigningKey,
     device_key: &VerifyingKey,
 ) -> Result<(), Error> {
-    let body = serde_json::to_vec(&AddDevice {
-        device_key: *device_key,
-    })
-    .expect("protocol messages serialise");
+    let body =
+        serde_json::to_vec(&AddDevice::new(*device_key)).expect("protocol messages serialise");
     let response = rpc
         .call(
             Method::Post,
@@ -114,8 +110,49 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
 }
 
 fn lists(devices: &Devices, key: &VerifyingKey, recovery: bool) -> bool {
-    devices.devices.contains(&DeviceRecord {
-        public_key: *key,
-        recovery,
-    })
+    devices
+        .devices
+        .iter()
+        .any(|d| d.public_key == *key && d.recovery == recovery && !d.removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use fongo_sync_protocol::api::DeviceRecord;
+
+    use super::*;
+
+    #[test]
+    fn a_removed_key_is_not_listed() {
+        let key = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let mut record = DeviceRecord {
+            public_key: key,
+            recovery: false,
+            wrap: None,
+            removed: false,
+            last_seen: Some(1),
+        };
+        assert!(lists(
+            &Devices {
+                devices: vec![record.clone()]
+            },
+            &key,
+            false
+        ));
+        assert!(!lists(
+            &Devices {
+                devices: vec![record.clone()]
+            },
+            &key,
+            true
+        ));
+        record.removed = true;
+        assert!(!lists(
+            &Devices {
+                devices: vec![record]
+            },
+            &key,
+            false
+        ));
+    }
 }

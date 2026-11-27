@@ -8,7 +8,7 @@ The kernel knows nothing about any particular application.
 |---|---|
 | `fongo-sync-core` | identities, hybrid logical clocks, change records and merge rules; `model`, the reference model of what replicas converge to; the evaluator and row planner that make every merge decision. No I/O. |
 | `fongo-sync-sqlite` | the storage adapter: change capture by trigger, the core's facts kept in SQLite, and every row written as the core plans it. |
-| `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes and server messages. Builds for `wasm32-unknown-unknown`. |
+| `fongo-sync-protocol` | the wire protocol: batch encoding, keys, encrypted and signed batches, request signatures, recovery codes, the format of stored files and server messages. Builds for `wasm32-unknown-unknown`. |
 | `fongo-sync-client` | a device's side: creating and joining a library, and one sync round against a server, over a transport the application implements with its own HTTP client. |
 
 An application declares its synced tables in a `Registry`, calls `Replica::install` when it opens
@@ -67,6 +67,19 @@ Devices exchange changes through a server that stores encrypted batches and lear
 their content: it sees a library id, a device id, a key epoch, a size and an arrival time.
 `fongo-sync-protocol` defines everything that crosses the wire, so a client and any server agree
 by depending on it.
+
+The protocol also defines how files travel beside the changes. A change names a file by its
+content hash and size, as an ordinary blob value; the server stores the file under an HMAC of
+that hash keyed from the library secret, as padded chunks each sealed under a key derived from the
+secret and the hash, with each chunk's nonce derived from the chunk itself, so the same file
+seals to the same bytes on every device of a library and different bytes never share a nonce. It
+defines the routes to upload and read such files, to ask which a server holds, to claim them in
+the same step as appending the changes that refer to them, and to retire them, with rules under
+which a server deletes a file only once no change in the library can refer to it; the protocol's
+documentation states the conditions and limits of that guarantee. It also defines removing a
+device: the server then refuses that device and stops waiting for it, which does not exclude
+anyone who holds the library secret. No client or server in this repository implements any of
+this yet.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list

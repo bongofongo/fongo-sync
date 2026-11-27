@@ -443,6 +443,7 @@ dependencies = [
  "fongo-sync-core",
  "getrandom 0.4.3",
  "hkdf",
+ "hmac",
  "proptest",
  "serde",
  "serde_json",
