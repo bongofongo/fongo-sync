@@ -536,29 +536,20 @@ impl<'d> Ctx<'d> {
         *earliest = (*earliest).min(clock);
     }
 
-    /// The least reading of this replica's node later than `latest`, which no later reading of
-    /// its clock can equal. `None` past the last millisecond the clock observes.
-    pub(crate) fn successor(&mut self, latest: Hlc) -> Result<Option<Hlc>> {
-        let (mut wall_ms, mut counter) = match latest.counter.checked_add(1) {
-            Some(counter) => (latest.wall_ms, counter),
-            None => (latest.wall_ms.saturating_add(1), 0),
-        };
-        if wall_ms == 0 {
-            // Clocks at wall 0 are adoptions, numbered by `adopted_seq`.
-            let seq = match meta_get(self.db, "adopted_seq")? {
-                Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
-                _ => 0,
-            };
-            if let Some(seq) = seq.max(latest.counter).checked_add(1) {
-                meta_set(self.db, "adopted_seq", Value::Int(i64::from(seq)))?;
-                return Ok(Some(Hlc {
-                    wall_ms: 0,
-                    counter: seq,
-                    node: self.node,
-                }));
+    /// The least reading of this replica's node later than `latest` that it may issue, which
+    /// the clock then observes so that no later reading equals it. Past a write at wall 0, whose
+    /// counters number adoptions, that is the first reading of wall 1, so that a counter from
+    /// elsewhere never moves this replica's own numbering. `None` past the last millisecond the
+    /// clock observes.
+    pub(crate) fn successor(&mut self, latest: Hlc) -> Option<Hlc> {
+        let (wall_ms, counter) = if latest.wall_ms == 0 {
+            (1, 0)
+        } else {
+            match latest.counter.checked_add(1) {
+                Some(counter) => (latest.wall_ms, counter),
+                None => (latest.wall_ms.saturating_add(1), 0),
             }
-            (wall_ms, counter) = (1, 0);
-        }
+        };
         let next = Hlc {
             wall_ms,
             counter,
@@ -569,10 +560,10 @@ impl<'d> Ctx<'d> {
             ..next
         };
         if !room.encodable() {
-            return Ok(None);
+            return None;
         }
         self.clock.observe(&next);
-        Ok(Some(next))
+        Some(next)
     }
 
     pub(crate) fn touch(&mut self, idx: usize, key: &str, gid: Gid, deleted: bool) {
@@ -1330,7 +1321,7 @@ impl Replica {
                 }
                 let clock = match latest {
                     None => cx.adoption_clock()?,
-                    Some(latest) => match cx.successor(latest)? {
+                    Some(latest) => match cx.successor(latest) {
                         Some(clock) => clock,
                         None => continue,
                     },

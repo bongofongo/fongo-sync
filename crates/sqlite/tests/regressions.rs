@@ -1375,7 +1375,7 @@ async fn node_of(peer: &mut Peer) -> Gid {
 }
 
 /// A completion's clock is one this node may never have ticked to, or may have given another
-/// row in the same millisecond, or is numbered from the adoption sequence: it is still one this
+/// row in the same millisecond, or is the first reading of wall 1: it is still one this
 /// database issued, so neither it nor another database takes it for a copy's.
 #[tokio::test]
 async fn a_completion_applied_again_anywhere_reports_no_shared_node() {
@@ -1407,7 +1407,7 @@ async fn a_completion_applied_again_anywhere_reports_no_shared_node() {
     let mine = node_of(&mut peers[0]).await;
     let clocks: BTreeSet<Hlc> = sent.iter().map(|c| c.clock).collect();
     assert!(clocks.iter().all(|c| c.node == mine), "{sent:#?}");
-    assert!(clocks.iter().any(|c| c.wall_ms == 0), "{sent:#?}");
+    assert!(clocks.iter().any(|c| c.wall_ms == 1), "{sent:#?}");
     assert!(
         clocks
             .iter()
@@ -1497,23 +1497,23 @@ async fn a_completion_past_the_last_counter_of_a_millisecond_takes_the_next_mill
     assert_eq!(rows, ["b0 done 0 4"]);
 }
 
+/// Past a set written at wall 0, where counters number adoptions, a completion takes the first
+/// reading of wall 1, so a counter from elsewhere never moves this node's own numbering.
 #[tokio::test]
-async fn a_completion_of_a_set_written_at_wall_zero_is_numbered_as_an_adoption() {
-    let (clocks, rows) = completed_at(&[(0, 5), (0, 3)]).await;
-    let at: Vec<(u64, u32)> = clocks
-        .iter()
-        .map(|c| c.map(|c| (c.wall_ms, c.counter)).unwrap())
-        .collect();
-    assert_eq!(at, [(0, 6), (0, 7)]);
-    assert_eq!(rows, ["b0 done 0 4", "b1 done 1 4"]);
-    // Once the adoption sequence is spent, the next millisecond after wall 0 serves.
-    let (clocks, rows) = completed_at(&[(0, u32::MAX - 1), (0, 7), (0, u32::MAX)]).await;
-    let at: Vec<(u64, u32)> = clocks
-        .iter()
-        .map(|c| c.map(|c| (c.wall_ms, c.counter)).unwrap())
-        .collect();
-    assert_eq!(at, [(0, u32::MAX), (1, 0), (1, 0)]);
-    assert_eq!(rows, ["b0 done 0 4", "b1 done 1 4", "b2 done 2 4"]);
+async fn a_completion_of_a_set_written_at_wall_zero_takes_the_first_reading_of_wall_one() {
+    for at in [
+        &[(0, 5), (0, 3)][..],
+        &[(0, u32::MAX - 1), (0, 7), (0, u32::MAX)][..],
+    ] {
+        let (clocks, rows) = completed_at(at).await;
+        let at: Vec<(u64, u32)> = clocks
+            .iter()
+            .map(|c| c.map(|c| (c.wall_ms, c.counter)).unwrap())
+            .collect();
+        assert!(at.iter().all(|&c| c == (1, 0)), "{at:?}");
+        assert_eq!(rows.len(), at.len());
+        assert!(rows.iter().all(|r| r.ends_with(" 4")), "{rows:?}");
+    }
 }
 
 /// A set last written in the last millisecond the text form holds cannot be recorded again at a
@@ -1653,7 +1653,8 @@ async fn a_foreign_adoption_counter_never_makes_a_clock_reused() {
 }
 
 /// Widening, narrowing and widening again over a set whose latest write is a change from
-/// elsewhere at wall 0 with a counter near the last, with a plain field adopted at each widening:
+/// elsewhere at wall 0 with a counter near the last, with the fields it gains written while not
+/// declared, so each widening adopts them anew:
 /// every clock this node gives one register is its own, and no replica takes it for another
 /// database's.
 #[tokio::test]
@@ -1686,9 +1687,9 @@ async fn widening_again_over_a_foreign_adoption_counter_reuses_no_clock() {
     }
     settle(&mut peers, &mut hub).await;
     let mut sent = Vec::new();
-    for n in 0..6 {
+    for n in 0..5 {
         let version = if n % 2 == 0 { 2 } else { 0 };
-        if version == 0 {
+        if version == 2 && n > 0 {
             peers[0]
                 .run(&format!("UPDATE books SET rating = {n}, extra = 'e{n}'"))
                 .await;
