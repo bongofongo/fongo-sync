@@ -57,11 +57,20 @@ write to any field of a set records the whole set at one clock, so a field the a
 itself, such as one derived from others or rewritten after a sync, records the person's fields
 with it, and that write beats an edit to them made concurrently on another device. Keep such
 fields out of a set with fields a person edits: sync them as plain fields, or keep them out of
-the registry and derive them on each device. Adding a field to an existing set changes what the
-set means: an upgrade records the set again without beating edits made elsewhere, but where a
-device still on the old version writes the set first, the new field reads NULL until that device
-upgrades, and a write to the set meanwhile loses the value. `Collection::together` sets out what
-an upgrade sends.
+the registry and derive them on each device.
+
+Adding a field to an existing set, merging two sets, or grouping fields written apart changes
+what the set means. On upgrade each device records such a set again where its writes so far hold
+only part of it, at the clock just past the set's latest write the device holds, with the values
+the merged changes hold. That record does not beat an edit made elsewhere and not yet received,
+except for an edit made in the same millisecond as that latest write, the part of that write
+still on its way, and a write older than that latest write to a field of the new set that it
+did not carry, which the new set hides anyway. A device with an unsent edit to a field of the set that reports
+conflicts is told of the record as a conflict whose remote value is the base. One loss remains:
+a value an upgrade moves into a newly added field is lost when a device not yet upgraded writes
+the set after the upgrade and the user of an upgraded device then edits the set before that
+device upgrades, since the new field reads NULL after the old device's write and the edit records
+that NULL. `Collection::together` sets out what an upgrade sends.
 
 When two replicas each make a row that is valid alone and together break a rule of the
 application's own, such as a partial unique index, the kernel holds one of them back and the
