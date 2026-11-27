@@ -90,12 +90,39 @@ pub fn sign_request(
     timestamp: u64,
     nonce: [u8; 16],
 ) -> RequestAuth {
+    sign_request_digest(
+        key,
+        method,
+        path,
+        &Sha256::digest(body).into(),
+        timestamp,
+        nonce,
+    )
+}
+
+/// [`sign_request`] for a body known by its SHA-256, so that a body streamed from elsewhere need
+/// not be held whole. The signature is the same as for the body itself.
+pub fn sign_request_digest(
+    key: &SigningKey,
+    method: &str,
+    path: &str,
+    body_sha256: &[u8; 32],
+    timestamp: u64,
+    nonce: [u8; 16],
+) -> RequestAuth {
     let device = DeviceId::of(&key.verifying_key());
     RequestAuth {
         device,
         timestamp,
         nonce,
-        signature: key.sign(&message(device, method, path, body, timestamp, &nonce)),
+        signature: key.sign(&message(
+            device,
+            method,
+            path,
+            body_sha256,
+            timestamp,
+            &nonce,
+        )),
     }
 }
 
@@ -110,6 +137,23 @@ pub fn verify_request(
     now: u64,
     skew: u64,
 ) -> Result<(), RequestError> {
+    let digest = Sha256::digest(body).into();
+    verify_request_digest(auth, key, method, path, &digest, now, skew)
+}
+
+/// [`verify_request`] for a body known by its SHA-256, computed by the host as the body arrives,
+/// so that a streamed body can be authenticated without being held whole. The host must compute
+/// the digest over exactly the bytes it accepts as the body, and act on them only once this
+/// returns `Ok`.
+pub fn verify_request_digest(
+    auth: &RequestAuth,
+    key: &VerifyingKey,
+    method: &str,
+    path: &str,
+    body_sha256: &[u8; 32],
+    now: u64,
+    skew: u64,
+) -> Result<(), RequestError> {
     if DeviceId::of(key) != auth.device {
         return Err(RequestError::WrongDevice);
     }
@@ -117,7 +161,14 @@ pub fn verify_request(
         return Err(RequestError::Stale);
     }
     key.verify_strict(
-        &message(auth.device, method, path, body, auth.timestamp, &auth.nonce),
+        &message(
+            auth.device,
+            method,
+            path,
+            body_sha256,
+            auth.timestamp,
+            &auth.nonce,
+        ),
         &auth.signature,
     )
     .map_err(|_| RequestError::BadSignature)
@@ -127,7 +178,7 @@ fn message(
     device: DeviceId,
     method: &str,
     path: &str,
-    body: &[u8],
+    body_sha256: &[u8; 32],
     timestamp: u64,
     nonce: &[u8; 16],
 ) -> Vec<u8> {
@@ -139,7 +190,7 @@ fn message(
         out.extend_from_slice(&(part.len() as u64).to_be_bytes());
         out.extend_from_slice(part);
     }
-    out.extend_from_slice(&Sha256::digest(body));
+    out.extend_from_slice(body_sha256);
     out.extend_from_slice(&timestamp.to_be_bytes());
     out.extend_from_slice(nonce);
     out
@@ -222,6 +273,50 @@ mod tests {
         assert_eq!(
             verify_request(&signed(), &other, "GET", PATH, b"", 1000, 300),
             Err(RequestError::WrongDevice)
+        );
+    }
+
+    #[test]
+    fn a_digest_verifies_as_its_body_does() {
+        let body = b"a streamed chunk";
+        let digest: [u8; 32] = Sha256::digest(body).into();
+        let auth = sign_request(&key(), "POST", PATH, body, 1000, [7; 16]);
+        assert_eq!(
+            sign_request_digest(&key(), "POST", PATH, &digest, 1000, [7; 16]),
+            auth
+        );
+        let by_digest = |auth: &RequestAuth, digest: &[u8; 32], now: u64| {
+            verify_request_digest(auth, &key().verifying_key(), "POST", PATH, digest, now, 300)
+        };
+        assert_eq!(by_digest(&auth, &digest, 1000), Ok(()));
+        assert_eq!(check(&auth, "POST", PATH, body, 1000), Ok(()));
+        let mut wrong = digest;
+        wrong[31] ^= 1;
+        assert_eq!(
+            by_digest(&auth, &wrong, 1000),
+            Err(RequestError::BadSignature)
+        );
+        assert_eq!(
+            by_digest(&auth, &[0; 32], 1000),
+            Err(RequestError::BadSignature)
+        );
+        assert_eq!(by_digest(&auth, &digest, 1301), Err(RequestError::Stale));
+        let empty: [u8; 32] = Sha256::digest(b"").into();
+        assert_eq!(
+            by_digest(&signed(), &empty, 1000),
+            Err(RequestError::BadSignature)
+        );
+        assert_eq!(
+            verify_request_digest(
+                &signed(),
+                &key().verifying_key(),
+                "GET",
+                PATH,
+                &empty,
+                1000,
+                300
+            ),
+            Ok(())
         );
     }
 

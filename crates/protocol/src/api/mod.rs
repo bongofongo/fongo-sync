@@ -2,22 +2,99 @@
 //! change notification. Every request except `GET` [`CAPABILITIES_PATH`] carries
 //! [`RequestAuth`](crate::RequestAuth) headers.
 //!
-//! The blob routes ([`BLOB_PATH`] to [`BLOBS_RETIRE_PATH`]), [`SETTLED_PATH`], [`STATUS_PATH`],
-//! [`ENTITLEMENT_PATH`] and [`REMOVE_DEVICE_PATH`] are for devices only: the recovery key is
-//! refused with [`ErrorCode::Forbidden`]. A removed device is refused on every route with
-//! [`ErrorCode::DeviceRemoved`].
+//! Any 2xx status is success; a client does not depend on which one a server sends. Every error
+//! answer is an [`ErrorBody`], and a client acts on its [`ErrorCode`] alone.
+//!
+//! [`Capabilities::blobs`] says whether [`BATCHES_CLAIMING_PATH`], the blob routes
+//! ([`BLOB_PATH`] to [`BLOBS_RETIRE_PATH`]), [`SETTLED_PATH`], [`STATUS_PATH`] and
+//! [`ENTITLEMENT_PATH`] are served, all together; [`Capabilities::device_removal`] says whether
+//! [`REMOVE_DEVICE_PATH`] is, and [`Capabilities::notifications`] whether [`NOTIFICATIONS_PATH`]
+//! is. A route that is not served answers [`ErrorCode::NotFound`].
+//!
+//! The blob routes, [`SETTLED_PATH`], [`STATUS_PATH`], [`ENTITLEMENT_PATH`] and
+//! [`REMOVE_DEVICE_PATH`] are for devices only: the recovery key is refused with
+//! [`ErrorCode::Forbidden`]. A removed device is refused on every authenticated route with
+//! [`ErrorCode::DeviceRemoved`], an append of an envelope the server already holds included. That
+//! answer comes only once the request's signature verifies, so a request that does not verify is
+//! refused for that, and only the holder of a key learns that it was removed.
+//!
+//! # Devices
+//!
+//! A device is added by `POST` [`AddDevice`] at [`DEVICES_PATH`]. A key not yet listed needs a
+//! free slot: a library already listing [`Capabilities::max_devices`] keys that are neither removed
+//! nor the recovery key refuses it with [`ErrorCode::DeviceLimit`]. Adding a key that is listed
+//! and not removed succeeds and changes nothing, its stored wrap key included. Adding a removed
+//! key restores it: the server answers 201, needs a free slot as for a new key
+//! ([`ErrorCode::DeviceLimit`] otherwise), keeps the [`Settled`] position the device reported
+//! before it was removed, and stores the wrap key the request carries; a request that carries
+//! none may leave the restored record without one.
+//!
+//! A [`DeviceRecord`]'s `last_seen`, documented there as the time of the last accepted request, is
+//! more precisely the start of the hour, a multiple of 3600, in which the key last made a request
+//! that authenticated; a request refused after authenticating, such as one
+//! from a removed device, may still move it.
+//!
+//! Whether a server checks a wrap key's proof before it finds the key already listed is not
+//! settled: re-adding a listed key with a wrap key whose proof does not verify may succeed and
+//! change nothing, or be refused with [`ErrorCode::InvalidProof`]. A client sends a valid proof or
+//! none.
+//!
+//! # Limits on requests
+//!
+//! [`Capabilities::max_batch_bytes`] bounds the envelope alone: the ids before the envelope in a
+//! [`ClaimingAppend`] do not count against it. [`Capabilities::max_query_ids`] bounds every list of
+//! blob ids: a [`BlobIds`] sent to [`BLOBS_QUERY_PATH`] or [`BLOBS_CLAIM_PATH`], a [`RetireBlobs`]
+//! and a [`ClaimingAppend`]. A list with more is refused with [`ErrorCode::MalformedRequest`]; an
+//! id repeated in one list counts once. A server that states `max_query_ids` accepts a JSON body
+//! of such a list up to 1024 bytes plus 67 for each id allowed, which a body this crate writes,
+//! with no more ids and none repeated, never exceeds; it may refuse a longer one with
+//! [`ErrorCode::TooLarge`] before reading it. A chunk body at [`BLOB_CHUNK_PATH`] or
+//! [`BLOB_WHOLE_PATH`] longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) is refused with
+//! [`ErrorCode::TooLarge`], before the body is read; a body of
+//! any other wrong length is [`ErrorCode::MalformedRequest`].
+//!
+//! A server may bound how many blob records a library has: one for each id it holds a claim, an
+//! upload or a complete blob for. For blobs it answers [`ErrorCode::LibraryFull`] only to a
+//! request that needs a record for an id that has none (a begin, `whole`, a claim at
+//! [`BLOBS_CLAIM_PATH`] or a [`ClaimingAppend`]) while the library has as many as it allows. A
+//! claiming append so refused appends nothing. A server drops idle records of ids it holds no
+//! complete blob for, whether or not devices have settled, so the refusal does not last for
+//! ever. This version has no capability that states the bound.
+//!
+//! # Entitlement and allowance
 //!
 //! A library that is not entitled to the service is refused [`ErrorCode::NotEntitled`] when
-//! appending an envelope (at either batch path), claiming, retiring or writing a blob; every `GET`, a blob query, adding a
-//! device, [`STATUS_PATH`], [`ENTITLEMENT_PATH`], [`SETTLED_PATH`] and [`REMOVE_DEVICE_PATH`]
-//! still work. A library over its allowance is refused [`ErrorCode::QuotaExceeded`] when beginning
-//! or writing a blob, and everything else works.
+//! appending an envelope (at either batch path), claiming, retiring or writing a blob; every `GET`,
+//! a blob query, adding a device, [`STATUS_PATH`], [`ENTITLEMENT_PATH`], [`SETTLED_PATH`] and
+//! [`REMOVE_DEVICE_PATH`] still work. A library over its allowance is refused
+//! [`ErrorCode::QuotaExceeded`] when beginning a blob or uploading a chunk or `whole`, and
+//! everything else works, `complete` included. At the edges:
+//!
+//! | request | not entitled | over its allowance |
+//! |---|---|---|
+//! | begin with the shape of a blob that is complete | success | success |
+//! | a chunk upload or `whole` with the bytes a complete blob holds there | success | success |
+//! | `complete` of a complete blob, with the matching digest | success | success |
+//! | `complete` of a blob not yet complete | [`ErrorCode::NotEntitled`] | success |
+//! | a [`ClaimingAppend`] of an envelope the server already holds, where it recognises it | success, and the claims are recorded | success, and the claims are recorded |
+//!
+//! # Appending an envelope twice
+//!
+//! A server may recognise an envelope identical to one it holds, at either batch path, or may not;
+//! a device does not rely on either, since it applies a copy idempotently. Where a server
+//! recognises one, it stores nothing, answers the sequence number it gave the envelope, and, for a
+//! [`ClaimingAppend`], records its ids as claimed at a position no lower than that number; it may
+//! record them at the library's head. A device relies only on that lower bound. A server that
+//! recognises a [`ClaimingAppend`] so does this also when the library is not entitled. Where a
+//! server does not recognise one, the request is an ordinary append, accepted or refused as any
+//! other.
 //!
 //! # Blob routes at their edges
 //!
 //! Where two rows apply, a malformed request ([`ErrorCode::MalformedRequest`]) is answered before
-//! a state error ([`ErrorCode::BlobMismatch`], [`ErrorCode::BlobIncomplete`]). A blob that was
-//! deleted, or an incomplete upload that was dropped, counts as never begun.
+//! a state error ([`ErrorCode::BlobMismatch`], [`ErrorCode::BlobIncomplete`]): a chunk index past
+//! the last of a blob not yet complete is malformed, not incomplete. A blob that was deleted, or
+//! an incomplete upload that was dropped, counts as never begun.
 //!
 //! | request | when | answer |
 //! |---|---|---|
@@ -25,16 +102,20 @@
 //! | begin or `whole` | the stored size is above [`Capabilities::max_blob_bytes`] | [`ErrorCode::BlobTooLarge`] |
 //! | begin or `whole` | an earlier begin, or a completion through `whole`, gave another shape | [`ErrorCode::BlobMismatch`] |
 //! | begin | the blob is complete with the same shape | `{complete: true, have: every chunk}` |
+//! | a chunk upload or `whole` | the body is longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) | [`ErrorCode::TooLarge`], before the body is read |
 //! | `whole` | the body is not the stored form of a one-chunk blob | [`ErrorCode::MalformedRequest`] |
 //! | `whole` | the blob was begun with the same one-chunk shape | stores the chunk and completes |
 //! | `whole` | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`] |
 //! | a chunk upload, `complete`, or a `GET` | the blob was never begun | [`ErrorCode::BlobNotFound`] |
 //! | a chunk upload or `GET` of a chunk | the index is not below the chunk count | [`ErrorCode::MalformedRequest`] |
-//! | a chunk upload | the body is not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
+//! | a chunk upload | the body is not longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) and not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
 //! | a chunk upload | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`]; nothing changes |
 //! | `complete` | the blob is complete | success if the digest matches, else [`ErrorCode::BlobMismatch`] |
 //! | `GET` a chunk or the blob | the blob is not complete | [`ErrorCode::BlobIncomplete`] |
 //! | [`RetireBlobs`] | `through` is above the library's current head | [`ErrorCode::MalformedRequest`] |
+//! | [`RetireBlobs`] | an id is not held complete | that id is ignored; success |
+//! | [`Settled`] | `seq` is above the library's current head | [`ErrorCode::MalformedRequest`] |
+//! | [`Settled`] | `seq` is not above what the device reported before | success; nothing changes |
 //!
 //! # Deleting files
 //!
@@ -66,26 +147,42 @@
 //!   share a clock with different values, which honest devices write only when two databases
 //!   write as one node. A build that keeps whichever of two such changes arrived first can keep a
 //!   value that the retiring device's winner replaced.
-//! - every device that sends file references sends them through [`BATCHES_CLAIMING_PATH`]. A
-//!   server that stops offering [`Capabilities::blobs`] and offers it again voids every retirement
-//!   it holds when it resumes, since appends meanwhile carried no claims.
-//! - no file field is a key field of a natural collection: the definition and the treatment of
-//!   rewritten key fields differ. A registry must not mark one.
+//! - every device that sends file references sends their claims as described below.
+//! - a field marked as naming files is merged by clock in every version of the application, is
+//!   never a key field of a natural collection, and once marked is never unmarked: the definition
+//!   and the treatment of rewritten key fields differ, and a device that does not count a field
+//!   as naming files can retire what it names. A registry must not mark a key field.
+//! - each device key is used by one database. Two databases on one key, such as a copy of a
+//!   database or a backup restored while the database it was taken from went on, are one device
+//!   to the server; see the limits.
+//! - a device's state holds only its own changes and the changes of envelopes in the log, each
+//!   envelope applied whole. A device that takes changes from outside the log, or applies only
+//!   part of an envelope, can retire a file that the log refers to.
+//! - the server holds to what a device relies on it for (see [the crate
+//!   documentation](crate#what-a-device-relies-on-the-server-for)).
 //!
 //! A device:
 //!
 //! - sends each envelope any of whose changes sets a file reference to [`BATCHES_CLAIMING_PATH`],
 //!   with the id of every file it sets, so that the claim is recorded at the envelope's sequence
-//!   number in the same step as the append. A server whose [`Capabilities::blobs`] is false gets
-//!   it at [`BATCHES_PATH`].
+//!   number in the same step as the append. An envelope it appends at [`BATCHES_PATH`] instead,
+//!   because [`Capabilities::blobs`] was false when it sent it or because the claiming append was
+//!   refused with [`ErrorCode::LibraryFull`], has its ids claimed at [`BLOBS_CLAIM_PATH`] before
+//!   the device next reports [`Settled`].
 //! - retires a file ([`RetireBlobs`]) only when it has merged every envelope through `through`,
 //!   has nothing unsent, and the changes through `through` do not refer to the file; its rows held
 //!   back count as referring. Only the changes through `through` count: its own envelopes appended
-//!   after `through` are in its local state but not in that set.
-//! - reports [`Settled`] `seq` only when it has merged every envelope through `seq` and has
-//!   nothing unsent. Before each such report it claims at [`BLOBS_CLAIM_PATH`] every file that a
-//!   row it holds back names: that claim is recorded at a head at or past `seq`, so it voids any
-//!   retirement the report could otherwise let through.
+//!   after `through` are in its local state but not in that set. A device that skipped, refused or
+//!   stepped past any envelope at or below `through` has not merged it, and does not retire.
+//! - reports [`Settled`] `seq` only when it has dealt with every envelope through `seq`, by merging
+//!   it or by skipping it and recording that it did, and has nothing unsent. Before each such
+//!   report, and after it has dealt with every envelope through `seq`, it claims at
+//!   [`BLOBS_CLAIM_PATH`] every file named by a row it holds back at that point, and it merges
+//!   nothing between that claim and the report: it never reports a `seq` above the position it had
+//!   dealt with when it claimed. The claim is then recorded at a head at or past `seq`, so it voids
+//!   any retirement the report could otherwise let through. A device that skipped an envelope may
+//!   still settle, since the guarantee uses its report only for having nothing unsent and for the
+//!   claim before it.
 //! - may also claim at [`BLOBS_CLAIM_PATH`] without appending, to learn which files the server
 //!   lacks.
 //!
@@ -94,40 +191,66 @@
 //! - records a claim, in a claiming append or at [`BLOBS_CLAIM_PATH`], for every id it names,
 //!   whether it holds that blob complete, incomplete or not at all. A claim dropped because an
 //!   upload was still incomplete would let an older retirement delete the blob once it completes.
-//! - treats a retirement `(through, id)` as void once the id has a claim recorded at a sequence
-//!   number at or above `through`, whether the claim arrived before or after the retirement.
-//! - deletes a complete blob only when it has a retirement that is not void, every device in
-//!   [`Devices::settling`] has reported [`Settled`] at or above that retirement's `through` (one
-//!   that never reported counts as 0), and [`Capabilities::blob_wait_days`] have passed since the
-//!   retirement arrived. A deletion and a claim of the same id are ordered: a claim after the
-//!   deletion finds the blob missing.
+//! - counts an id as claimed at the library's head whenever it may have missed or forgotten its
+//!   claims: when it begins to offer [`Capabilities::blobs`], for the first time or again, since
+//!   appends made meanwhile carried no claims, and when it drops the record of an id it holds no
+//!   complete blob for, with that record's claims. It does so with a claim floor per library,
+//!   raised at such a moment to a head at or above the one then, before it deletes anything: every
+//!   id counts as claimed at the floor as well as wherever its own claims were recorded.
+//! - treats a retirement `(through, id)` as void once the id has a claim recorded, or counts as
+//!   claimed, at a sequence number at or above `through`, whether the claim arrived before or
+//!   after the retirement.
+//! - keeps, of the retirements of an id that are not void, the earliest to arrive, so that a
+//!   retirement sent again never restarts the wait. It keeps at most four retirements of one id;
+//!   keeping fewer only delays a deletion, and is always safe.
+//! - deletes a complete blob only while it offers [`Capabilities::blobs`], and only when it has a
+//!   retirement that is not void, every device in [`Devices::settling`] has reported [`Settled`]
+//!   at or above that retirement's `through` (one that never reported counts as 0), and
+//!   [`Capabilities::blob_wait_days`] have passed since the retirement arrived. A deletion and a
+//!   claim of the same id are ordered: a claim after the deletion finds the blob missing.
 //!
 //! Why no change that is or will be in the log refers to a deleted file: an honest retirement at
 //! `through` means the changes through `through` do not refer to it. Every later set of changes
 //! holds those, so one that refers to the file holds a later change setting a reference to it. If
-//! that change was appended, it was appended with a claim at a sequence number above `through`,
-//! which voids the retirement. If it is not yet appended, it is unsent on a device, and a device
-//! holding unsent changes has not settled; every device that counts has settled at or above
-//! `through`, so it made the change after settling.
+//! that change was appended with its claim, the claim is at a sequence number above `through`,
+//! which voids the retirement; a claim recorded for a recognised copy of the envelope is at or
+//! above the envelope's number, and so above `through` too. If it was appended without its claim
+//! while the server was not offering blobs, the floor raised when it began again is above `through`
+//! and voids the retirement in the same way. Otherwise it was appended without its claim, or is not
+//! yet appended, and its device has not settled since making it: a device claims what it appended
+//! without claims before it next settles, and a device holding unsent changes does not settle.
+//! Every device that counts has settled at or above `through`, so that device made the change after
+//! settling. A row a device holds back is not in the log, but the file it names was claimed after
+//! that device had dealt with every envelope through its report and before the report, at a head at
+//! or past it, so every retirement that report lets through is void.
 //!
 //! The limits:
 //!
-//! - any change a device makes after its [`Settled`] at or above `through` that refers to the
-//!   file, and that it sends after the deletion, finds the file missing. If the device holds the
-//!   file it uploads it again; if not, the file is unavailable. The same holds for a removed device
-//!   that joins again and sends changes it had not sent. A device that refers anew to a file it
-//!   does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
+//! - any change a device makes after its [`Settled`] at or above `through` that refers to the file,
+//!   and that it sends without its claim or after the deletion, can find the file deleted before
+//!   its claim arrives: a claiming append refused with [`ErrorCode::LibraryFull`] and sent plainly,
+//!   or one sent plainly because the device read [`Capabilities::blobs`] as false just before the
+//!   server began to offer it, is claimed only later. The device recovers the file only if it still
+//!   holds it, by uploading it again; if not, the file is unavailable. The same holds for a removed
+//!   device that joins again and sends changes it had not sent. A device that refers anew to a file
+//!   it does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
 //! - a device catching up, newly joined or restored, passes through states that refer to files
 //!   rightly deleted since. Fetching one answers [`ErrorCode::BlobNotFound`], which is not an error
 //!   in the library.
 //! - a retirement of an id that is not complete is ignored, so a blob completed later that nothing
 //!   refers to stays.
+//! - after a server begins to offer blobs again, or forgets an id's claims, every retirement
+//!   through its floor is void, so deletion resumes only once the log has grown past the floor and
+//!   a device retires the file again.
 //! - a device that never reports [`Settled`] holds back every deletion until it is removed.
-//! - two databases that act as one device, such as a copy of a database or a backup restored
-//!   while the database it was taken from went on, are one device to the server, so the
+//! - a device that skipped an envelope may settle, and can then show a file that the skipped
+//!   envelope replaced and that was rightly deleted; fetching it answers
+//!   [`ErrorCode::BlobNotFound`].
+//! - two databases that act as one device, against the conditions above, can lose a file: the
 //!   [`Settled`] one reports can stand for unsent changes the other holds. Such a change that
 //!   refers to a file and is sent after the file's deletion finds it missing, as in the first
-//!   limit.
+//!   limit; so does one in a database restored from a backup, or made by a new database on a key
+//!   an older one used.
 
 mod blobs;
 mod error;
@@ -143,7 +266,7 @@ pub use blobs::{
     Settled,
 };
 pub use error::{ErrorBody, ErrorCode};
-pub use notify::{NOTIFICATION_FORMAT, Notification};
+pub use notify::{CLOSE_DEVICE_REMOVED, CLOSE_SUPERSEDED, NOTIFICATION_FORMAT, Notification};
 pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
@@ -187,7 +310,7 @@ pub const BLOB_WHOLE_PATH: &str = "/v1/libraries/{library}/blobs/{id}/whole";
 pub const BLOBS_QUERY_PATH: &str = "/v1/libraries/{library}/blobs/query";
 /// `POST` [`BlobIds`]: [`MissingBlobs`].
 pub const BLOBS_CLAIM_PATH: &str = "/v1/libraries/{library}/blobs/claim";
-/// `POST` [`RetireBlobs`], answered with no body.
+/// `POST` [`RetireBlobs`], answered with no body, also when every id was ignored.
 pub const BLOBS_RETIRE_PATH: &str = "/v1/libraries/{library}/blobs/retire";
 /// `POST` [`Settled`], answered with no body.
 pub const SETTLED_PATH: &str = "/v1/libraries/{library}/settled";
@@ -227,19 +350,20 @@ pub struct Capabilities {
     pub protocol_version: u32,
     /// Whether [`BATCHES_CLAIMING_PATH`], the blob routes ([`BLOB_PATH`] to
     /// [`BLOBS_RETIRE_PATH`]), [`SETTLED_PATH`], [`STATUS_PATH`] and [`ENTITLEMENT_PATH`] are
-    /// served.
+    /// served. While it is false the server deletes no blob; see
+    /// [the module documentation](self#deleting-files).
     pub blobs: bool,
     /// Whether [`NOTIFICATIONS_PATH`] is served.
     pub notifications: bool,
     /// How far a request timestamp may be from the server's clock, either side, in seconds.
     pub skew_secs: u64,
-    /// Largest envelope accepted, in bytes.
+    /// Largest envelope accepted, in bytes. In a [`ClaimingAppend`] only the envelope counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_bytes: Option<u64>,
     /// Largest total of stored envelope bytes per library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_library_bytes: Option<u64>,
-    /// Most devices per library, not counting the recovery key.
+    /// Most devices per library, not counting the recovery key or removed devices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_devices: Option<u32>,
     /// Most envelopes in one [`BatchPage`], whatever `limit` asks for.
@@ -251,7 +375,9 @@ pub struct Capabilities {
     /// Largest blob accepted, in stored bytes ([`BlobInfo::size`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_blob_bytes: Option<u64>,
-    /// Most ids in one [`BlobIds`] sent to [`BLOBS_QUERY_PATH`].
+    /// Most distinct ids in one list of blob ids: a [`BlobIds`] sent to [`BLOBS_QUERY_PATH`] or
+    /// [`BLOBS_CLAIM_PATH`], a [`RetireBlobs`] or a [`ClaimingAppend`]. A list with more is
+    /// [`ErrorCode::MalformedRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_ids: Option<u32>,
     /// Days a retired blob is kept at least, counted from when its retirement arrived; see
@@ -354,10 +480,13 @@ fn proof_message(library: LibraryId, device: &VerifyingKey, recovery: &Verifying
 /// can check that the device chose it and not whoever passed it on. In JSON it is the two fields
 /// `wrap_key` and `wrap_proof` of the message that carries it, both or neither.
 ///
-/// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's
-/// public key and the wrap key. A server refuses a wrap key whose proof does not verify, with
-/// [`ErrorCode::InvalidProof`]. The proof carries no counter, so a server can present any wrap key
-/// a device ever signed for the library; replacing a wrap key will need a new label or a counter.
+/// `wrap_proof` signs `fongo-sync/v1/wrap-key` and a zero byte, the library id, the device's public
+/// key and the wrap key. A server refuses, with [`ErrorCode::InvalidProof`], a wrap key whose proof
+/// does not verify in a request that would store it; for a key already listed, whether the proof is
+/// checked before the server finds the key listed is not settled (see [the module
+/// documentation](self#devices)). The proof carries no counter, so a server can present any wrap
+/// key a device ever signed for the library; replacing a wrap key will need a new label or a
+/// counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SignedWrapKey {
     pub wrap_key: WrapKey,

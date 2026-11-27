@@ -67,7 +67,7 @@ codes! {
         "this device already used this request nonce within the clock skew";
     DeviceRemoved = "device_removed", 401, "the signing device was removed from this library";
     NotEntitled = "not_entitled", 402, "this library is not entitled to the service";
-    Forbidden = "forbidden", 403, "the recovery key may only list and add devices";
+    Forbidden = "forbidden", 403, "this request is not permitted";
     DeviceLimit = "device_limit", 403, "the library has as many devices as it may";
     NotFound = "not_found", 404, "no such endpoint";
     LibraryNotFound = "library_not_found", 404, "no such library";
@@ -103,7 +103,8 @@ impl<'de> Deserialize<'de> for ErrorCode {
     }
 }
 
-/// The JSON body of every error response.
+/// The JSON body of every error response. `message` is for people: a client acts on `code`, and a
+/// server may word the message otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: ErrorCode,

@@ -3,13 +3,26 @@ use crate::wire::{DecodeError, Reader};
 /// The notification format this crate writes, and the only one it reads.
 pub const NOTIFICATION_FORMAT: u8 = 1;
 
+/// The WebSocket close code a server sends when it closes a device's channel because the same
+/// device has opened newer ones beyond what the server allows it. The newer channels carry the
+/// notifications; the device does not reconnect this one.
+pub const CLOSE_SUPERSEDED: u16 = 4000;
+
+/// The WebSocket close code a server sends when the device was removed from the library
+/// ([`RemoveDevice`](super::RemoveDevice)). It means what
+/// [`ErrorCode::DeviceRemoved`](super::ErrorCode::DeviceRemoved) means on any other route; the
+/// device does not reconnect.
+pub const CLOSE_DEVICE_REMOVED: u16 = 4001;
+
 /// "The library's log has reached sequence `seq`." Sent as one binary WebSocket message on
 /// [`NOTIFICATIONS_PATH`](super::NOTIFICATIONS_PATH).
 ///
 /// The upgrade request is a `GET` with an empty body, authenticated like any request and open to
 /// devices only. The server sends the current head on connect and again after appends; it may
 /// coalesce, since only the latest matters. A notification is a hint: the client reads batches
-/// after its own cursor as usual, and treats one it cannot decode as a reason to read.
+/// after its own cursor as usual, and treats one it cannot decode as a reason to read. A server
+/// may close the channel at any time; when it closes it with [`CLOSE_SUPERSEDED`] or
+/// [`CLOSE_DEVICE_REMOVED`] the client does not reconnect it, and after any other close it may.
 ///
 /// Bytes: format, then `seq` as a big-endian u64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -197,7 +197,12 @@ impl BlobDigest {
 /// the blobs its changes set references to. The server appends the envelope as
 /// [`BATCHES_PATH`](super::BATCHES_PATH) would, with the same checks and errors, and in the same
 /// atomic step records each id as claimed at the envelope's sequence number; it answers
-/// [`Appended`](super::Appended).
+/// [`Appended`](super::Appended). A server may recognise an envelope identical to one it already
+/// holds; see [the module documentation](super#appending-an-envelope-twice) for what it does then.
+/// A request that names an id needing a record the library has no room for is refused with
+/// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and appends nothing. The ids count
+/// against [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids), and not against
+/// [`Capabilities::max_batch_bytes`](super::Capabilities::max_batch_bytes).
 ///
 /// The ids tell the server which envelope, and so which device and when, refers to which blob
 /// ids; not what the files are.
@@ -240,9 +245,9 @@ impl ClaimingAppend {
     }
 }
 
-/// The body of a query or a claim. A query takes at most
-/// [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids) ids. A claim sent to
-/// [`BLOBS_CLAIM_PATH`](super::BLOBS_CLAIM_PATH) is recorded at the library's current head.
+/// The body of a query or a claim, of at most
+/// [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids) distinct ids. A claim sent
+/// to [`BLOBS_CLAIM_PATH`](super::BLOBS_CLAIM_PATH) is recorded at the library's current head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobIds {
     pub ids: Vec<BlobId>,
@@ -262,15 +267,19 @@ pub struct MissingBlobs {
 
 /// Marks complete blobs as referred to by no change through log position `through`, by the rules
 /// in [the module documentation](super#deleting-files). Ids the server does not hold complete are
-/// ignored.
+/// ignored. A server keeps the earliest retirement of an id that is not void, so sending one again
+/// never restarts the wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireBlobs {
     pub through: u64,
     pub ids: Vec<BlobId>,
 }
 
-/// The sender has merged every envelope through sequence number `seq` and has nothing unsent. A
-/// server keeps the greatest it was told, and keeps it when a removed device is restored.
+/// The sender has dealt with every envelope through sequence number `seq`, by merging it or by
+/// skipping it and recording that it did, and has nothing unsent. A device that skipped an
+/// envelope may settle, but never retires through it. A server keeps the greatest it was told,
+/// and keeps it when a removed device is restored; a `seq` above the library's head is
+/// [`ErrorCode::MalformedRequest`](super::ErrorCode::MalformedRequest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settled {
     pub seq: u64,
@@ -288,7 +297,10 @@ pub struct LibraryStatus {
     pub allowance_bytes: Option<u64>,
 }
 
-/// An opaque token the server's policy reads; a server without one ignores it.
+/// An opaque token the server's policy reads; a server without one ignores it. A stale token, one
+/// the policy reads but no longer acts on, leaves the status as it was and is answered with it; one
+/// the server cannot verify is refused with
+/// [`ErrorCode::NotEntitled`](super::ErrorCode::NotEntitled).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entitlement {
     pub entitlement: String,
@@ -300,6 +312,10 @@ pub struct Entitlement {
 /// recovery key is refused with [`ErrorCode::Forbidden`](super::ErrorCode::Forbidden); naming an
 /// id the library does not list, or a device already removed, changes nothing. Either way the
 /// answer is the device list; [`Devices::remove`](super::Devices::remove) does this to a list.
+///
+/// The server keeps the removed device's record, with its key, in the device list: a device stops
+/// reading the log at an envelope whose signer the list does not hold, so dropping the record would
+/// stop every device at that signer's envelopes. This version has no way to drop one.
 ///
 /// Removal does not lock anyone out: whoever holds the library secret can derive the recovery
 /// key and add a device again, and can read whatever they obtain.
