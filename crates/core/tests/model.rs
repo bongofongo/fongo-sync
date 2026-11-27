@@ -165,7 +165,33 @@ fn natural(collection: &str, g: u8, pick: u8) -> (Vec<Value>, Gid) {
 
 /// Changes to a few gids per collection. Most changes to a natural entity arrive with the writes
 /// of its key (and its parent's), so natural entities are common; some key writes are hostile.
+/// Some are twins: another value at an earlier change's clock, as a copied database writes.
 fn arb_changes() -> impl Strategy<Value = Vec<Change>> {
+    (
+        arb_honest_changes(),
+        proptest::collection::vec((any::<prop::sample::Index>(), arb_value()), 0..12),
+    )
+        .prop_map(|(mut changes, twins)| {
+            if changes.is_empty() {
+                return changes;
+            }
+            for (at, value) in twins {
+                let n = at.index(changes.len());
+                let value = match (&changes[n].field[..], &changes[n].value) {
+                    (DELETED, Value::Int(v)) => Value::Int(1 - v),
+                    _ => value,
+                };
+                let copy = Change {
+                    value,
+                    ..changes[n].clone()
+                };
+                changes.push(copy);
+            }
+            changes
+        })
+}
+
+fn arb_honest_changes() -> impl Strategy<Value = Vec<Change>> {
     let one = (
         0usize..FIELDS.len(),
         0u8..4,
@@ -339,7 +365,7 @@ proptest! {
                     gid: gid(g),
                     field: field.into(),
                     value,
-                    clock: Hlc { wall_ms, counter: i as u32, node: gid(0) },
+                    clock: Hlc { wall_ms, counter: i as u32 % 2, node: gid(0) },
                 }
             })
             .collect();
@@ -501,7 +527,52 @@ fn the_later_write_wins_and_the_greater_value_wins_with_ties_to_the_later_write(
     assert_eq!(v.row("sites", gid(1)).unwrap()["score"], Value::Int(9));
 }
 
+/// Two changes to one field at one clock, as two databases writing as one node make them: the
+/// greater value shows, whichever arrives first, also for a tombstone and across the members of
+/// a group.
+#[test]
+fn of_two_writes_at_one_clock_the_greater_value_shows_in_either_order() {
+    let tie = [
+        change("sites", gid(1), "name", text("b"), 1),
+        change("sites", gid(1), "name", text("a"), 1),
+        change("sites", gid(1), "code", Value::Null, 1),
+        change("sites", gid(1), "code", text("c"), 1),
+        change("sites", gid(2), "name", text("x"), 1),
+        change("sites", gid(2), DELETED, Value::Int(0), 2),
+        change("sites", gid(2), DELETED, Value::Int(1), 2),
+        change("sites", gid(3), "name", text("p"), 1),
+        change("sites", gid(4), "name", text("q"), 1),
+        change("sites", gid(4), ALIAS, Value::Ref(gid(3)), 2),
+    ];
+    let mut reversed = tie.to_vec();
+    reversed.reverse();
+    for changes in [tie.to_vec(), reversed] {
+        let v = view(&schema(), &changes);
+        let r = v.row("sites", gid(1)).unwrap();
+        assert_eq!((&r["name"], &r["code"]), (&text("b"), &text("c")));
+        assert!(v.row("sites", gid(2)).is_none());
+        assert_eq!(v.row("sites", gid(3)).unwrap()["name"], text("q"));
+    }
+}
+
 // --- 3. Field sets --------------------------------------------------------------------------
+
+/// Two writes to a set at one clock cannot be told apart: each field shows its greater value,
+/// which mixes them.
+#[test]
+fn two_writes_to_a_together_set_at_one_clock_show_each_fields_greater_value() {
+    let v = view(
+        &schema(),
+        &[
+            change("sites", gid(1), "x", Value::Int(1), 1),
+            change("sites", gid(1), "y", Value::Int(2), 1),
+            change("sites", gid(1), "x", Value::Int(2), 1),
+            change("sites", gid(1), "y", Value::Int(1), 1),
+        ],
+    );
+    let r = v.row("sites", gid(1)).unwrap();
+    assert_eq!((&r["x"], &r["y"]), (&Value::Int(2), &Value::Int(2)));
+}
 
 #[test]
 fn a_together_set_takes_only_the_fields_written_at_its_latest_clock() {

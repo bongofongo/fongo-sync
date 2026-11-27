@@ -45,6 +45,8 @@ pub struct World {
     seed: u64,
     wall: Arc<Mutex<Wall>>,
     streams: Streams,
+    /// Whether two of the world's databases have come to share a node.
+    shared: Arc<Mutex<bool>>,
 }
 
 impl World {
@@ -72,7 +74,18 @@ impl World {
                 back_rng: seed ^ 0xB4CC,
             })),
             streams: Streams::default(),
+            shared: Arc::default(),
         }
+    }
+
+    /// Records that two of the world's databases share a node from now on.
+    pub fn share(&self) {
+        *self.shared.lock().unwrap() = true;
+    }
+
+    /// Whether two of the world's databases have shared a node.
+    pub fn shared(&self) -> bool {
+        *self.shared.lock().unwrap()
     }
 
     /// A copy of database `n`, on a connection whose randomness and wall clock go on from where
@@ -98,21 +111,25 @@ impl World {
             seed: self.seed,
             wall: Arc::new(Mutex::new(wall)),
             streams: Streams::default(),
+            shared: self.shared.clone(),
         };
         let mut copy = world.open(n, Some(states)).await;
-        let mut from = super::lock(conn).await;
-        let mut to = super::lock(&mut copy).await;
-        let (src, dest) = (from.as_raw_handle().as_ptr(), to.as_raw_handle().as_ptr());
-        let main = CString::new("main").unwrap();
-        // SAFETY: both handles are open and locked for the copy.
-        unsafe {
-            let backup = ffi::sqlite3_backup_init(dest, main.as_ptr(), src, main.as_ptr());
-            assert!(!backup.is_null());
-            assert_eq!(ffi::sqlite3_backup_step(backup, -1), ffi::SQLITE_DONE);
-            assert_eq!(ffi::sqlite3_backup_finish(backup), ffi::SQLITE_OK);
-        }
-        drop((from, to));
+        backup(conn, &mut copy).await;
         (world, copy)
+    }
+
+    /// A copy of `conn`'s database as database `n` of this world, on the same clock, with
+    /// randomness of its own: a second database sharing the first's identity, as a copied file
+    /// or a restored backup is.
+    pub async fn copy(&self, conn: &mut SqliteConnection, n: u64) -> SqliteConnection {
+        let mut copy = self.open(n, None).await;
+        backup(conn, &mut copy).await;
+        copy
+    }
+
+    /// Puts `from`'s database in place of `to`'s, as restoring a backup does.
+    pub async fn restore(&self, from: &mut SqliteConnection, to: &mut SqliteConnection) {
+        backup(from, to).await;
     }
 
     /// Stops the clock moving by itself, so that every write until it starts again shares one
@@ -189,6 +206,21 @@ impl World {
         drop(handle);
         self.streams.lock().unwrap().insert(n, streams);
         conn
+    }
+}
+
+/// Copies every page of `from`'s main database over `to`'s.
+async fn backup(from: &mut SqliteConnection, to: &mut SqliteConnection) {
+    let mut from = super::lock(from).await;
+    let mut to = super::lock(to).await;
+    let (src, dest) = (from.as_raw_handle().as_ptr(), to.as_raw_handle().as_ptr());
+    let main = CString::new("main").unwrap();
+    // SAFETY: both handles are open and locked for the copy.
+    unsafe {
+        let backup = ffi::sqlite3_backup_init(dest, main.as_ptr(), src, main.as_ptr());
+        assert!(!backup.is_null());
+        assert_eq!(ffi::sqlite3_backup_step(backup, -1), ffi::SQLITE_DONE);
+        assert_eq!(ffi::sqlite3_backup_finish(backup), ffi::SQLITE_OK);
     }
 }
 

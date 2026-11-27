@@ -48,6 +48,44 @@ impl Peer {
         }
     }
 
+    /// [`Peer::new`] over database `n` of `world`, whose clock and randomness the world gives.
+    pub async fn in_world(
+        world: &super::world::World,
+        n: u64,
+        schema: &[&str],
+        registry: Registry,
+    ) -> Peer {
+        let mut conn = world.connect(n).await;
+        for sql in schema {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+        let mut peer = Peer {
+            conn,
+            replica: Replica::new(registry),
+            cursor: 0,
+            taken: Vec::new(),
+            checking: true,
+            suspended: false,
+            writes: Default::default(),
+        };
+        peer.install().await;
+        peer
+    }
+
+    /// A copy of this peer's database as database `n` of `world`, with all it knew: a second
+    /// database sharing its identity, as a copied file or a restored backup is.
+    pub async fn copy(&mut self, world: &super::world::World, n: u64) -> Peer {
+        Peer {
+            conn: world.copy(&mut self.conn, n).await,
+            replica: self.replica.clone(),
+            cursor: self.cursor,
+            taken: self.taken.clone(),
+            checking: self.checking,
+            suspended: self.suspended,
+            writes: self.writes.clone(),
+        }
+    }
+
     pub async fn new(schema: &[&str], registry: Registry) -> Peer {
         let mut peer = Peer::bare(schema, registry).await;
         peer.install().await;

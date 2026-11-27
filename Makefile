@@ -29,9 +29,9 @@ deep:
 	@echo "make deep SEED=$(SEED)"; status=0; \
 	PROPTEST_RNG_SEED=$(SEED) PROPTEST_CASES=4000 \
 		cargo test --release --locked -p fongo-sync-sqlite --test property || status=1; \
-	EXHAUSTIVE_STEPS=4 \
+	EXHAUSTIVE_STEPS=4 EXHAUSTIVE_COPIED_EVERY=1 \
 		cargo test --release --locked -p fongo-sync-sqlite --test exhaustive -- --nocapture || status=1; \
-	EXHAUSTIVE_REPLICAS=3 EXHAUSTIVE_STEPS=3 EXHAUSTIVE_SEEDS=2 \
+	EXHAUSTIVE_REPLICAS=3 EXHAUSTIVE_STEPS=3 EXHAUSTIVE_SEEDS=2 EXHAUSTIVE_COPIED_EVERY=1 \
 		cargo test --release --locked -p fongo-sync-sqlite --test exhaustive -- --nocapture || status=1; \
 	exit $$status
 

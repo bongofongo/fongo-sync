@@ -5,13 +5,16 @@
 //! picks, with the application writing between some steps; every other time it collects in steps
 //! with no writes between, a copy of its database made at the start collects whole, and the two
 //! must send, hold and show the same. `PROPERTY_STEP` (`whole` or a number of rows) makes every
-//! replica collect one way.
+//! replica collect one way. In a second property a replica's database can be replaced by a copy
+//! of another's, or by a backup of its own, which then issues clocks already issued, so changes
+//! to one field share a clock and differ. Until that first happens in a run, no apply may report
+//! a shared node.
 
 mod support;
 
 use std::collections::BTreeSet;
 
-use fongo_sync_sqlite::core::Change;
+use fongo_sync_sqlite::core::{Change, Gid};
 use fongo_sync_sqlite::{COLLECT_ROWS, Collection, LocalDefault, Made, Registry, Replica, Resume};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -142,6 +145,8 @@ struct Peer {
     world: World,
     n: u64,
     pushes: usize,
+    /// The node the replica's clocks carry, which a copy of its database shares.
+    node: Gid,
 }
 
 impl Peer {
@@ -179,9 +184,36 @@ impl Peer {
             taken: Vec::new(),
             writes: Default::default(),
             origins: None,
+            node: Gid([0; 16]),
         };
         peer.install().await.unwrap();
+        let node = peer.replica.inspect(&mut peer.conn).await.unwrap().node;
+        peer.node = node.expect("an installed replica has a node");
         peer
+    }
+
+    /// A copy of this replica's database as database `n` of its world, with everything this
+    /// replica knew: a second database sharing its identity, as a copied file or a restored
+    /// backup is.
+    async fn copy(&mut self, n: u64) -> Peer {
+        let conn = self.world.copy(&mut self.conn, n).await;
+        Peer {
+            conn,
+            replica: self.replica.clone(),
+            step: self.step,
+            seed: self.seed,
+            steps: self.steps,
+            upgraded: self.upgraded,
+            seen: self.seen.clone(),
+            sent: self.sent,
+            taken: self.taken.clone(),
+            writes: self.writes.clone(),
+            origins: None,
+            world: self.world.clone(),
+            n,
+            pushes: self.pushes,
+            node: self.node,
+        }
     }
 
     /// Installs whole, or in steps: an install that collects one step, then steps of collecting,
@@ -371,6 +403,12 @@ impl Peer {
         let applied = self.replica.apply(&mut self.conn, batch).await.unwrap();
         self.writes.touched(&applied.touched);
         self.writes.after(&mut self.conn, &self.replica).await;
+        if !self.world.shared() && !applied.shared.is_empty() {
+            return Err(format!(
+                "no two databases share a node, yet an apply reports {:?}",
+                applied.shared
+            ));
+        }
         self.midway().await
     }
 
@@ -664,6 +702,15 @@ enum Op {
     /// Takes everything one device has sent that this peer has not seen, as a device that reads
     /// each device's log in turn does.
     Log(usize, bool),
+    /// This peer's database is replaced by a copy of the database of peer `.0`, which issues the
+    /// clocks that one issues. With the clock held still, each of the two titles its `.1`th book
+    /// with a title of its own and sends it, so the two changes share a clock.
+    Copy(usize, usize),
+    /// This peer keeps a copy of its database.
+    Backup,
+    /// This peer's database goes back to the copy it kept, if any, and issues again the clocks
+    /// it issued since.
+    Restore,
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
@@ -710,6 +757,16 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// [`arb_op`], and now and then a database copied over another, backed up or restored.
+fn arb_op_copying() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        30 => arb_op(),
+        1 => (0usize..5, 0usize..6).prop_map(|(a, b)| Op::Copy(a, b)),
+        1 => Just(Op::Backup),
+        1 => Just(Op::Restore),
+    ]
+}
+
 async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), String> {
     let isbn = |v: u8| {
         if v == 3 {
@@ -720,6 +777,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
     };
     let sql = match op {
         Op::Upgrade => return peer.upgrade().await,
+        Op::Copy(..) | Op::Backup | Op::Restore => unreachable!("done by the run"),
         Op::Suspended(n, v) => {
             let replica = peer.replica.clone();
             replica.suspend(&mut peer.conn).await.unwrap();
@@ -993,8 +1051,9 @@ async fn finish(peers: &mut [Peer], hub: &mut Vec<Change>) -> Result<(), String>
 }
 
 /// Replicas that hold the same changes under the same registry agree on who made each live
-/// group and wrote each field: at most one says it made a group, and at most one that it wrote a
-/// field. Returns how many pairs of replicas were compared.
+/// group and wrote each field: at most one node says it made a group, and at most one that it
+/// wrote a field; databases that share a node, being copies, each say so. Returns how many pairs
+/// of replicas were compared.
 fn agree(peers: &[Peer], with: usize) -> Result<usize, String> {
     let Some((held, mine)) = &peers[with].origins else {
         return Ok(0);
@@ -1006,8 +1065,8 @@ fn agree(peers: &[Peer], with: usize) -> Result<usize, String> {
         return Ok(0);
     }
     for (group, (_, fields, _)) in mine {
-        let mut makers = 0;
-        let mut writers: std::collections::BTreeMap<&String, usize> = Default::default();
+        let mut makers = BTreeSet::new();
+        let mut writers: std::collections::BTreeMap<&String, BTreeSet<Gid>> = Default::default();
         for &i in &alike {
             let theirs = peers[i].origins.as_ref().map(|(_, a)| a).unwrap();
             let Some((made, written, _)) = theirs.get(group) else {
@@ -1015,31 +1074,40 @@ fn agree(peers: &[Peer], with: usize) -> Result<usize, String> {
                     "peers {with} and {i} hold the same changes; {i} has no {group:?}"
                 ));
             };
-            makers += usize::from(*made == Made::Here);
+            if *made == Made::Here {
+                makers.insert(peers[i].node);
+            }
             for (f, here) in written {
                 if here.is_some() != fields[f].is_some() {
                     return Err(format!(
                         "peers {with} and {i} disagree on whether {group:?}.{f} was written"
                     ));
                 }
-                *writers.entry(f).or_default() += usize::from(*here == Some(true));
+                let nodes = writers.entry(f).or_default();
+                if *here == Some(true) {
+                    nodes.insert(peers[i].node);
+                }
             }
         }
-        if makers > 1 {
+        if makers.len() > 1 {
             return Err(format!(
-                "{makers} replicas holding the same changes made {group:?}"
+                "{} replicas holding the same changes made {group:?}",
+                makers.len()
             ));
         }
-        if let Some((f, n)) = writers.iter().find(|(_, n)| **n > 1) {
+        if let Some((f, n)) = writers.iter().find(|(_, n)| n.len() > 1) {
             return Err(format!(
-                "{n} replicas holding the same changes wrote {group:?}.{f}"
+                "{} replicas holding the same changes wrote {group:?}.{f}",
+                n.len()
             ));
         }
     }
     Ok(alike.len() - 1)
 }
 
-async fn check(peers: &mut [Peer]) -> Result<(), String> {
+/// `copied` says whether two databases shared an identity: their writes at one clock to a set of
+/// fields that changes together can mix, so a book's status and finish date need not match.
+async fn check(peers: &mut [Peer], copied: bool) -> Result<(), String> {
     for peer in peers.iter_mut() {
         peer.midway().await?;
     }
@@ -1058,7 +1126,7 @@ async fn check(peers: &mut [Peer]) -> Result<(), String> {
             .await
             .map_err(|e| format!("peer {i}: {e}"))?;
         let mixed = peer.lines(MIXED).await;
-        if !mixed.is_empty() {
+        if !mixed.is_empty() && !copied {
             return Err(format!("peer {i}: {mixed:#?}"));
         }
         let view = support::read(&mut peer.conn, &peer.replica).await.view;
@@ -1140,18 +1208,83 @@ fn run_back(
             let rows = if found { found_at_install(n) } else { &[] };
             peers.push(Peer::new(&world, n, schema, rows, seed, step).await);
         }
+        let mut backups: Vec<Option<Peer>> = (0..5).map(|_| None).collect();
+        let mut databases = 5;
+        let mut copied = false;
         for (step, (who, op)) in script.iter().cloned().enumerate() {
-            perform(&mut peers[who], op, &mut hub)
-                .await
-                .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
+            let done = match op {
+                Op::Copy(from, book) => {
+                    copied |= from != who;
+                    copy(
+                        &world,
+                        &mut peers,
+                        &mut hub,
+                        from,
+                        who,
+                        book,
+                        &mut databases,
+                    )
+                    .await
+                }
+                Op::Backup => {
+                    databases += 1;
+                    backups[who] = Some(peers[who].copy(databases).await);
+                    Ok(())
+                }
+                Op::Restore => match &mut backups[who] {
+                    Some(backup) => {
+                        copied = true;
+                        world.share();
+                        databases += 1;
+                        peers[who] = backup.copy(databases).await;
+                        Ok(())
+                    }
+                    None => Ok(()),
+                },
+                op => perform(&mut peers[who], op, &mut hub).await,
+            };
+            done.map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
             agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
         finish(&mut peers, &mut hub)
             .await
             .map_err(|e| format!("while exchanging everything: {e}"))?;
-        check(&mut peers).await
+        check(&mut peers, copied).await
     });
     outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
+}
+
+/// Replaces peer `to`'s database with a copy of peer `from`'s; then, with the clock held, each
+/// titles its `book`th book with a title of its own and sends it.
+async fn copy(
+    world: &World,
+    peers: &mut [Peer],
+    hub: &mut Vec<Change>,
+    from: usize,
+    to: usize,
+    book: usize,
+    databases: &mut u64,
+) -> Result<(), String> {
+    if from == to {
+        return Ok(());
+    }
+    world.share();
+    world.hold(true);
+    *databases += 1;
+    peers[to] = peers[from].copy(*databases).await;
+    let mut outcome = Ok(());
+    for i in [from, to] {
+        let peer = &mut peers[i];
+        if let Some(id) = peer.pick("books", book).await {
+            peer.run(&format!(
+                "UPDATE books SET title = 'copy{i}' WHERE id = {id}"
+            ))
+            .await;
+        }
+        outcome = outcome.and(peer.push(hub).await);
+    }
+    world.hold(false);
+    outcome
 }
 
 /// A failing case as a test to paste below.
@@ -1182,6 +1315,14 @@ fn cases() -> u32 {
         .unwrap_or(32)
 }
 
+/// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
+fn sharing_cases() -> u32 {
+    match std::env::var("PROPTEST_CASES") {
+        Ok(_) => cases(),
+        Err(_) => cases() / 2,
+    }
+}
+
 /// One fixed run unless `PROPTEST_RNG_SEED` asks for another, so `make check` is repeatable;
 /// `make deep` picks a new seed each time and prints it.
 fn rng_seed() -> RngSeed {
@@ -1207,6 +1348,29 @@ proptest! {
         script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
     ) {
         let outcome = run_back(SCHEMA, found, seed, every, back, &script, None);
+        if let Err(error) = outcome {
+            prop_assert!(false, "{}", error);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: sharing_cases(),
+        rng_seed: rng_seed(),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    /// The same, with databases copied over others, backed up and restored, so that two
+    /// databases write as one node and their changes share clocks.
+    #[test]
+    fn replicas_sharing_a_node_agree_with_the_model_at_every_step_and_show_its_view_at_the_end(
+        seed in any::<u64>(),
+        every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
+        back in prop_oneof![Just(0u64), Just(1), Just(2), Just(40)],
+        script in proptest::collection::vec((0usize..5, arb_op_copying()), 0..300)
+    ) {
+        let outcome = run_back(SCHEMA, false, seed, every, back, &script, None);
         if let Err(error) = outcome {
             prop_assert!(false, "{}", error);
         }

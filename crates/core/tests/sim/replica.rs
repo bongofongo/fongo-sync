@@ -52,11 +52,14 @@ fn same_row(a: &Row, b: &Row) -> bool {
             .all(|((fa, va), (fb, vb))| fa == fb && same(va, vb))
 }
 
+#[derive(Clone)]
 pub struct Replica<'s> {
     pub schema: &'s Schema,
     ev: Evaluator<'s>,
     pub id: u8,
     clock: Clock,
+    /// A copy of the replica as it was when last backed up.
+    pub backup: Option<Box<Replica<'s>>>,
     pub wall: u64,
     pub store: Store,
     pub merged: Vec<Change>,
@@ -103,6 +106,7 @@ impl<'s> Replica<'s> {
             ev: Evaluator::new(schema).unwrap(),
             id,
             clock: Clock::new(Gid([0xC0 | id; 16])),
+            backup: None,
             wall: 0,
             store: Store::default(),
             merged: Vec::new(),
@@ -129,6 +133,17 @@ impl<'s> Replica<'s> {
             app_cells: BTreeSet::new(),
             expected: Vec::new(),
         }
+    }
+
+    /// A copy of this replica's database in place of `replaced`: it issues the clocks this one
+    /// would, and mints gids neither this one nor `replaced` minted, as gids minted at random
+    /// would be.
+    pub fn copy_over(&self, replaced: &Replica) -> Replica<'s> {
+        let mut copy = self.clone();
+        copy.id = replaced.id;
+        copy.backup = None;
+        copy.minted = self.minted.max(replaced.minted);
+        copy
     }
 
     pub fn is_clean(&self) -> bool {

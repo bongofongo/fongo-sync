@@ -78,6 +78,13 @@ instance : LawfulEqOrd Value where
         | contradiction
         | rw [LawfulEqOrd.eq_of_compare h]
 
+/-- The value order is total: of two different values, one is the smaller. -/
+theorem Value.compare_total (a b : Value) : compare a b = .lt ∨ a = b ∨ compare b a = .lt := by
+  cases h : compare a b with
+  | lt => exact .inl rfl
+  | eq => exact .inr (.inl (LawfulEqOrd.eq_of_compare h))
+  | gt => exact .inr (.inr (OrientedCmp.lt_of_gt h))
+
 /-- `ALIAS`: the field whose value, a reference to another gid, says that the two are one. -/
 def ALIAS : String := "$alias"
 
@@ -290,13 +297,12 @@ theorem inputs_eq (sc : Schema) {cs₁ cs₂ : List (Change Value)} (same : ∀ 
     simp only [edges, List.mem_filterMap, mem_ours_iff sc same, hk]
   simp only [inputs, regs, hk, canonical_eq_of_mem_iff _ _ he]
 
-theorem step_swap (sc : Schema) (st : State Value) (a b : Change Value)
-    (h : a.field = ALIAS ∨ b.field = ALIAS ∨ Compatible a b) :
+theorem step_swap (sc : Schema) (st : State Value) (a b : Change Value) :
     step sc (step sc st a) b = step sc (step sc st b) a := by
   by_cases ha : Writes a
   · by_cases hb : Writes b
     · simp only [step, ha, hb, ↓reduceIte]
-      exact State.apply_swap _ _ _ _ (by simpa [ha.1, hb.1] using h)
+      exact State.apply_swap _ _ _ _
     · simp [step, hb]
   · simp [step, ha]
 
@@ -313,17 +319,15 @@ theorem registers_eq_merged (sc : Schema) (cs : List (Change Value)) :
   funext st c
   by_cases h : Writes c <;> simp [h, step]
 
-/-- Swapping two neighbouring changes leaves the view the same, if either is an alias or they do
-not write one register at one clock with different values. -/
-theorem view_swap (sc : Schema) (pre post : List (Change Value)) (a b : Change Value)
-    (h : a.field = ALIAS ∨ b.field = ALIAS ∨ Compatible a b) :
+/-- Swapping two neighbouring changes leaves the view the same. -/
+theorem view_swap (sc : Schema) (pre post : List (Change Value)) (a b : Change Value) :
     view sc (pre ++ a :: b :: post) = view sc (pre ++ b :: a :: post) := by
   apply view_from_inputs
   apply inputs_eq
   · intro c; simp only [List.mem_append, List.mem_cons]
     constructor <;> rintro (h | h | h | h) <;> simp [h]
   · simp only [registers, List.foldl_append, List.foldl_cons]
-    rw [step_swap sc _ a b h]
+    rw [step_swap sc _ a b]
 
 /-- Receiving a change twice in a row leaves the view as receiving it once. -/
 theorem view_twice (sc : Schema) (pre post : List (Change Value)) (a : Change Value) :
@@ -340,23 +344,20 @@ theorem view_twice (sc : Schema) (pre post : List (Change Value)) (a : Change Va
 /-- **The view is a function of the set of changes.** Two replicas that have seen the same set of
 changes show the same data, whatever order the changes arrived in and however often. -/
 theorem view_eq_of_mem_iff (sc : Schema) {cs₁ cs₂ : List (Change Value)}
-    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) (unique : ClockDetermines cs₁) :
+    (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     view sc cs₁ = view sc cs₂ := by
   apply view_from_inputs
   apply inputs_eq sc same
   rw [registers_eq_merged, registers_eq_merged]
   apply merged_eq_of_mem_iff
-  · intro c; simp [same]
-  · intro a ha b hb
-    exact unique a (List.mem_filter.mp ha).1 b (List.mem_filter.mp hb).1
+  intro c; simp [same]
 
-theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂)
-    (unique : ClockDetermines cs₁) : view sc cs₁ = view sc cs₂ :=
-  view_eq_of_mem_iff sc (fun _ => p.mem_iff) unique
+theorem view_perm (sc : Schema) {cs₁ cs₂ : List (Change Value)} (p : cs₁.Perm cs₂) :
+    view sc cs₁ = view sc cs₂ :=
+  view_eq_of_mem_iff sc (fun _ => p.mem_iff)
 
-theorem view_dup (sc : Schema) (cs : List (Change Value)) (unique : ClockDetermines cs) :
+theorem view_dup (sc : Schema) (cs : List (Change Value)) :
     view sc (cs ++ cs) = view sc cs :=
-  view_eq_of_mem_iff sc (by simp) (by
-    intro a ha b hb; simp only [List.mem_append, or_self] at ha hb; exact unique a ha b hb)
+  view_eq_of_mem_iff sc (by simp)
 
 end FongoSync

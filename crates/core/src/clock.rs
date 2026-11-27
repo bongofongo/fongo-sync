@@ -3,7 +3,8 @@ use crate::value::{Gid, push_hex_digits};
 const WALL_MAX: u64 = 0xFFFF_FFFF_FFFF;
 
 /// A hybrid logical clock reading. Ordered by wall time, then counter, then node, so no two
-/// readings from different nodes are ever equal.
+/// readings from different nodes are ever equal. Two databases that write as one node, such as a
+/// copied database file, issue equal readings; the merge rules settle those by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hlc {
     pub wall_ms: u64,

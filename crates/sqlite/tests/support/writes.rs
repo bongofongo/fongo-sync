@@ -22,7 +22,7 @@ use super::{key_columns, quoted, rows, text};
 /// Rows by collection and key, each field by name, so rows read under two registries compare.
 type Rows = BTreeMap<(String, String), BTreeMap<String, Value>>;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Writes {
     /// The rows as the last kernel step left them.
     after: Rows,
@@ -833,7 +833,8 @@ impl Writes {
 impl Writes {
     /// Whether every write the application made is in the merged state of `everything`: some
     /// member of its entity's group holds the field at the clock it was sent with, or a later
-    /// one; a `Max` field holds a value at least as great, and a natural key field that value.
+    /// one, and at that clock a value at least as great; a `Max` field holds a value at least as
+    /// great, and a natural key field that value.
     pub fn kept(
         &self,
         registry: &fongo_sync_sqlite::Registry,
@@ -871,7 +872,7 @@ impl Writes {
                         } else if strategy == fongo_sync_sqlite::core::Strategy::Max {
                             v.total_cmp(&w.value) != std::cmp::Ordering::Less
                         } else {
-                            *at > w.clock || (*at == w.clock && same(v))
+                            at.cmp(&w.clock).then(v.total_cmp(&w.value)) != std::cmp::Ordering::Less
                         }
                     })
             });

@@ -1,6 +1,7 @@
 //! The facts `fongo_sync_core::source` describes, kept in the kernel's tables and read back
 //! through the indexed questions of [`Source`].
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::model::Schema;
@@ -362,6 +363,18 @@ fn clock_text(clock: &Hlc) -> Value {
     Value::Text(clock.encode())
 }
 
+/// What keeping one fact did.
+pub(crate) struct Kept {
+    /// Whether anything kept changed.
+    pub changed: bool,
+    /// Whether nothing kept could have come from this fact before: it gave its entity its first
+    /// claim in the collection or an earlier one, added an alias, or wrote a field that held no
+    /// entry. No fact is ever removed, whatever the strategies, so a fact kept once is never new.
+    pub new: bool,
+    /// Whether the field held an entry at the fact's clock with another value.
+    pub tied: bool,
+}
+
 /// The facts, answering the evaluator.
 pub(crate) struct Facts<'a> {
     pub db: &'a Db,
@@ -383,11 +396,10 @@ impl Facts<'_> {
             .collect()
     }
 
-    /// Keeps a fact as [`fongo_sync_core::source::Store::keep`] does. Returns whether anything
-    /// kept changed.
-    pub(crate) fn keep(&self, fact: &Fact) -> Result<bool> {
+    /// Keeps a fact as [`fongo_sync_core::source::Store::keep`] does.
+    pub(crate) fn keep(&self, fact: &Fact) -> Result<Kept> {
         let collection = Value::Text(fact.collection.clone());
-        let mut changed = self.db.exec(
+        let claimed = self.db.exec(
             "INSERT INTO fongo_claims (gid, collection, first) VALUES (?1, ?2, ?3)
              ON CONFLICT (gid, collection) DO UPDATE SET first = excluded.first
               WHERE excluded.first < fongo_claims.first",
@@ -397,18 +409,29 @@ impl Facts<'_> {
                 clock_text(&fact.clock),
             ],
         )? > 0;
+        let mut kept = Kept {
+            changed: claimed,
+            new: claimed,
+            tied: false,
+        };
         match &fact.body {
             Body::Alias { target } => {
-                changed |= self.db.exec(
+                let added = self.db.exec(
                     "INSERT OR IGNORE INTO fongo_alias (collection, a, b) VALUES (?1, ?2, ?3)",
                     &[collection, Value::Ref(fact.gid), Value::Ref(*target)],
                 )? > 0;
+                kept.changed |= added;
+                kept.new |= added;
             }
             Body::Field { field, value, slot } => {
                 let mut entries = self.entries_of(&fact.collection, fact.gid, field)?;
-                let (kept, _) = keep(*slot, &mut entries, value, fact.clock);
-                if kept {
-                    changed = true;
+                kept.new |= entries.is_empty();
+                kept.tied = entries
+                    .iter()
+                    .any(|(v, k)| *k == fact.clock && v.total_cmp(value) != Ordering::Equal);
+                let (changed, _) = keep(*slot, &mut entries, value, fact.clock);
+                if changed {
+                    kept.changed = true;
                     let at = [
                         collection.clone(),
                         Value::Ref(fact.gid),
@@ -429,7 +452,7 @@ impl Facts<'_> {
                 }
             }
         }
-        Ok(changed)
+        Ok(kept)
     }
 
     /// Every collection with a fact about `gid`, with the clock of the first.
@@ -448,7 +471,9 @@ impl Facts<'_> {
             .collect()
     }
 
-    /// The winning entry of a field among `members`, as a group shows it.
+    /// The winning entry of a field among `members`, as a group shows it. Of a natural key
+    /// field's entries, each member offers its latest, and of those at one clock the greatest
+    /// value.
     pub(crate) fn register(
         &self,
         schema: &Schema,
@@ -465,8 +490,11 @@ impl Facts<'_> {
         for &m in members {
             let mut entries = self.entries_of(collection, m, field)?;
             if slot == Slot::Earliest {
-                entries.sort_by_key(|e| std::cmp::Reverse(e.1));
-                entries.truncate(1);
+                entries = entries
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0)))
+                    .into_iter()
+                    .collect();
             }
             for (v, k) in entries {
                 let strategy = if field == fongo_sync_core::DELETED {

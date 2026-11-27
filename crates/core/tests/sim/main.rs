@@ -9,8 +9,10 @@
 //! - no identity is left unmerged;
 //! - every write an application made is in the merged state: for each entity, field, value and
 //!   clock a collect found by comparing rows with images (see `Replica::writes`), some member of
-//!   the entity's group holds that field at that clock with that value, or at a later clock (for
-//!   a `Max` field, a value at least as great; for a natural key field, that value).
+//!   the entity's group holds that field at that clock with that value or a greater one, or at a
+//!   later clock (for a `Max` field, a value at least as great; for a natural key field, that
+//!   value). A greater value at the same clock is a twin's: a copied database or a restored
+//!   backup issues the clocks its original issued.
 //!
 //! In the other direction, each collect checks that it sends no value the application did not
 //! write (`Replica::collect`).
@@ -136,6 +138,23 @@ pub enum Op {
         at: u8,
         first: u8,
         second: u8,
+    },
+    /// Replica `to` is replaced by a copy of replica `from`'s database, which issues the clocks
+    /// `from` issues. Each of the two then makes the same edits with other values and collects
+    /// them, so their changes share clocks.
+    Copy {
+        from: u8,
+        to: u8,
+        edits: Vec<(u8, u8, u8, u8)>,
+    },
+    /// Replica `at` keeps a copy of its database.
+    Backup {
+        at: u8,
+    },
+    /// Replica `at` goes back to the copy it kept, if any, and issues again the clocks it issued
+    /// since.
+    Restore {
+        at: u8,
     },
 }
 
@@ -338,6 +357,44 @@ pub fn step(world: &World, rs: &mut [Replica], log: &mut Vec<(u8, Change)>, op: 
                 r.edit("sites", x, "code", cy);
             }
         }
+        Op::Copy { from, to, edits } => {
+            let (from, to) = (at(*from), at(*to));
+            if from == to {
+                return;
+            }
+            rs[to] = rs[from].copy_over(&rs[to]);
+            for &(collection, row, field, pick) in edits {
+                let c = pick_collection(collection);
+                let f = &c.fields[usize::from(field) % c.fields.len()].name;
+                for (i, pick) in [(from, pick), (to, pick.wrapping_add(1))] {
+                    let r = &mut rs[i];
+                    let keys = r.keys(&c.name);
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let k = keys[usize::from(row) % keys.len()];
+                    let v = value(world, r, &c.name, f, pick);
+                    r.edit(&c.name, k, f, v);
+                }
+            }
+            deliver(rs, log, from, &[]);
+            deliver(rs, log, to, &[]);
+        }
+        Op::Backup { at: a } => {
+            let r = &mut rs[at(*a)];
+            r.backup = None;
+            let copy = r.clone();
+            r.backup = Some(Box::new(copy));
+        }
+        Op::Restore { at: a } => {
+            let r = &mut rs[at(*a)];
+            if let Some(backup) = r.backup.take() {
+                let wall = r.wall;
+                *r = backup.copy_over(r);
+                r.wall = wall;
+                r.backup = Some(backup);
+            }
+        }
         Op::Sync { at: a, from, picks } => {
             let candidates: Vec<&Change> = log
                 .iter()
@@ -400,11 +457,14 @@ fn writes_kept(schema: &Schema, rs: &[Replica], everything: &[Change]) -> Result
                 .map_or(Merge::Lww, |f| f.strategy);
             let key = matches!(&coll.identity, Identity::Natural(k) if k.contains(&w.field));
             let same = |v: &Value| v.total_cmp(&w.value) == std::cmp::Ordering::Equal;
+            let later = |v: &Value, at: &fongo_sync_core::Hlc| {
+                at.cmp(&w.clock).then(v.total_cmp(&w.value)) != std::cmp::Ordering::Less
+            };
             let holds = |m: &Gid| {
                 merged.entities.get(m).is_some_and(|e| {
                     e.registers
                         .get(&w.field)
-                        .is_some_and(|(v, at)| *at > w.clock || (*at == w.clock && same(v)))
+                        .is_some_and(|(v, at)| later(v, at))
                 })
             };
             if let Some(m) = w.members.iter().find(|m| !holds(m)) {
@@ -423,7 +483,7 @@ fn writes_kept(schema: &Schema, rs: &[Replica], everything: &[Change]) -> Result
                         } else if strategy == Merge::Max && w.field != fongo_sync_core::DELETED {
                             v.total_cmp(&w.value) != std::cmp::Ordering::Less
                         } else {
-                            *at > w.clock || (*at == w.clock && same(v))
+                            later(v, at)
                         }
                     })
             });
@@ -493,7 +553,10 @@ pub fn run(world: &World, replicas: usize, ops: &[Op]) -> Result<Exercised, Stri
             | Op::Twin { at, .. }
             | Op::TwinItem { at, .. }
             | Op::MoveMerged { at, .. }
-            | Op::Swap { at, .. } => usize::from(*at) % rs.len(),
+            | Op::Swap { at, .. }
+            | Op::Backup { at }
+            | Op::Restore { at }
+            | Op::Copy { to: at, .. } => usize::from(*at) % rs.len(),
         };
         if rs[touched].is_clean() {
             rs[touched]
@@ -553,6 +616,10 @@ fn arb_op() -> impl Strategy<Value = Op> {
             .prop_map(|(at, first, second)| Op::Swap { at, first, second }),
         4 => (any::<u8>(), any::<u8>(), any::<u8>())
             .prop_map(|(at, row, site)| Op::MoveMerged { at, row, site }),
+        2 => (any::<u8>(), any::<u8>(), proptest::collection::vec(any::<(u8, u8, u8, u8)>(), 1..4))
+            .prop_map(|(from, to, edits)| Op::Copy { from, to, edits }),
+        1 => any::<u8>().prop_map(|at| Op::Backup { at }),
+        1 => any::<u8>().prop_map(|at| Op::Restore { at }),
     ]
 }
 

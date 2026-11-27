@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{arb_case, arb_family, gid};
+use common::{arb_case, arb_family, gid, same, same_row};
 use fongo_sync_core::eval::{Evaluator, Target};
 use fongo_sync_core::model::{
     Collection, FieldKind, Identity, Row, Schema, unmerged_identities, view,
@@ -250,10 +250,11 @@ proptest! {
             if revives {
                 // Moving the entity moves members that were dead only through their old owner;
                 // they come back and their fields compete as any live member's do.
-                prop_assert_eq!(&after.row.as_ref().unwrap()[&f.name], &edited[&f.name]);
+                let (got, want) = (&after.row.as_ref().unwrap()[&f.name], &edited[&f.name]);
+                prop_assert!(same(got, want), "{:?} != {:?}", got, want);
                 continue;
             }
-            prop_assert_eq!(after.row.as_ref(), Some(&edited));
+            prop_assert!(same_row(after.row.as_ref(), Some(&edited)), "{:?} != {:?}", after.row, edited);
             prop_assert_eq!(write(after.row.as_ref(), Some(&edited)), RowAction::Nothing);
         }
     }
@@ -317,7 +318,7 @@ proptest! {
                 f == field.name
                     || coll.fields.iter().any(|d| d.name == f && d.kind == FieldKind::Plain)
             );
-            prop_assert_eq!(&v, &row[&f]);
+            prop_assert!(same(&v, &row[&f]), "{:?} != {:?}", v, row[&f]);
         }
     }
 
