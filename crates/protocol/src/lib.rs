@@ -74,8 +74,10 @@
 //! it holds the private halves of the keys named (the wrap key's own signature shows that of the
 //! device key), or anything against a holder of the secret, who can make a proof for any key. A
 //! server can drop a proof, so that a device that registered one shows none; it cannot make one,
-//! or move one to another key or wrap key. Absent and invalid proofs are told apart, so that
-//! devices registered before proofs existed can be treated otherwise than forged ones. A record
+//! or move one to another key or wrap key. Absent and invalid proofs are told apart only so that
+//! an application can tell a device that needs to register again from a forgery: an absent proof
+//! is also exactly what a key the server planted looks like, so it gives no assurance at all and
+//! must never be treated more leniently than an invalid one when deciding who receives a secret. A record
 //! whose proof is not 64 hex digits still parses, and its proof checks as invalid; a request
 //! carrying one does not parse.
 //!

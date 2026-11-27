@@ -27,7 +27,11 @@ pub enum MemberCheck {
     /// The proof checks against this secret, for the record's key and wrap key.
     Valid,
     /// The record carries no proof: registered by a build that made none, by the recovery key,
-    /// or with the proof dropped by the server.
+    /// with the proof dropped by the server, or planted by the server, which is exactly what a key
+    /// of its own looks like. It gives no assurance at all, and must never be treated more
+    /// leniently than [`MemberCheck::Invalid`] when deciding who receives a secret; it is told
+    /// apart only so that an application can tell a device that needs to register again from a
+    /// forgery.
     Absent,
     /// The proof does not check: made under another secret, or for another key or wrap key.
     Invalid,
