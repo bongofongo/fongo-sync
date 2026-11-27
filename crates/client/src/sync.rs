@@ -74,7 +74,9 @@ pub struct Pace {
     pub collect: usize,
     /// Most changes this device seals into one envelope, so a receiver's single apply of it stays
     /// short; the server's maximum envelope size can make envelopes smaller still. 0 counts as 1.
-    /// Default 1,000.
+    /// Default 1,000. It also bounds how long a sync holds the write lock to read and seal an
+    /// envelope and record it as being sent: on a fast laptop, about a millisecond for 50
+    /// changes and up to about 14 ms for 1,000.
     pub seal: u32,
     /// How long the sync holds the write lock, summed over its transactions, before it pauses.
     /// Default 250 ms.
