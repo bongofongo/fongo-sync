@@ -197,8 +197,9 @@ impl BlobDigest {
 /// the blobs its changes set references to. The server appends the envelope as
 /// [`BATCHES_PATH`](super::BATCHES_PATH) would, with the same checks and errors, and in the same
 /// atomic step records each id as claimed at the envelope's sequence number; it answers
-/// [`Appended`](super::Appended). An envelope the server already holds is not appended again, and
-/// its ids are claimed at the library's head instead. A request that names an id needing a record
+/// [`Appended`](super::Appended). A server may recognise an envelope identical to one it already
+/// holds; see [the module documentation](super#appending-an-envelope-twice) for what it does then.
+/// A request that names an id needing a record
 /// the library has no room for is refused with
 /// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and appends nothing. The ids count
 /// against [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids), and not against

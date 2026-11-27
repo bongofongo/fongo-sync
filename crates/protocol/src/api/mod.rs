@@ -30,7 +30,13 @@
 //! none may leave the restored record without one.
 //!
 //! A [`DeviceRecord`]'s `last_seen` is the start of the hour, a multiple of 3600, in which the key
-//! last made a request that authenticated.
+//! last made a request that authenticated; a request refused after authenticating, such as one
+//! from a removed device, may still move it.
+//!
+//! Whether a server checks a wrap key's proof before it finds the key already listed is not
+//! settled: re-adding a listed key with a wrap key whose proof does not verify may succeed and
+//! change nothing, or be refused with [`ErrorCode::InvalidProof`]. A client sends a valid proof or
+//! none.
 //!
 //! # Limits on requests
 //!
@@ -43,7 +49,8 @@
 //! with no more ids and none repeated, never exceeds; it may refuse a longer one with
 //! [`ErrorCode::TooLarge`] before reading it. A chunk body at [`BLOB_CHUNK_PATH`] or
 //! [`BLOB_WHOLE_PATH`] longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) is refused with
-//! [`ErrorCode::TooLarge`].
+//! [`ErrorCode::TooLarge`], before the body is read; a body of
+//! any other wrong length is [`ErrorCode::MalformedRequest`].
 //!
 //! A server may bound how many blob records a library has: one for each id it holds a claim, an
 //! upload or a complete blob for. For blobs it answers [`ErrorCode::LibraryFull`] only to a
@@ -59,23 +66,27 @@
 //! appending an envelope (at either batch path), claiming, retiring or writing a blob; every `GET`,
 //! a blob query, adding a device, [`STATUS_PATH`], [`ENTITLEMENT_PATH`], [`SETTLED_PATH`] and
 //! [`REMOVE_DEVICE_PATH`] still work. A library over its allowance is refused
-//! [`ErrorCode::QuotaExceeded`] when beginning or writing a blob, and everything else works. At
-//! the edges:
+//! [`ErrorCode::QuotaExceeded`] when beginning a blob or uploading a chunk or `whole`, and
+//! everything else works, `complete` included. At the edges:
 //!
 //! | request | not entitled | over its allowance |
 //! |---|---|---|
 //! | begin with the shape of a blob that is complete | success | success |
 //! | a chunk upload or `whole` with the bytes a complete blob holds there | success | success |
 //! | `complete` of a complete blob, with the matching digest | success | success |
-//! | `complete` of a blob not yet complete | [`ErrorCode::NotEntitled`] | as usual |
-//! | a [`ClaimingAppend`] of an envelope the server already holds | success, and the claims are recorded | success, and the claims are recorded |
+//! | `complete` of a blob not yet complete | [`ErrorCode::NotEntitled`] | success |
+//! | a [`ClaimingAppend`] of an envelope the server already holds, where it recognises it | success, and the claims are recorded | success, and the claims are recorded |
 //!
 //! # Appending an envelope twice
 //!
-//! A server may recognise an envelope identical to one it holds and answer the sequence number it
-//! gave it without storing it again; a device does not rely on this, since it applies a copy
-//! idempotently. A [`ClaimingAppend`] answered so still records its claims, at the library's head
-//! when the request arrives, not at the stored envelope's sequence number.
+//! A server may recognise an envelope identical to one it holds, at either batch path, or may not;
+//! a device does not rely on either, since it applies a copy idempotently. Where a server
+//! recognises one, it stores nothing, answers the sequence number it gave the envelope, and, for a
+//! [`ClaimingAppend`], records its ids as claimed at a position no lower than that number; it may
+//! record them at the library's head. A device relies only on that lower bound. A server that
+//! recognises a [`ClaimingAppend`] so does this also when the library is not entitled. Where a
+//! server does not recognise one, the request is an ordinary append, accepted or refused as any
+//! other.
 //!
 //! # Blob routes at their edges
 //!
@@ -90,13 +101,13 @@
 //! | begin or `whole` | the stored size is above [`Capabilities::max_blob_bytes`] | [`ErrorCode::BlobTooLarge`] |
 //! | begin or `whole` | an earlier begin, or a completion through `whole`, gave another shape | [`ErrorCode::BlobMismatch`] |
 //! | begin | the blob is complete with the same shape | `{complete: true, have: every chunk}` |
-//! | a chunk upload or `whole` | the body is longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) | [`ErrorCode::TooLarge`] |
+//! | a chunk upload or `whole` | the body is longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) | [`ErrorCode::TooLarge`], before the body is read |
 //! | `whole` | the body is not the stored form of a one-chunk blob | [`ErrorCode::MalformedRequest`] |
 //! | `whole` | the blob was begun with the same one-chunk shape | stores the chunk and completes |
 //! | `whole` | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`] |
 //! | a chunk upload, `complete`, or a `GET` | the blob was never begun | [`ErrorCode::BlobNotFound`] |
 //! | a chunk upload or `GET` of a chunk | the index is not below the chunk count | [`ErrorCode::MalformedRequest`] |
-//! | a chunk upload | the body is not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
+//! | a chunk upload | the body is not longer than [`SEALED_CHUNK_LEN`](crate::SEALED_CHUNK_LEN) and not that chunk's [`BlobInfo::stored_chunk_len`] | [`ErrorCode::MalformedRequest`] |
 //! | a chunk upload | the blob is complete | success if the bytes equal the stored chunk, else [`ErrorCode::BlobMismatch`]; nothing changes |
 //! | `complete` | the blob is complete | success if the digest matches, else [`ErrorCode::BlobMismatch`] |
 //! | `GET` a chunk or the blob | the blob is not complete | [`ErrorCode::BlobIncomplete`] |
@@ -198,7 +209,8 @@
 //! `through` means the changes through `through` do not refer to it. Every later set of changes
 //! holds those, so one that refers to the file holds a later change setting a reference to it. If
 //! that change was appended with its claim, the claim is at a sequence number above `through`,
-//! which voids the retirement. If it was appended without its claim while the server was not
+//! which voids the retirement; a claim recorded for a recognised copy of the envelope is at or
+//! above the envelope's number, and so above `through` too. If it was appended without its claim while the server was not
 //! offering blobs, the floor raised when it began again is above `through` and voids the
 //! retirement in the same way. Otherwise it was appended without its claim, or is not yet
 //! appended, and its device has not settled since making it: a device claims what it appended
@@ -209,8 +221,11 @@
 //! The limits:
 //!
 //! - any change a device makes after its [`Settled`] at or above `through` that refers to the
-//!   file, and that it sends after the deletion, finds the file missing. If the device holds the
-//!   file it uploads it again; if not, the file is unavailable. The same holds for a removed device
+//!   file, and that it sends without its claim or after the deletion, can find the file deleted
+//!   before its claim arrives: a claiming append refused with [`ErrorCode::LibraryFull`] and sent
+//!   plainly, or one sent plainly because the device read [`Capabilities::blobs`] as false just
+//!   before the server began to offer it, is claimed only later. The device recovers the file only
+//!   if it still holds it, by uploading it again; if not, the file is unavailable. The same holds for a removed device
 //!   that joins again and sends changes it had not sent. A device that refers anew to a file it
 //!   does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
 //! - a device catching up, newly joined or restored, passes through states that refer to files

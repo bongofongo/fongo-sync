@@ -39,14 +39,16 @@
 //!   different logs can diverge for good.
 //! - honest sequence numbers: each library's envelopes are numbered 1, 2, 3 and so on without
 //!   gaps, the number in [`api::Appended`] is the one the envelope is read back at, and the head a
-//!   server reports or checks against is its log's. A client can see a page whose numbers skip,
-//!   repeat or go back; it cannot see a log rolled back, or a number answered for an envelope that
-//!   is not read back there.
+//!   server reports or checks against is its log's.
 //! - the device list: which keys' envelopes and requests a library accepts, as the limits below
 //!   say.
 //! - deleting files only by the rules in [`api`]. A file deleted early is unavailable, not altered.
 //!
-//! This version detects none of these failures. It does not rely on a server storing an identical
+//! A client can observe one kind of failure: a page whose numbers do not run on from its cursor
+//! without a gap, repeat or step back. It cannot observe a log truncated or rolled back, which
+//! looks like nothing new; a fork, where devices are shown different envelopes at one number; a
+//! number in [`api::Appended`] that the envelope is not read back at; or an envelope withheld from
+//! it. This version detects none of these. It does not rely on a server storing an identical
 //! envelope only once, since a copy is applied idempotently, nor on notifications arriving, since
 //! they are hints, nor on anything a server reports about a library (`last_seen`, its status) for
 //! the library's content.
