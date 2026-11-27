@@ -975,19 +975,20 @@ impl Replica {
         .await
     }
 
-    /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
-    /// What it adopts of the registry for collections installed before (new fields, sets now
-    /// written together, sets narrowed, whose collections' rows are all written again), and every
-    /// row that brings up to date, is done whole in this first step, as `install` does it; records an install under another registry left waiting are first adopted whole,
-    /// under the registry they were recorded with, as by that install. The rows found in the tables of a collection installed for the first time are
-    /// recorded, with their values as they stand, and later steps adopt them from the records;
-    /// what the application writes to them meanwhile is collected once every record is adopted,
-    /// as an edit made after a whole install. Recording reads every found row in this one
-    /// transaction. Where rows written before this install are still to be collected, or an
-    /// earlier install's records still wait, the found rows are instead adopted whole by the
-    /// next step. A collect or an apply made while records wait adopts the rest first, whole:
-    /// a caller that wants the lock held briefly takes steps until [`Collected::more`] is false
-    /// before it applies anything. The adoptions are the changes a whole install would send,
+    /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction. What
+    /// it adopts of the registry for collections installed before (new fields, sets now written
+    /// together, sets narrowed, whose collections' rows are all written again), and every row that
+    /// brings up to date, is done whole in this first step, as `install` does it; records an
+    /// install under another registry left waiting are first adopted whole, under the registry they
+    /// were recorded with, as by that install. The rows found in the tables of a collection
+    /// installed for the first time are recorded, with their values as they stand, and later steps
+    /// adopt them from the records; what the application writes to them meanwhile is collected once
+    /// every record is adopted, as an edit made after a whole install. Recording reads every found
+    /// row in this one transaction. Where rows written before this install are still to be
+    /// collected, or an earlier install's records still wait, the found rows are instead adopted
+    /// whole by the next step. A collect or an apply made while records wait adopts the rest first,
+    /// whole: a caller that wants the lock held briefly takes steps until [`Collected::more`] is
+    /// false before it applies anything. The adoptions are the changes a whole install would send,
     /// with the same gids and clocks, but in the outbox in the order of their batches rather than
     /// of their collections and keys. The design is set out with the kernel's tables, in
     /// `store.rs`.
@@ -1136,8 +1137,8 @@ impl Replica {
                 adopted.extend(changes);
                 set.extend(more);
             }
-            // A field that leaves a set shows its own latest write again, where the wider set
-            // showed it NULL: the rows are written again from what the merge holds.
+            // A field that leaves a set shows its own latest write that the merge still holds,
+            // where the wider set showed it NULL: the rows are written again from the merge.
             let parted = old
                 .as_ref()
                 .is_some_and(|old| old.iter().any(|o| !c.together.iter().any(|s| within(o, s))));
