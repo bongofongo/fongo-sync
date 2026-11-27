@@ -43,7 +43,9 @@ pub enum MemberCheck {
 /// [`MemberCheck::Invalid`] and is written back as an empty string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListedMemberProof {
+    /// 64 hex digits, read as a proof; whether it checks is [`DeviceRecord::check_member_proof`](crate::api::DeviceRecord::check_member_proof)'s question.
     Readable(MemberProof),
+    /// Anything else the server listed in the field.
     Unreadable,
 }
 

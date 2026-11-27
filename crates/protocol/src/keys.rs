@@ -109,10 +109,13 @@ impl<'de> serde::Deserialize<'de> for WrapKey {
 pub struct WrapSecret([u8; 32]);
 
 impl WrapSecret {
+    /// The secret from its 32 bytes, as [`WrapSecret::as_bytes`] gives them. Any 32 bytes are a
+    /// secret: they are clamped when used.
     pub fn from_bytes(bytes: &[u8; 32]) -> WrapSecret {
         WrapSecret(*bytes)
     }
 
+    /// The secret's 32 bytes, to store with the device's other secrets.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

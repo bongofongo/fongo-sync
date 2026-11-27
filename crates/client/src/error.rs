@@ -48,8 +48,8 @@ pub enum Error {
     /// The library or device slot exists. From [`crate::create_library`] and
     /// [`crate::join_library`], which make the credentials themselves, `credentials` holds them;
     /// from the other calls, whose caller holds them, it is `None`. The device can sync, but
-    /// must not count on receiving a new library secret sealed to its wrap key. Nothing was
-    /// changed.
+    /// must not count on receiving a new library secret sealed to its wrap key. A first create or
+    /// join made the library or slot; a repeat left the listing as it was.
     #[error("this device's key is registered with another wrap key or membership proof")]
     RegisteredOtherwise {
         credentials: Option<Box<crate::Credentials>>,

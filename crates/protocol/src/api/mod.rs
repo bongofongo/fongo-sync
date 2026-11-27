@@ -461,8 +461,12 @@ impl CreateLibrary {
     }
 
     /// The same request with the [`MemberProof`] `keys` make for its device key and wrap key.
-    /// `keys` are the library's, whose id is `library`.
+    ///
+    /// # Panics
+    ///
+    /// If `keys` are not those of `library`: their proof would never check.
     pub fn with_member_proof(self, keys: &LibraryKeys) -> CreateLibrary {
+        assert_eq!(keys.id, self.library, "the keys are another library's");
         CreateLibrary {
             member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
             ..self
@@ -584,8 +588,17 @@ impl AddDevice {
     }
 
     /// The same request with the [`MemberProof`] the library's `keys` make for its device key
-    /// and wrap key.
+    /// and wrap key. `keys` must be those of the library the request is sent to: the request does
+    /// not name its library, so only a wrap key, signed for one, shows a mismatch.
+    ///
+    /// # Panics
+    ///
+    /// If the request carries a wrap key its device key did not sign for `keys`' library.
     pub fn with_member_proof(self, keys: &LibraryKeys) -> AddDevice {
+        assert!(
+            self.wrap.is_none() || self.verify_wrap(keys.id),
+            "the wrap key is not signed for the keys' library"
+        );
         AddDevice {
             member_proof: Some(member_proof(keys, &self.device_key, self.wrap.as_ref())),
             ..self
@@ -1033,6 +1046,22 @@ mod tests {
                 assert!(serde_json::from_value::<AddDevice>(request).is_err());
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "another library")]
+    fn a_create_proof_from_another_librarys_keys_is_refused() {
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let _ = CreateLibrary::new(LibraryId([3; 16]), &device, device.verifying_key())
+            .with_member_proof(&LibraryKeys::new(LibraryId([4; 16]), [7; 32]));
+    }
+
+    #[test]
+    #[should_panic(expected = "not signed for the keys' library")]
+    fn an_add_proof_from_another_librarys_keys_is_refused() {
+        let device = SigningKey::from_bytes(&[1; 32]);
+        let _ = AddDevice::with_wrap_key(LibraryId([3; 16]), &device, WrapKey([5; 32]))
+            .with_member_proof(&LibraryKeys::new(LibraryId([4; 16]), [7; 32]));
     }
 
     #[test]

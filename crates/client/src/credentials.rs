@@ -68,7 +68,8 @@ impl Credentials {
     }
 
     /// Credentials for a new library: a random library id and secret, device key and wrap
-    /// secret, epoch 0. Store them before [`crate::create_library_with`] registers them.
+    /// secret, epoch 0. Store them before [`crate::create_library_with`] registers them. Holding a
+    /// wrap secret, they are stored in a format a build from before wrap secrets cannot read.
     pub fn for_new_library() -> Result<Credentials, Error> {
         let library = LibraryKeys::generate().map_err(|_| Error::Randomness)?;
         Credentials::for_new_device(library)
@@ -76,14 +77,16 @@ impl Credentials {
 
     /// Credentials for a new device of the library whose recovery code this is: its keys, a
     /// random device key and wrap secret, epoch 0. Store them before [`crate::join_library_with`]
-    /// registers them.
+    /// registers them. Holding a wrap secret, they are stored in a format a build from before wrap
+    /// secrets cannot read.
     pub fn for_recovery_code(recovery_code: &str) -> Result<Credentials, Error> {
         Credentials::for_new_device(LibraryKeys::from_recovery_code(recovery_code)?)
     }
 
     /// Credentials for a new device of a library whose keys the application handed over: a random
     /// device key and wrap secret, epoch 0. Store them, then give a device already in the library
-    /// [`Credentials::device_offer`] to add with [`crate::add_device`].
+    /// [`Credentials::device_offer`] to add with [`crate::add_device`]. Holding a wrap secret,
+    /// they are stored in a format a build from before wrap secrets cannot read.
     pub fn for_new_device(library: LibraryKeys) -> Result<Credentials, Error> {
         let device = generate_signing_key().map_err(|_| Error::Randomness)?;
         let wrap = WrapSecret::generate().map_err(|_| Error::Randomness)?;
@@ -122,6 +125,7 @@ impl Credentials {
         self.epoch
     }
 
+    /// The secret of the wrap key this device registers, if the credentials hold one.
     pub fn wrap_secret(&self) -> Option<&WrapSecret> {
         self.wrap.as_ref()
     }
@@ -157,7 +161,8 @@ impl Credentials {
     /// With a wrap secret, 117 bytes of format [`CREDENTIALS_FORMAT`]: the format, the library
     /// id, the library secret, the device key's seed, the epoch (big-endian) and the wrap secret.
     /// Without one, the first 85 of those bytes, of format [`CREDENTIALS_FORMAT_WITHOUT_WRAP`], as
-    /// builds before wrap secrets wrote them. Secret; store it as such.
+    /// builds before wrap secrets wrote them. A build from before wrap secrets cannot read the
+    /// longer form. Secret; store it as such.
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::with_capacity(LEN));
         out.push(match self.wrap {
