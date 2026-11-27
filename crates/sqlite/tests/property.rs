@@ -550,9 +550,14 @@ struct Left {
     outbox: Vec<Change>,
     rows: Vec<String>,
     values: Vec<String>,
+    /// Each natural entity's gid as its key derives it read in group terms: see `same_as_whole`.
+    natural: std::collections::BTreeMap<fongo_sync_sqlite::core::Gid, fongo_sync_sqlite::core::Gid>,
 }
 
 async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left {
+    use fongo_sync_sqlite::Key;
+    use fongo_sync_sqlite::core::{Gid, Value};
+    use std::collections::BTreeMap;
     let mut rows = Vec::new();
     for table in [
         "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers", "series",
@@ -565,11 +570,39 @@ async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left
     }
     let inspection = replica.inspect(conn).await.unwrap();
     // A reference is held as the group it names: see `same_as_whole`.
-    let canonical: std::collections::BTreeMap<fongo_sync_sqlite::core::Gid, _> = inspection
+    let canonical: BTreeMap<Gid, _> = inspection
         .aliases
         .iter()
         .map(|(_, g, k)| (*g, *k))
         .collect();
+    let in_group = |v: &Value| match v {
+        Value::Ref(r) => Value::Ref(*canonical.get(r).unwrap_or(r)),
+        v => v.clone(),
+    };
+    // Only a gid its key derives is read in group terms, so one it does not derive still shows.
+    let mut natural = BTreeMap::new();
+    for c in replica.registry().collections() {
+        let Key::Natural { fields } = &c.key else {
+            continue;
+        };
+        let mut held: BTreeMap<Gid, BTreeMap<&str, &Value>> = BTreeMap::new();
+        for (_, g, f, v, _) in inspection.registers.iter().filter(|r| r.0 == c.name) {
+            held.entry(*g).or_default().insert(f.as_str(), v);
+        }
+        for (g, held) in held {
+            let Some(values) = fields
+                .iter()
+                .map(|f| held.get(f.as_str()).map(|v| (*v).clone()))
+                .collect::<Option<Vec<Value>>>()
+            else {
+                continue;
+            };
+            if Gid::derive(&c.name, &values) == g {
+                let read: Vec<Value> = values.iter().map(in_group).collect();
+                natural.insert(g, Gid::derive(&c.name, &read));
+            }
+        }
+    }
     Left {
         outbox: replica.outbox(conn, 1_000_000).await.unwrap().changes,
         rows,
@@ -577,16 +610,12 @@ async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left
             .registers
             .iter()
             .map(|(c, g, f, v, _)| {
-                let v = match v {
-                    fongo_sync_sqlite::core::Value::Ref(r) => {
-                        fongo_sync_sqlite::core::Value::Ref(*canonical.get(r).unwrap_or(r))
-                    }
-                    v => v.clone(),
-                };
-                format!("{c} {g:?} {f} {v:?}")
+                let g = natural.get(g).unwrap_or(g);
+                format!("{c} {g:?} {f} {:?}", in_group(v))
             })
             .chain(inspection.aliases.iter().map(|a| format!("{a:?}")))
             .collect(),
+        natural,
     }
 }
 
@@ -596,7 +625,7 @@ fn same_as_whole(start: usize, whole: &Left, stepped: &Left) -> Result<(), Strin
     use fongo_sync_sqlite::core::{ALIAS, Gid, Value};
     // A reference may name another member of a group the steps join, as it may across two
     // collects: references are compared by the group they name, each side's groups joined by
-    // the aliases it sent.
+    // the aliases it sent, and a natural entity by the key it derives so read.
     let groups = |left: &Left| {
         let mut parent: std::collections::BTreeMap<Gid, Gid> = std::collections::BTreeMap::new();
         fn root(parent: &std::collections::BTreeMap<Gid, Gid>, mut g: Gid) -> Gid {
@@ -632,7 +661,8 @@ fn same_as_whole(start: usize, whole: &Left, stepped: &Left) -> Result<(), Strin
                     Value::Ref(g) => Value::Ref(group(*g)),
                     v => v.clone(),
                 };
-                format!("{} {:?} {} {:?}", c.collection, c.gid, c.field, value)
+                let gid = left.natural.get(&c.gid).unwrap_or(&c.gid);
+                format!("{} {gid:?} {} {value:?}", c.collection, c.field)
             })
             .collect::<Vec<_>>()
     };
@@ -2402,3 +2432,78 @@ fn found_books_written_between_the_steps_of_a_first_install() {
 fn a_found_book_whose_isbn_is_written_back_between_install_steps() {
     run_found(8364741249218391914, &[]).unwrap();
 }
+
+/// Found by long runs (seeds 8301947 and 5550123). A replica holds a book from elsewhere with no
+/// row, of which only the ISBN has arrived; the application makes a book with that ISBN and, a
+/// millisecond later, a tag on it. One collect derives the tag's key from the new book's own
+/// entity, steps from the entity of the group the first step joined it to: one tag, which the
+/// test compares by the key it derives with the book read as its group.
+#[tokio::test]
+async fn a_tag_on_a_book_found_to_be_one_is_one_tag_in_steps() {
+    let world = World::new(3);
+    world.hold(true);
+    let replica = Replica::new(registry(false));
+    let mut a = world.connect(0).await;
+    let mut b = world.connect(1).await;
+    for conn in [&mut a, &mut b] {
+        for sql in SCHEMA {
+            sqlx::query(sql).execute(&mut *conn).await.unwrap();
+        }
+        replica.install(&mut *conn).await.unwrap();
+    }
+    for sql in [
+        "INSERT INTO shelves (name) VALUES ('shelf1')",
+        "INSERT INTO books (shelf_id, title, isbn, seen) VALUES (1, 'title1', 'i0', 0)",
+    ] {
+        sqlx::query(sql).execute(&mut b).await.unwrap();
+    }
+    replica.collect(&mut b).await.unwrap();
+    let isbn: Vec<Change> = replica
+        .outbox(&mut b, u32::MAX)
+        .await
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter(|c| c.collection == "books" && c.field == "isbn")
+        .collect();
+    world.later(1);
+    replica.apply(&mut a, &isbn).await.unwrap();
+    world.later(1);
+    for sql in [
+        "INSERT INTO shelves (name) VALUES ('shelf0')",
+        "INSERT INTO books (shelf_id, title, isbn, seen) VALUES (1, 'title0', 'i0', 0)",
+    ] {
+        sqlx::query(sql).execute(&mut a).await.unwrap();
+    }
+    world.later(1);
+    sqlx::query("INSERT INTO tags (book_id, tag) VALUES (1, 'tag0')")
+        .execute(&mut a)
+        .await
+        .unwrap();
+    world.later(1);
+    let start = replica
+        .outbox(&mut a, u32::MAX)
+        .await
+        .unwrap()
+        .changes
+        .len();
+    let (_, mut copy) = world.twin(0, &mut a).await;
+    replica.collect(&mut copy).await.unwrap();
+    let whole = collected_whole(&mut copy, &replica).await;
+    while replica.collect_step(&mut a, 1).await.unwrap().more {}
+    let stepped = collected_whole(&mut a, &replica).await;
+    let tags = |left: &Left| -> BTreeSet<_> {
+        left.outbox[start..]
+            .iter()
+            .filter(|c| c.collection == "tags")
+            .map(|c| c.gid)
+            .collect()
+    };
+    assert_ne!(
+        tags(&whole),
+        tags(&stepped),
+        "one collect and the steps derive the tag from one member of the book's group"
+    );
+    same_as_whole(start, &whole, &stepped).unwrap();
+}
+
