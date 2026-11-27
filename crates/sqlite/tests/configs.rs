@@ -1,8 +1,9 @@
 //! Configurations of the application's schema, connection and registry outside the shape the
-//! other tests use, each in the smallest setting that shows whether replicas still converge: every
-//! peer checks itself against the model after each apply and collect, every write the
-//! application made must be sent, nothing it did not write may be sent, and the end of each test
-//! requires every replica to show the model's view of all changes.
+//! other tests use, each in the smallest setting that shows it. Those the kernel supports must
+//! converge: every peer checks itself against the model after each apply and collect, every write
+//! the application made must be sent and nothing else, and replicas end showing the model's view.
+//! Those it is to refuse must be refused with an error of its own, leaving the database as it was.
+//! Ignored tests are those the kernel does not yet refuse or handle.
 
 mod support;
 
@@ -1052,42 +1053,102 @@ async fn references_whose_foreign_key_acts_otherwise_than_the_registry_says_conv
     );
 }
 
-/// A correct kernel sends the bytes as written, or refuses the write or the collect with an
-/// error of its own and sends nothing altered; it never sends other text.
-#[tokio::test]
-#[ignore = "known fault: text that is not UTF-8 is read lossily and sent altered, so other replicas receive replacement characters"]
-async fn text_that_is_not_utf8_is_sent_as_written_or_refused() {
-    let world = World::new(26);
+/// Whether `error` is a refusal of the kernel's own, rather than SQLite's or a state it found.
+fn kernel_refusal(error: &Error) -> bool {
+    !matches!(
+        error,
+        Error::Sql(_)
+            | Error::Sqlite { .. }
+            | Error::Corrupt(_)
+            | Error::Suspended
+            | Error::NotInstalled
+            | Error::NewerLayout { .. }
+            | Error::OlderLayout { .. }
+            | Error::UnknownLayout { .. }
+    )
+}
+
+/// What a correct kernel gives for a value it may not hold as written: the application's write
+/// succeeds; the value then reaches every replica exactly as `read` shows it, or the collect is
+/// refused with an error of the kernel's own and nothing of `collection` is sent.
+async fn exact_or_refused(
+    peers: &mut [Peer],
+    collection: &str,
+    write: &str,
+    read: &str,
+    expected: &[&str],
+) {
     let mut hub = Vec::new();
-    let mut peers = peers_in(&world, 2, LIBRARY, library).await;
-    for peer in &mut peers {
+    for peer in peers.iter_mut() {
         peer.checking = false;
     }
-    let written = sqlx::query("INSERT INTO shelves (name) VALUES (CAST(x'ff41' AS TEXT))")
-        .execute(&mut peers[0].conn)
-        .await;
-    if written.is_err() {
-        assert!(peers[0].lines("SELECT name FROM shelves").await.is_empty());
-        return;
-    }
+    let written = sqlx::query(write).execute(&mut peers[0].conn).await;
+    assert!(
+        written.is_ok(),
+        "the application's own write failed: {written:?}"
+    );
     let p = &mut peers[0];
-    if p.replica.collect(&mut p.conn).await.is_err() {
+    if let Err(e) = p.replica.collect(&mut p.conn).await {
+        assert!(kernel_refusal(&e), "the collect failed with {e:?}");
         let outbox = p.replica.outbox(&mut p.conn, u32::MAX).await.unwrap();
         assert!(
-            outbox.changes.iter().all(|c| c.collection != "shelves"),
+            outbox.changes.iter().all(|c| c.collection != collection),
             "{:?}",
             outbox.changes
         );
         return;
     }
-    settle(&mut peers, &mut hub).await;
+    settle(peers, &mut hub).await;
     for (i, peer) in peers.iter_mut().enumerate() {
-        assert_eq!(
-            peer.lines("SELECT hex(name) FROM shelves").await,
-            ["FF41"],
-            "peer {i}"
-        );
+        assert_eq!(peer.lines(read).await, expected, "peer {i}");
     }
+}
+
+#[tokio::test]
+#[ignore = "known fault: text that is not UTF-8 is read lossily and sent altered, so other replicas receive replacement characters"]
+async fn text_that_is_not_utf8_is_sent_as_written_or_refused() {
+    let world = World::new(26);
+    let mut peers = peers_in(&world, 2, LIBRARY, library).await;
+    exact_or_refused(
+        &mut peers,
+        "shelves",
+        "INSERT INTO shelves (name) VALUES (CAST(x'ff41' AS TEXT))",
+        "SELECT hex(name) FROM shelves",
+        &["FF41"],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "known fault: a blob written to a natural key column declared TEXT makes the application's own write fail in the kernel's trigger, with JSON cannot hold BLOB values"]
+async fn a_blob_written_to_a_text_natural_key_is_synced_or_refused() {
+    let world = World::new(41);
+    let schema = &["CREATE TABLE tags (tag TEXT NOT NULL PRIMARY KEY, n INTEGER)"];
+    let mut peers = peers_in(&world, 2, schema, tags).await;
+    exact_or_refused(
+        &mut peers,
+        "tags",
+        "INSERT INTO tags (tag, n) VALUES (x'00ff', 1)",
+        "SELECT typeof(tag) || ' ' || hex(tag) || ' ' || n FROM tags",
+        &["blob 00FF 1"],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "known fault: a real written to a natural key column declared INTEGER is recorded with 15 digits, so its row is never sent"]
+async fn a_real_written_to_an_integer_natural_key_is_synced_or_refused() {
+    let world = World::new(42);
+    let schema = &["CREATE TABLE codes (code INTEGER NOT NULL UNIQUE, label TEXT)"];
+    let mut peers = peers_in(&world, 2, schema, codes).await;
+    exact_or_refused(
+        &mut peers,
+        "codes",
+        "INSERT INTO codes (code, label) VALUES (1.0 / 3, 'a')",
+        "SELECT typeof(code) || ' ' || printf('%!.17g', code) || ' ' || label FROM codes",
+        &["real 0.33333333333333331 a"],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1169,29 +1230,40 @@ fn without_status() -> Registry {
     Registry::new(collections).unwrap()
 }
 
-/// Every table of `conn`, the kernel's among them, with its rows and its definition.
+/// Every table of `conn` in the main and temporary schemas, the kernel's and `sqlite_sequence`
+/// among them, with its rows, every object's definition, and the user version.
 async fn dump(conn: &mut SqliteConnection) -> Vec<String> {
-    let tables: Vec<(String, String)> = sqlx::query_as(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' ORDER BY name",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .unwrap();
-    let mut out: Vec<String> = sqlx::query_scalar(
-        "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') FROM sqlite_master ORDER BY 1",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .unwrap();
-    for (name, _) in tables {
-        let mut rows: Vec<String> = support::rows(conn, &format!("SELECT * FROM \"{name}\""), &[])
-            .await
-            .iter()
-            .map(|row| format!("{name} {row:?}"))
-            .collect();
-        rows.sort();
-        out.extend(rows);
+    let mut out = Vec::new();
+    for schema in ["main", "temp"] {
+        let objects: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT type, name, sql FROM {schema}.sqlite_master ORDER BY type, name"
+        ))
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        for (kind, name, sql) in objects {
+            out.push(format!(
+                "{schema} {kind} {name} {}",
+                sql.unwrap_or_default()
+            ));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows: Vec<String> =
+                support::rows(conn, &format!("SELECT * FROM {schema}.\"{name}\""), &[])
+                    .await
+                    .iter()
+                    .map(|row| format!("{schema}.{name} {row:?}"))
+                    .collect();
+            rows.sort();
+            out.extend(rows);
+        }
     }
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    out.push(format!("user_version {version}"));
     out
 }
 
@@ -1252,7 +1324,10 @@ async fn a_plain_field_that_becomes_a_reference_is_refused() {
 
 const SHELF_REFS: &[&str] = &[
     "CREATE TABLE shelves (id INTEGER PRIMARY KEY, name TEXT)",
-    "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, shelf INTEGER)",
+    "CREATE TABLE books (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        shelf INTEGER REFERENCES shelves(id) ON DELETE SET NULL)",
 ];
 
 fn plain_shelf() -> Registry {
@@ -1360,7 +1435,7 @@ async fn a_natural_key_that_gains_a_field_is_refused() {
         .unwrap()
     }
     let schema = &["CREATE TABLE marks (
-        code TEXT NOT NULL, kind TEXT NOT NULL, label TEXT, PRIMARY KEY (code, kind))"];
+        code TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, label TEXT, PRIMARY KEY (code, kind))"];
     let world = World::new(36);
     let mut peers = peers_in(&world, 1, schema, || marks(&["code"])).await;
     peers[0]
