@@ -445,3 +445,149 @@ async fn a_field_whose_strategy_changed_reports_nothing_when_its_own_writes_arri
     assert_eq!(reported(&applied), []);
     peers[0].checking = true;
 }
+
+fn settings_only() -> Registry {
+    Registry::new(vec![
+        Collection::natural("settings", "settings", &["key"])
+            .field("key")
+            .field("value"),
+    ])
+    .unwrap()
+}
+
+/// Peers that know every collection and one that keeps books for a registry that has them,
+/// each given `changes`; then the third installs that registry.
+async fn kept_as_foreign(world: &World, changes: &[Change], checking: bool) -> Vec<Peer> {
+    let mut knows = Peer::in_world(world, 1, SCHEMA, registry()).await;
+    let mut foreign = Peer::in_world(world, 2, SCHEMA, settings_only()).await;
+    knows.checking = checking;
+    foreign.checking = checking;
+    knows.apply(changes).await;
+    foreign.apply(changes).await;
+    foreign.upgrade(registry()).await;
+    foreign.apply(&[]).await;
+    vec![knows, foreign]
+}
+
+/// The books one peer makes, sent to `hub`, by gid.
+async fn books(world: &World, hub: &mut Vec<Change>, sql: &str) -> (Vec<Change>, Vec<Gid>) {
+    let mut maker = Peer::in_world(world, 0, SCHEMA, registry()).await;
+    maker.run(sql).await;
+    let sent = maker.push(hub).await;
+    let mut gids: Vec<Gid> = sent
+        .iter()
+        .filter(|c| c.collection == "books")
+        .map(|c| c.gid)
+        .collect();
+    gids.sort();
+    gids.dedup();
+    (sent, gids)
+}
+
+/// A change `admit` drops never displaces one it keeps, whichever is the greater value, so a
+/// replica that kept the collection for a later registry ends as one that always had it.
+#[tokio::test]
+async fn a_change_admit_drops_tied_with_one_it_keeps_does_not_displace_it_when_kept_as_foreign() {
+    let world = World::new(47);
+    let mut hub = Vec::new();
+    let (sent, gids) = books(
+        &world,
+        &mut hub,
+        "INSERT INTO books (id, title) VALUES (1, 'a'), (2, 'b')",
+    )
+    .await;
+    let made = sent
+        .iter()
+        .find(|c| c.field == DELETED && c.gid == gids[0])
+        .unwrap();
+    let mut gone = made.clone();
+    gone.clock.wall_ms += 1_000_000;
+    gone.value = Value::Int(1);
+    let mut alias = Change {
+        gid: gids[1],
+        field: fongo_sync_sqlite::core::ALIAS.into(),
+        value: Value::Ref(gids[0]),
+        ..gone.clone()
+    };
+    alias.clock.counter += 1;
+    let mut ties = vec![
+        (gone.clone(), twin(&gone, Value::Int(2))),
+        (gone.clone(), twin(&gone, Value::Real(1.0))),
+        (gone.clone(), twin(&gone, Value::Text("1".into()))),
+        // An alias to itself: the greater reference, since gids[1] > gids[0].
+        (alias.clone(), twin(&alias, Value::Ref(gids[1]))),
+    ];
+    let flipped: Vec<(Change, Change)> = ties.iter().map(|(a, b)| (b.clone(), a.clone())).collect();
+    ties.extend(flipped);
+    for (first, second) in ties {
+        let mut changes = hub.clone();
+        changes.extend([first.clone(), second.clone()]);
+        let mut peers = kept_as_foreign(&world, &changes, true).await;
+        let rows = peers[0].lines(ROWS).await;
+        assert_eq!(
+            peers[1].lines(ROWS).await,
+            rows,
+            "{first:?} then {second:?}"
+        );
+    }
+}
+
+/// Pins a gap the follow-up change closes: a replica that kept books for a later registry keeps
+/// one value per field and clock, so of two aliases from one gid at one clock it keeps one, and
+/// shows two books where every other replica shows one, until the dropped alias arrives again.
+#[tokio::test]
+async fn two_aliases_at_one_clock_kept_as_foreign_lose_one_until_delivered_again() {
+    let world = World::new(53);
+    let mut hub = Vec::new();
+    let (sent, gids) = books(
+        &world,
+        &mut hub,
+        "INSERT INTO books (id, title) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    let mut at = sent[0].clock;
+    at.wall_ms += 1_000_000;
+    let alias = |to: Gid| Change {
+        collection: "books".into(),
+        gid: gids[2],
+        field: fongo_sync_sqlite::core::ALIAS.into(),
+        value: Value::Ref(to),
+        clock: at,
+    };
+    let mut changes = hub.clone();
+    changes.extend([alias(gids[0]), alias(gids[1])]);
+    let mut peers = kept_as_foreign(&world, &changes, false).await;
+    let books = |rows: &[String]| rows.iter().filter(|r| r.starts_with("book ")).count();
+    assert_eq!(books(&peers[0].lines(ROWS).await), 1);
+    assert_eq!(books(&peers[1].lines(ROWS).await), 2);
+    peers[1].apply(&changes).await;
+    assert_eq!(peers[1].lines(ROWS).await, peers[0].lines(ROWS).await);
+}
+
+/// Pins the other gap: a natural key field written twice at one clock, kept as foreign, keeps
+/// only the greater value, until the smaller arrives again.
+#[tokio::test]
+async fn two_key_values_at_one_clock_kept_as_foreign_lose_one_until_delivered_again() {
+    let world = World::new(59);
+    let mut hub = Vec::new();
+    let mut maker = Peer::in_world(&world, 0, SCHEMA, registry()).await;
+    maker
+        .run("INSERT INTO settings (key, value) VALUES ('k', 'v')")
+        .await;
+    let sent = maker.push(&mut hub).await;
+    let key = to(&sent, "key").remove(0);
+    let mut changes = hub.clone();
+    changes.push(twin(&key, Value::Text("zzz".into())));
+    let mut knows = Peer::in_world(&world, 1, SCHEMA, registry()).await;
+    let mut foreign = Peer::in_world(&world, 2, SCHEMA, books_only()).await;
+    knows.checking = false;
+    foreign.checking = false;
+    knows.apply(&changes).await;
+    foreign.apply(&changes).await;
+    foreign.upgrade(registry()).await;
+    foreign.apply(&[]).await;
+    let (a, b) = (knows.lines(ROWS).await, foreign.lines(ROWS).await);
+    assert_ne!(a, b);
+    foreign.apply(&changes).await;
+    assert_eq!(foreign.lines(ROWS).await, knows.lines(ROWS).await);
+}

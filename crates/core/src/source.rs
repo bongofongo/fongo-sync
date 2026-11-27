@@ -77,16 +77,11 @@ pub enum Body {
 /// slot orders its entries totally.
 pub fn admit(schema: &Schema, change: &Change) -> Option<Fact> {
     let collection = schema.collection(&change.collection)?;
-    if !change.clock.encodable()
-        || (change.field == DELETED && !matches!(change.value, Value::Int(0 | 1)))
-    {
+    if !well_formed(change) {
         return None;
     }
-    let body = if change.field == ALIAS {
-        match change.value {
-            Value::Ref(target) if target != change.gid => Body::Alias { target },
-            _ => return None,
-        }
+    let body = if let (ALIAS, Value::Ref(target)) = (&change.field[..], &change.value) {
+        Body::Alias { target: *target }
     } else {
         Body::Field {
             field: change.field.clone(),
@@ -100,6 +95,17 @@ pub fn admit(schema: &Schema, change: &Change) -> Option<Fact> {
         clock: change.clock,
         body,
     })
+}
+
+/// Whether [`admit`] keeps `change` in a schema that declares its collection: its clock is one
+/// `Hlc::encode` holds, a `$deleted` is `Int(0)` or `Int(1)`, and an alias names another gid.
+pub fn well_formed(change: &Change) -> bool {
+    change.clock.encodable()
+        && match &change.field[..] {
+            DELETED => matches!(change.value, Value::Int(0 | 1)),
+            ALIAS => matches!(change.value, Value::Ref(target) if target != change.gid),
+            _ => true,
+        }
 }
 
 /// How a field of a declared collection is kept.

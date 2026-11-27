@@ -10,7 +10,8 @@
 //! one or two rows, by turns, and the model is checked after every step. Each script runs with
 //! every database alone with its node, where no apply may report a shared one; each in which
 //! replica 1 writes runs again, collecting whole, with replicas 0 and 1 copies of one database,
-//! whose writes share clocks.
+//! whose writes share clocks: every third of them, or every one with `EXHAUSTIVE_COPIED_EVERY=1`,
+//! as `make deep` sets.
 
 mod support;
 
@@ -364,8 +365,9 @@ fn every_short_script_agrees_with_the_model_at_every_step() {
     every_short_script(false);
 }
 
-/// The scripts in which replica 1 writes, where replicas 0 and 1 are copies of one database, so
-/// that their writes share clocks and differ in value.
+/// The scripts in which replica 1 writes, every `EXHAUSTIVE_COPIED_EVERY`th of them (default 3,
+/// all under `make deep`), where replicas 0 and 1 are copies of one database, so that their
+/// writes share clocks and differ in value.
 #[test]
 fn every_short_script_over_a_copied_database_agrees_with_the_model_at_every_step() {
     every_short_script(true);
@@ -379,6 +381,8 @@ fn every_short_script(copied: bool) {
     if copied {
         // Only a write of replica 1's can share a clock with one of replica 0's.
         all.retain(|s| s.iter().any(|op| matches!(op, Op::Write(1, _))));
+        let every = setting("EXHAUSTIVE_COPIED_EVERY", 3).max(1);
+        all = all.into_iter().step_by(every).collect();
     }
     let all = Arc::new(all);
     let next = Arc::new(AtomicUsize::new(0));

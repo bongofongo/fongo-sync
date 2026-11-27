@@ -60,12 +60,22 @@ guarantees the maker or the latest writer ever acts: it may be gone, may no long
 collection, or may have uninstalled and installed again under a new id, so an application that
 waits for it needs its own way on.
 
-Every merge is a function of the set of changes seen, with no condition on clocks. A field merged
-by clock takes the change with the later clock and, of two at exactly one clock, the greater
-value; a field merged by greatest value takes the greater value and, of two equal ones, the later
-clock. Values have one total order: NULL, then numbers, then text, blobs and references, each by
-bytes. Numbers compare exactly as numbers, an integer just below a real of equal value, and two
-values are equal only when identical, so the integer 1 and the real 1.0 stay different values.
+The merge rules are a function of the set of changes seen, with no condition on clocks, and so
+are `model::view` and a replica whose registry had a collection when that collection's changes
+arrived. A field merged by clock takes the change with the later clock and, of two at exactly one
+clock, the greater value; a field merged by greatest value takes the greater value and, of two
+equal ones, the later clock. Values have one total order: NULL, then numbers, then text, blobs and
+references, each by bytes. Numbers compare exactly as numbers, an integer just below a real of
+equal value, and two values are equal only when identical, so the integer 1 and the real 1.0 stay
+different values.
+
+A replica keeps the changes to a collection its registry lacks for a later registry that has it,
+one value for each field and clock: the greater of two, but never one the later registry would
+ignore in place of one it keeps. That is exact for every field merged by clock or by greatest
+value. It is not exact in two cases: two aliases from one gid at one clock, and a key field of a
+natural collection written twice at one clock, where the later registry keeps both. Once its
+registry has the collection, such a replica can show other rows than the rest, until the change
+it dropped is delivered to it again.
 
 Honest clocks never repeat. Two databases that write as one node do repeat them: a copied
 database file, or a backup restored over a database that went on without it. Each still converges

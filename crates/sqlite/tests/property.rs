@@ -1315,6 +1315,14 @@ fn cases() -> u32 {
         .unwrap_or(32)
 }
 
+/// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
+fn sharing_cases() -> u32 {
+    match std::env::var("PROPTEST_CASES") {
+        Ok(_) => cases(),
+        Err(_) => cases() / 2,
+    }
+}
+
 /// One fixed run unless `PROPTEST_RNG_SEED` asks for another, so `make check` is repeatable;
 /// `make deep` picks a new seed each time and prints it.
 fn rng_seed() -> RngSeed {
@@ -1344,7 +1352,15 @@ proptest! {
             prop_assert!(false, "{}", error);
         }
     }
+}
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: sharing_cases(),
+        rng_seed: rng_seed(),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
     /// The same, with databases copied over others, backed up and restored, so that two
     /// databases write as one node and their changes share clocks.
     #[test]

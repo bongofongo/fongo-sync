@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use fongo_sync_core::eval::{Evaluator, Origin};
 use fongo_sync_core::model::{Row, Schema};
 use fongo_sync_core::plan::{self, FieldEdit};
-use fongo_sync_core::source::admit;
+use fongo_sync_core::source::{admit, well_formed};
 use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
@@ -115,6 +115,9 @@ pub struct Applied {
 /// node) or an adoption of found rows. Neither is complete: a copy's write that loses to a later
 /// clock, or that the other copy's facts already pass, leaves no trace, so a copy can go
 /// unnoticed until both write one field at one clock.
+///
+/// What an install finds while it replays the changes kept for a collection its registry lacked
+/// is not reported: an install returns no report.
 ///
 /// While two databases share a node, the kernel still converges, but it cannot tell their
 /// writes apart: both answer [`Made::Here`] and [`Replica::written_here`] for the other's
@@ -392,9 +395,8 @@ pub(crate) struct Ctx<'d> {
     /// A step adopting found rows from their records: what it writes to a row the application
     /// has written since, it writes only to fields the application left as the image holds them.
     pub adopting: bool,
-    /// The last clock this database had issued when the operation began, and the last counter
-    /// of an adoption clock it had given out.
-    pub issued: (Hlc, u32),
+    /// The last clock this database had issued when the operation began.
+    pub issued: Hlc,
     /// Nodes two databases write as, each with the earliest clock that shows it.
     pub shared: BTreeMap<Gid, Hlc>,
 }
@@ -434,13 +436,9 @@ impl<'d> Ctx<'d> {
             None => Clock::new(node),
         };
         meta_set(db, "applying", Value::Int(1))?;
-        let adopted = match meta_get(db, "adopted_seq")? {
-            Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
-            _ => 0,
-        };
         Ok(Ctx {
             db,
-            issued: (clock.last(), adopted),
+            issued: clock.last(),
             shared: BTreeMap::new(),
             clock,
             node,
@@ -505,11 +503,22 @@ impl<'d> Ctx<'d> {
         })
     }
 
-    /// Whether this database had issued `clock` of its own node by the time the operation began:
-    /// a reading no later than its clock's last, or an adoption clock it had given out.
-    fn had_issued(&self, clock: &Hlc) -> bool {
-        let (last, adopted) = self.issued;
-        *clock <= last || (clock.wall_ms == 0 && clock.counter <= adopted)
+    /// Whether this database may have issued `clock` of its own node: a reading no later than
+    /// its clock's last when the operation began, or an adoption clock it has given out, which
+    /// does not move its clock. Read only for a clock past the last, so an operation that meets
+    /// none pays nothing.
+    fn had_issued(&self, clock: &Hlc) -> Result<bool> {
+        if *clock <= self.issued {
+            return Ok(true);
+        }
+        if clock.wall_ms != 0 {
+            return Ok(false);
+        }
+        let adopted = match meta_get(self.db, "adopted_seq")? {
+            Some(Value::Int(seq)) => u32::try_from(seq).unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        Ok(clock.counter <= adopted)
     }
 
     /// Notes evidence that two databases write as the node of `clock`.
@@ -701,7 +710,7 @@ impl Replica {
         }
         let limit = cx.db.length_limit();
         for change in incoming {
-            if change.clock.node == cx.node && !cx.had_issued(&change.clock) {
+            if change.clock.node == cx.node && !cx.had_issued(&change.clock)? {
                 cx.shared_at(change.clock);
             }
             if self.registry.index(&change.collection).is_none()
@@ -721,57 +730,54 @@ impl Replica {
 
     /// Keeps a change to a collection this registry lacks, for a registry that has it: one value
     /// at each clock of a field, the greater of two that share one, as both strategies would keep
-    /// them. Where a registry that has the collection keeps more than one, a key field of a
-    /// natural collection or `$alias`, the smaller of two values at one clock is lost; only two
-    /// databases writing as one node give a field two values at one clock.
+    /// them, but never one `admit` drops in place of one it keeps. Where a registry that has the
+    /// collection keeps more than one, a key field of a natural collection or `$alias`, the
+    /// smaller of two well-formed values at one clock is lost until it is delivered again. Two
+    /// values at one clock come from two databases writing as one node, or from a crafted change.
     fn keep_foreign(&self, cx: &mut Ctx, change: &Change) -> Result<()> {
-        let at = [
+        let (value, kind) = stored(&change.value);
+        let row = [
             Value::Text(change.collection.clone()),
             Value::Ref(change.gid),
             Value::Text(change.field.clone()),
             Value::Text(change.clock.encode()),
+            value,
+            kind,
         ];
+        if cx.db.exec(
+            "INSERT OR IGNORE INTO fongo_foreign (collection, gid, field, clock, value, is_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &row,
+        )? > 0
+        {
+            return Ok(());
+        }
         let held = cx.db.query(
             "SELECT value, is_ref FROM fongo_foreign
               WHERE collection = ?1 AND gid = ?2 AND field = ?3 AND clock = ?4",
-            &at,
+            &row[..4],
         )?;
-        let (value, kind) = stored(&change.value);
-        match held.first() {
-            None => {
-                cx.db.exec(
-                    "INSERT INTO fongo_foreign (collection, gid, field, clock, value, is_ref)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    &[
-                        at[0].clone(),
-                        at[1].clone(),
-                        at[2].clone(),
-                        at[3].clone(),
-                        value,
-                        kind,
-                    ],
-                )?;
-            }
-            Some(r) => {
-                let order = change.value.total_cmp(&loaded(&r[0], &r[1])?);
-                if order != Ordering::Equal {
-                    cx.shared_at(change.clock);
-                }
-                if order == Ordering::Greater {
-                    cx.db.exec(
-                        "UPDATE fongo_foreign SET value = ?5, is_ref = ?6
-                          WHERE collection = ?1 AND gid = ?2 AND field = ?3 AND clock = ?4",
-                        &[
-                            at[0].clone(),
-                            at[1].clone(),
-                            at[2].clone(),
-                            at[3].clone(),
-                            value,
-                            kind,
-                        ],
-                    )?;
-                }
-            }
+        let Some(r) = held.first() else {
+            return Ok(());
+        };
+        let kept = Change {
+            value: loaded(&r[0], &r[1])?,
+            ..change.clone()
+        };
+        // A value `admit` will drop must not displace one it keeps: the registry that has the
+        // collection ignores the first and keeps the second.
+        let order = well_formed(change)
+            .cmp(&well_formed(&kept))
+            .then(change.value.total_cmp(&kept.value));
+        if order != Ordering::Equal && well_formed(change) && well_formed(&kept) {
+            cx.shared_at(change.clock);
+        }
+        if order == Ordering::Greater {
+            cx.db.exec(
+                "UPDATE fongo_foreign SET value = ?5, is_ref = ?6
+                  WHERE collection = ?1 AND gid = ?2 AND field = ?3 AND clock = ?4",
+                &row,
+            )?;
         }
         Ok(())
     }

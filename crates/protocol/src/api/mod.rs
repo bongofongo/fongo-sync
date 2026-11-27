@@ -49,13 +49,23 @@
 //! member of a merged group can show an older member's file again without any change naming it),
 //! which is why it is not the definition.
 //!
-//! A winner is a function of the set of changes and is one of its values, the same on every
-//! replica, with no condition on clocks: of two changes to one field at one clock, which a
-//! database restored from a backup or a copy of a database can write, the greater value wins on
-//! every replica. So a replica never keeps a value that the retiring device's winner replaced.
+//! On a build that settles clock ties by value, a winner is a function of the set of changes and
+//! is one of its values, the same on every replica, with no condition on clocks: of two changes
+//! to one field at one clock, which a database restored from a backup or a copy of a database can
+//! write, the greater value wins. That holds also on a replica that kept the changes for a
+//! collection its registry lacked and declared it later: it keeps one value for each field and
+//! clock, the greater, which is exact for a field merged by clock or by greatest value. A file
+//! field is such a field, a plain field that is never a key field of a natural collection, so it
+//! is not one of the two cases where such a replica keeps too few values (aliases, and key
+//! fields of natural collections). So a replica never keeps a value that the retiring device's
+//! winner replaced.
 //!
 //! The guarantee below holds under these conditions:
 //!
+//! - every device runs a build that settles clock ties by value, or no two changes to one field
+//!   share a clock with different values, which honest devices write only when two databases
+//!   write as one node. A build that keeps whichever of two such changes arrived first can keep a
+//!   value that the retiring device's winner replaced.
 //! - every device that sends file references sends them through [`BATCHES_CLAIMING_PATH`]. A
 //!   server that stops offering [`Capabilities::blobs`] and offers it again voids every retirement
 //!   it holds when it resumes, since appends meanwhile carried no claims.
