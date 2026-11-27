@@ -336,6 +336,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn routes_round_trip(library in any::<[u8; 16]>(), blob in any::<[u8; 32]>(), chunk in any::<u64>()) {
             for route in every_route(LibraryId(library), BlobId(blob), chunk) {

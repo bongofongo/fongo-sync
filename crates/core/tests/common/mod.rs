@@ -820,3 +820,19 @@ impl fongo_sync_core::source::Source for Counting<'_> {
         self.count(self.inner.gids())
     }
 }
+
+/// Settings for every property test here: `cases` cases drawn from one fixed seed unless
+/// `PROPTEST_RNG_SEED` names another, so a run of the suite is repeatable and `make deep` still
+/// explores; no failures are kept in files between runs.
+pub fn config(cases: u32) -> ProptestConfig {
+    let rng_seed = match std::env::var("PROPTEST_RNG_SEED") {
+        Ok(_) => ProptestConfig::default().rng_seed,
+        Err(_) => proptest::test_runner::RngSeed::Fixed(29),
+    };
+    ProptestConfig {
+        cases,
+        rng_seed,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    }
+}

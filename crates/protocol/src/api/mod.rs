@@ -1407,6 +1407,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(crate::proptest_config())]
+
         #[test]
         fn pages_round_trip(
             raw in proptest::collection::vec((any::<u64>(), proptest::collection::vec(any::<u8>(), 0..64)), 0..8),

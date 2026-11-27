@@ -8,12 +8,24 @@
 //! queue and member lists compared, and in `order` rows, requirements and parkings looked at.
 //!
 //! - `affected` over a batch of B changes, then `target` of every pair it reports: work is at
-//!   most 512 + 8 · E · log2(E + 2) · max(D, 1)². E is B, plus the gids the changes name and
-//!   the pairs reported, plus what deciding each distinct group these fall in, before and after,
-//!   reads by the model's groups: the gids of the group and of every group its natural keys
-//!   reach, and for each distinct key among them, read through the groups, the product of the
-//!   sizes of the groups it names. D is the most natural collections a chain of natural keys
-//!   passes through (its cost grows about as the square of that depth).
+//!   most 512 + 8 · E · log2(E + 2) · max(D, 1)². E is B, plus the gids the changes name, the
+//!   pairs reported and the gids referring to a moved entity, plus what deciding each distinct
+//!   group these fall in, before and after, reads by the model's groups: the gids of the group
+//!   and of every group its natural keys reach, and for each distinct key among them, read
+//!   through the groups, the product of the sizes of the groups it names. D is the most natural
+//!   collections a chain of natural keys passes through (its cost grows about as the square of
+//!   that depth).
+//!
+//!   An entity is moved when its collection, its canonical gid or whether its group has a live
+//!   member differs before and after the batch, and a gid refers to it when either model shows
+//!   it holding a reference to the entity in a reference, owner or natural key field. These
+//!   gids are in E because `affected`, as documented, queues every gid holding such a reference
+//!   whenever the entity's collection, canonical gid or liveness differs, and decides each one
+//!   in both sessions with the same questions as a gid the batch names. Each therefore costs
+//!   what a named gid costs, one plus what deciding its group reads, though its row may not
+//!   change. Leaving them out bounds by what the batch changes alone, which many gids referring
+//!   to one entity exceed, as
+//!   `affected_and_targets_count_the_gids_referring_to_a_moved_entity` shows.
 //! - `order` over n rows with e requirements among them: at most 512 + 8 · (n + e) ·
 //!   log2(n + e + 2). A requirement is a reference to a row being inserted or deleted, or a pair
 //!   of rows one of which takes the unique values the other holds.
@@ -24,7 +36,8 @@
 //! `Limits::lookups` makes it undetermined beyond 512 items; `merged_teams_and_users` (√n teams
 //! and √n users merged, keyed by both) reads n.
 //!
-//! `FONGO_WORK_CASES` sets how many random cases run (default 200).
+//! `FONGO_WORK_CASES` sets how many random cases run (default 200), drawn from a fixed seed
+//! unless `PROPTEST_RNG_SEED` names another.
 
 #![cfg(feature = "work-counters")]
 
@@ -37,7 +50,7 @@ use fongo_sync_core::eval::Evaluator;
 use fongo_sync_core::model::{self, ALIAS, Collection, FieldKind, Identity, Row, Schema};
 use fongo_sync_core::plan::{Columns, Planned, RowAction, order};
 use fongo_sync_core::source::{Body, Store, admit};
-use fongo_sync_core::{Change, Gid, Hlc, Strategy as Merge, Value, work};
+use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value, work};
 use proptest::prelude::*;
 
 /// Work any call may do whatever its size, and the slope of what grows with it.
@@ -99,7 +112,12 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
     }
     done += counting.work.get() + work::take();
 
-    // The groups of what the batch names and of what `affected` reports, before and after.
+    // The groups of what the batch names, of what `affected` reports and of what refers to an
+    // entity the batch moves, before and after.
+    let mut all = base.to_vec();
+    all.extend_from_slice(batch);
+    let models = [model::merge(schema, base), model::merge(schema, &all)];
+    let groups_of = [members(&models[0]), members(&models[1])];
     let mut named: BTreeSet<(String, Gid)> = found.clone();
     for c in batch {
         if let Some(fact) = admit(schema, c) {
@@ -109,11 +127,8 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
             }
         }
     }
+    named.extend(referrers(schema, &models));
     let mut extent = batch.len() + named.len();
-    let mut all = base.to_vec();
-    all.extend_from_slice(batch);
-    let models = [model::merge(schema, base), model::merge(schema, &all)];
-    let groups_of = [members(&models[0]), members(&models[1])];
     let (mut was, mut will) = (ev.session(&before), ev.session(&after));
     let mut groups = BTreeSet::new();
     for (c, g) in &named {
@@ -130,7 +145,11 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
     let grows = extent as f64 * log2(extent as f64) * depth.max(1.0).powi(2);
     let bound = FIXED + SLOPE * grows;
     if std::env::var_os("FONGO_WORK_RATIOS").is_some() {
-        eprintln!("ratio {:.3} extent {extent}", done as f64 / grows);
+        eprintln!(
+            "ratio {:.3} extent {extent} of bound {:.3}",
+            done as f64 / grows,
+            done as f64 / bound
+        );
     }
     if done as f64 > bound {
         return Err(format!(
@@ -143,6 +162,58 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
 
 /// The members of each group, by canonical gid.
 type Members = BTreeMap<Gid, Vec<Gid>>;
+
+/// Every gid that either model shows holding a reference to a moved entity in a reference, owner
+/// or natural key field, with its collection. An entity is moved when its collection, its
+/// canonical gid or whether a member of its group is live differs between the models.
+fn referrers(schema: &Schema, models: &[model::Merge; 2]) -> BTreeSet<(String, Gid)> {
+    let live: Vec<BTreeSet<Gid>> = models
+        .iter()
+        .map(|m| {
+            m.entities
+                .values()
+                .filter(|e| e.live)
+                .map(|e| e.canonical)
+                .collect()
+        })
+        .collect();
+    let read = |when: usize, x: &Gid| {
+        let e = models[when].entities.get(x)?;
+        Some((
+            &e.collection,
+            e.canonical,
+            live[when].contains(&e.canonical),
+        ))
+    };
+    let moved: BTreeSet<Gid> = models
+        .iter()
+        .flat_map(|m| m.entities.keys())
+        .filter(|x| read(0, x) != read(1, x))
+        .copied()
+        .collect();
+    let mut found = BTreeSet::new();
+    for m in models {
+        for (y, e) in &m.entities {
+            let Some(c) = schema.collection(&e.collection) else {
+                continue;
+            };
+            let key: &[String] = match &c.identity {
+                Identity::Natural(key) => key,
+                Identity::Minted => &[],
+            };
+            let refers = c.fields.iter().any(|f| {
+                let referring = matches!(f.kind, FieldKind::Reference(_) | FieldKind::Owner(_))
+                    || key.contains(&f.name);
+                let held = e.registers.get(&f.name).map(|(v, _)| v);
+                referring && matches!(held, Some(Value::Ref(x)) if moved.contains(x))
+            });
+            if refers {
+                found.insert((e.collection.clone(), *y));
+            }
+        }
+    }
+    found
+}
 
 fn members(merged: &model::Merge) -> Members {
     let mut members = Members::new();
@@ -569,6 +640,15 @@ fn shape(kind: u8, n: u32) -> (Schema, Vec<Change>, Vec<Change>) {
                 vec![change("members", g, "role", Value::Int(1), 2, 0)],
             )
         }
+        // Many tags of an item not yet seen, then its deletion alone: the item joins its
+        // collection, so `affected` decides every tag again, though none of their rows changes.
+        13 => {
+            let base = (0..n)
+                .flat_map(|l| tag(wide(100), l.into(), 1, l))
+                .collect();
+            let batch = vec![change("items", wide(100), DELETED, Value::Int(1), 2, 0)];
+            (schema, base, batch)
+        }
         // Two copies of paths through natural keys four collections deep, joined at the root.
         _ => {
             let depth = 4;
@@ -603,7 +683,7 @@ fn shape(kind: u8, n: u32) -> (Schema, Vec<Change>, Vec<Change>) {
 }
 
 /// How many shapes [`shape`] makes.
-const SHAPES: u8 = 13;
+const SHAPES: u8 = 14;
 
 /// Teams, users and memberships keyed by both, team first or user first; and the changes that
 /// create a membership.
@@ -934,7 +1014,7 @@ fn cases() -> u32 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases()))]
+    #![proptest_config(common::config(cases()))]
 
     #[test]
     fn affected_and_targets_work_within_their_bound_on_random_changes(seed in any::<u64>()) {
@@ -977,15 +1057,12 @@ proptest! {
     }
 }
 
-/// This input exceeds the bound. It is kept so that whether the suite sees it does not depend on
-/// drawing it at random.
+/// The gids referring to a moved entity are decided again however little the batch changes, so
+/// the bound counts them: here a batch of one change makes `n` tags be decided again.
 #[test]
-#[ignore = "affected and targets: work 860 for extent 10, keys chained 1 deep (bound 799)"]
-fn affected_and_targets_exceed_their_bound_on_one_random_input() {
-    let mut rng = Rng(16231279769609292276 | 1);
-    let schema = random_schema(&mut rng);
-    let n = 1 + rng.below(120);
-    let changes = random_changes(&mut rng, &schema, n);
-    let cut = rng.below(changes.len() + 1);
-    affected_within_bound(&schema, &changes[..cut], &changes[cut..]).unwrap();
+fn affected_and_targets_count_the_gids_referring_to_a_moved_entity() {
+    for n in [1, 20, 300] {
+        let (schema, base, batch) = shape(13, n);
+        affected_within_bound(&schema, &base, &batch).unwrap();
+    }
 }

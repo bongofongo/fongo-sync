@@ -210,7 +210,10 @@ What is tested against what (`crates/core/tests`):
 | `work.rs` | counted work of `affected`, `target` and `order` stays within a stated bound over random schemas, batches and plans and a set of named hard shapes (needs the `work-counters` feature) |
 | `sim` | several replicas over tables with real constraints, random edits and partial, reordered, per-device, repeated delivery, and replicas replaced by a copy of another's database or by a backup of their own, which issue clocks already issued: rows equal `model::view` of what each replica merged after every step and once everything is delivered; no replica sends a value its application did not write, and every write an application made is in the merged state, or lost a tie at its clock to a greater value; also every short script over a small alphabet |
 
-`FONGO_SIM_CASES` and `FONGO_EXHAUSTIVE_LENGTH` raise the volume of the last two.
+`FONGO_WORK_CASES` raises the number of random cases in `work.rs`, and `FONGO_SIM_CASES` and
+`FONGO_EXHAUSTIVE_LENGTH` those of `sim`: its random scripts and the length of its short ones.
+Every property test draws its cases from a fixed seed unless `PROPTEST_RNG_SEED` names another,
+so a run is repeatable; `make deep` passes a new seed each time and prints it.
 
 ## Verification
 

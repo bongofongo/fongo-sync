@@ -641,7 +641,7 @@ fn cases() -> u32 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases()))]
+    #![proptest_config(common::config(cases()))]
 
     #[test]
     fn replicas_converge_to_the_model_and_keep_every_write(
@@ -663,7 +663,7 @@ proptest! {
 fn what_the_random_runs_cover() {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::new(common::config(1));
     let cases = (
         arb_sim_family(),
         2usize..4,

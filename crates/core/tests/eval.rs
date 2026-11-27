@@ -116,7 +116,7 @@ fn agrees(schema: &Schema, changes: &[Change]) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(3000))]
+    #![proptest_config(common::config(3000))]
 
     #[test]
     fn the_evaluator_shows_what_the_model_shows((schema, changes) in arb_case(0..60)) {

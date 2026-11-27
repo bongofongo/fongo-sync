@@ -70,7 +70,7 @@ fn from_scratch(ev: &Evaluator, store: &Store) -> View {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(3000))]
+    #![proptest_config(common::config(3000))]
 
     /// The incremental law: re-evaluating only what `affected` names after each batch keeps the
     /// materialised rows equal to evaluating everything, and to `model::view`.
