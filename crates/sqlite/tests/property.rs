@@ -151,6 +151,23 @@ fn file_sql(n: u8) -> String {
     format!("X'{hex}'")
 }
 
+/// A blob beginning with the byte file references begin with, as an SQL literal: a reference to
+/// the first file, which covers also name, one that does not decode, or the second file's hash
+/// with no size.
+fn lookalike_sql(v: u8) -> String {
+    let bytes = match v {
+        0 => fongo_sync_sqlite::FileRef::of(&[1; 3]).encode(),
+        1 => vec![1, 0],
+        _ => {
+            let mut b = vec![1];
+            b.extend_from_slice(&fongo_sync_sqlite::FileRef::of(&[2; 3]).hash.0);
+            b
+        }
+    };
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    format!("X'{hex}'")
+}
+
 /// What must hold on every replica once everything is exchanged, of the application's own
 /// tables: a book holds a finish date exactly when it is done.
 const MIXED: &str = "
@@ -833,6 +850,9 @@ enum Op {
     Purge,
     /// A write with the triggers suspended, sent on resuming.
     Suspended(usize, u8),
+    /// A title written with the triggers suspended as a blob that begins as a file reference
+    /// does, kept as this replica's own on resuming.
+    Pinned(usize, u8),
     Upgrade,
     Sync,
     Push,
@@ -893,6 +913,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         1 => n.clone().prop_map(Op::DeleteAttachment),
         1 => Just(Op::Purge),
         1 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::Suspended(a, b)),
+        1 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::Pinned(a, b)),
         1 => Just(Op::Upgrade),
         4 => Just(Op::Sync),
         2 => Just(Op::Push),
@@ -940,6 +961,30 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
             peer.writes
                 .installed(&mut peer.conn, &peer.replica, waiting)
                 .await;
+            return peer.midway().await;
+        }
+        Op::Pinned(n, v) => {
+            let replica = peer.replica.clone();
+            replica.suspend(&mut peer.conn).await.unwrap();
+            if let Some(id) = peer.pick("books", n).await {
+                peer.run(&format!(
+                    "UPDATE books SET title = {} WHERE id = {id}",
+                    lookalike_sql(v)
+                ))
+                .await;
+            }
+            let waiting = peer
+                .writes
+                .installing(&mut peer.conn, &peer.replica, &peer.taken)
+                .await;
+            replica
+                .resume(&mut peer.conn, Resume::Baseline)
+                .await
+                .unwrap();
+            peer.writes
+                .installed(&mut peer.conn, &peer.replica, waiting)
+                .await;
+            peer.writes.pinned(&mut peer.conn, &peer.replica).await;
             return peer.midway().await;
         }
         Op::Sync => {
@@ -1298,7 +1343,8 @@ async fn check(peers: &mut [Peer], copied: bool) -> Result<(), String> {
             return Err(format!("a purge cleared a member that shows: {clearing:?}"));
         }
     }
-    let mut first: Option<fongo_sync_sqlite::core::model::View> = None;
+    let mut views = Vec::new();
+    let mut pinned = BTreeSet::new();
     for (i, peer) in peers.iter_mut().enumerate() {
         support::settled(&mut peer.conn, &peer.replica, &peer.taken)
             .await
@@ -1307,13 +1353,20 @@ async fn check(peers: &mut [Peer], copied: bool) -> Result<(), String> {
         if !mixed.is_empty() && !copied {
             return Err(format!("peer {i}: {mixed:#?}"));
         }
-        let view = support::read(&mut peer.conn, &peer.replica).await.view;
-        match &first {
-            None => first = Some(view),
-            Some(first) if *first != view => {
-                return Err(format!("rows differ, 0 and {i}:\n{first:#?}\n{view:#?}"));
-            }
-            Some(_) => {}
+        let kernel = support::read(&mut peer.conn, &peer.replica).await;
+        pinned.extend(support::pinned(&kernel));
+        views.push(kernel.view);
+    }
+    // A field kept as one replica's own shows its own value there until it is next written.
+    for view in &mut views {
+        support::without(view, &pinned);
+    }
+    for (i, view) in views.iter().enumerate().skip(1) {
+        if *view != views[0] {
+            return Err(format!(
+                "rows differ, 0 and {i}:\n{:#?}\n{view:#?}",
+                views[0]
+            ));
         }
     }
     Ok(())
@@ -2529,4 +2582,142 @@ fn a_note_on_a_book_found_to_be_one_names_its_group_in_steps() {
 #[test]
 fn rows_a_first_install_in_steps_adopts_after_it_are_its_adoptions() {
     run_found(8319302663633078794, &[]).unwrap();
+}
+
+/// Three titles kept as one replica's own, each a blob below every reference held: the pins fill
+/// a page and must neither be listed nor keep the listing from moving on.
+#[test]
+fn titles_kept_as_a_replicas_own_never_stall_the_listing() {
+    use Op::*;
+    let script = vec![
+        (0, AddShelf(0)),
+        (0, AddBook(0, 0, 3)),
+        (0, AddBook(0, 1, 3)),
+        (0, AddBook(0, 2, 3)),
+        (0, SetCover(0, 0)),
+        (0, SetCover(1, 2)),
+        (0, Push),
+        (0, Pinned(0, 1)),
+        (0, Pinned(1, 1)),
+        (0, Pinned(2, 1)),
+        (0, Pinned(1, 0)),
+        (0, Sync),
+        (1, Sync),
+        (1, SetTitle(0, 1)),
+        (1, Sync),
+        (0, Sync),
+    ];
+    for seed in 0..4 {
+        run(seed, &script).unwrap();
+    }
+}
+
+/// Found at 32 cases: a title kept as peer 0's own is released by a write delivered later, and
+/// was never owed to any send.
+#[test]
+fn a_title_kept_as_its_own_and_later_released_is_owed_nothing() {
+    use Op::*;
+    let script = vec![
+        (2, Sync),
+        (3, Sync),
+        (2, Sync),
+        (3, AddBook(4, 2, 2)),
+        (0, AddTag(1, 0)),
+        (4, SetStatus(5, 3)),
+        (3, Deliver(4019901953634309706, false, true)),
+        (2, Purge),
+        (0, SetSeriesCode(0, 0)),
+        (4, RenameShelf(5, 0)),
+        (4, Log(4, false)),
+        (3, AddMark(3, 1)),
+        (4, SetNote(2, 1)),
+        (4, Log(3, true)),
+        (1, Purge),
+        (0, Log(0, true)),
+        (1, SetFavourite(1, 0)),
+        (0, SetSeriesCode(1, 0)),
+        (1, AddAttachment(3, 1)),
+        (3, AddBook(0, 1, 2)),
+        (4, AddMark(3, 2)),
+        (3, SetScan(4, 0)),
+        (4, SetCover(0, 0)),
+        (0, DeleteMark(4)),
+        (1, AddShelf(0)),
+        (1, SetExtra(5, 0)),
+        (1, AddVolume(5, 2)),
+        (1, AddAttachment(1, 0)),
+        (0, SetCover(0, 0)),
+        (1, AddAuthor(2)),
+        (3, Log(1, true)),
+        (2, AddBook(2, 0, 2)),
+        (3, SetSetting(1, 2)),
+        (4, SetCover(1, 0)),
+        (0, AddShelf(0)),
+        (1, AddAuthor(0)),
+        (0, SetTitle(0, 2)),
+        (3, AddAttachment(0, 3)),
+        (4, AddTag(1, 1)),
+        (3, DeleteTag(5)),
+        (2, AddTag(4, 0)),
+        (0, Log(0, true)),
+        (3, SetStatus(2, 0)),
+        (4, Deliver(9893601081946180798, false, false)),
+        (1, AddBook(2, 2, 2)),
+        (2, SetCover(4, 2)),
+        (0, AddAttachment(3, 1)),
+        (0, AddNote(5, 1)),
+        (3, AddMark(5, 2)),
+        (1, Deliver(18138133055768263563, false, true)),
+        (0, Pinned(0, 2)),
+        (4, Deliver(4223627420028885671, true, false)),
+        (4, AddAttachment(0, 0)),
+        (0, DeleteShelf(2)),
+        (0, AddTag(5, 0)),
+        (1, SetNote(1, 2)),
+        (4, AddVolume(3, 1)),
+        (4, SetSetting(1, 1)),
+        (4, SetScan(3, 0)),
+        (3, AddBook(3, 2, 0)),
+        (1, Deliver(15420451650328217620, false, true)),
+        (0, AddAuthor(0)),
+        (0, AddTag(4, 0)),
+        (0, Deliver(16942152408861462063, false, true)),
+        (4, SetIsbn(0, 3)),
+        (0, AddAuthor(2)),
+        (1, AddAttachment(3, 3)),
+        (0, MoveBookDeleteShelf(4, 1)),
+        (4, RenameShelf(5, 2)),
+        (3, SetExtra(3, 1)),
+        (4, Deliver(15089938181745806929, true, false)),
+        (3, SetScan(1, 0)),
+        (3, SetIsbn(5, 3)),
+        (0, SetTitle(0, 1)),
+        (3, AddTag(4, 0)),
+        (2, SetTagNote(1, 0)),
+        (0, Log(2, true)),
+        (4, RenameShelf(3, 1)),
+        (2, Deliver(10024521848954104531, false, false)),
+        (3, AddSeries(1, 1)),
+        (3, AddBook(2, 2, 1)),
+        (3, SetScan(0, 1)),
+        (2, SetExtra(2, 0)),
+        (4, SetTitle(1, 1)),
+        (2, AddVolume(5, 0)),
+        (4, SetStatus(2, 3)),
+        (0, Sync),
+        (4, Deliver(14531169433190373776, true, false)),
+        (0, AddMark(2, 2)),
+        (0, Log(2, false)),
+        (1, Deliver(14067599918911493962, true, false)),
+        (1, AddCover(2)),
+        (0, Deliver(4500746534554028341, false, false)),
+        (4, SetScan(4, 2)),
+        (3, SetExtra(3, 2)),
+        (2, AddNote(0, 2)),
+        (1, AddSeries(0, 2)),
+        (4, AddMark(5, 0)),
+        (0, Log(2, false)),
+        (3, AddCover(5)),
+    ];
+    run_found(143749082451908664, &script).unwrap();
 }

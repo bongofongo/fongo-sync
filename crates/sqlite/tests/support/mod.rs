@@ -406,7 +406,8 @@ async fn tables(conn: &mut SqliteConnection, replica: &Replica, kernel: &Kernel)
     wrong
 }
 
-fn pinned(kernel: &Kernel) -> BTreeSet<(String, Gid, String)> {
+/// The fields the application kept as its own, by collection, canonical gid and field.
+pub fn pinned(kernel: &Kernel) -> BTreeSet<(String, Gid, String)> {
     let mut out = BTreeSet::new();
     for (collection, key, field) in &kernel.pinned {
         if let Some(((_, gid), _)) = kernel
@@ -519,6 +520,19 @@ pub async fn midway_answering(
         wrong.push(context(&merge, &kernel));
     }
     verdict(wrong, "the replica departs from the model").map(|()| (seen, answered))
+}
+
+/// `view` without the values of `fields`, by collection, canonical gid and field.
+pub fn without(view: &mut View, fields: &BTreeSet<(String, Gid, String)>) {
+    for (collection, gid, field) in fields {
+        if let Some(row) = view
+            .collections
+            .get_mut(collection)
+            .and_then(|rows| rows.get_mut(gid))
+        {
+            row.remove(field);
+        }
+    }
 }
 
 /// The groups and what waits, to read a failure by.

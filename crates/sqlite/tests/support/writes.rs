@@ -487,6 +487,16 @@ impl Writes {
         self.gone_with_install();
     }
 
+    /// After a resume that kept what was written meanwhile as the replica's own: a field it
+    /// pinned is never sent, so nothing is owed of it, whatever later releases the pin.
+    pub async fn pinned(&mut self, conn: &mut SqliteConnection, replica: &Replica) {
+        let inspection = replica.inspect(conn).await.unwrap();
+        for cell in inspection.pinned {
+            self.owed.remove(&cell);
+            self.named.remove(&cell);
+        }
+    }
+
     /// What was owed of a row the install collected and then removed, merging its entity into
     /// another's row, before anything here saw the entity: owed still, but by value, since the
     /// row's key could be given to another entity before the next send.

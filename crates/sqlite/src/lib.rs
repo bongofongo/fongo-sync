@@ -39,18 +39,6 @@
 //!   `uninstall` refuses ([`Error::NotInstalled`]). An install that finds no kernel tables
 //!   first removes the client's own `fongo_client_` tables, which alone do not count as the
 //!   kernel's and describe a state that is gone; `uninstall` removes them with the kernel's.
-//!
-//! # Reserved names
-//!
-//! Names beginning `fongo_`, in any case, are reserved to the kernel and its client, for tables,
-//! indexes and triggers; a registry naming such a table is refused. What the kernel does to
-//! objects so named: `install`, `install_step`, `resume`, `suspend` and `uninstall` drop the
-//! capture triggers, those named `fongo_<collection>_ai`, `_au` or `_ad` whose body marks rows
-//! in `fongo_dirty`; `uninstall` drops the tables any layout of the kernel made (from
-//! `fongo_alias` to `fongo_shadow`, a fixed list) and those whose names begin exactly
-//! `fongo_client_`; a first install drops the latter. Every call reads the kernel's objects
-//! from the schema by name. Nothing else so named is touched, but an application's object
-//! named as one of the kernel's would be taken for it.
 //! - While capture is suspended (a suspend is recorded, or a collection that was installed
 //!   lacks a trigger on its table; see [`Replica::resume`]), `install`, `install_step`,
 //!   `collect`, `collect_step`, `apply`, `purge_step` and `uncollected_rows` refuse
@@ -64,6 +52,20 @@
 //! has read fails with `SQLITE_BUSY` at its first write if another connection wrote meanwhile.
 //! Every read runs in a savepoint, so it answers from one state of the database; in
 //! rollback-journal mode, another connection's commit waits for it while it lasts.
+//!
+//! # Reserved names
+//!
+//! Names beginning `fongo_`, in any case, are reserved to the kernel and its client, for tables,
+//! indexes and triggers; a registry naming such a table is refused. What the kernel does to
+//! objects so named: `install`, `install_step`, `resume`, `suspend` and `uninstall` drop the
+//! capture triggers, those named `fongo_<collection>_ai`, `_au` or `_ad` whose body marks rows
+//! in `fongo_dirty`; `uninstall` drops the tables any layout of the kernel made (from
+//! `fongo_alias` to `fongo_shadow`, a fixed list) and those whose names begin exactly
+//! `fongo_client_`; a first install drops the latter. Every call reads the kernel's objects
+//! from the schema by name. Nothing else so named is touched, but an application's object
+//! named as one of the kernel's would be taken for it; `install`, `install_step` and `resume`
+//! refuse a trigger of the application's named as a capture trigger they would make
+//! ([`Error::Reserved`]).
 //!
 //! # Files
 //!
@@ -79,7 +81,10 @@
 //! - [`Registry::files_set`]: the files an outgoing batch sets, the ids to claim with it.
 //! - [`Replica::refers`] and [`Replica::files`]: the contents the state may refer to, counted
 //!   beyond the protocol's definition for data the registry cannot interpret, so that a replica
-//!   of an older registry never reports as unreferred a content a later one's field names.
+//!   of an older registry never reports as unreferred a content a later one's field names. A
+//!   listing is read in pages and is not a snapshot: writes between its pages can keep it from
+//!   naming a file referred to throughout. It is for showing files and finding candidates, never
+//!   grounds for retiring one: that is decided with `refers` while `nothing_pending` holds.
 //! - [`Replica::files_to_claim`]: the files rows held back and fields kept as this replica's own
 //!   show, which no change it holds may set, to claim before each report that it has settled.
 //! - [`Applied::files`] and [`Collected::files`]: what an operation did to the contents referred

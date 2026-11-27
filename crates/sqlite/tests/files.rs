@@ -5,6 +5,8 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use fongo_sync_sqlite::core::{ALIAS, Change, DELETED, Gid, Hlc, Strategy, Value};
 use fongo_sync_sqlite::{
     Collection, ContentHash, Error, Field, FileChanges, FileRef, FilesFrom, Kind, Registry, Replica,
@@ -1346,5 +1348,276 @@ async fn a_refused_write_is_cleared_by_correcting_or_deleting_the_row() {
             replica.nothing_pending(&mut a).await.unwrap(),
             "path {path}"
         );
+    }
+}
+
+/// Books whose `thumb` is a plain field, beside a cover that names files.
+const LOOKALIKES: &str = "CREATE TABLE books (
+    id INTEGER PRIMARY KEY,
+    title TEXT,
+    slot INTEGER UNIQUE,
+    thumb BLOB,
+    cover BLOB)";
+
+fn lookalikes() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("slot")
+            .field("thumb")
+            .file("cover"),
+    ])
+    .unwrap()
+}
+
+/// Runs `sql` with `?1` bound to `bytes`.
+async fn with_blob(conn: &mut SqliteConnection, sql: &str, bytes: Vec<u8>) {
+    sqlx::query(sql).bind(bytes).execute(conn).await.unwrap();
+}
+
+/// Pages through `files` `limit` at a time, requiring every page's cursor to move on and the
+/// listing to end within `most` pages: the references listed, then the run of rows held back.
+async fn paged(
+    replica: &Replica,
+    conn: &mut SqliteConnection,
+    limit: usize,
+    most: usize,
+) -> (Vec<FileRef>, Vec<FileRef>) {
+    let (mut values, mut held) = (Vec::new(), Vec::new());
+    let mut from: Option<FilesFrom> = None;
+    for _ in 0..most {
+        let page = replica.files(conn, from.as_ref(), limit).await.unwrap();
+        assert!(page.files.len() <= limit, "a page of {limit}");
+        let run = if page.held_back {
+            &mut held
+        } else {
+            assert!(held.is_empty(), "values listed after rows held back");
+            &mut values
+        };
+        run.extend(page.files.iter().map(|r| r.file));
+        let Some(next) = page.next else {
+            return (values, held);
+        };
+        if let Some(from) = &from {
+            assert!(next > *from, "pages of {limit}: the cursor did not move on");
+        }
+        from = Some(next);
+    }
+    panic!("pages of {limit}: no end within {most} pages");
+}
+
+/// Fields kept as this replica's own whose field names no file, showing values that begin as
+/// references do, neither list nor stop a page.
+#[tokio::test]
+async fn pins_of_a_plain_field_never_stall_the_listing() {
+    for (pins, limit) in [(1u8, 1usize), (3, 3), (3, 2), (2, 3), (4, 1)] {
+        let world = World::new(30);
+        let replica = Replica::new(lookalikes());
+        let mut a = world.connect(0).await;
+        run(&mut a, LOOKALIKES).await;
+        for i in 0..4 {
+            with_file(
+                &mut a,
+                "INSERT INTO books (title, cover) VALUES ('Middlemarch', ?1)",
+                file(i),
+            )
+            .await;
+        }
+        replica.install(&mut a).await.unwrap();
+        sent(&replica, &mut a).await;
+        replica.suspend(&mut a).await.unwrap();
+        for i in 0..pins {
+            with_blob(
+                &mut a,
+                &format!("UPDATE books SET thumb = ?1 WHERE id = {}", i + 1),
+                vec![1, 0, i],
+            )
+            .await;
+        }
+        replica
+            .resume(&mut a, fongo_sync_sqlite::Resume::Baseline)
+            .await
+            .unwrap();
+        let inspection = replica.inspect(&mut a).await.unwrap();
+        assert_eq!(inspection.pinned.len(), usize::from(pins));
+        let (values, held) = paged(&replica, &mut a, limit, 20).await;
+        let mut expected: Vec<FileRef> = (0..4).map(file).collect();
+        expected.sort_by_key(|f| f.encode());
+        assert_eq!(
+            (values, held),
+            (expected, vec![]),
+            "{pins} pins, pages of {limit}"
+        );
+    }
+}
+
+/// Every kind of value that begins as a reference does without naming a file, in every source a
+/// page reads (values kept, changes to a collection the registry lacks, fields kept as this
+/// replica's own, rows held back), at several page sizes: every page moves on, the listing ends
+/// within the pages its sources bound, lists nothing twice, and names exactly the contents
+/// `refers` says are referred to.
+#[tokio::test]
+async fn every_page_moves_on_whatever_the_sources_hold() {
+    let world = World::new(31);
+    let replica = Replica::new(lookalikes());
+    let mut b = world.connect(1).await;
+    run(&mut b, LOOKALIKES).await;
+    replica.install(&mut b).await.unwrap();
+    let blob = |f: FileRef| Value::Blob(f.encode());
+    let longer = |n: u8| {
+        let mut b = file(n).encode();
+        b.push(0);
+        Value::Blob(b)
+    };
+    let sizeless = |n: u8| {
+        let mut b = vec![1];
+        b.extend_from_slice(&hash(n).0);
+        Value::Blob(b)
+    };
+    let mut tick = 0;
+    let mut at = |collection: &str, gid: u8, field: &str, value: Value| {
+        tick += 1;
+        change(collection, gid, field, value, tick)
+    };
+    let mut first = Vec::new();
+    // Entities that will be held back, showing their first cover.
+    for i in 1..=3u8 {
+        first.push(at("books", i, DELETED, Value::Int(0)));
+        first.push(at("books", i, "slot", Value::Int(i.into())));
+        first.push(at("books", i, "cover", blob(file(90 + i))));
+    }
+    for i in 0..6u8 {
+        let g = 10 + i;
+        first.push(at("books", g, DELETED, Value::Int(0)));
+        let (cover, thumb, junk) = match i % 3 {
+            0 => (
+                blob(file(20 + i)),
+                Value::Blob(vec![1, i]),
+                sizeless(40 + i),
+            ),
+            1 => (longer(20 + i), blob(file(30 + i)), blob(file(40 + i))),
+            _ => (Value::Null, sizeless(30 + i), longer(40 + i)),
+        };
+        first.push(at("books", g, "cover", cover));
+        first.push(at("books", g, "thumb", thumb));
+        first.push(at("books", g, "junk", junk));
+        first.push(at(
+            "books",
+            g,
+            "title",
+            Value::Text("\u{1}Middlemarch".into()),
+        ));
+        let elsewhere = match i % 3 {
+            0 => blob(file(50 + i)),
+            1 => longer(50 + i),
+            _ => sizeless(50 + i),
+        };
+        first.push(at("annexes", 60 + i, DELETED, Value::Int(0)));
+        first.push(at("annexes", 60 + i, "scan", elsewhere));
+        first.push(at("annexes", 60 + i, "note", Value::Blob(vec![1])));
+    }
+    replica.apply(&mut b, &first).await.unwrap();
+    // Rows of this replica's take the slots the held entities move to.
+    for i in 1..=3u8 {
+        run(
+            &mut b,
+            &format!(
+                "INSERT INTO books (title, slot) VALUES ('Romola', {})",
+                100 + i
+            ),
+        )
+        .await;
+    }
+    replica.collect(&mut b).await.unwrap();
+    sent(&replica, &mut b).await;
+    let mut moved = Vec::new();
+    for i in 1..=3u8 {
+        moved.push(at("books", i, "slot", Value::Int((100 + i).into())));
+        moved.push(at("books", i, "cover", blob(file(95 + i))));
+    }
+    let applied = replica.apply(&mut b, &moved).await.unwrap();
+    assert_eq!(applied.held.len(), 3, "{applied:?}");
+    // Fields kept as this replica's own: plain ones showing lookalikes and references, covers
+    // showing references and NULL.
+    replica.suspend(&mut b).await.unwrap();
+    let mut pinned = Vec::new();
+    for (gid, field, value) in [
+        (10, "thumb", Some(vec![1, 7])),
+        (11, "thumb", Some(vec![1])),
+        (12, "thumb", Some(file(70).encode())),
+        (13, "thumb", Some(file(71).encode())),
+        (14, "cover", Some(file(80).encode())),
+        (15, "cover", Some(file(81).encode())),
+        (10, "cover", None),
+    ] {
+        let id = replica
+            .key_for_gid(&mut b, "books", Gid([gid; 16]))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE books SET {field} = ?1 WHERE json_array(id) = '{id}'"
+        ))
+        .bind(value.clone())
+        .execute(&mut b)
+        .await
+        .unwrap();
+        pinned.push(value);
+    }
+    replica
+        .resume(&mut b, fongo_sync_sqlite::Resume::Baseline)
+        .await
+        .unwrap();
+    assert_eq!(replica.inspect(&mut b).await.unwrap().pinned.len(), 7);
+
+    let mut referred: Vec<u8> = Vec::new();
+    for i in 0..6u8 {
+        match i % 3 {
+            0 => referred.extend([20 + i, 50 + i]),
+            1 => referred.extend([30 + i, 40 + i]),
+            _ => {}
+        }
+    }
+    referred.extend([80, 81, 91, 92, 93, 96, 97, 98]);
+    let mut asked: Vec<ContentHash> = (0..=100).map(hash).collect();
+    asked.push(FileRef::of(b"held by nobody").hash);
+    let answers = replica.refers(&mut b, &asked).await.unwrap();
+    let says: BTreeSet<ContentHash> = asked
+        .iter()
+        .zip(answers)
+        .filter(|(_, r)| *r)
+        .map(|(h, _)| *h)
+        .collect();
+    let expected: BTreeSet<ContentHash> = referred.iter().map(|n| hash(*n)).collect();
+    assert_eq!(says, expected);
+
+    // Every value the sources may index begins with byte 1; each is one entry at most.
+    let begins = |v: &Value| matches!(v, Value::Blob(b) if b.first() == Some(&1));
+    let entries = first
+        .iter()
+        .chain(&moved)
+        .filter(|c| begins(&c.value))
+        .count()
+        + pinned
+            .iter()
+            .flatten()
+            .filter(|b| b.first() == Some(&1))
+            .count();
+    for limit in [1, 2, 3, 7] {
+        let most = entries / limit + 3 / limit + 2;
+        let (values, held) = paged(&replica, &mut b, limit, most).await;
+        let encoded: Vec<Vec<u8>> = values.iter().map(FileRef::encode).collect();
+        assert!(
+            encoded.windows(2).all(|w| w[0] < w[1]),
+            "pages of {limit}: values listed out of order or twice"
+        );
+        let distinct: BTreeSet<Vec<u8>> = held.iter().map(FileRef::encode).collect();
+        assert_eq!(
+            distinct.len(),
+            held.len(),
+            "pages of {limit}: held listed twice"
+        );
+        let listed: BTreeSet<ContentHash> = values.iter().chain(&held).map(|f| f.hash).collect();
+        assert_eq!(listed, says, "pages of {limit}");
     }
 }

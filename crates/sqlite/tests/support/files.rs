@@ -105,6 +105,9 @@ pub async fn listed(
             }
         }
         match page.next {
+            Some(next) if from.as_ref().is_some_and(|f| next <= *f) => {
+                return Err("a page's cursor did not move on".into());
+            }
             Some(next) => from = Some(next),
             None => break,
         }

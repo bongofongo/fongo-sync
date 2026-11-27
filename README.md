@@ -119,7 +119,8 @@ again, and `Replica::suspended` says whether it must. When capture is intact, `r
 `install`. `uninstall` removes everything the kernel added, and the client's tables with it.
 Names beginning `fongo_` are reserved to the kernel and its client, for tables, indexes and
 triggers; only the kernel's own objects are ever dropped (see the crate documentation of
-`fongo-sync-sqlite`), and a registry naming a table so is refused.
+`fongo-sync-sqlite`), and a registry naming a table so is refused, as is an install or resume
+where a trigger of the application's has the name of a capture trigger it would make.
 
 Each call that writes, made with no transaction open, takes SQLite's write lock with its first
 statement and so waits for another connection's write in the busy handler; made inside the
@@ -200,7 +201,10 @@ any value held names it, at any size.
   registry predates a field marked as naming files never reports a content that field refers
   to as unreferred, as long as every field ever marked as naming files is marked so, merged by
   clock and outside any key in every version that writes it. Rows held back and fields kept as
-  this replica's own on resuming count too.
+  this replica's own on resuming count too. A listing is not a snapshot: writes between its
+  pages can keep it from naming a file referred to throughout, so it serves to show files and
+  find candidates, never to decide that one may be retired; that is `refers`, asked while
+  `nothing_pending` holds.
 - `Replica::files_to_claim` names the files rows held back and fields kept as this replica's
   own show, which a device claims before it reports that it has settled.
 - `Applied::files`, and `Collected::files` of a step or of `collect_reported`,

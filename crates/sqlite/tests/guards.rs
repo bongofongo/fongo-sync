@@ -1664,3 +1664,47 @@ async fn only_the_kernels_own_objects_are_touched() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A trigger of the application's named as a capture trigger the registry needs is refused by
+/// name, by a first install, an install in steps and a resume alike, leaving the database as it
+/// was; renamed, it is left alone.
+#[tokio::test]
+async fn a_trigger_named_as_a_capture_trigger_is_refused() {
+    let world = World::new(31);
+    let replica = Replica::new(registry());
+    let mine = |name: &str| {
+        format!(
+            "CREATE TRIGGER {name} AFTER INSERT ON books BEGIN
+                UPDATE books SET title = upper(NEW.title) WHERE id = NEW.id; END"
+        )
+    };
+    let refused = |outcome: Result<(), Error>, name: &str| match outcome {
+        Err(Error::Reserved { name: named }) => assert_eq!(named, name),
+        other => panic!("{name}: {other:?}"),
+    };
+    for (n, name) in ["fongo_books_ai", "FONGO_notes_AD"].into_iter().enumerate() {
+        let mut c = database(&world, n as u64).await;
+        run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+        run(&mut c, &mine(name)).await;
+        let before = dump(&mut c).await;
+        refused(replica.install(&mut c).await, name);
+        refused(replica.install_step(&mut c, 1).await.map(drop), name);
+        assert_eq!(dump(&mut c).await, before, "{name}");
+        run(&mut c, &format!("DROP TRIGGER {name}")).await;
+        replica.install(&mut c).await.unwrap();
+        replica.collect(&mut c).await.unwrap();
+        replica.suspend(&mut c).await.unwrap();
+        run(&mut c, &mine(name)).await;
+        let before = dump(&mut c).await;
+        refused(replica.resume(&mut c, Resume::Send).await, name);
+        assert_eq!(dump(&mut c).await, before, "{name}");
+        run(&mut c, &format!("DROP TRIGGER {name}")).await;
+        run(&mut c, &mine("books_upper")).await;
+        replica.resume(&mut c, Resume::Send).await.unwrap();
+        run(&mut c, "INSERT INTO books (title) VALUES ('Romola')").await;
+        assert_eq!(titles(&mut c).await, ["Middlemarch", "ROMOLA"]);
+        replica.collect(&mut c).await.unwrap();
+        let sent = sent(&replica, &mut c).await;
+        assert!(sends(&sent, "ROMOLA"), "{sent:?}");
+    }
+}

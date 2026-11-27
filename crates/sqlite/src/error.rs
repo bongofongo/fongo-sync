@@ -23,6 +23,11 @@ pub enum Error {
         field: String,
         key: Option<String>,
     },
+    /// A trigger of the application's has the name of a capture trigger the kernel makes for a
+    /// collection of the registry, `fongo_<collection>_ai`, `_au` or `_ad` in any case. An
+    /// install or resume refused it before changing anything; renaming the trigger lets it run.
+    #[error("the trigger `{name}` has a name reserved to the sync kernel's capture triggers")]
+    Reserved { name: String },
     #[error("sync state is corrupt: {0}")]
     Corrupt(String),
     /// The database holds none of the kernel's tables: it was never installed, or was

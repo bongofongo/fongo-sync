@@ -46,13 +46,14 @@ pub struct Referred {
     pub declared: bool,
 }
 
-/// Where a page of [`Replica::files`] ended, to ask for the next.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where a page of [`Replica::files`] ended, to ask for the next. Ordered as the listing goes:
+/// every page's [`FilePage::next`] is greater than the cursor it was asked from.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FilesFrom(Run);
 
 /// The two runs of [`Replica::files`]: values held past an encoding, then rows held back past an
-/// entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// entity. The variants' order is the listing's, which the derived order follows.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Run {
     Values(Vec<u8>),
     Held(Option<(String, Gid)>),
@@ -401,11 +402,17 @@ impl Replica {
     /// the same wherever it starts, and looks each content it returns up in every field declared
     /// as naming files; a page of the second reads about `limit` entities held back and their
     /// rows, more where one entity's rows show more files than that. Nothing is read whole.
+    /// Whatever the tables hold, every page's [`FilePage::next`] is greater than the cursor it was
+    /// asked from, so a listing ends.
     ///
-    /// The pages are not a snapshot: a page reflects the state when it is read, and what was
-    /// written between pages may be listed or missed. A read that writes nothing. It answers
-    /// while capture is suspended, when what the application wrote meanwhile is not known: see
-    /// [`Replica::nothing_pending`].
+    /// A listing is not a snapshot: each page reflects the state when it is read, and what is
+    /// written between pages may be listed or missed, even a file referred to the whole time: the
+    /// values run passes a file only a row held back shows, another entity is then set to it, and
+    /// the row is released and written over before the second run reaches it; the file was
+    /// referred to throughout, and no page names it. A listing is for showing files and finding candidates,
+    /// never grounds for retiring one: decide with [`Replica::refers`] while
+    /// [`Replica::nothing_pending`] holds. A read that writes nothing. It answers while capture is
+    /// suspended, when what the application wrote meanwhile is not known.
     pub async fn files(
         &self,
         conn: &mut SqliteConnection,
@@ -429,24 +436,32 @@ impl Replica {
         }
     }
 
+    /// A page of the first run. Each source is read up to `limit` entries past `after`, and every
+    /// entry read is a candidate, listed or not, so the page passes at least the first of them:
+    /// its cursor moves past `after`, or the run ends. Past the least last entry of a source that
+    /// had more, what the other sources hold is not read, so the page ends there.
     fn values_page(&self, db: &Db, after: Vec<u8>, limit: usize) -> Result<FilePage> {
         let n = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
-        // Each source is read up to `limit` values: past the least last value of one that had
-        // more, what the others hold may be missing from the page.
+        // Each value read, with whether it is listed if it is a reference: a value held anywhere
+        // is, a field kept as this replica's own only where it is declared as naming files.
+        let mut candidates: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
         let mut bound: Option<Vec<u8>> = None;
-        let mut cut = |rows: Vec<Vec<Value>>, candidates: &mut BTreeSet<Vec<u8>>| {
+        let mut read = |rows: Vec<(Vec<u8>, bool)>| {
             let full = rows.len() == limit;
             let mut last = None;
-            for r in rows {
-                if let Value::Blob(bytes) = &r[0] {
-                    candidates.insert(bytes.clone());
-                    last = Some(bytes.clone());
-                }
+            for (bytes, listed) in rows {
+                *candidates.entry(bytes.clone()).or_default() |= listed;
+                last = Some(bytes);
             }
             if full && let Some(last) = last {
                 bound = Some(bound.take().map_or(last.clone(), |b: Vec<u8>| b.min(last)));
             }
+        };
+        let blob = |v: &Value| match v {
+            Value::Blob(b) => Ok(b.clone()),
+            _ => Err(Error::Corrupt(
+                "a value that may name a file is not a blob".into(),
+            )),
         };
         // The cursor comes first: SQLite bounds the range by the first lower bound it is given.
         for table in [
@@ -460,40 +475,36 @@ impl Replica {
                 ),
                 &[Value::Blob(after.clone()), Value::Int(n)],
             )?;
-            cut(rows, &mut candidates);
+            read(
+                rows.iter()
+                    .map(|r| Ok((blob(&r[0])?, true)))
+                    .collect::<Result<_>>()?,
+            );
         }
-        let mut pinned = Vec::new();
-        for r in db.query(
+        let rows = db.query(
             &format!(
                 "SELECT shown, collection, field FROM fongo_pins INDEXED BY fongo_pins_files
                   WHERE shown > ?1 AND {PINNED} ORDER BY shown LIMIT ?2"
             ),
             &[Value::Blob(after.clone()), Value::Int(n)],
-        )? {
-            // Every row read bounds the page, whether or not its field names files.
-            let named = self.registry.is_file(as_text(&r[1])?, as_text(&r[2])?);
-            pinned.push((r, named));
-        }
-        let mut kept = BTreeSet::new();
-        let named: BTreeSet<Vec<u8>> = pinned
-            .iter()
-            .filter(|(_, named)| *named)
-            .filter_map(|(r, _)| match &r[0] {
-                Value::Blob(b) => Some(b.clone()),
-                _ => None,
-            })
-            .collect();
-        cut(pinned.into_iter().map(|(r, _)| r).collect(), &mut kept);
-        candidates.extend(kept.into_iter().filter(|b| named.contains(b)));
+        )?;
+        read(
+            rows.iter()
+                .map(|r| {
+                    let named = self.registry.is_file(as_text(&r[1])?, as_text(&r[2])?);
+                    Ok((blob(&r[0])?, named))
+                })
+                .collect::<Result<_>>()?,
+        );
         let mut page = FilePage::default();
         let mut last: Option<Vec<u8>> = None;
         let mut stopped = false;
-        for bytes in candidates {
+        for (bytes, listed) in candidates {
             if page.files.len() == limit || bound.as_ref().is_some_and(|b| bytes > *b) {
                 stopped = true;
                 break;
             }
-            if let Ok(file) = FileRef::decode(&bytes) {
+            if listed && let Ok(file) = FileRef::decode(&bytes) {
                 page.files.push(Referred {
                     file,
                     declared: false,

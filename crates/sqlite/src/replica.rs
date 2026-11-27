@@ -334,6 +334,28 @@ fn made_here(kind: &str, name: &str, sql: &str, client: bool) -> bool {
     }
 }
 
+/// Refuses where a trigger of the application's has the name of a capture trigger `registry`
+/// needs, which creating the kernel's would fail on.
+fn capture_names_free(db: &Db, registry: &Registry) -> Result<()> {
+    let needed: BTreeSet<String> = registry
+        .collections()
+        .iter()
+        .flat_map(|c| ["ai", "au", "ad"].map(|s| format!("fongo_{}_{s}", c.name).to_lowercase()))
+        .collect();
+    for row in db.query(
+        "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'fongo%'",
+        &[],
+    )? {
+        let name = as_text(&row[0])?;
+        if needed.contains(&name.to_lowercase())
+            && !made_here("trigger", name, as_text(&row[1])?, false)
+        {
+            return Err(Error::Reserved { name: name.into() });
+        }
+    }
+    Ok(())
+}
+
 /// Drops every object of a type the kernel made, its capture triggers or its tables and the
 /// client's, and nothing else.
 fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
@@ -1057,6 +1079,7 @@ impl Replica {
                 None
             }
         };
+        capture_names_free(db, &self.registry)?;
         if matches!(kernel.state, State::Older(_)) {
             self.show_pins(db)?;
         }
