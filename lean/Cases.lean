@@ -168,7 +168,9 @@ def things (fields : List Full.Field) (together : List (List String)) : Full.Col
 def shelves : Full.Collection := ⟨"shelves", [plainLww "name"], [], none⟩
 
 /-- Schemas that differ only in the rules `Schema.Restricted` states, one rule broken or kept
-at a time. -/
+at a time, but for a collection owning its own rows: that is also an ownership cycle, which
+`Schema.Restricted` and `Schema::check` each refuse on its own, so no case tests the rule against
+owning one's own rows alone, and none can. -/
 def schemaCases : List (String × List Full.Collection) := [
   ("a set of plain fields", [things [plainLww "title", plainLww "subtitle"] [["title", "subtitle"]]]),
   ("a reference in a set", [things [plainLww "title", ⟨"link", .reference "things", .lww⟩]

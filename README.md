@@ -274,8 +274,10 @@ on fixed cases: `model::view` against the single-collection Lean view, computed 
 to its specification, and against a computed view over several collections, also proven equal
 to its specification, keys, groups and liveness;
 `Schema::check` against `Schema.Restricted`, which states every rule of `Schema::check` but
-those on identity keys, on schemas that each break or keep one rule; and `Clock` against `Clock.lean` on fixed histories. The Lean view
-covers several collections, which collection a gid belongs to, the changes `model::view` ignores,
+those on identity keys, on schemas that each break or keep one rule (a collection owning its own
+rows also breaks the rule against ownership cycles, which on both sides refuses it alone, so the
+rule against owning its own rows is never the only one tested); and `Clock` against
+`Clock.lean` on fixed histories. The Lean view covers several collections, which collection a gid belongs to, the changes `model::view` ignores,
 `together` sets and natural keys, but not `Real` values, and it is a specification: it states the
 first key that derives a gid, the least groups and the least live set rather than computing them.
 
