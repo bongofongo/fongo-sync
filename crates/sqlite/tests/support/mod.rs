@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+pub mod files;
 pub mod library;
 pub mod peer;
 pub mod statements;

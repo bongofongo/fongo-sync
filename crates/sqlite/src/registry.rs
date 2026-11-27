@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use fongo_sync_core::model;
-use fongo_sync_core::{DELETED, Strategy, Value};
+use fongo_sync_core::{Change, DELETED, Strategy, Value};
+use fongo_sync_protocol::FileRef;
 
 use crate::error::{Error, Result};
 
@@ -26,6 +27,9 @@ pub enum Kind {
         collection: String,
         owned: bool,
     },
+    /// Names a file stored beside the changes: an encoded [`FileRef`] or NULL. To merging it is
+    /// a plain field merged by clock; see [`Collection::file`].
+    File,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +174,28 @@ impl Collection {
         self
     }
 
+    /// A field that names a file stored beside the changes, holding an encoded [`FileRef`]
+    /// ([`FileRef::encode`]) or NULL. It merges as a plain field merged by clock does, and the
+    /// changes carry it as an ordinary blob. A collect refuses a local write of anything else
+    /// with [`Error::NotAFile`]; a value from elsewhere that is not a reference is kept and shown
+    /// as any value is, and names no file. A file field is not part of a natural key, whose
+    /// entries are kept otherwise than by their winner, nor of a set of fields that change
+    /// together, which a write to any of its fields records whole, and does not report conflicts.
+    ///
+    /// Once a version of an application marks a field as naming files, every later version keeps
+    /// it so, merged by clock: a replica that does not know the field counts what it holds of it
+    /// as last-writer-wins, and it can be relied on only while that is what the field is. See
+    /// [`crate::Replica::refers`].
+    pub fn file(mut self, name: &str) -> Collection {
+        self.fields.push(Field {
+            name: name.into(),
+            kind: Kind::File,
+            strategy: Strategy::Lww,
+            reports_conflicts: false,
+        });
+        self
+    }
+
     /// A reference that goes null when its target is deleted (`ON DELETE SET NULL`).
     pub fn reference(self, name: &str, collection: &str) -> Collection {
         self.refer(name, collection, false)
@@ -311,6 +337,18 @@ impl Registry {
                     }
                 }
             }
+            for f in c.fields.iter().filter(|f| matches!(f.kind, Kind::File)) {
+                if f.strategy != Strategy::Lww
+                    || f.reports_conflicts
+                    || c.key_columns().contains(&f.name.as_str())
+                    || c.together_of(&f.name).is_some()
+                {
+                    return bad(format!(
+                        "`{}.{}` names files, so it is merged by clock, reports no conflicts, and is neither a key field nor in a set",
+                        c.name, f.name
+                    ));
+                }
+            }
             for identity in &c.identity {
                 if !matches!(c.key, Key::Minted { .. }) {
                     return bad(format!(
@@ -356,7 +394,7 @@ impl Registry {
                         Kind::Ref { collection, .. } => {
                             collections.iter().position(|o| o.name == *collection)
                         }
-                        Kind::Plain => None,
+                        Kind::Plain | Kind::File => None,
                     })
                     .collect()
             })
@@ -398,7 +436,7 @@ impl Registry {
                     .map(|f| model::Field {
                         name: f.name.clone(),
                         kind: match &f.kind {
-                            Kind::Plain => model::FieldKind::Plain,
+                            Kind::Plain | Kind::File => model::FieldKind::Plain,
                             Kind::Ref { collection, .. } if c.owns_through(f) => {
                                 model::FieldKind::Owner(collection.clone())
                             }
@@ -423,6 +461,55 @@ impl Registry {
     pub(crate) fn index(&self, name: &str) -> Option<usize> {
         self.collections.iter().position(|c| c.name == name)
     }
+
+    /// Whether `collection.field` is declared as naming files.
+    pub fn is_file(&self, collection: &str, field: &str) -> bool {
+        self.collections.iter().any(|c| {
+            c.name == collection
+                && c.fields
+                    .iter()
+                    .any(|f| f.name == field && matches!(f.kind, Kind::File))
+        })
+    }
+
+    /// Every field declared as naming files, as (collection, field), in registry order.
+    pub fn file_fields(&self) -> Vec<(&str, &str)> {
+        self.collections
+            .iter()
+            .flat_map(|c| {
+                c.fields
+                    .iter()
+                    .filter(|f| matches!(f.kind, Kind::File))
+                    .map(|f| (c.name.as_str(), f.name.as_str()))
+            })
+            .collect()
+    }
+
+    /// The files that `changes` set references to: each value of a change to a field declared as
+    /// naming files that is a [`FileRef`], once, in the order the changes give them. A function of
+    /// the registry and the changes alone, so an outgoing batch gives the same files however
+    /// often it is sealed or sent: they are the files the batch claims.
+    pub fn files_set(&self, changes: &[Change]) -> Vec<FileRef> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for change in changes {
+            if let Some(file) = file_of(&change.value)
+                && self.is_file(&change.collection, &change.field)
+                && seen.insert(file)
+            {
+                out.push(file);
+            }
+        }
+        out
+    }
+}
+
+/// The file a value names, if it is an encoded [`FileRef`].
+pub(crate) fn file_of(value: &Value) -> Option<FileRef> {
+    match value {
+        Value::Blob(bytes) => FileRef::decode(bytes).ok(),
+        _ => None,
+    }
 }
 
 impl Registry {
@@ -441,6 +528,7 @@ impl Registry {
             for f in &c.fields {
                 let (kind, target, owned) = match &f.kind {
                     Kind::Plain => ("P", "", false),
+                    Kind::File => ("B", "", false),
                     Kind::Ref { collection, owned } => ("R", collection.as_str(), *owned),
                 };
                 let strategy = match f.strategy {
@@ -509,6 +597,7 @@ impl Registry {
                     name: (*name).to_string(),
                     kind: match *kind {
                         "P" => Kind::Plain,
+                        "B" => Kind::File,
                         "R" => Kind::Ref {
                             collection: (*target).to_string(),
                             owned: *owned == "1",
@@ -642,6 +731,21 @@ mod tests {
             model::Collection::minted("notes").owner("book_id", "books"),
         ]);
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn a_file_field_reads_back_from_its_text() {
+        let registry = Registry::new(vec![
+            Collection::minted("books", "books", "id")
+                .field("title")
+                .file("cover"),
+        ])
+        .unwrap();
+        let text = registry.encode();
+        let back = Registry::decode(&text, &registry).unwrap();
+        assert_eq!(back.encode(), text);
+        assert!(back.is_file("books", "cover") && !back.is_file("books", "title"));
+        assert_eq!(back.file_fields(), [("books", "cover")]);
     }
 
     #[test]

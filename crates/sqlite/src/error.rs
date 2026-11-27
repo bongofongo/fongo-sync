@@ -8,6 +8,18 @@ pub enum Error {
     Sqlite { code: i32, message: String },
     #[error("registry: {0}")]
     Registry(String),
+    /// The application wrote a value other than an encoded
+    /// [`FileRef`](fongo_sync_protocol::FileRef) or NULL to a field that names files
+    /// ([`crate::Collection::file`]). Nothing was collected; the write stays to be collected
+    /// once the row holds a reference or NULL there. `key` is the row's, when it has one.
+    #[error(
+        "`{collection}.{field}` names files, and a row holds a value that is not a file reference"
+    )]
+    NotAFile {
+        collection: String,
+        field: String,
+        key: Option<String>,
+    },
     #[error("sync state is corrupt: {0}")]
     Corrupt(String),
     /// The database holds none of the kernel's tables: it was never installed, or was

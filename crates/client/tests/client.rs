@@ -1310,7 +1310,7 @@ async fn a_sync_refuses_a_suspended_or_newer_kernel_before_reaching_the_server()
         .unwrap();
     assert!(peer.sync(&server).await.unwrap().sent > 0);
 
-    peer.run("UPDATE fongo_meta SET value = 5 WHERE key = 'layout'")
+    peer.run("UPDATE fongo_meta SET value = 6 WHERE key = 'layout'")
         .await;
     let requests = server.with(|s| s.requests.len());
     let file = std::fs::read(&path).unwrap();
@@ -1318,7 +1318,7 @@ async fn a_sync_refuses_a_suspended_or_newer_kernel_before_reaching_the_server()
     assert!(
         matches!(
             refused,
-            Err(Error::Database(Kernel::NewerLayout { found: 5, known: 4 }))
+            Err(Error::Database(Kernel::NewerLayout { found: 6, known: 5 }))
         ),
         "{refused:?}"
     );
@@ -1326,7 +1326,7 @@ async fn a_sync_refuses_a_suspended_or_newer_kernel_before_reaching_the_server()
     assert!(
         matches!(
             read,
-            Err(Error::Database(Kernel::NewerLayout { found: 5, known: 4 }))
+            Err(Error::Database(Kernel::NewerLayout { found: 6, known: 5 }))
         ),
         "{read:?}"
     );
@@ -1351,9 +1351,11 @@ async fn a_sync_refuses_a_database_not_installed_or_of_layout_three() {
         (
             &[
                 "DROP TABLE fongo_found",
+                "DROP INDEX fongo_shadow_files",
+                "DROP INDEX fongo_foreign_files",
                 "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
             ][..],
-            "OlderLayout { found: 3, known: 4 }",
+            "OlderLayout { found: 3, known: 5 }",
         ),
         (&[][..], "NotInstalled"),
     ] {

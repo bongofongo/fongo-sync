@@ -11,9 +11,9 @@ use fongo_sync_core::{Gid, Hlc, Value};
 use crate::db::{Db, as_gid, as_text, loaded, stored};
 use crate::error::{Error, Result};
 
-/// The kernel's own tables. Layout 4: facts as `source::admit` keeps them, a row image and the
-/// entity each local row stands for, what waits, and the rows a first install found that it has
-/// not adopted yet.
+/// The kernel's own tables. Layout 5: facts as `source::admit` keeps them, a row image and the
+/// entity each local row stands for, what waits, the rows a first install found that it has not
+/// adopted yet, and indexes of the values kept that may be file references.
 ///
 /// # Adopting found rows in steps
 ///
@@ -50,13 +50,24 @@ use crate::error::{Error, Result};
 /// Suspending adopts every record first, whole, while the tables still match that registry, so
 /// a schema changed while suspended never meets a record.
 ///
-/// Layout 3 is upgraded in place by the next install: it gains the empty `fongo_found` table and
-/// the index of marks in collecting order, and keeps everything else as it was. The move is one
-/// way: a build of layout 3 refuses to install over layout 4, as over any layout it does not
-/// know. Such a build calling `collect` or `apply` without installing first is not refused, and
-/// would leave records waiting unadopted; an application installs at every open. This build
-/// refuses every call on a later layout, and every call but an install, a resume, an uninstall
-/// or asking whether capture is suspended on layout 3.
+/// # Values that may name files
+///
+/// `fongo_shadow_files` and `fongo_foreign_files` index, by value, every kept value and every
+/// change held for a collection this registry lacks that is a blob whose first byte is a
+/// [`FileRef`](fongo_sync_protocol::FileRef)'s format, whatever its collection and field, so
+/// that whether anything held may name a file is one lookup, and the files held are read in
+/// order without reading anything else. A value that is not a reference is cheap to index and
+/// skipped where it is read.
+///
+/// # Upgrades
+///
+/// Layouts 3 and 4 are upgraded in place by the next install. Layout 3 gains the empty
+/// `fongo_found` table and the index of marks in collecting order; both gain the indexes of
+/// values that may name files; everything else is kept as it was. The move is one way: a build
+/// of layout 3 or 4 refuses to install over layout 5, as over any layout it does not know. Such a
+/// build calling `collect` or `apply` without installing first is not refused; an application
+/// installs at every open. This build refuses every call on a later layout, and every call but
+/// an install, a resume, an uninstall or asking whether capture is suspended on layouts 3 and 4.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.
@@ -76,6 +87,8 @@ pub(crate) const TABLES: &[&str] = &[
         clock TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS fongo_shadow_entity ON fongo_shadow (collection, gid, field)",
     "CREATE INDEX IF NOT EXISTS fongo_shadow_value ON fongo_shadow (collection, field, value, is_ref, gid)",
+    "CREATE INDEX IF NOT EXISTS fongo_shadow_files ON fongo_shadow (value, collection, field)
+        WHERE is_ref = 0 AND value >= x'01' AND value < x'02'",
     "CREATE TABLE IF NOT EXISTS fongo_alias (
         collection TEXT NOT NULL,
         a BLOB NOT NULL,
@@ -91,6 +104,8 @@ pub(crate) const TABLES: &[&str] = &[
         is_ref INTEGER NOT NULL DEFAULT 0,
         clock TEXT NOT NULL,
         PRIMARY KEY (collection, gid, field, clock))",
+    "CREATE INDEX IF NOT EXISTS fongo_foreign_files ON fongo_foreign (value, collection, field)
+        WHERE is_ref = 0 AND value >= x'01' AND value < x'02'",
     // Each local row: the entity it stands for, and its image. `local` is a minted row's id.
     "CREATE TABLE IF NOT EXISTS fongo_ids (
         collection TEXT NOT NULL,
@@ -160,10 +175,14 @@ pub(crate) const TABLES: &[&str] = &[
         PRIMARY KEY (collection, gid, field))",
 ];
 
-pub(crate) const LAYOUT: i64 = 4;
+pub(crate) const LAYOUT: i64 = 5;
 
 /// Earlier layouts the next install upgrades in place, adding what `TABLES` adds.
-pub(crate) const UPGRADES: &[i64] = &[3];
+pub(crate) const UPGRADES: &[i64] = &[3, 4];
+
+/// What makes a kernel value one that may be a file reference: the condition of the indexes of
+/// such values in [`TABLES`], word for word, or a query naming it cannot use them.
+pub(crate) const MAY_NAME_A_FILE: &str = "is_ref = 0 AND value >= x'01' AND value < x'02'";
 
 /// The `fongo_meta` key that records that capture is suspended: set by `suspend` with dropping
 /// the triggers, removed by `resume` with putting them back.
@@ -219,7 +238,7 @@ pub(crate) fn kernel_tables() -> impl Iterator<Item = &'static str> {
     })
 }
 
-/// The table layout 4 added to layout 3.
+/// The table layout 4 added to layout 3; layout 5 added only indexes.
 const ADDED: &str = "fongo_found";
 
 /// The suffixes of the three triggers that capture a collection's writes, named
@@ -337,7 +356,10 @@ pub(crate) fn read(db: &Db) -> Result<Kernel> {
         }
         Some(Value::Int(LAYOUT)) => State::Partial,
         Some(Value::Int(found)) if found > LAYOUT => State::Newer(found),
-        Some(Value::Int(found)) if UPGRADES.contains(&found) && core => State::Older(found),
+        Some(Value::Int(3)) if core => State::Older(3),
+        Some(Value::Int(found)) if UPGRADES.contains(&found) && core && tables.contains(ADDED) => {
+            State::Older(found)
+        }
         Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Partial,
         Some(Value::Int(found)) => State::Unknown(Some(found)),
         _ => State::Unknown(None),
@@ -373,6 +395,8 @@ pub(crate) struct Kept {
     pub new: bool,
     /// Whether the field held an entry at the fact's clock with another value.
     pub tied: bool,
+    /// The value of a field's entry the fact replaced, if one went.
+    pub replaced: Option<Value>,
 }
 
 /// The facts, answering the evaluator.
@@ -413,6 +437,7 @@ impl Facts<'_> {
             changed: claimed,
             new: claimed,
             tied: false,
+            replaced: None,
         };
         match &fact.body {
             Body::Alias { target } => {
@@ -429,7 +454,8 @@ impl Facts<'_> {
                 kept.tied = entries
                     .iter()
                     .any(|(v, k)| *k == fact.clock && v.total_cmp(value) != Ordering::Equal);
-                let (changed, _) = keep(*slot, &mut entries, value, fact.clock);
+                let (changed, gone) = keep(*slot, &mut entries, value, fact.clock);
+                kept.replaced = gone;
                 if changed {
                     kept.changed = true;
                     let at = [

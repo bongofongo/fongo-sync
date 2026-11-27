@@ -12,6 +12,10 @@
 //! replica 1 writes runs again, collecting whole, with replicas 0 and 1 copies of one database,
 //! whose writes share clocks: every third of them, or every one with `EXHAUSTIVE_COPIED_EVERY=1`,
 //! as `make deep` sets.
+//!
+//! A shelf names a badge file, so that merged and deleted shelves keep referring to theirs; after
+//! every apply and collect the files a replica reports are checked against the protocol's
+//! definition over the changes it holds (`support::files`).
 
 mod support;
 
@@ -24,7 +28,7 @@ use sqlx::SqliteConnection;
 use support::world::World;
 
 const SCHEMA: &[&str] = &[
-    "CREATE TABLE shelves (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT)",
+    "CREATE TABLE shelves (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT, badge BLOB)",
     "CREATE TABLE books (
         id INTEGER PRIMARY KEY,
         shelf_id INTEGER NOT NULL REFERENCES shelves(id) ON DELETE CASCADE,
@@ -41,6 +45,7 @@ fn registry() -> Registry {
         Collection::minted("shelves", "shelves", "id")
             .field("code")
             .field("name")
+            .file("badge")
             .identity(&["code"]),
         Collection::minted("books", "books", "id")
             .owner("shelf_id", "shelves")
@@ -59,6 +64,7 @@ fn registry() -> Registry {
 enum Write {
     MakeShelf,
     RenameShelf,
+    Badge,
     Recode,
     DeleteShelf,
     AddBook,
@@ -71,6 +77,7 @@ enum Write {
 const WRITES: &[Write] = &[
     Write::MakeShelf,
     Write::RenameShelf,
+    Write::Badge,
     Write::Recode,
     Write::DeleteShelf,
     Write::AddBook,
@@ -99,6 +106,14 @@ impl Write {
             }
             Write::RenameShelf => {
                 format!("UPDATE shelves SET name = 'by {replica}' WHERE id = {shelf}")
+            }
+            Write::Badge => {
+                let hex: String = fongo_sync_sqlite::FileRef::of(&[replica as u8])
+                    .encode()
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect();
+                format!("UPDATE shelves SET badge = X'{hex}' WHERE id = {shelf}")
             }
             Write::Recode => format!(
                 "UPDATE OR IGNORE shelves
@@ -217,6 +232,7 @@ impl Peer {
                 let mut seen = self.taken.clone();
                 seen.extend(outbox.changes);
                 support::midway(&mut self.conn, &self.replica, &seen).await?;
+                support::files::check(&mut self.conn, &self.replica, &seen, &[]).await?;
                 if !collected.more {
                     break;
                 }
@@ -240,7 +256,9 @@ impl Peer {
             .unwrap();
         self.taken.extend(outbox.changes.iter().cloned());
         batches.push(outbox.changes);
-        support::midway(&mut self.conn, &self.replica, &self.taken).await
+        support::midway(&mut self.conn, &self.replica, &self.taken).await?;
+        support::files::check(&mut self.conn, &self.replica, &self.taken, &[]).await?;
+        Ok(())
     }
 
     /// Takes batch `n`. With `alone`, no two databases share a node, so the apply must report
@@ -248,6 +266,7 @@ impl Peer {
     async fn take(&mut self, batches: &[Vec<Change>], n: usize, alone: bool) -> Result<(), String> {
         self.has.resize(batches.len(), false);
         self.has[n] = true;
+        let before = support::files::check(&mut self.conn, &self.replica, &self.taken, &[]).await?;
         self.taken.extend(batches[n].iter().cloned());
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
@@ -262,7 +281,10 @@ impl Peer {
         if alone && !applied.shared.is_empty() {
             return Err(format!("an apply reports {:?}", applied.shared));
         }
-        support::midway(&mut self.conn, &self.replica, &self.taken).await
+        support::midway(&mut self.conn, &self.replica, &self.taken).await?;
+        let after = support::files::check(&mut self.conn, &self.replica, &self.taken, &[]).await?;
+        let brought = support::files::carried(&batches[n]);
+        support::files::reported(&before, &after, &applied.files, Some(&brought))
     }
 }
 

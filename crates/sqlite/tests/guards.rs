@@ -289,6 +289,10 @@ enum Call {
     GroupOf,
     GidOf,
     Inspect,
+    Files,
+    Refers,
+    HeldFiles,
+    PurgeStep,
 }
 
 const CALLS: &[Call] = &[
@@ -314,6 +318,10 @@ const CALLS: &[Call] = &[
     Call::GroupOf,
     Call::GidOf,
     Call::Inspect,
+    Call::Files,
+    Call::Refers,
+    Call::HeldFiles,
+    Call::PurgeStep,
 ];
 
 /// What a call returned: `Ok`, with the answer where it is a count or a flag, or the error.
@@ -374,6 +382,16 @@ async fn call(call: Call, replica: &Replica, conn: &mut SqliteConnection) -> Str
             .await
             .map(|_| String::new()),
         Call::Inspect => replica.inspect(conn).await.map(|_| String::new()),
+        Call::Files => replica.files(conn, None, 10).await.map(|_| String::new()),
+        Call::Refers => replica
+            .refers(conn, &[fongo_sync_sqlite::FileRef::of(b"Middlemarch")])
+            .await
+            .map(|_| String::new()),
+        Call::HeldFiles => replica.held_files(conn).await.map(|_| String::new()),
+        Call::PurgeStep => replica
+            .purge_step(conn, u64::MAX, None, 10)
+            .await
+            .map(|_| String::new()),
     })
 }
 
@@ -386,6 +404,8 @@ enum Laid {
     Newer,
     /// Kernel tables of layout 3, laid down as the upgrade tests lay them.
     Older,
+    /// Kernel tables of layout 4, laid down as the upgrade tests lay them.
+    OlderFour,
     /// Kernel tables of layout 2, which this build does not upgrade.
     Unknown,
     /// Kernel tables that record no layout.
@@ -449,10 +469,17 @@ async fn laid(state: Laid) -> (SqliteConnection, Replica) {
             replica.suspend(&mut c).await.unwrap();
             &["UPDATE books SET title = 'Romola!' WHERE id = 2"]
         }
-        Laid::Newer => &["UPDATE fongo_meta SET value = 5 WHERE key = 'layout'"],
+        Laid::Newer => &["UPDATE fongo_meta SET value = 6 WHERE key = 'layout'"],
         Laid::Older => &[
             "DROP TABLE fongo_found",
+            "DROP INDEX fongo_shadow_files",
+            "DROP INDEX fongo_foreign_files",
             "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+        ],
+        Laid::OlderFour => &[
+            "DROP INDEX fongo_shadow_files",
+            "DROP INDEX fongo_foreign_files",
+            "UPDATE fongo_meta SET value = 4 WHERE key = 'layout'",
         ],
         Laid::Unknown => &["UPDATE fongo_meta SET value = 2 WHERE key = 'layout'"],
         Laid::Unrecorded => &["DELETE FROM fongo_meta WHERE key = 'layout'"],
@@ -470,7 +497,18 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
     let ok = |unchanged: bool| ("Ok".to_string(), unchanged);
     let read = matches!(
         call,
-        Outbox | Merged | Made | WrittenHere | GidForKey | KeyForGid | GroupOf | GidOf | Inspect
+        Outbox
+            | Merged
+            | Made
+            | WrittenHere
+            | GidForKey
+            | KeyForGid
+            | GroupOf
+            | GidOf
+            | Inspect
+            | Files
+            | Refers
+            | HeldFiles
     );
     match state {
         Laid::Installed => match call {
@@ -479,7 +517,7 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
             _ => ok(read),
         },
         Laid::Suspended | Laid::TriggersLost | Laid::OddFlag => match call {
-            Install | InstallStep | Collect | CollectStep | Apply | UncollectedRows => {
+            Install | InstallStep | Collect | CollectStep | Apply | UncollectedRows | PurgeStep => {
                 refused("Suspended")
             }
             Installed | Suspended => ("Ok(true)".into(), true),
@@ -491,19 +529,20 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
             Uninstall => ok(false),
             _ => ("Err(Corrupt(".into(), true),
         },
-        Laid::Newer => refused("NewerLayout { found: 5, known: 4 }"),
-        Laid::Older => match call {
+        Laid::Newer => refused("NewerLayout { found: 6, known: 5 }"),
+        Laid::Older | Laid::OlderFour => match call {
             Install | InstallStep | Resume | Uninstall => ok(false),
             Suspended => ("Ok(false)".into(), true),
-            _ => refused("OlderLayout { found: 3, known: 4 }"),
+            _ if matches!(state, Laid::Older) => refused("OlderLayout { found: 3, known: 5 }"),
+            _ => refused("OlderLayout { found: 4, known: 5 }"),
         },
         Laid::Unknown => match call {
             Uninstall => ok(false),
-            _ => refused("UnknownLayout { found: Some(2), known: 4 }"),
+            _ => refused("UnknownLayout { found: Some(2), known: 5 }"),
         },
         Laid::Unrecorded => match call {
             Uninstall => ok(false),
-            _ => refused("UnknownLayout { found: None, known: 4 }"),
+            _ => refused("UnknownLayout { found: None, known: 5 }"),
         },
         Laid::Absent | Laid::ClientOnly => match call {
             Install | InstallStep | Resume => ok(false),
@@ -526,6 +565,7 @@ async fn every_call_in_every_state() {
         Laid::Suspended,
         Laid::Newer,
         Laid::Older,
+        Laid::OlderFour,
         Laid::Unknown,
         Laid::Unrecorded,
         Laid::Absent,
@@ -556,14 +596,16 @@ async fn every_call_in_every_state() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Layout 3 is upgraded by an install, and only then do the other calls work on it.
+/// Layouts 3 and 4 are upgraded by an install, and only then do the other calls work on them.
 #[tokio::test]
 async fn an_older_layout_works_once_installed() {
-    for &c in CALLS {
-        let (mut conn, replica) = laid(Laid::Older).await;
-        replica.install(&mut conn).await.unwrap();
-        let got = call(c, &replica, &mut conn).await;
-        assert!(got.starts_with("Ok"), "{c:?}: {got}");
+    for state in [Laid::Older, Laid::OlderFour] {
+        for &c in CALLS {
+            let (mut conn, replica) = laid(state).await;
+            replica.install(&mut conn).await.unwrap();
+            let got = call(c, &replica, &mut conn).await;
+            assert!(got.starts_with("Ok"), "{state:?} {c:?}: {got}");
+        }
     }
 }
 
@@ -653,6 +695,7 @@ enum Writer {
     Uninstall,
     Acknowledge,
     ReleaseBases,
+    PurgeStep,
 }
 
 const WRITERS: &[Writer] = &[
@@ -666,6 +709,7 @@ const WRITERS: &[Writer] = &[
     Writer::Uninstall,
     Writer::Acknowledge,
     Writer::ReleaseBases,
+    Writer::PurgeStep,
 ];
 
 async fn write(w: Writer, replica: &Replica, conn: &mut SqliteConnection) -> Result<(), Error> {
@@ -680,6 +724,7 @@ async fn write(w: Writer, replica: &Replica, conn: &mut SqliteConnection) -> Res
         Writer::Uninstall => replica.uninstall(conn).await,
         Writer::Acknowledge => replica.acknowledge(conn, i64::MAX).await,
         Writer::ReleaseBases => replica.release_bases(conn, i64::MAX).await,
+        Writer::PurgeStep => replica.purge_step(conn, u64::MAX, None, 10).await.map(drop),
     }
 }
 
@@ -811,11 +856,11 @@ fn pinned(inspection: &fongo_sync_sqlite::Inspection, field: &str) -> bool {
 }
 
 /// Capture dropped without a suspend being recorded, as a build that recorded none left it, at
-/// this layout or at layout 3: an install is refused, and a resume compares the tables as after
-/// a suspend, sending or keeping what was written meanwhile as asked.
+/// this layout or at layouts 4 and 3: an install is refused, and a resume compares the tables as
+/// after a suspend, sending or keeping what was written meanwhile as asked.
 #[tokio::test]
 async fn capture_lost_without_a_record_is_resumed_as_a_suspension() {
-    for layout in [4, 3] {
+    for layout in [5, 4, 3] {
         for how in [Resume::Send, Resume::Baseline] {
             let world = World::new(10);
             let mut c = database(&world, 0).await;
@@ -826,13 +871,17 @@ async fn capture_lost_without_a_record_is_resumed_as_a_suspension() {
             sent(&replica, &mut c).await;
             drop_triggers(&mut c, "fongo%").await;
             run(&mut c, "UPDATE books SET title = 'Romola'").await;
-            if layout == 3 {
-                run(&mut c, "DROP TABLE fongo_found").await;
+            if layout < 5 {
+                run(&mut c, "DROP INDEX fongo_shadow_files").await;
+                run(&mut c, "DROP INDEX fongo_foreign_files").await;
                 run(
                     &mut c,
-                    "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+                    &format!("UPDATE fongo_meta SET value = {layout} WHERE key = 'layout'"),
                 )
                 .await;
+            }
+            if layout == 3 {
+                run(&mut c, "DROP TABLE fongo_found").await;
             }
             let at = format!("layout {layout}, {how:?}");
             let before = dump(&mut c).await;

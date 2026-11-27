@@ -1,7 +1,8 @@
 //! How long the kernel takes over a large library, printed as a table so runs can be compared:
 //! `make bench`. Ignored by default; meaningful only in a release build. One test that is not
 //! ignored checks, by counting statements and SQLite's work rather than time, that a small batch
-//! costs no more in a large library than in a small one.
+//! costs no more in a large library than in a small one, with a field naming files or without,
+//! and the questions about files neither.
 
 mod support;
 
@@ -22,7 +23,8 @@ const GROUP: u8 = 200;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE books (
-        id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE, year INTEGER, pages INTEGER)",
+        id INTEGER PRIMARY KEY, title TEXT, isbn TEXT UNIQUE, year INTEGER, pages INTEGER,
+        cover BLOB)",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
@@ -36,13 +38,22 @@ const SCHEMA: &[&str] = &[
 ];
 
 fn registry() -> Registry {
+    registry_with(false)
+}
+
+/// The registry, with books naming a cover file or not.
+fn registry_with(files: bool) -> Registry {
+    let mut books = Collection::minted("books", "books", "id")
+        .field("title")
+        .field("isbn")
+        .field("year")
+        .field("pages")
+        .identity(&["isbn"]);
+    if files {
+        books = books.file("cover");
+    }
     Registry::new(vec![
-        Collection::minted("books", "books", "id")
-            .field("title")
-            .field("isbn")
-            .field("year")
-            .field("pages")
-            .identity(&["isbn"]),
+        books,
         Collection::minted("notes", "notes", "id")
             .owner("book_id", "books")
             .field("body"),
@@ -77,6 +88,11 @@ async fn drain(replica: &Replica, conn: &mut SqliteConnection) -> Vec<Change> {
     outbox.changes
 }
 
+/// SQL for a file reference of a few bytes whose hash is `x`, an integer expression.
+fn cover(x: &str) -> String {
+    format!("unhex('01' || printf('%064x', {x}) || '05')")
+}
+
 struct Table(Vec<(String, Duration)>);
 
 impl Table {
@@ -93,7 +109,9 @@ async fn library(replica: &Replica, books: i64) -> (SqliteConnection, SqliteConn
         &mut a,
         &format!(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {books})
-             INSERT INTO books (title, isbn, year, pages) SELECT 'title ' || x, 'isbn ' || x, x, x FROM n"
+             INSERT INTO books (title, isbn, year, pages, cover)
+             SELECT 'title ' || x, 'isbn ' || x, x, x, {} FROM n",
+            cover("x")
         ),
     )
     .await;
@@ -120,7 +138,10 @@ async fn library(replica: &Replica, books: i64) -> (SqliteConnection, SqliteConn
 async fn small_batch(replica: &Replica, a: &mut SqliteConnection) -> Vec<Change> {
     run(
         a,
-        "UPDATE books SET title = title || '!' WHERE id IN (2, 3)",
+        &format!(
+            "UPDATE books SET title = title || '!', cover = {} WHERE id IN (2, 3)",
+            cover("id + 1000000")
+        ),
     )
     .await;
     run(
@@ -147,26 +168,11 @@ async fn count_work(conn: &mut SqliteConnection) -> Arc<AtomicU64> {
     work
 }
 
-/// Statements and work of applying a small batch, then collecting a one-row edit, in a library
-/// of `books` books.
-async fn small_costs(books: i64) -> [(u64, u64); 2] {
-    let replica = Replica::new(registry());
-    let (mut a, mut b) = library(&replica, books).await;
-    let batch = small_batch(&replica, &mut a).await;
-    let statements = Statements::watch(&mut b).await;
-    let work = count_work(&mut b).await;
-    replica.apply(&mut b, &batch).await.unwrap();
-    let applied = (statements.count(), work.swap(0, Ordering::Relaxed));
-    let mut texts = statements.texts();
-    run(&mut b, "UPDATE books SET year = 1871 WHERE id = 9").await;
-    statements.reset();
-    replica.collect(&mut b).await.unwrap();
-    let collected = (statements.count(), work.load(Ordering::Relaxed));
-    texts.extend(statements.texts());
-    // Every statement looks kernel tables up by an index, but for the marks of what to collect
-    // and what waits, which are as long as the work they stand for, and a test for any pin.
+/// Every statement in `texts` looks kernel tables up by an index, but for the marks of what to
+/// collect and what waits, which are as long as the work they stand for, and a test for any pin.
+async fn indexed(conn: &mut SqliteConnection, texts: &std::collections::BTreeSet<String>) {
     for text in texts.iter().filter(|t| !t.starts_with("--")) {
-        let detail: Vec<String> = support::rows(&mut b, &format!("EXPLAIN QUERY PLAN {text}"), &[])
+        let detail: Vec<String> = support::rows(conn, &format!("EXPLAIN QUERY PLAN {text}"), &[])
             .await
             .into_iter()
             .map(|row| format!("{:?}", row[3]))
@@ -182,14 +188,101 @@ async fn small_costs(books: i64) -> [(u64, u64); 2] {
             "{text} reads a whole kernel table: {detail:?}"
         );
     }
+}
+
+/// Statements and work of applying a small batch, then collecting a one-row edit, in a library
+/// of `books` books.
+async fn small_costs(books: i64, files: bool) -> [(u64, u64); 2] {
+    let replica = Replica::new(registry_with(files));
+    let (mut a, mut b) = library(&replica, books).await;
+    let batch = small_batch(&replica, &mut a).await;
+    let statements = Statements::watch(&mut b).await;
+    let work = count_work(&mut b).await;
+    replica.apply(&mut b, &batch).await.unwrap();
+    let applied = (statements.count(), work.swap(0, Ordering::Relaxed));
+    let mut texts = statements.texts();
+    run(&mut b, "UPDATE books SET year = 1871 WHERE id = 9").await;
+    statements.reset();
+    replica.collect(&mut b).await.unwrap();
+    let collected = (statements.count(), work.load(Ordering::Relaxed));
+    texts.extend(statements.texts());
+    indexed(&mut b, &texts).await;
     [applied, collected]
 }
 
 #[tokio::test]
 async fn a_small_batch_costs_no_more_in_a_larger_library() {
-    let small = small_costs(500).await;
-    let large = small_costs(4_000).await;
-    for ((what, s), l) in ["apply", "collect"].iter().zip(small).zip(large) {
+    for files in [false, true] {
+        let small = small_costs(500, files).await;
+        let large = small_costs(4_000, files).await;
+        for ((what, s), l) in ["apply", "collect"].iter().zip(small).zip(large) {
+            eprintln!(
+                "{what}, files {files}: {} statements, work {}; then {} and {}",
+                s.0, s.1, l.0, l.1
+            );
+            assert!(l.0 <= s.0 + 10, "{what}: {} statements, then {}", s.0, l.0);
+            assert!(
+                l.1 <= s.1 + s.1 / 2 + 10,
+                "{what}: work {}, then {}",
+                s.1,
+                l.1
+            );
+        }
+    }
+}
+
+/// Statements and work of each question about files, and of a step clearing the files of 20
+/// books deleted, in a library of `books` books with a cover each.
+async fn file_costs(books: i64) -> Vec<(u64, u64)> {
+    let replica = Replica::new(registry_with(true));
+    let (mut a, mut b) = library(&replica, books).await;
+    run(&mut a, "DELETE FROM books WHERE id BETWEEN 100 AND 119").await;
+    replica.collect(&mut a).await.unwrap();
+    let deleted = drain(&replica, &mut a).await;
+    replica.apply(&mut b, &deleted).await.unwrap();
+    let asked: Vec<fongo_sync_sqlite::FileRef> = (0..10u8)
+        .map(|i| fongo_sync_sqlite::FileRef::of(&[i]))
+        .collect();
+    let statements = Statements::watch(&mut b).await;
+    let work = count_work(&mut b).await;
+    let mut costs = Vec::new();
+    let mut texts = std::collections::BTreeSet::new();
+    for what in 0..4 {
+        statements.reset();
+        work.store(0, Ordering::Relaxed);
+        match what {
+            0 => drop(replica.refers(&mut b, &asked).await.unwrap()),
+            1 => {
+                let page = replica.files(&mut b, None, 10).await.unwrap();
+                assert_eq!(page.files.len(), 10);
+                let next = replica.files(&mut b, page.next.as_ref(), 10).await.unwrap();
+                assert_eq!(next.files.len(), 10);
+            }
+            2 => drop(replica.held_files(&mut b).await.unwrap()),
+            _ => {
+                let step = replica
+                    .purge_step(&mut b, u64::MAX, None, 100)
+                    .await
+                    .unwrap();
+                assert_eq!((step.examined, step.cleared), (20, 20), "{step:?}");
+            }
+        }
+        costs.push((statements.count(), work.load(Ordering::Relaxed)));
+        texts.extend(statements.texts());
+    }
+    indexed(&mut b, &texts).await;
+    costs
+}
+
+#[tokio::test]
+async fn questions_about_files_cost_no_more_in_a_larger_library() {
+    let small = file_costs(500).await;
+    let large = file_costs(4_000).await;
+    for ((what, s), l) in ["refers", "files", "held_files", "purge_step"]
+        .iter()
+        .zip(small)
+        .zip(large)
+    {
         eprintln!(
             "{what}: {} statements, work {}; then {} and {}",
             s.0, s.1, l.0, l.1
@@ -338,8 +431,23 @@ async fn a_group_costs_in_proportion_to_its_members() {
 #[tokio::test]
 #[ignore = "a benchmark: make bench"]
 async fn timings() {
+    let plain = timings_with(false).await;
+    let files = timings_with(true).await;
+    println!("\n{:<60} {:>12} {:>12}", "operation", "ms", "with files");
+    for ((what, took), (_, with)) in plain.0.iter().zip(&files.0) {
+        println!(
+            "{what:<60} {:>12.1} {:>12.1}",
+            took.as_secs_f64() * 1000.0,
+            with.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// The timings of [`timings`], with books naming a cover file, one each and changed with every
+/// edit, or with no field naming files.
+async fn timings_with(files: bool) -> Table {
     let mut table = Table(Vec::new());
-    let replica = Replica::new(registry());
+    let replica = Replica::new(registry_with(files));
 
     // A library of books adopted by a first install.
     let mut a = database().await;
@@ -347,7 +455,9 @@ async fn timings() {
         &mut a,
         &format!(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {ROWS})
-             INSERT INTO books (title, isbn, year, pages) SELECT 'title ' || x, 'isbn ' || x, x, x FROM n"
+             INSERT INTO books (title, isbn, year, pages, cover)
+             SELECT 'title ' || x, 'isbn ' || x, x, x, {} FROM n",
+            cover("x")
         ),
     )
     .await;
@@ -371,7 +481,10 @@ async fn timings() {
     // Edits to some of the rows.
     run(
         &mut a,
-        &format!("UPDATE books SET title = title || '!' WHERE id <= {DIRTY}"),
+        &format!(
+            "UPDATE books SET title = title || '!', cover = {} WHERE id <= {DIRTY}",
+            cover("id + 1000000")
+        ),
     )
     .await;
     let started = Instant::now();
@@ -505,12 +618,51 @@ async fn timings() {
             &format!("collect of a one-row edit in {books} books"),
             started,
         );
+        if books < 100_000 {
+            continue;
+        }
+        // The questions about files, in the larger library, and clearing the deleted rows' files.
+        let asked: Vec<fongo_sync_sqlite::FileRef> = (0..1000u32)
+            .map(|i| fongo_sync_sqlite::FileRef::of(&i.to_be_bytes()))
+            .collect();
+        let started = Instant::now();
+        replica.refers(&mut b, &asked).await.unwrap();
+        table.time("refers, 1,000 files, in 100000 books", started);
+        let started = Instant::now();
+        let mut from = None;
+        let mut listed = 0;
+        loop {
+            let page = replica.files(&mut b, from.as_ref(), 1000).await.unwrap();
+            listed += page.files.len();
+            match page.next {
+                Some(next) => from = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(listed, if files { 100_000 } else { 0 });
+        table.time("files, every page of 1,000, in 100000 books", started);
+        run(&mut a, "DELETE FROM books WHERE id <= 10000").await;
+        replica.collect(&mut a).await.unwrap();
+        let deleted = drain(&replica, &mut a).await;
+        let started = Instant::now();
+        replica.apply(&mut b, &deleted).await.unwrap();
+        table.time("apply of a delete of 10,000 books in 100000", started);
+        let started = Instant::now();
+        let mut from = None;
+        loop {
+            let step = replica
+                .purge_step(&mut b, u64::MAX, from.as_ref(), 1000)
+                .await
+                .unwrap();
+            match step.next {
+                Some(next) => from = Some(next),
+                None => break,
+            }
+        }
+        table.time("purge steps of 1,000 over 10,000 deleted books", started);
     }
 
-    println!("\n{:<60} {:>12}", "operation", "ms");
-    for (what, took) in &table.0 {
-        println!("{what:<60} {:>12.1}", took.as_secs_f64() * 1000.0);
-    }
+    table
 }
 
 /// What a call that finds nothing to do costs, in a schema of the kernel's tables alone and in

@@ -25,11 +25,11 @@ again after the rows naming it is collected with all of them, and rows written i
 millisecond are collected together. The rows found in a collection's tables when it is first
 installed in steps are recorded by that install and adopted by the steps after it, in batches,
 as a whole install at that moment would adopt them; what the application writes meanwhile is
-collected after them as its edits. The kernel's tables are of layout 4: a build that knows only
-layout 3 refuses to install over them, and this one upgrades layout 3 in place at its next
-install. Every call reads the layout first: this build refuses tables of a later layout in every
-call, and layout 3 in every call but `install`, `install_step`, `resume`, `uninstall` and
-`Replica::suspended`; with no kernel tables, a call that needs them fails with
+collected after them as its edits. The kernel's tables are of layout 5: a build that knows only
+layout 3 or 4 refuses to install over them, and this one upgrades layouts 3 and 4 in place at its
+next install. Every call reads the layout first: this build refuses tables of a later layout in
+every call, and layouts 3 and 4 in every call but `install`, `install_step`, `resume`,
+`uninstall` and `Replica::suspended`; with no kernel tables, a call that needs them fails with
 `Error::NotInstalled`, and with some of them missing every call but `uninstall` fails with
 `Error::Corrupt`.
 
@@ -47,6 +47,9 @@ reference may own its row, which then goes with its target. A collection can als
   log is told; the other takes the winning value without a report.
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
+- fields that name files (`Collection::file`), holding a `FileRef` from `fongo-sync-protocol` or
+  NULL. They merge as plain fields merged by clock; a collect refuses a local write of anything
+  else. See [Files](#files).
 
 When two replicas each make a row that is valid alone and together break a rule of the
 application's own, such as a partial unique index, the kernel holds one of them back and the
@@ -136,8 +139,9 @@ the same step as appending the changes that refer to them, and to retire them, w
 which a server deletes a file only once no change in the library can refer to it; the protocol's
 documentation states the conditions and limits of that guarantee. It also defines removing a
 device: the server then refuses that device and stops waiting for it, which does not exclude
-anyone who holds the library secret. No client or server in this repository implements any of
-this yet.
+anyone who holds the library secret. The storage adapter answers what a device needs of its own
+state to follow these rules (see [Files](#files)); no client or server in this repository
+transfers files yet.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
@@ -169,6 +173,37 @@ make check
 `make check` formats, lints, tests, builds the protocol for wasm and checks the proofs, as CI
 does. It needs [cargo-nextest](https://nexte.st), which runs every test in a process of its own
 with all test binaries at once, and [Lean](#verification) through `elan`.
+
+## Files
+
+A replica answers, from the changes it holds, what the protocol's rules for deleting files ask of
+a device. The protocol's definition: a set of changes refers to a file when, for some field
+marked as naming files and some collection and gid, the field's winner among the set's changes
+to it is a reference to the file, whatever the row's liveness or group.
+
+- `Registry::files_set` gives the files the changes of one outgoing batch set, the ids to claim
+  with it; it is a function of the registry and the changes, so a batch sealed or sent again
+  claims the same.
+- `Replica::refers` says whether the replica's state may refer to each of a list of files, and
+  `Replica::files` lists every such file in pages, each marked as named by a field this registry
+  declares or only by data it cannot interpret. Both count any value held that is a file
+  reference, in any collection and field: a field this registry does not declare, of a
+  collection it does, keeps its winner by clock, and changes to a collection it lacks are held
+  whole. So a replica whose registry predates a field marked as naming files never reports a
+  file that field refers to as unreferred, as long as every field ever marked as naming files is
+  merged by clock in every version. Rows held back and fields kept as this replica's own on
+  resuming count too.
+- `Replica::held_files` names the files rows held back show, which a device claims before it
+  reports that it has settled.
+- `Applied::files`, and `Collected::files` of a bounded step, say which files the operation made
+  the state refer to (to fetch) and which nothing refers to any more (to consider retiring).
+- Deleting a row does not clear its file fields, which would change what is sent and merged: a
+  deleted row refers to its file until the field is written. `Replica::purge_step` clears, in
+  bounded steps, the file fields of entities deleted before a time the application chooses, as
+  local writes sent like any other.
+
+Values that may be file references are indexed in the kernel's tables, so each of these is a
+few indexed lookups per file and a read of the rows held back, never a scan of the library.
 
 ## Structure
 
@@ -240,7 +275,12 @@ One chain, each link checked against the one above it:
    the application wrote must be sent and, once everything is exchanged, be in the merged
    state. Who made each live group, and wrote the latest of each field and of lists of its
    fields, as `Replica::made` and `Replica::written_here` answer, is checked against the model at
-   the same steps. The tests read
+   the same steps, and so are the files each replica reports as referred to: exactly those the
+   protocol's definition gives over the changes it holds under its registry, with its rows held
+   back and kept as its own, never fewer than the definition gives under a later registry that
+   marks a field it does not know, and changed by each apply, collect and purge only as that
+   operation reports and only through a change that sets a reference (`tests/files.rs` holds the
+   directed cases). The tests read
    the kernel only through `Replica::inspect` and the public lookups, so they hold any
    implementation to the same account, and `Registry::model_schema` gives the model's schema; a
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,
@@ -255,11 +295,12 @@ One chain, each link checked against the one above it:
    what collects placed between the same writes do. `tests/departures.rs`
    holds the ways an earlier adapter was seen to depart from the model; `tests/crash.rs` stops an
    apply, a collect, a suspend, a resume and every step of a bounded install or collect at every
-   statement and requires the database unchanged and the rest to complete; `tests/guards.rs`
+   statement and requires the database unchanged and the rest to complete, as `tests/files.rs`
+   does for a step of purging; `tests/guards.rs`
    calls every entry point with no kernel tables, with capture suspended and with tables of
    other layouts, and makes another connection write in the middle of every call that writes;
-   `tests/bench.rs` requires a small batch to run the same statements in a large library as in a
-   small one.
+   `tests/bench.rs` requires a small batch, with a field naming files or without, and each
+   question about files to run the same statements in a large library as in a small one.
    Where the core plans no write (rows that wait on each other through columns none of which
    accepts NULL), rows wait for the application: ignored tests in `crates/core/tests/plan.rs`,
    `tests/converge.rs` and `tests/property.rs` show it.

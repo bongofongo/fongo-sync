@@ -21,6 +21,7 @@ use crate::adopt;
 use crate::collect::{Edits, Minted, Place, last_adopted, marked_at, marked_past, marked_through};
 use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
+use crate::files::{FileChanges, FileWatch};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
 use crate::store::{Facts, Kernel, LAYOUT, SUSPENDED, State, TABLES, as_clock, read, state};
@@ -68,6 +69,10 @@ pub struct Collected {
     /// that it could write at last, and the like. A row it collected is among them when bringing
     /// rows up to date wrote or removed it, as one a merge gives up; one only collected is not.
     pub touched: Vec<Touched>,
+    /// What the step did to the files this replica refers to: empty when no field names files.
+    /// A first step of [`Replica::install_step`] reports what it merges, not the files a field
+    /// it newly declares already held, which [`Replica::files`] lists.
+    pub files: FileChanges,
 }
 
 /// Local changes waiting to be sent, oldest first.
@@ -98,6 +103,9 @@ pub struct Applied {
     /// Nodes this apply found evidence that two databases write as, by node. Nothing is held
     /// back or refused for it; see [`SharedNode`].
     pub shared: Vec<SharedNode>,
+    /// What this apply did to the files this replica refers to, as [`Replica::refers`] counts
+    /// them: empty when no field names files.
+    pub files: FileChanges,
 }
 
 /// Evidence that two databases write as one node: a copied database file, or a backup restored
@@ -304,7 +312,10 @@ fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
 /// once it has run every earlier command and holds the handle, which it keeps until our unlock
 /// arrives, so `lock_handle` cannot find the lock free and leave that unlock behind (see the
 /// crate documentation).
-async fn with_db<T>(conn: &mut SqliteConnection, work: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+pub(crate) async fn with_db<T>(
+    conn: &mut SqliteConnection,
+    work: impl FnOnce(&Db) -> Result<T>,
+) -> Result<T> {
     conn.ping().await?;
     let mut handle = conn.lock_handle().await?;
     // SAFETY: the handle is locked for as long as `db` lives, and nothing else uses it meanwhile.
@@ -399,6 +410,8 @@ pub(crate) struct Ctx<'d> {
     pub issued: Hlc,
     /// Nodes two databases write as, each with the earliest clock that shows it.
     pub shared: BTreeMap<Gid, Hlc>,
+    /// What the operation does to the files referred to, when it reports that.
+    pub files: Option<FileWatch>,
 }
 
 /// What a bounded try must not leave a later write to: the entities whose rows a merge may
@@ -429,7 +442,7 @@ pub(crate) struct Base {
 }
 
 impl<'d> Ctx<'d> {
-    fn begin(db: &'d Db) -> Result<Ctx<'d>> {
+    pub(crate) fn begin(db: &'d Db) -> Result<Ctx<'d>> {
         let node = node_of(db)?;
         let clock = match meta_get(db, "clock")? {
             Some(clock) => Clock::resume(as_clock(&clock)?),
@@ -451,6 +464,7 @@ impl<'d> Ctx<'d> {
             abandoned: 0,
             watch: None,
             adopting: false,
+            files: None,
         })
     }
 
@@ -482,7 +496,7 @@ impl<'d> Ctx<'d> {
         }
     }
 
-    fn finish(&self) -> Result<()> {
+    pub(crate) fn finish(&self) -> Result<()> {
         meta_set(self.db, "clock", Value::Text(self.clock.last().encode()))?;
         meta_set(self.db, "applying", Value::Int(0))
     }
@@ -575,7 +589,7 @@ impl Replica {
             .find(|f| f.name == field)
             .and_then(|f| match &f.kind {
                 Kind::Ref { collection, .. } => self.registry.index(collection),
-                Kind::Plain => None,
+                Kind::Plain | Kind::File => None,
             })
     }
 
@@ -632,6 +646,9 @@ impl Replica {
         if changes.is_empty() {
             return Ok(Ok(BTreeSet::new()));
         }
+        if local {
+            self.only_files(cx.db, changes)?;
+        }
         let ev = self.evaluator();
         let facts = Facts { db: cx.db };
         let affected = ev.affected(&facts, changes);
@@ -652,7 +669,11 @@ impl Replica {
             let Some(fact) = admit(&self.schema, change) else {
                 continue;
             };
+            self.saw_brought(cx, change)?;
             let kept = facts.keep(&fact)?;
+            if let Some(replaced) = &kept.replaced {
+                self.saw_replaced(cx, change, replaced);
+            }
             if local {
                 continue;
             }
@@ -1001,6 +1022,7 @@ impl Replica {
             }
         }
         let mut cx = Ctx::begin(db)?;
+        self.watch_files(&mut cx)?;
         let mut set = BTreeSet::new();
         let mut adopted = Vec::new();
         cx.collected += self.adopt_as_recorded(&mut cx)?;
@@ -1083,6 +1105,7 @@ impl Replica {
         let mut foreign = Vec::new();
         for c in self.registry.collections() {
             let at = [Value::Text(c.name.clone())];
+            let start = foreign.len();
             for r in db.query(
                 "SELECT gid, field, value, is_ref, clock FROM fongo_foreign WHERE collection = ?1",
                 &at,
@@ -1094,6 +1117,9 @@ impl Replica {
                     value: loaded(&r[2], &r[3])?,
                     clock: as_clock(&r[4])?,
                 });
+            }
+            for change in &foreign[start..] {
+                self.saw_brought(&mut cx, change)?;
             }
             db.exec("DELETE FROM fongo_foreign WHERE collection = ?1", &at)?;
         }
@@ -1115,6 +1141,7 @@ impl Replica {
         }
         self.record_found(db, &to_record)?;
         let more = self.step(&mut cx, &[], set, take)?;
+        let files = self.file_changes(&mut cx)?;
         cx.finish()?;
         Ok(Collected {
             produced: cx.produced,
@@ -1122,6 +1149,7 @@ impl Replica {
             abandoned: cx.abandoned,
             more,
             touched: self.touched_rows(cx.touched),
+            files,
         })
     }
 
@@ -1377,7 +1405,7 @@ impl Replica {
     /// Fails unless the kernel's tables are of this build's layout with capture running: not
     /// suspended, and every collection ever adopted with its triggers in place; or there are
     /// none, which it returns for the caller to decide.
-    fn ready(&self, db: &Db) -> Result<State> {
+    pub(crate) fn ready(&self, db: &Db) -> Result<State> {
         let kernel = read(db)?;
         if kernel.state == State::Absent {
             return Ok(kernel.state);
@@ -1650,7 +1678,9 @@ impl Replica {
             db.atomically_writing(|db| {
                 self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
+                self.watch_files(&mut cx)?;
                 let more = self.step(&mut cx, &[], BTreeSet::new(), Some(rows))?;
+                let files = self.file_changes(&mut cx)?;
                 cx.finish()?;
                 Ok(Collected {
                     produced: cx.produced,
@@ -1658,6 +1688,7 @@ impl Replica {
                     abandoned: cx.abandoned,
                     more,
                     touched: self.touched_rows(cx.touched),
+                    files,
                 })
             })
         })
@@ -1749,8 +1780,10 @@ impl Replica {
 
     fn apply_in(&self, db: &Db, changes: &[Change]) -> Result<Applied> {
         let mut cx = Ctx::begin(db)?;
+        self.watch_files(&mut cx)?;
         self.step(&mut cx, changes, BTreeSet::new(), None)?;
         let conflicts = self.conflicts(&mut cx, changes)?;
+        let files = self.file_changes(&mut cx)?;
         cx.finish()?;
         let ev = self.evaluator();
         let facts = Facts { db };
@@ -1801,6 +1834,7 @@ impl Replica {
             conflicts,
             held,
             shared,
+            files,
         })
     }
 

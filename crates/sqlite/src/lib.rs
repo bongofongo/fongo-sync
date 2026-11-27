@@ -27,8 +27,8 @@
 //!
 //! - Tables of a later layout than this build's are refused by every call
 //!   ([`Error::NewerLayout`]).
-//! - Tables of layout 3 are upgraded by `install`, `install_step` and `resume`, removed by
-//!   `uninstall`, and read by `suspended`; every other call refuses them
+//! - Tables of layouts 3 and 4 are upgraded by `install`, `install_step` and `resume`, removed
+//!   by `uninstall`, and read by `suspended`; every other call refuses them
 //!   ([`Error::OlderLayout`]).
 //! - Tables of any other layout, or that record none, are removed by `uninstall` and refused by
 //!   every other call ([`Error::UnknownLayout`]).
@@ -41,8 +41,9 @@
 //!   alone do not count as the kernel's tables.
 //! - While capture is suspended (a suspend is recorded, or a collection that was installed
 //!   lacks a trigger on its table; see [`Replica::resume`]), `install`, `install_step`,
-//!   `collect`, `collect_step`, `apply` and `uncollected_rows` refuse ([`Error::Suspended`]);
-//!   the reads, `acknowledge` and `release_bases` answer as at any other time.
+//!   `collect`, `collect_step`, `apply`, `purge_step` and `uncollected_rows` refuse
+//!   ([`Error::Suspended`]); the reads, `acknowledge` and `release_bases` answer as at any other
+//!   time.
 //!
 //! Every call that writes, called with no transaction open, takes SQLite's write lock with its
 //! first statement, so while another connection writes it waits in the busy handler. Called
@@ -51,6 +52,20 @@
 //! has read fails with `SQLITE_BUSY` at its first write if another connection wrote meanwhile.
 //! Every read runs in a savepoint, so it answers from one state of the database; in
 //! rollback-journal mode, another connection's commit waits for it while it lasts.
+//!
+//! # Files
+//!
+//! A field declared with [`Collection::file`] holds an encoded [`FileRef`] or NULL; merging treats
+//! it as a plain field merged by clock. The kernel answers, from the changes it holds, what the
+//! protocol's rules for deleting files (`fongo_sync_protocol::api`, "Deleting files") ask of a
+//! device: [`Registry::files_set`], the files an outgoing batch sets and so claims;
+//! [`Replica::refers`] and [`Replica::files`], the files the state may refer to, counted beyond
+//! the protocol's definition for data the registry cannot interpret, so that a replica of an
+//! older registry never reports as unreferred a file a later one's field names;
+//! [`Replica::held_files`], the files rows held back show; [`Applied::files`] and
+//! [`Collected::files`], what an operation did to those files; and [`Replica::purge_step`],
+//! which clears, as local writes, the file fields of entities deleted long enough ago. The
+//! values that may name files are indexed, so none of these reads the library whole.
 //!
 //! # What is supported and tested
 //!
@@ -70,6 +85,7 @@ mod adopt;
 mod collect;
 mod db;
 mod error;
+mod files;
 mod image;
 mod reconcile;
 mod registry;
@@ -78,7 +94,9 @@ mod store;
 mod tables;
 
 pub use error::{Error, Result};
+pub use files::{FileChanges, FilePage, FilesFrom, PurgeFrom, Purged, Referred};
 pub use fongo_sync_core as core;
+pub use fongo_sync_protocol::FileRef;
 pub use registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 pub use replica::{
     Applied, COLLECT_ROWS, Collected, Conflict, Held, Inspection, Made, Outbox, Replica, Resume,

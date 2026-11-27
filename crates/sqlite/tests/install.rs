@@ -615,32 +615,44 @@ fn found_rows_not_adopted_yet_count_as_uncollected() {
     });
 }
 
-/// A database of layout 3, as origin/main left it or as it was with the index of marks, is
+/// A database of layout 3, as it was without or with the index of marks, or of layout 4, is
 /// upgraded in place by its next install, whole or in steps: what it held is kept and it goes on
 /// collecting.
 #[test]
-fn layout_three_is_upgraded_in_place() {
+fn layouts_three_and_four_are_upgraded_in_place() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     runtime.block_on(async {
-        for (indexed, stepped) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (layout, indexed, stepped) in [
+            (3, false, false),
+            (3, true, false),
+            (3, false, true),
+            (3, true, true),
+            (4, true, false),
+            (4, true, true),
+        ] {
             let world = World::new(10);
             let mut a = database(&world, 0).await;
             existing(&mut a, 8).await;
             let replica = Replica::new(registry());
             replica.install(&mut a).await.unwrap();
             library::run(&mut a, "UPDATE books SET title = 'kept' WHERE id = 3").await;
-            // Read before the downgrade: no call but an install works on layout 3.
+            // Read before the downgrade: no call but an install works on an older layout.
             let before = (
                 replica.outbox(&mut a, u32::MAX).await.unwrap().changes,
                 replica.inspect(&mut a).await.unwrap(),
             );
-            // As layout 3 laid its tables down.
+            // As layout 4, or 3, laid its tables down.
+            let set = format!("UPDATE fongo_meta SET value = {layout} WHERE key = 'layout'");
             let mut downgrade = vec![
-                "DROP TABLE fongo_found",
-                "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+                "DROP INDEX fongo_shadow_files",
+                "DROP INDEX fongo_foreign_files",
+                set.as_str(),
             ];
+            if layout == 3 {
+                downgrade.push("DROP TABLE fongo_found");
+            }
             if !indexed {
                 downgrade.push("DROP INDEX fongo_dirty_order");
             }
@@ -652,25 +664,29 @@ fn layout_three_is_upgraded_in_place() {
             } else {
                 replica.install(&mut a).await.unwrap();
             }
-            let layout: i64 =
+            let now: i64 =
                 sqlx::query_scalar("SELECT value FROM fongo_meta WHERE key = 'layout'")
                     .fetch_one(&mut a)
                     .await
                     .unwrap();
-            assert_eq!(layout, 4);
+            assert_eq!(now, 5);
             let objects: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM sqlite_master WHERE name IN ('fongo_found', 'fongo_found_batch', 'fongo_dirty_order')",
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('fongo_found', 'fongo_found_batch',
+                    'fongo_dirty_order', 'fongo_shadow_files', 'fongo_foreign_files')",
             )
             .fetch_one(&mut a)
             .await
             .unwrap();
-            assert_eq!(objects, 3);
+            assert_eq!(objects, 5);
             replica.collect(&mut a).await.unwrap();
             let after = (
                 replica.outbox(&mut a, u32::MAX).await.unwrap().changes,
                 replica.inspect(&mut a).await.unwrap(),
             );
-            assert!(after.0.starts_with(&before.0), "indexed {indexed}, stepped {stepped}");
+            assert!(
+                after.0.starts_with(&before.0),
+                "layout {layout}, indexed {indexed}, stepped {stepped}"
+            );
             assert!(
                 after.0[before.0.len()..]
                     .iter()

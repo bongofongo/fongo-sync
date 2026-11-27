@@ -461,6 +461,7 @@ name = "fongo-sync-sqlite"
 version = "0.1.0"
 dependencies = [
  "fongo-sync-core",
+ "fongo-sync-protocol",
  "libsqlite3-sys",
  "proptest",
  "sqlx",

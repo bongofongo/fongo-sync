@@ -9,6 +9,12 @@
 //! of another's, or by a backup of its own, which then issues clocks already issued, so changes
 //! to one field share a clock and differ. Until that first happens in a run, no apply may report
 //! a shared node.
+//!
+//! Books name a cover file, and the upgrade marks a field of notes and a new collection as naming
+//! files, so that a replica not yet upgraded holds references it cannot interpret. After every
+//! step the files a replica reports are checked against the protocol's definition computed from
+//! the changes it holds (`support::files`), under its registry and the upgraded one, and what each
+//! apply, collect and purge reports doing to them against what it did.
 
 mod support;
 
@@ -39,11 +45,17 @@ const SCHEMA: &[&str] = &[
         status TEXT,
         finished INTEGER,
         extra TEXT,
-        seen INTEGER NOT NULL)",
+        seen INTEGER NOT NULL,
+        cover BLOB)",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
         book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-        body TEXT)",
+        body TEXT,
+        scan BLOB)",
+    "CREATE TABLE attachments (
+        id INTEGER PRIMARY KEY,
+        note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        file BLOB)",
     "CREATE TABLE marks (
         id INTEGER PRIMARY KEY,
         note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
@@ -66,7 +78,8 @@ const SCHEMA: &[&str] = &[
         title TEXT)",
 ];
 
-/// The registry before and after an upgrade that adds a field.
+/// The registry before and after an upgrade that adds a field, a field naming files and a
+/// collection whose field names files.
 fn registry(upgraded: bool) -> Registry {
     let mut books = Collection::minted("books", "books", "id")
         .owner("shelf_id", "shelves")
@@ -75,6 +88,7 @@ fn registry(upgraded: bool) -> Registry {
         .reference("author_id", "authors")
         .field("status")
         .field("finished")
+        .file("cover")
         .together(&["status", "finished"])
         .identity(&["isbn"])
         .local_default(
@@ -82,10 +96,20 @@ fn registry(upgraded: bool) -> Registry {
             LocalDefault::Sql("SELECT COALESCE(max(seen), 0) + 1 FROM books".into()),
         )
         .local_dependent("covers", "book_id");
+    let mut notes = Collection::minted("notes", "notes", "id")
+        .owner("book_id", "books")
+        .field_reporting_conflicts("body");
+    let mut later = Vec::new();
     if upgraded {
         books = books.field("extra");
+        notes = notes.file("scan");
+        later.push(
+            Collection::minted("attachments", "attachments", "id")
+                .owner("note_id", "notes")
+                .file("file"),
+        );
     }
-    Registry::new(vec![
+    let mut collections = vec![
         Collection::minted("shelves", "shelves", "id")
             .field("name")
             .identity(&["name"]),
@@ -93,9 +117,7 @@ fn registry(upgraded: bool) -> Registry {
             .field("name")
             .reference("favourite", "books"),
         books,
-        Collection::minted("notes", "notes", "id")
-            .owner("book_id", "books")
-            .field_reporting_conflicts("body"),
+        notes,
         Collection::minted("marks", "marks", "id")
             .owner("note_id", "notes")
             .field("place")
@@ -114,8 +136,19 @@ fn registry(upgraded: bool) -> Registry {
         Collection::minted("volumes", "volumes", "id")
             .owner("series_id", "series")
             .field("title"),
-    ])
-    .unwrap()
+    ];
+    collections.extend(later);
+    Registry::new(collections).unwrap()
+}
+
+/// A file reference as an SQL literal: the `n`th file, or NULL for 3.
+fn file_sql(n: u8) -> String {
+    if n == 3 {
+        return "NULL".into();
+    }
+    let bytes = fongo_sync_sqlite::FileRef::of(&[n; 3]).encode();
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    format!("X'{hex}'")
 }
 
 /// What must hold on every replica once everything is exchanged, of the application's own
@@ -147,6 +180,8 @@ struct Peer {
     pushes: usize,
     /// The node the replica's clocks carry, which a copy of its database shares.
     node: Gid,
+    /// The files it reported at its last check.
+    files: support::files::Reported,
 }
 
 impl Peer {
@@ -185,6 +220,7 @@ impl Peer {
             writes: Default::default(),
             origins: None,
             node: Gid([0; 16]),
+            files: Default::default(),
         };
         peer.install().await.unwrap();
         let node = peer.replica.inspect(&mut peer.conn).await.unwrap().node;
@@ -213,6 +249,7 @@ impl Peer {
             n,
             pushes: self.pushes,
             node: self.node,
+            files: self.files.clone(),
         }
     }
 
@@ -278,7 +315,61 @@ impl Peer {
     /// holds.
     async fn collected(&mut self) -> Result<(), String> {
         let seen = self.holding().await;
-        support::midway(&mut self.conn, &self.replica, &seen).await
+        support::midway(&mut self.conn, &self.replica, &seen).await?;
+        self.files = self.files_now().await?;
+        Ok(())
+    }
+
+    /// The files the replica reports, checked against the changes it holds under its registry
+    /// and, before it upgrades, the upgraded one.
+    async fn files_now(&mut self) -> Result<support::files::Reported, String> {
+        let seen = self.holding().await;
+        let later = if self.upgraded {
+            Vec::new()
+        } else {
+            vec![registry(true)]
+        };
+        support::files::check(&mut self.conn, &self.replica, &seen, &later)
+            .await
+            .map_err(|e| format!("files: {e}"))
+    }
+
+    /// Clears the files of every deleted entity, in steps of a few, each checked: a local write
+    /// the application asks for, though no row of its own changes.
+    async fn purge(&mut self) -> Result<(), String> {
+        let mut from = None;
+        loop {
+            let before = self.files_now().await?;
+            let waiting = self
+                .replica
+                .outbox(&mut self.conn, u32::MAX)
+                .await
+                .unwrap()
+                .changes
+                .len();
+            let step = self
+                .replica
+                .purge_step(&mut self.conn, u64::MAX, from.as_ref(), 2)
+                .await
+                .unwrap();
+            let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+            let cleared = &outbox.changes[waiting..];
+            if cleared.len() != step.cleared
+                || cleared
+                    .iter()
+                    .any(|c| c.value != fongo_sync_sqlite::core::Value::Null)
+            {
+                return Err(format!("a purge step sent {cleared:?}, reporting {step:?}"));
+            }
+            self.writes.asked(cleared);
+            self.collected().await?;
+            support::files::reported(&before, &self.files, &step.files, None)
+                .map_err(|e| format!("purging: {e}"))?;
+            match step.next {
+                Some(next) => from = Some(next),
+                None => return Ok(()),
+            }
+        }
     }
 
     /// Before a step of collecting that follows another.
@@ -344,6 +435,7 @@ impl Peer {
         let mut held: BTreeSet<String> = seen.iter().map(|c| format!("{c:?}")).collect();
         held.insert(format!("upgraded {}", self.upgraded));
         self.origins = Some((held, answers));
+        self.files = self.files_now().await?;
         Ok(())
     }
 
@@ -396,6 +488,14 @@ impl Peer {
     }
 
     async fn apply(&mut self, batch: &[Change]) -> Result<(), String> {
+        let before = self.files_now().await?;
+        let waiting = self
+            .replica
+            .outbox(&mut self.conn, u32::MAX)
+            .await
+            .unwrap()
+            .changes
+            .len();
         self.taken.extend(batch.iter().cloned());
         self.writes
             .before(&mut self.conn, &self.replica, &self.taken)
@@ -409,7 +509,12 @@ impl Peer {
                 applied.shared
             ));
         }
-        self.midway().await
+        self.midway().await?;
+        let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+        let mut brought = support::files::carried(batch);
+        brought.extend(support::files::carried(&outbox.changes[waiting..]));
+        support::files::reported(&before, &self.files, &applied.files, Some(&brought))
+            .map_err(|e| format!("applying: {e}"))
     }
 
     async fn push(&mut self, hub: &mut Vec<Change>) -> Result<(), String> {
@@ -439,6 +544,14 @@ impl Peer {
                 self.replica.collect(&mut self.conn).await.unwrap();
             }
             Some(rows) => loop {
+                let before = self.files_now().await?;
+                let waiting = self
+                    .replica
+                    .outbox(&mut self.conn, u32::MAX)
+                    .await
+                    .unwrap()
+                    .changes
+                    .len();
                 let collected = self
                     .replica
                     .collect_step(&mut self.conn, rows)
@@ -451,6 +564,10 @@ impl Peer {
                     self.writes.after(&mut self.conn, &self.replica).await;
                 }
                 self.collected().await?;
+                let outbox = self.replica.outbox(&mut self.conn, u32::MAX).await.unwrap();
+                let brought = support::files::carried(&outbox.changes[waiting..]);
+                support::files::reported(&before, &self.files, &collected.files, Some(&brought))
+                    .map_err(|e| format!("collecting a step: {e}"))?;
                 if !collected.more {
                     break;
                 }
@@ -550,8 +667,17 @@ struct Left {
 async fn collected_whole(conn: &mut SqliteConnection, replica: &Replica) -> Left {
     let mut rows = Vec::new();
     for table in [
-        "shelves", "authors", "books", "notes", "marks", "tags", "settings", "covers", "series",
+        "shelves",
+        "authors",
+        "books",
+        "notes",
+        "marks",
+        "tags",
+        "settings",
+        "covers",
+        "series",
         "volumes",
+        "attachments",
     ] {
         let sql = format!("SELECT * FROM {table} ORDER BY rowid");
         for row in support::rows(conn, &sql, &[]).await {
@@ -693,6 +819,13 @@ enum Op {
     AddSeries(u8, u8),
     SetSeriesCode(usize, u8),
     AddVolume(usize, u8),
+    SetCover(usize, u8),
+    SetScan(usize, u8),
+    AddAttachment(usize, u8),
+    SetAttachment(usize, u8),
+    DeleteAttachment(usize),
+    /// Clears the files of every deleted entity.
+    Purge,
     /// A write with the triggers suspended, sent on resuming.
     Suspended(usize, u8),
     Upgrade,
@@ -748,6 +881,12 @@ fn arb_op() -> impl Strategy<Value = Op> {
         3 => (0u8..2, v.clone()).prop_map(|(a, b)| Op::AddSeries(a, b)),
         2 => (n.clone(), 0u8..2).prop_map(|(a, b)| Op::SetSeriesCode(a, b)),
         2 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::AddVolume(a, b)),
+        4 => (n.clone(), 0u8..4).prop_map(|(a, b)| Op::SetCover(a, b)),
+        3 => (n.clone(), 0u8..4).prop_map(|(a, b)| Op::SetScan(a, b)),
+        3 => (n.clone(), 0u8..4).prop_map(|(a, b)| Op::AddAttachment(a, b)),
+        2 => (n.clone(), 0u8..4).prop_map(|(a, b)| Op::SetAttachment(a, b)),
+        1 => n.clone().prop_map(Op::DeleteAttachment),
+        1 => Just(Op::Purge),
         1 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::Suspended(a, b)),
         1 => Just(Op::Upgrade),
         4 => Just(Op::Sync),
@@ -778,6 +917,7 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
     let sql = match op {
         Op::Upgrade => return peer.upgrade().await,
         Op::Copy(..) | Op::Backup | Op::Restore => unreachable!("done by the run"),
+        Op::Purge => return peer.purge().await,
         Op::Suspended(n, v) => {
             let replica = peer.replica.clone();
             replica.suspend(&mut peer.conn).await.unwrap();
@@ -1009,6 +1149,32 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
         },
         Op::AddVolume(n, v) => match peer.pick("series", n).await {
             Some(id) => format!("INSERT INTO volumes (series_id, title) VALUES ({id}, 'v{v}')"),
+            None => return Ok(()),
+        },
+        Op::SetCover(n, v) => match peer.pick("books", n).await {
+            Some(id) => format!("UPDATE books SET cover = {} WHERE id = {id}", file_sql(v)),
+            None => return Ok(()),
+        },
+        Op::SetScan(n, v) => match peer.pick("notes", n).await {
+            Some(id) => format!("UPDATE notes SET scan = {} WHERE id = {id}", file_sql(v)),
+            None => return Ok(()),
+        },
+        Op::AddAttachment(n, v) => match peer.pick("notes", n).await {
+            Some(id) => format!(
+                "INSERT INTO attachments (note_id, file) VALUES ({id}, {})",
+                file_sql(if v == 3 { 3 } else { 4 + v })
+            ),
+            None => return Ok(()),
+        },
+        Op::SetAttachment(n, v) => match peer.pick("attachments", n).await {
+            Some(id) => format!(
+                "UPDATE attachments SET file = {} WHERE id = {id}",
+                file_sql(if v == 3 { 3 } else { 4 + v })
+            ),
+            None => return Ok(()),
+        },
+        Op::DeleteAttachment(n) => match peer.pick("attachments", n).await {
+            Some(id) => format!("DELETE FROM attachments WHERE id = {id}"),
             None => return Ok(()),
         },
     };

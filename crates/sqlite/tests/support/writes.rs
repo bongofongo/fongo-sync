@@ -452,6 +452,12 @@ impl Writes {
             .insert(Gid::derive(collection, &values));
     }
 
+    /// Changes the kernel made at the application's asking that no row of the application's
+    /// shows, such as the clearing of deleted rows' files: they may be sent.
+    pub fn asked(&mut self, changes: &[Change]) {
+        self.adopted.extend(changes.iter().cloned());
+    }
+
     /// Before an install, which may record what rows hold for fields it adopts.
     pub async fn installing(
         &mut self,
