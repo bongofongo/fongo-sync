@@ -322,40 +322,128 @@ pub(crate) async fn read_past(
     Ok(through)
 }
 
+/// Whether an envelope is recorded as being sent, by this sync or another.
+pub(crate) async fn sending(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<bool, Error> {
+    Ok(sqlx::query_scalar(
+        "SELECT sending_envelope IS NOT NULL FROM fongo_client_state WHERE library = ?",
+    )
+    .bind(&library.0[..])
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(false))
+}
+
+/// Whether `envelope` is still the one recorded as being sent.
+pub(crate) async fn still_sending(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    envelope: &[u8],
+) -> Result<bool, Error> {
+    Ok(
+        sqlx::query("SELECT 1 FROM fongo_client_state WHERE library = ? AND sending_envelope = ?")
+            .bind(&library.0[..])
+            .bind(envelope)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some(),
+    )
+}
+
+/// What the database knows of an envelope this device signed: where a sync appended it, or the
+/// outbox position it covers if it is the one recorded as being sent.
+pub(crate) enum Known {
+    Appended(Vec<u64>),
+    Sending(i64),
+}
+
+pub(crate) async fn known(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+    digest: Digest32,
+    envelope: &[u8],
+) -> Result<Option<Known>, Error> {
+    let seqs: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM fongo_client_appended WHERE library = ? AND digest = ? ORDER BY seq",
+    )
+    .bind(&library.0[..])
+    .bind(&digest[..])
+    .fetch_all(&mut *conn)
+    .await?;
+    if !seqs.is_empty() {
+        let seqs = seqs.into_iter().map(seq_of).collect::<Result<_, _>>()?;
+        return Ok(Some(Known::Appended(seqs)));
+    }
+    let through: Option<i64> = sqlx::query_scalar(
+        "SELECT sending_through FROM fongo_client_state WHERE library = ? AND sending_envelope = ?",
+    )
+    .bind(&library.0[..])
+    .bind(envelope)
+    .fetch_optional(&mut *conn)
+    .await?
+    .flatten();
+    Ok(through.map(Known::Sending))
+}
+
+/// The stored cursor.
+pub(crate) async fn stored_cursor(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<u64, Error> {
+    let cursor: i64 = sqlx::query_scalar("SELECT cursor FROM fongo_client_state WHERE library = ?")
+        .bind(&library.0[..])
+        .fetch_one(&mut *conn)
+        .await?;
+    u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))
+}
+
+/// Records `sending` as being sent, unless an envelope already is.
 pub(crate) async fn record_sending(
     conn: &mut SqliteConnection,
     library: LibraryId,
     sending: &Sending,
 ) -> Result<(), Error> {
-    sqlx::query(
+    let recorded = sqlx::query(
         "UPDATE fongo_client_state
-         SET sending_through = ?, sending_envelope = ?, sending_after = ? WHERE library = ?",
+         SET sending_through = ?, sending_envelope = ?, sending_after = ?
+         WHERE library = ? AND sending_envelope IS NULL",
     )
     .bind(sending.through)
     .bind(&sending.envelope[..])
     .bind(sending.after.map(as_i64).transpose()?)
     .bind(&library.0[..])
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected();
+    if recorded != 1 {
+        return Err(corrupt("an envelope was already recorded as being sent"));
+    }
     Ok(())
 }
 
+/// Forgets `envelope` as being sent; another envelope recorded since stays.
 pub(crate) async fn clear_sending(
     conn: &mut SqliteConnection,
     library: LibraryId,
+    envelope: &[u8],
 ) -> Result<(), Error> {
     sqlx::query(
         "UPDATE fongo_client_state
          SET sending_through = NULL, sending_envelope = NULL, sending_after = NULL
-         WHERE library = ?",
+         WHERE library = ? AND sending_envelope = ?",
     )
     .bind(&library.0[..])
+    .bind(envelope)
     .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-/// Records where the pull stopped at a later version's envelope, or that it did not.
+/// Records where the pull stopped at a later version's envelope, unless the stored cursor is
+/// already past it, and forgets a recorded stop the stored cursor has passed. Written after the
+/// cursor, so that a stop another sync recorded further on stays.
 pub(crate) async fn record_stop(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -363,7 +451,12 @@ pub(crate) async fn record_stop(
 ) -> Result<(), Error> {
     let seq = stopped.map(|(seq, _)| as_i64(seq)).transpose()?;
     sqlx::query(
-        "UPDATE fongo_client_state SET stopped_seq = ?, stopped_digest = ? WHERE library = ?",
+        "UPDATE fongo_client_state SET
+            stopped_seq = CASE WHEN ?1 > cursor THEN ?1
+                               WHEN stopped_seq <= cursor THEN NULL ELSE stopped_seq END,
+            stopped_digest = CASE WHEN ?1 > cursor THEN ?2
+                                  WHEN stopped_seq <= cursor THEN NULL ELSE stopped_digest END
+         WHERE library = ?3",
     )
     .bind(seq)
     .bind(stopped.map(|(_, digest)| digest.to_vec()))
@@ -373,15 +466,18 @@ pub(crate) async fn record_stop(
     Ok(())
 }
 
+/// Forgets an envelope to step past once the pull has read through it.
 pub(crate) async fn clear_passing(
     conn: &mut SqliteConnection,
     library: LibraryId,
+    read: u64,
 ) -> Result<(), Error> {
     sqlx::query(
         "UPDATE fongo_client_state SET passing_seq = NULL, passing_digest = NULL
-         WHERE library = ?",
+         WHERE library = ? AND passing_seq <= ?",
     )
     .bind(&library.0[..])
+    .bind(as_i64(read)?)
     .execute(&mut *conn)
     .await?;
     Ok(())

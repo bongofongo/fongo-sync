@@ -332,8 +332,9 @@ pub struct SyncReport {
 /// depend on reading: the outbox is still sent, and this device's own envelopes then land past
 /// the cursor and are read back, and the bases of its edits released, by a build that reads on.
 ///
-/// Each envelope to send is recorded in the database before it is appended, and the outbox
-/// acknowledged and the record cleared in one transaction once the server confirms. When a sync
+/// Each envelope to send is sealed and recorded in the database in one transaction that holds the
+/// write lock, and the outbox acknowledged and the record cleared in one transaction once the
+/// server confirms; the write lock is not held while the server is asked. When a sync
 /// stops between the two, whether or not the server stored the envelope, the next sync appends
 /// the same recorded bytes again before anything new, unless it finds them in the log: by its
 /// pull, or, when the pull stopped before the end of the log, among the 16 envelopes after the
@@ -355,6 +356,17 @@ pub struct SyncReport {
 /// landed, so a remote change between the two that edits a field reporting conflicts is reported
 /// as a conflict with this device's edit, though it may have been made knowing it.
 ///
+/// Syncs on several connections to one database at once do not seal the same changes twice: a
+/// sync that finds an envelope recorded by another sync it did not load at its start sends
+/// nothing more, and leaves that envelope to the other sync or, should it never be acknowledged,
+/// to the next sync. Each sync clears the record only of the bytes it found or sent, and the
+/// record of where a pull stopped only once the stored cursor is past it, so neither erases what
+/// another wrote. A pull that meets an envelope another sync appended meanwhile knows it as this
+/// device's own. What remains: a sync that finds at its start an envelope recorded by another
+/// sync still sending it cannot tell it from one left by a crash, and appends the same bytes
+/// again, which a server that stores an identical envelope only once answers with the first
+/// copy's place, and which otherwise leaves a copy in the log as above.
+///
 /// Envelopes this device signed are applied like any other: applying a change already held is a
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
 /// may not hold them. Such a database writes as the same node as the one it was copied from, and
@@ -365,17 +377,18 @@ pub struct SyncReport {
 /// # Other writers
 ///
 /// SQLite lets one connection write at a time. A sync writes in transactions of its own: steps of
-/// collecting local writes and each apply, then [`Apply::caught_up`], then a record and an
-/// acknowledgment for each envelope it sends. Each takes the write lock with its first statement,
-/// waiting for it in the connection's busy handler, and holds it until it commits, so the longest
-/// hold is the largest of them. What bounds each: a step of collecting takes about
+/// collecting local writes and each apply, then [`Apply::caught_up`], then for each envelope it
+/// sends one that seals and records it and one that acknowledges it. Each takes the write lock
+/// with its first statement, waiting for it in the connection's busy handler, and holds it until
+/// it commits, so the longest hold is the largest of them. What bounds each: a step of collecting takes about
 /// [`Pace::collect`] rows, more where rows depend on later ones, share a millisecond or follow
 /// rows that cannot be collected yet, at worst every row waiting; an
 /// apply takes at most [`Pace::apply`] received changes unless one envelope holds more, and
 /// collects the rows written while the steps before it ran, which nothing bounds, with fewer
 /// than [`Pace::collect`] left over besides; [`Apply::caught_up`] holds what the application
-/// makes it hold; a record or an acknowledgment is small. Nothing here bounds what the
-/// application does outside a sync: [`Replica::resume`], a first [`Replica::install`] over rows
+/// makes it hold; sealing and recording an envelope reads and seals at most [`Pace::seal`]
+/// changes, and an acknowledgment is small. Nothing here bounds what the application does outside
+/// a sync: [`Replica::resume`], a first [`Replica::install`] over rows
 /// already in its tables, and a plain [`Replica::install`] or [`Replica::collect`] each hold the
 /// lock for everything they do. A first [`Replica::install_step`] records the rows it finds in
 /// one transaction and leaves adopting them to steps, which a sync takes as steps of collecting
@@ -664,7 +677,7 @@ async fn run<T: Transport, A: Apply>(
         held = Duration::ZERO;
     }
     let saved = state::load(conn, library).await?;
-    let mut cursor = saved.cursor;
+    let cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
     let mut keys = Keys::new(credentials);
     let mut report = SyncReport::default();
@@ -717,8 +730,8 @@ async fn run<T: Transport, A: Apply>(
             .await
     };
     pulled.and(committed)?;
-    cursor = pull.read;
-    report.head = cursor
+    report.head = pull
+        .read
         .max(report.blocked.map_or(0, |b| b.seq))
         .max(report.newer.map_or(0, |n| n.seq));
 
@@ -746,12 +759,13 @@ async fn run<T: Transport, A: Apply>(
     if let Some(sending) = pull.sending.take() {
         let ours = Envelope::decode(&sending.envelope)
             .is_ok_and(|envelope| envelope.library == library && envelope.device == me);
-        if ours {
+        if ours && !state::still_sending(conn, library, &sending.envelope).await? {
+            // Another sync acknowledged it, or found it refused, since this one began.
+        } else if ours {
             let count = open(&sending.envelope, credentials.library(), |_| {
                 Some(credentials.device().verifying_key())
             })
             .map_or(0, |opened| opened.changes.len());
-            let digest = state::digest(&sending.envelope);
             let read_all = report.blocked.is_none() && report.newer.is_none() && !report.more;
             let found = if read_all {
                 None
@@ -761,88 +775,51 @@ async fn run<T: Transport, A: Apply>(
             };
             let appended = match found {
                 Some(seq) => Ok(seq),
-                None => append(&rpc, credentials, sending.envelope).await,
+                None => append(&rpc, credentials, sending.envelope.clone()).await,
             };
             match appended {
                 Ok(seq) => {
-                    let through = sending.through;
-                    acknowledge(conn, &mut steps, library, through, seq, digest, &mut cursor)
-                        .await?;
+                    acknowledge(conn, &mut steps, library, &sending, seq).await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
                 Err(Error::Server { code, .. }) if refuses_the_envelope(code) => {
-                    clear_sending(conn, &mut steps, library).await?;
+                    clear_sending(conn, &mut steps, library, &sending.envelope).await?;
                 }
                 Err(error) => return Err(error),
             }
         } else {
-            clear_sending(conn, &mut steps, library).await?;
+            clear_sending(conn, &mut steps, library, &sending.envelope).await?;
         }
     }
 
     let max = caps.max_batch_bytes;
     let seal_at_most = steps.pace.seal.max(1);
+    let sealing = Sealing {
+        replica,
+        credentials,
+        library,
+        max,
+        seal_at_most,
+    };
     loop {
-        let full = replica.outbox(conn, seal_at_most).await?;
-        let Some(first) = full.changes.first() else {
+        if replica.outbox(conn, 1).await?.changes.is_empty() {
+            break;
+        }
+        let (mut tx, began) = steps.begin(conn).await?;
+        let claimed = sealing.claim(&mut tx, report.head).await;
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(error) => return Err(abandon(tx, error).await),
+        };
+        tx.commit().await?;
+        steps.committed(began);
+        let Some((sending, count)) = claimed else {
             break;
         };
-        let mut n = fitting(&full.changes, max);
-        let (outbox, envelope) = loop {
-            if n == 0 {
-                let max = max.unwrap_or(u64::MAX);
-                let internal = first.field == DELETED || first.field == ALIAS;
-                if internal || max < envelope_len(SMALLEST_BATCH) as u64 {
-                    return Err(Error::MaxBatchTooSmall { max });
-                }
-                return Err(Error::ChangeTooLarge {
-                    collection: first.collection.clone(),
-                    field: first.field.clone(),
-                    bytes: envelope_len(encode_batch(std::slice::from_ref(first)).len()),
-                    max,
-                });
-            }
-            let outbox = if n < full.changes.len() {
-                replica.outbox(conn, n as u32).await?
-            } else {
-                full.clone()
-            };
-            let nonce = random_nonce().map_err(|_| Error::Randomness)?;
-            let envelope = seal(
-                &outbox.changes,
-                credentials.library(),
-                credentials.epoch(),
-                credentials.device(),
-                nonce,
-            );
-            if max.is_none_or(|max| envelope.len() as u64 <= max) {
-                break (outbox, envelope);
-            }
-            n -= 1;
-        };
-        let sending = Sending {
-            through: outbox.through,
-            envelope,
-            after: Some(report.head),
-        };
-        steps.turn(conn).await?;
-        let began = Instant::now();
-        state::record_sending(conn, library, &sending).await?;
-        steps.committed(began);
-        let digest = state::digest(&sending.envelope);
-        let seq = append(&rpc, credentials, sending.envelope).await?;
-        acknowledge(
-            conn,
-            &mut steps,
-            library,
-            sending.through,
-            seq,
-            digest,
-            &mut cursor,
-        )
-        .await?;
-        report.sent += outbox.changes.len();
+        let seq = append(&rpc, credentials, sending.envelope.clone()).await?;
+        acknowledge(conn, &mut steps, library, &sending, seq).await?;
+        report.sent += count;
         report.head = report.head.max(seq);
     }
     let mut conflicts = Vec::new();
@@ -863,17 +840,89 @@ async fn run<T: Transport, A: Apply>(
     Ok(report)
 }
 
-/// Forgets the recorded envelope, in a write of its own.
+/// Forgets `envelope` as being sent, in a write of its own.
 async fn clear_sending<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
+    envelope: &[u8],
 ) -> Result<(), Error> {
     steps.turn(conn).await?;
     let began = Instant::now();
-    state::clear_sending(conn, library).await?;
+    state::clear_sending(conn, library, envelope).await?;
     steps.committed(began);
     Ok(())
+}
+
+/// What the outbox is sealed with.
+struct Sealing<'a> {
+    replica: &'a Replica,
+    credentials: &'a Credentials,
+    library: fongo_sync_protocol::LibraryId,
+    max: Option<u64>,
+    seal_at_most: u32,
+}
+
+impl Sealing<'_> {
+    /// Seals the front of the outbox and records it as being sent, inside a transaction that
+    /// holds the write lock, so that no other sync seals the same changes: returns the envelope
+    /// and how many changes it holds. Returns `None` when the outbox is empty, or when an
+    /// envelope is already recorded as being sent, by another sync that will acknowledge it or
+    /// left for the next sync to find. `head` is the head of the log as the sync knows it.
+    async fn claim(
+        &self,
+        conn: &mut SqliteConnection,
+        head: u64,
+    ) -> Result<Option<(Sending, usize)>, Error> {
+        if state::sending(conn, self.library).await? {
+            return Ok(None);
+        }
+        let full = self.replica.outbox(conn, self.seal_at_most).await?;
+        let Some(first) = full.changes.first() else {
+            return Ok(None);
+        };
+        let max = self.max;
+        let mut n = fitting(&full.changes, max);
+        let (outbox, envelope) = loop {
+            if n == 0 {
+                let max = max.unwrap_or(u64::MAX);
+                let internal = first.field == DELETED || first.field == ALIAS;
+                if internal || max < envelope_len(SMALLEST_BATCH) as u64 {
+                    return Err(Error::MaxBatchTooSmall { max });
+                }
+                return Err(Error::ChangeTooLarge {
+                    collection: first.collection.clone(),
+                    field: first.field.clone(),
+                    bytes: envelope_len(encode_batch(std::slice::from_ref(first)).len()),
+                    max,
+                });
+            }
+            let outbox = if n < full.changes.len() {
+                self.replica.outbox(conn, n as u32).await?
+            } else {
+                full.clone()
+            };
+            let nonce = random_nonce().map_err(|_| Error::Randomness)?;
+            let envelope = seal(
+                &outbox.changes,
+                self.credentials.library(),
+                self.credentials.epoch(),
+                self.credentials.device(),
+                nonce,
+            );
+            if max.is_none_or(|max| envelope.len() as u64 <= max) {
+                break (outbox, envelope);
+            }
+            n -= 1;
+        };
+        let sending = Sending {
+            through: outbox.through,
+            envelope,
+            after: Some(head),
+        };
+        state::record_sending(conn, self.library, &sending).await?;
+        Ok(Some((sending, outbox.changes.len())))
+    }
 }
 
 /// The replica received changes are applied to, how, and the turns the sync takes at writing.
@@ -1066,8 +1115,8 @@ struct Pull {
     moved: Vec<(Digest32, u64)>,
     /// The envelope recorded before an append whose answer never came, until the pull finds it.
     sending: Option<Sending>,
-    /// The outbox position and digest of the recorded envelope, once found at `read`.
-    landed: Option<(i64, Digest32)>,
+    /// The outbox position and bytes of a recorded envelope, once found at `read`.
+    landed: Option<(i64, Vec<u8>)>,
     /// Where the last sync's pull stopped at a later version's envelope.
     stopped_at: Option<u64>,
     /// Where this one did, and the digest of what it stopped at.
@@ -1103,17 +1152,18 @@ impl Pull {
                 None
             };
             state::advance(&mut tx, library, self.read).await?;
-            if let Some((through, digest)) = self.landed {
-                replica.acknowledge(&mut tx, through).await?;
-                state::clear_sending(&mut tx, library).await?;
-                state::record_appended(&mut tx, library, self.read, through, digest).await?;
+            if let Some((through, envelope)) = &self.landed {
+                replica.acknowledge(&mut tx, *through).await?;
+                state::clear_sending(&mut tx, library, envelope).await?;
+                let digest = state::digest(envelope);
+                state::record_appended(&mut tx, library, self.read, *through, digest).await?;
             }
             for &(digest, seq) in &self.moved {
                 state::land_at(&mut tx, library, digest, seq).await?;
             }
             state::record_stop(&mut tx, library, self.stopped).await?;
             if self.passing.is_some_and(|(seq, _)| seq <= self.read) {
-                state::clear_passing(&mut tx, library).await?;
+                state::clear_passing(&mut tx, library, self.read).await?;
             }
             if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
                 replica.release_bases(&mut tx, through).await?;
@@ -1156,6 +1206,7 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     report: &mut SyncReport,
 ) -> Result<(), Error> {
     let library = keys.credentials.library_id();
+    let me = keys.credentials.device_id();
     for page_number in 0..MAX_PAGES {
         // Where the last sync stopped at a later version's envelope, one is enough to see whether
         // it still does.
@@ -1226,8 +1277,30 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             // appended here, and must not be appended again.
             if let Some(sending) = landed {
                 report.sent += pull.held.len() - before;
-                pull.landed = Some((sending.through, state::digest(&sending.envelope)));
+                pull.landed = Some((sending.through, sending.envelope));
                 pull.appended.insert(batch.seq);
+            }
+            // Another sync on this database may have appended it since this one began.
+            if pull.held.len() > before
+                && !pull.appended.contains(&batch.seq)
+                && Envelope::decode(&batch.envelope).is_ok_and(|e| e.device == me)
+            {
+                let digest = state::digest(&batch.envelope);
+                if !pull.own.contains_key(&digest) {
+                    match state::known(conn, library, digest, &batch.envelope).await? {
+                        Some(state::Known::Appended(recorded)) => {
+                            pull.appended.insert(batch.seq);
+                            if recorded != [batch.seq] {
+                                pull.moved.push((digest, batch.seq));
+                            }
+                        }
+                        Some(state::Known::Sending(through)) => {
+                            pull.landed = Some((through, batch.envelope.clone()));
+                            pull.appended.insert(batch.seq);
+                        }
+                        None => {}
+                    }
+                }
             }
             // The first copy of an envelope this device appended is where it landed, whichever
             // copy it recorded.
@@ -1514,30 +1587,32 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
 }
 
 /// Drops what the server confirmed from the outbox and records where the envelope landed. When it
-/// landed right after the cursor, nothing came between, so the cursor moves past it too. The bases
-/// of its edits are released at once when the cursor is past it, which is also the case when the
-/// server answers with an earlier copy of the same envelope; otherwise by the pull that reads
-/// past it.
+/// landed right after the stored cursor, nothing came between, so the cursor moves past it too.
+/// The bases of its edits are released at once when the cursor is past it, which is also the case
+/// when the server answers with an earlier copy of the same envelope; otherwise by the pull that
+/// reads past it. The record of the envelope being sent is cleared only if it still holds these
+/// bytes: another sync may have found them first and recorded the next.
 async fn acknowledge<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
-    through: i64,
+    sending: &Sending,
     seq: u64,
-    digest: Digest32,
-    cursor: &mut u64,
 ) -> Result<(), Error> {
-    let follows = Some(seq) == cursor.checked_add(1);
     let replica = steps.replica;
+    let through = sending.through;
+    let digest = state::digest(&sending.envelope);
     let (mut tx, began) = steps.begin(conn).await?;
     let written = async {
+        let cursor = state::stored_cursor(&mut tx, library).await?;
+        let follows = Some(seq) == cursor.checked_add(1);
         replica.acknowledge(&mut tx, through).await?;
-        state::clear_sending(&mut tx, library).await?;
+        state::clear_sending(&mut tx, library, &sending.envelope).await?;
         state::record_appended(&mut tx, library, seq, through, digest).await?;
         if follows {
             state::advance(&mut tx, library, seq).await?;
         }
-        let read = if follows { seq } else { *cursor };
+        let read = if follows { seq } else { cursor };
         if let Some(through) = state::read_past(&mut tx, library, read).await? {
             replica.release_bases(&mut tx, through).await?;
         }
@@ -1549,9 +1624,6 @@ async fn acknowledge<A: Apply>(
     }
     tx.commit().await?;
     steps.committed(began);
-    if follows {
-        *cursor = seq;
-    }
     Ok(())
 }
 

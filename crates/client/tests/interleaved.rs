@@ -23,8 +23,16 @@ use libsqlite3_sys as ffi;
 use sqlx::SqliteConnection;
 use support::{Peer, Server, assert_converged, assert_no_change_sent_twice, now, scratch, settle};
 
-const SEEDS: std::ops::Range<u64> = 0..48;
 const STEPS: usize = 90;
+
+/// The seeds run are a fixed list, `FONGO_INTERLEAVED_SEEDS` of them from
+/// `FONGO_INTERLEAVED_FROM`; 48 from 0 by default.
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -411,7 +419,8 @@ async fn run(seed: u64) {
 
 #[tokio::test]
 async fn interleaved_syncs_on_one_database_send_each_change_once_and_converge() {
-    for seed in SEEDS {
+    let from = env("FONGO_INTERLEAVED_FROM", 0);
+    for seed in from..from + env("FONGO_INTERLEAVED_SEEDS", 48) {
         eprintln!("seed {seed}");
         run(seed).await;
     }
