@@ -167,7 +167,8 @@ def things (fields : List Full.Field) (together : List (List String)) : Full.Col
 
 def shelves : Full.Collection := ⟨"shelves", [plainLww "name"], [], none⟩
 
-/-- Schemas that differ only in the rules `Schema.Restricted` states. -/
+/-- Schemas that differ only in the rules `Schema.Restricted` states, one rule broken or kept
+at a time. -/
 def schemaCases : List (String × List Full.Collection) := [
   ("a set of plain fields", [things [plainLww "title", plainLww "subtitle"] [["title", "subtitle"]]]),
   ("a reference in a set", [things [plainLww "title", ⟨"link", .reference "things", .lww⟩]
@@ -201,7 +202,30 @@ def schemaCases : List (String × List Full.Collection) := [
      ⟨"b", [⟨"a", .reference "a", .lww⟩], [], none⟩]),
   ("a reference outside the key leading round",
     [⟨"a", [plainLww "name", ⟨"b", .reference "b", .lww⟩], [], some ["name"]⟩,
-     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩])
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], some ["a"]⟩]),
+  ("a collection declared twice", [shelves, shelves]),
+  ("a field declared twice", [things [plainLww "title", plainLww "title"] []]),
+  ("a reserved field name", [things [plainLww "title", plainLww "$deleted"] []]),
+  ("a reference to an unknown collection",
+    [things [plainLww "title", ⟨"link", .reference "shelves", .lww⟩] []]),
+  ("an owner in an unknown collection",
+    [things [plainLww "title", ⟨"shelf", .owner "shelves", .lww⟩] []]),
+  ("an empty key", [⟨"things", [plainLww "title"], [], some []⟩]),
+  ("an undeclared key field", [⟨"things", [plainLww "title"], [], some ["name"]⟩]),
+  ("owners round two collections",
+    [⟨"a", [⟨"b", .owner "b", .lww⟩], [], none⟩,
+     ⟨"b", [⟨"a", .owner "a", .lww⟩], [], none⟩]),
+  ("owners round three collections",
+    [⟨"a", [⟨"b", .owner "b", .lww⟩], [], none⟩,
+     ⟨"b", [⟨"c", .owner "c", .lww⟩], [], none⟩,
+     ⟨"c", [⟨"a", .owner "a", .lww⟩], [], none⟩]),
+  ("an owner chain going down",
+    [⟨"a", [⟨"b", .owner "b", .lww⟩], [], none⟩,
+     ⟨"b", [⟨"c", .owner "c", .lww⟩], [], none⟩,
+     ⟨"c", [plainLww "name"], [], none⟩]),
+  ("an owner and a reference round two collections",
+    [⟨"a", [⟨"b", .owner "b", .lww⟩], [], none⟩,
+     ⟨"b", [⟨"a", .reference "a", .lww⟩], [], none⟩])
 ]
 
 end Schemas

@@ -97,22 +97,55 @@ def Collection.keyTargets (c : Collection) : List String :=
 def Schema.keyTargetsOf (sc : Schema) (name : String) : List String :=
   ((sc.find name).map (·.keyTargets)).getD []
 
-/-- The collections natural keys lead to from `start`, in one step or more. A path back to `start`
+/-- The collections `next` leads to from `start`, in one step or more. A path back to `start`
 passes through distinct collections, so as many rounds as there are collections find it. -/
-def Schema.keyReachable (sc : Schema) (start : String) : List String :=
+def Schema.reachable (sc : Schema) (next : String → List String) (start : String) : List String :=
   (List.range sc.collections.length).foldl
-    (fun acc _ => (acc ++ acc.flatMap sc.keyTargetsOf).eraseDups) (sc.keyTargetsOf start)
+    (fun acc _ => (acc ++ acc.flatMap next).eraseDups) (next start)
 
-/-- The rules `Schema::check` enforces on self-ownership, on `together` sets and on natural keys:
-no collection owns its own rows; each set is non-empty, holds only fields it may hold, and shares
-none with another set; and no natural key leads, through the key fields of the collections it
-refers to, back to its own collection. The convergence theorem does not need them. -/
+/-- The collections natural keys lead to from `start`, in one step or more. -/
+def Schema.keyReachable (sc : Schema) (start : String) : List String :=
+  sc.reachable sc.keyTargetsOf start
+
+/-- The collections a collection's owner fields name. -/
+def Schema.ownerTargetsOf (sc : Schema) (name : String) : List String :=
+  ((sc.find name).map fun c => c.fields.filterMap fun f =>
+    match f.kind with
+    | .owner t => some t
+    | _ => none).getD []
+
+/-- The collections ownership leads to from `start`, in one step or more. -/
+def Schema.ownerReachable (sc : Schema) (start : String) : List String :=
+  sc.reachable sc.ownerTargetsOf start
+
+/-- A reference or owner field names a declared collection. -/
+def Schema.targetDeclared (sc : Schema) (f : Field) : Bool :=
+  match f.kind with
+  | .plain => true
+  | .reference t | .owner t => (sc.find t).isSome
+
+/-- A natural collection's key is non-empty and names only declared fields. -/
+def Collection.keyDeclared (c : Collection) : Bool :=
+  c.natural.all fun key => !key.isEmpty && key.all fun f => (c.declared f).isSome
+
+/-- The rules `Schema::check` enforces, but for those on identity keys, which are not modelled
+here: no two collections share a name, and no two fields of one collection; no field name starts
+with `$`; every reference and owner names a declared collection; a natural key is non-empty and
+names only declared fields; no collection owns its own rows; each `together` set is non-empty,
+holds only fields it may hold, and shares none with another set; no natural key leads, through
+the key fields of the collections it refers to, back to its own collection; and no ownership
+leads back to the collection it starts from. The convergence theorem does not need them. -/
 def Schema.Restricted (sc : Schema) : Prop :=
+  (sc.collections.map (·.name)).Nodup ∧
   ∀ c ∈ sc.collections,
+    (c.fields.map (·.name)).Nodup ∧
+    (∀ f ∈ c.fields, f.name.startsWith "$" = false ∧ sc.targetDeclared f = true) ∧
+    c.keyDeclared = true ∧
     (∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
     (∀ set ∈ c.together, set ≠ [] ∧ ∀ name ∈ set, c.groupable name) ∧
     c.together.flatten.Nodup ∧
-    c.name ∉ sc.keyReachable c.name
+    c.name ∉ sc.keyReachable c.name ∧
+    c.name ∉ sc.ownerReachable c.name
 
 instance (sc : Schema) : Decidable sc.Restricted := by
   unfold Schema.Restricted; infer_instance

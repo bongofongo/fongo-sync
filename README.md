@@ -270,8 +270,8 @@ faithful. The one cross-check is `make lean-diff` (part of `make check`), which 
 on fixed cases: `model::view` against the single-collection Lean view, computed and proven equal
 to its specification, and against a computed view over several collections, also proven equal
 to its specification, keys, groups and liveness;
-`Schema::check` against `Schema.Restricted` on schemas that differ in their `together` sets,
-ownership and natural keys; and `Clock` against `Clock.lean` on fixed histories. The Lean view
+`Schema::check` against `Schema.Restricted`, which states every rule of `Schema::check` but
+those on identity keys, on schemas that each break or keep one rule; and `Clock` against `Clock.lean` on fixed histories. The Lean view
 covers several collections, which collection a gid belongs to, the changes `model::view` ignores,
 `together` sets and natural keys, but not `Real` values, and it is a specification: it states the
 first key that derives a gid, the least groups and the least live set rather than computing them.
