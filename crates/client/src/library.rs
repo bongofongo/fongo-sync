@@ -299,22 +299,36 @@ async fn post_device<T: Transport, N: Fn() -> u64 + Sync>(
 /// device will not be kept at a change of secret, or cannot be sent one.
 /// [`create_library`] and [`join_library`] do not report the flags at all.
 ///
-/// - Both true: the device is listed with the wrap key and membership proof it sent.
-/// - `wrap_kept` true, `proof_kept` false: listed with its wrap key but no proof. The device can
-///   sync, but cannot be recognised as a member when the library's secret is changed until a
-///   server that keeps proofs lists it with one.
-/// - Both false: listed with neither. The device can sync, but cannot be sent a new secret. A
-///   proof over a wrap key the record lacks shows nothing, so `proof_kept` is false whenever
-///   `wrap_kept` is.
+/// | `wrap` | `proof_kept` | the device |
+/// |---|---|---|
+/// | [`WrapListing::Kept`] | true | can be sent a new secret and recognised as a member |
+/// | [`WrapListing::Kept`] | false | can be sent a new secret, but is not recognised as a member until a server that keeps proofs lists it with one |
+/// | [`WrapListing::Dropped`] | false | cannot be sent a new secret: the server dropped its wrap key, and a proof over a wrap key the record lacks shows nothing |
+/// | [`WrapListing::NoneSent`] | true | cannot be sent a new secret, having no wrap key, but is recognised as a member |
+/// | [`WrapListing::NoneSent`] | false | cannot be sent a new secret, and is not recognised as a member |
 ///
 /// Adding a listed key again changes nothing, so it does not add what was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Registered {
-    /// Whether the server lists the device with the wrap key it sent.
-    pub wrap_kept: bool,
-    /// Whether the server lists the device with its wrap key and the membership proof it sent.
+    /// The wrap key the server lists for the device, against the one it sent.
+    pub wrap: WrapListing,
+    /// Whether the server lists the device with the membership proof it sent, over a wrap key
+    /// the record also lists. Always false when `wrap` is [`WrapListing::Dropped`].
     pub proof_kept: bool,
+}
+
+/// What became of the wrap key a registration sent, as the server's answer lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WrapListing {
+    /// Listed as sent: the device can be sent a new library secret.
+    Kept,
+    /// Sent, but the server lists none, as one built before wrap keys does.
+    Dropped,
+    /// None was sent, since the credentials hold no wrap secret ([`Credentials::new`], or
+    /// credentials an earlier build wrote), and none is listed.
+    NoneSent,
 }
 
 /// What the listed record of `key` says of the registration: a wrap key and proof, where listed,
@@ -331,9 +345,10 @@ fn registered_as(
         .iter()
         .find(|d| d.public_key == *key && !d.recovery && !d.removed)
         .ok_or_else(otherwise)?;
-    let wrap_kept = match (record.wrap.as_ref(), wrap) {
-        (None, Some(_)) => false,
-        (listed, sent) if listed == sent => true,
+    let listing = match (record.wrap.as_ref(), wrap) {
+        (None, None) => WrapListing::NoneSent,
+        (None, Some(_)) => WrapListing::Dropped,
+        (Some(listed), Some(sent)) if listed == sent => WrapListing::Kept,
         _ => return Err(otherwise()),
     };
     let proof_kept = match (record.member_proof, proof) {
@@ -342,8 +357,8 @@ fn registered_as(
         _ => return Err(otherwise()),
     };
     Ok(Registered {
-        wrap_kept,
-        proof_kept: wrap_kept && proof_kept,
+        wrap: listing,
+        proof_kept: proof_kept && listing != WrapListing::Dropped,
     })
 }
 

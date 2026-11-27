@@ -10,7 +10,7 @@ use fongo_sync_client::protocol::{
     LibraryKeys, ListedMemberProof, MemberCheck, SigningKey, WrapKey, WrapSecret,
 };
 use fongo_sync_client::{
-    Credentials, Error, Method, Registered, Request, add_device, create_library,
+    Credentials, Error, Method, Registered, Request, WrapListing, add_device, create_library,
     create_library_with, join_library, join_library_with,
 };
 use support::{Peer, Server, assert_converged, now};
@@ -314,21 +314,21 @@ async fn a_repeat_after_the_server_dropped_the_proof_succeeds_and_says_so() {
     let server = Server::new();
     let made = Credentials::for_new_library().unwrap();
     let first = create_library_with(&server, &made, now).await.unwrap();
-    assert!(first.proof_kept);
+    assert!(first.proof_kept && first.wrap == WrapListing::Kept);
     server.with(|s| {
         for device in &mut s.libraries.get_mut(&made.library_id()).unwrap().devices {
             device.member_proof = None;
         }
     });
     let again = create_library_with(&server, &made, now).await.unwrap();
-    assert!(again.wrap_kept && !again.proof_kept);
+    assert!(again.wrap == WrapListing::Kept && !again.proof_kept);
     server.with(|s| {
         for device in &mut s.libraries.get_mut(&made.library_id()).unwrap().devices {
             device.wrap = None;
         }
     });
     let bare = create_library_with(&server, &made, now).await.unwrap();
-    assert!(!bare.wrap_kept && !bare.proof_kept);
+    assert!(bare.wrap == WrapListing::Dropped && !bare.proof_kept);
     let other = Credentials::for_new_device(made.library().clone()).unwrap();
     let foreign = other.device_offer().unwrap().wrap;
     server.with(|s| {
@@ -351,7 +351,8 @@ async fn a_server_that_keeps_neither_wrap_keys_nor_proofs_registers_without_them
         s.stored_wrap = Some(None);
         s.stored_proof = Some(None);
     });
-    let bare = |registered: Registered| !registered.wrap_kept && !registered.proof_kept;
+    let bare =
+        |registered: Registered| registered.wrap == WrapListing::Dropped && !registered.proof_kept;
     let made = Credentials::for_new_library().unwrap();
     assert!(bare(
         create_library_with(&server, &made, now).await.unwrap()
@@ -495,4 +496,33 @@ async fn a_server_that_lists_an_unreadable_proof_is_reported() {
         made.check_member(&record(&server, &joined)),
         MemberCheck::Invalid
     );
+}
+
+#[tokio::test]
+async fn credentials_without_a_wrap_secret_are_reported_as_sending_none() {
+    let server = Server::new();
+    let keys = Credentials::for_new_library().unwrap().library().clone();
+    let made = Credentials::new(keys.clone(), SigningKey::from_bytes(&[5; 32]), 0);
+    let created = create_library_with(&server, &made, now).await.unwrap();
+    assert_eq!(
+        (created.wrap, created.proof_kept),
+        (WrapListing::NoneSent, true)
+    );
+    let listed = record(&server, &made);
+    assert!(listed.wrap.is_none());
+    assert_eq!(made.check_member(&listed), MemberCheck::Valid);
+
+    let joined = Credentials::new(keys.clone(), SigningKey::from_bytes(&[6; 32]), 0);
+    server.with(|s| s.stored_proof = Some(None));
+    let join = join_library_with(&server, &joined, now).await.unwrap();
+    assert_eq!((join.wrap, join.proof_kept), (WrapListing::NoneSent, false));
+    assert_eq!(
+        made.check_member(&record(&server, &joined)),
+        MemberCheck::Absent
+    );
+
+    let wrapped = Credentials::for_new_device(keys).unwrap();
+    server.with(|s| s.stored_proof = None);
+    let join = join_library_with(&server, &wrapped, now).await.unwrap();
+    assert_eq!((join.wrap, join.proof_kept), (WrapListing::Kept, true));
 }
