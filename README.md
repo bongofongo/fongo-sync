@@ -220,9 +220,12 @@ One chain, each link checked against the one above it:
    changes to one register at one clock the greater value wins, and a register holds the greatest
    of what it was given in the order its strategy names; the
    view depends on nothing but registers, the gids seen and the groups; which writes to a natural
-   key field count depends only on the set of writes; and every `Clock::tick` is later than every
-   reading issued or observed before it, for a clock that ignores observed readings in or past
-   the last millisecond `Hlc::encode` holds and has not yet issued the last reading it holds.
+   key field count depends only on the set of writes; a `together` set shows the fields one live
+   member wrote at the latest clock any live member wrote to the set, one write where no two
+   changes to a register share a clock and otherwise, field by field, the greater value; and
+   every `Clock::tick` is later than every reading issued or observed before it, for a clock that
+   ignores observed readings in or past the last millisecond `Hlc::encode` holds and has not yet
+   issued the last reading it holds.
    The Lean values have no reals: that an integer and a real compare exactly is checked in Rust,
    against a comparison of the two by integer arithmetic.
    `make lean` builds the proofs and fails if any law rests on an unproven step; `make check`
@@ -267,15 +270,17 @@ One chain, each link checked against the one above it:
 
 Nothing mechanically links the Lean to the Rust. `lean/` mirrors `crates/core/src/change.rs`,
 `clock.rs` and `model.rs` by hand, so a proof covers the Rust only as far as that transcription is
-faithful. The one cross-check is `make lean-diff` (part of `make check`), which compares output
-on fixed cases: `model::view` against the single-collection Lean view, computed and proven equal
-to its specification, and against a computed view over several collections, whose liveness is
-proven to be its specification's but whose keys and groups are computed without proof;
-`Schema::check` against `Schema.Restricted` on schemas that differ in their `together` sets,
-ownership and natural keys; and `Clock` against `Clock.lean` on fixed histories. The Lean view
-covers several collections, which collection a gid belongs to, the changes `model::view` ignores,
-`together` sets and natural keys, but not `Real` values, and it is a specification: it states the
-least groups and least live set rather than computing them.
+faithful. The one cross-check is `make lean-diff` (part of `make check`), which compares output on
+fixed cases: `model::view` against the single-collection Lean view, computed and proven equal to
+its specification, and against a computed view over several collections, also proven equal to its
+specification, keys, groups and liveness; `Schema::check` against `Schema.Restricted`, which
+states every rule of `Schema::check` but those on identity keys, on schemas that each break or
+keep one rule (a collection owning its own rows also breaks the rule against ownership cycles,
+which on both sides refuses it alone, so the rule against owning its own rows is never the only
+one tested); and `Clock` against `Clock.lean` on fixed histories. The Lean view covers several
+collections, which collection a gid belongs to, the changes `model::view` ignores, `together` sets
+and natural keys, but not `Real` values, and it is a specification: it states the first key that
+derives a gid, the least groups and the least live set rather than computing them.
 
 ## Licence
 

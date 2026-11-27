@@ -15,7 +15,8 @@ collection, the rule for which collection a gid belongs to, the changes ignored 
    changes to each key field of a gid only those among the `KEY_ENTRIES` smallest
    `(clock, value)` pairs count (`earliest`). A gid is verified if some key derives it: one value
    per key field, each written to that field by a change that counts, whose `derive` is the gid.
-   A change to a key field is ignored unless it counts and its value is part of that key.
+   A change to a key field is ignored unless it counts and its value is part of the first such
+   key, comparing keys field by field (only a hash collision lets two keys derive one gid).
 2. Each (collection, gid, field) holds the winner among its changes; `$deleted` and undeclared
    fields merge `Lww`.
 3. An alias whose target belongs to the same collection joins the two gids, unless either is
@@ -96,22 +97,56 @@ def Collection.keyTargets (c : Collection) : List String :=
 def Schema.keyTargetsOf (sc : Schema) (name : String) : List String :=
   ((sc.find name).map (·.keyTargets)).getD []
 
-/-- The collections natural keys lead to from `start`, in one step or more. A path back to `start`
+/-- The collections `next` leads to from `start`, in one step or more. A path back to `start`
 passes through distinct collections, so as many rounds as there are collections find it. -/
-def Schema.keyReachable (sc : Schema) (start : String) : List String :=
+def Schema.reachable (sc : Schema) (next : String → List String) (start : String) : List String :=
   (List.range sc.collections.length).foldl
-    (fun acc _ => (acc ++ acc.flatMap sc.keyTargetsOf).eraseDups) (sc.keyTargetsOf start)
+    (fun acc _ => (acc ++ acc.flatMap next).eraseDups) (next start)
 
-/-- The rules `Schema::check` enforces on self-ownership, on `together` sets and on natural keys:
-no collection owns its own rows; each set is non-empty, holds only fields it may hold, and shares
-none with another set; and no natural key leads, through the key fields of the collections it
-refers to, back to its own collection. The convergence theorem does not need them. -/
+/-- The collections natural keys lead to from `start`, in one step or more. -/
+def Schema.keyReachable (sc : Schema) (start : String) : List String :=
+  sc.reachable sc.keyTargetsOf start
+
+/-- The collections a collection's owner fields name. -/
+def Schema.ownerTargetsOf (sc : Schema) (name : String) : List String :=
+  ((sc.find name).map fun c => c.fields.filterMap fun f =>
+    match f.kind with
+    | .owner t => some t
+    | _ => none).getD []
+
+/-- The collections ownership leads to from `start`, in one step or more. -/
+def Schema.ownerReachable (sc : Schema) (start : String) : List String :=
+  sc.reachable sc.ownerTargetsOf start
+
+/-- A reference or owner field names a declared collection. -/
+def Schema.targetDeclared (sc : Schema) (f : Field) : Bool :=
+  match f.kind with
+  | .plain => true
+  | .reference t | .owner t => (sc.find t).isSome
+
+/-- A natural collection's key is non-empty and names only declared fields. -/
+def Collection.keyDeclared (c : Collection) : Bool :=
+  c.natural.all fun key => !key.isEmpty && key.all fun f => (c.declared f).isSome
+
+/-- The rules `Schema::check` enforces, but for those on identity keys, which are not modelled
+here: no two collections share a name, and no two fields of one collection; no field name starts
+with `$`; every reference and owner names a declared collection; a natural key is non-empty and
+names only declared fields; no collection owns its own rows; each `together` set is non-empty,
+holds only fields it may hold, and shares none with another set; no natural key leads, through
+the key fields of the collections it refers to, back to its own collection; and no ownership
+leads back to the collection it starts from, which covers a collection owning its own rows, as
+the Rust's cycle check does. The convergence theorem does not need them. -/
 def Schema.Restricted (sc : Schema) : Prop :=
+  (sc.collections.map (·.name)).Nodup ∧
   ∀ c ∈ sc.collections,
+    (c.fields.map (·.name)).Nodup ∧
+    (∀ f ∈ c.fields, f.name.startsWith "$" = false ∧ sc.targetDeclared f = true) ∧
+    c.keyDeclared = true ∧
     (∀ f ∈ c.fields, f.kind ≠ .owner c.name) ∧
     (∀ set ∈ c.together, set ≠ [] ∧ ∀ name ∈ set, c.groupable name) ∧
     c.together.flatten.Nodup ∧
-    c.name ∉ sc.keyReachable c.name
+    c.name ∉ sc.keyReachable c.name ∧
+    c.name ∉ sc.ownerReachable c.name
 
 instance (sc : Schema) : Decidable sc.Restricted := by
   unfold Schema.Restricted; infer_instance
@@ -164,13 +199,21 @@ def Derives (g : Gid) (c : Collection) (fields : List String) (k : List Value) :
     (∀ p ∈ fields.zip k, ∃ w ∈ earliest (keyWrites sc cs g p.1), w.2 = p.2) ∧
     sc.derive c.name k = g
 
-/-- The key that derives a natural gid, if any. The Rust takes the first in sorted order; the two
-agree unless two keys derive one gid, which takes a hash collision. -/
+/-- Keys compare field by field, each by the value order. -/
+def KeyLt : List Value → List Value → Prop := List.Lex fun a b => compare a b = .lt
+
+/-- `k` is the first key, comparing keys field by field, that derives `g`, as the Rust takes it.
+Only a hash collision lets two keys derive one gid. -/
+def FirstKey (g : Gid) (c : Collection) (fields : List String) (k : List Value) : Prop :=
+  Derives sc cs g c fields k ∧ ∀ k', Derives sc cs g c fields k' → k = k' ∨ KeyLt k k'
+
+/-- The first key that derives a natural gid, if any. -/
 noncomputable def key (g : Gid) : Option (List Value) :=
   match homeCollection sc cs g with
   | some c =>
     match c.natural with
-    | some fields => if h : ∃ k, Derives sc cs g c fields k then some (Classical.choose h) else none
+    | some fields =>
+      if h : ∃ k, FirstKey sc cs g c fields k then some (Classical.choose h) else none
     | none => none
   | none => none
 
@@ -422,7 +465,7 @@ theorem derives_eq : Derives sc cs₁ = Derives sc cs₂ := by
 
 theorem key_eq : key sc cs₁ = key sc cs₂ := by
   funext g
-  unfold key
+  unfold key FirstKey
   rw [homeCollection_eq sc same, derives_eq sc same]
 
 theorem unverified_eq : Unverified sc cs₁ = Unverified sc cs₂ := by
@@ -527,5 +570,612 @@ theorem view_ignores_bad_alias (sc : Schema) (c : Change Value) (cs : List (Chan
 theorem view_ignores_bad_tombstone (sc : Schema) (c : Change Value) (cs : List (Change Value))
     (h : deletedOk c = false) : view sc (c :: cs) = view sc cs :=
   view_ignores sc c cs fun h' => by simp [h] at h'
+
+
+/-! ## A `together` set shows one member's fields at one clock -/
+
+theorem Hlc.not_lt_trans {a b c : Hlc} (h₁ : ¬ b < a) (h₂ : ¬ c < b) : ¬ c < a := by
+  rw [Hlc.lt_iff] at *; dsimp only [Gid] at *; omega
+
+theorem Hlc.not_lt_of_lt {a b : Hlc} (h : a < b) : ¬ b < a := by
+  rw [Hlc.lt_iff] at *; dsimp only [Gid] at *; omega
+
+theorem Hlc.lt_irrefl (a : Hlc) : ¬ a < a := by
+  rw [Hlc.lt_iff]; dsimp only [Gid]; omega
+
+/-- Keep the one with the later clock, the one held on a tie. -/
+def laterStep {α : Type} (key : α → Hlc) : Option α → α → Option α
+  | none, x => some x
+  | some b, x => if key b < key x then some x else some b
+
+theorem fold_laterStep_none {α : Type} (key : α → Hlc) (l : List α) (init : Option α) :
+    l.foldl (laterStep key) init = none → init = none ∧ l = [] := by
+  induction l generalizing init with
+  | nil => intro h; exact ⟨h, rfl⟩
+  | cons x xs ih =>
+    intro h
+    have := (ih _ h).1
+    cases init with
+    | none => simp [laterStep] at this
+    | some b =>
+      simp only [laterStep] at this
+      split at this <;> cases this
+
+theorem fold_laterStep_some {α : Type} (key : α → Hlc) (l : List α) (init : Option α) (b : α)
+    (h : l.foldl (laterStep key) init = some b) :
+    (init = some b ∨ b ∈ l) ∧ (∀ x ∈ l, ¬ key b < key x) ∧
+      (∀ i, init = some i → ¬ key b < key i) := by
+  induction l generalizing init with
+  | nil =>
+    simp only [List.foldl] at h
+    subst h
+    exact ⟨.inl rfl, by simp, fun i hi => by cases hi; exact Hlc.lt_irrefl _⟩
+  | cons x xs ih =>
+    simp only [List.foldl] at h
+    obtain ⟨hm, hall, hinit⟩ := ih _ h
+    -- what the step holds is no earlier than `x` or than what `init` held
+    have step : ∀ s, laterStep key init x = some s →
+        ¬ key s < key x ∧ (∀ i, init = some i → ¬ key s < key i) ∧ (s = x ∨ init = some s) := by
+      intro s hs
+      cases init with
+      | none =>
+        simp only [laterStep, Option.some.injEq] at hs
+        subst hs
+        exact ⟨Hlc.lt_irrefl _, by simp, .inl rfl⟩
+      | some i =>
+        simp only [laterStep] at hs
+        split at hs
+        · rename_i hlt
+          cases hs
+          refine ⟨Hlc.lt_irrefl _, fun j hj => ?_, .inl rfl⟩
+          cases hj
+          exact Hlc.not_lt_of_lt hlt
+        · rename_i hlt
+          cases hs
+          exact ⟨hlt, fun j hj => by cases hj; exact Hlc.lt_irrefl _, .inr rfl⟩
+    obtain ⟨s, hs⟩ : ∃ s, laterStep key init x = some s := by
+      cases init with
+      | none => exact ⟨x, rfl⟩
+      | some i => simp only [laterStep]; split <;> exact ⟨_, rfl⟩
+    obtain ⟨sx, si, sw⟩ := step s hs
+    have hbs := hinit s hs
+    refine ⟨?_, ?_, fun i hi => Hlc.not_lt_trans (si i hi) hbs⟩
+    · rcases hm with hm | hm
+      · rw [hs] at hm
+        cases hm
+        rcases sw with rfl | e
+        · exact .inr (.head _)
+        · exact .inl e
+      · exact .inr (.tail _ hm)
+    · intro y hy
+      rcases List.mem_cons.mp hy with rfl | hy
+      · exact Hlc.not_lt_trans sx hbs
+      · exact hall y hy
+
+theorem Hlc.eq_of_not_lt {a b : Hlc} (h₁ : ¬ a < b) (h₂ : ¬ b < a) : a = b := by
+  cases h : compare a b with
+  | lt => exact absurd h h₁
+  | eq => exact Std.LawfulEqOrd.eq_of_compare h
+  | gt => exact absurd (Std.OrientedCmp.lt_of_gt h) h₂
+
+/-- Starting from a held value, the fold ends at it or at something strictly later. -/
+theorem fold_laterStep_from {α : Type} (key : α → Hlc) (l : List α) (i b : α)
+    (h : l.foldl (laterStep key) (some i) = some b) : b = i ∨ key i < key b := by
+  induction l generalizing i with
+  | nil => cases h; exact .inl rfl
+  | cons y ys ih =>
+    simp only [List.foldl, laterStep] at h
+    split at h
+    · rename_i hlt
+      rcases ih y h with rfl | h'
+      · exact .inr hlt
+      · exact .inr (Std.TransCmp.lt_trans hlt h')
+    · exact ih i h
+
+/-- Of the values that tie with the result, the fold keeps the first: over a list ordered by `R`,
+the result comes before every other value with its key. -/
+theorem fold_laterStep_first {α : Type} (key : α → Hlc) (R : α → α → Prop) (l : List α)
+    (init : Option α) (b : α) (h : l.foldl (laterStep key) init = some b)
+    (sorted : l.Pairwise R) (hinit : ∀ i, init = some i → ∀ x ∈ l, R i x) :
+    ∀ x ∈ l, key x = key b → x = b ∨ R b x := by
+  induction l generalizing init with
+  | nil => intro x hx; cases hx
+  | cons y ys ih =>
+    rw [List.pairwise_cons] at sorted
+    simp only [List.foldl] at h
+    have hinit' : ∀ i, laterStep key init y = some i → ∀ x ∈ ys, R i x := by
+      intro i hi x hx
+      cases init with
+      | none => cases hi; exact sorted.1 x hx
+      | some i₀ =>
+        simp only [laterStep] at hi
+        split at hi
+        · cases hi; exact sorted.1 x hx
+        · injection hi with hi; subst hi; exact hinit _ rfl x (.tail _ hx)
+    intro x hx hk
+    rcases List.mem_cons.mp hx with rfl | hx
+    · -- `x` is the head: what the step holds after it is `x`, or something no earlier
+      have fromY : ∀ i, laterStep key init x = some i → (i = x ∨ R i x) ∧ ¬ key i < key x := by
+        intro i hi
+        cases init with
+        | none => cases hi; exact ⟨.inl rfl, Hlc.lt_irrefl _⟩
+        | some i₀ =>
+          simp only [laterStep] at hi
+          split at hi
+          · cases hi; exact ⟨.inl rfl, Hlc.lt_irrefl _⟩
+          · rename_i hlt; injection hi with hi; subst hi; exact ⟨.inr (hinit _ rfl x (.head _)), hlt⟩
+      obtain ⟨i, hi⟩ : ∃ i, laterStep key init x = some i := by
+        cases init with
+        | none => exact ⟨x, rfl⟩
+        | some i₀ => simp only [laterStep]; split <;> exact ⟨_, rfl⟩
+      rw [hi] at h
+      obtain ⟨hix, hnl⟩ := fromY i hi
+      rcases fold_laterStep_from key ys i b h with rfl | hlt
+      · rcases hix with rfl | hr
+        · exact .inl rfl
+        · exact .inr hr
+      · rw [← hk] at hlt; exact absurd hlt hnl
+    · exact ih _ h sorted.2 hinit' x hx hk
+
+section Together
+
+variable (inp : Inputs)
+
+theorem latest_eq (set : List String) (m : Gid) :
+    latest inp set m =
+      (set.filterMap fun name => (register inp m name).map (·.clock)).foldl (laterStep id) none := by
+  unfold latest
+  congr
+  funext best k
+  cases best <;> rfl
+
+theorem latest_none {set : List String} {m : Gid} (h : latest inp set m = none) :
+    ∀ name ∈ set, register inp m name = none := by
+  rw [latest_eq] at h
+  have := (fold_laterStep_none id _ none h).2
+  intro name hn
+  rw [List.filterMap_eq_nil_iff] at this
+  have := this name hn
+  cases hr : register inp m name with
+  | none => rfl
+  | some e => rw [hr] at this; cases this
+
+theorem latest_some {set : List String} {m : Gid} {at_ : Hlc} (h : latest inp set m = some at_) :
+    (∃ name ∈ set, ∃ e, register inp m name = some e ∧ e.clock = at_) ∧
+      ∀ name ∈ set, ∀ e, register inp m name = some e → ¬ at_ < e.clock := by
+  rw [latest_eq] at h
+  obtain ⟨hm, hall, _⟩ := fold_laterStep_some id _ none at_ h
+  refine ⟨?_, fun name hn e he => hall e.clock (List.mem_filterMap.mpr ⟨name, hn, by simp [he]⟩)⟩
+  rcases hm with hm | hm
+  · cases hm
+  · obtain ⟨name, hn, hc⟩ := List.mem_filterMap.mp hm
+    cases hr : register inp m name with
+    | none => rw [hr] at hc; cases hc
+    | some e =>
+      rw [hr] at hc
+      cases hc
+      exact ⟨name, hn, e, hr, rfl⟩
+
+end Together
+
+
+section Holder
+
+variable (inp : Inputs) (live : Gid → Prop) [DecidablePred live]
+
+theorem setHolder_eq (set : List String) (r : Gid) :
+    setHolder inp live set r =
+      ((liveMembers inp live r).filterMap fun m => (latest inp set m).map (·, m)).foldl
+        (laterStep Prod.fst) none := by
+  unfold setHolder
+  generalize liveMembers inp live r = l
+  generalize (none : Option (Hlc × Gid)) = init
+  induction l generalizing init with
+  | nil => rfl
+  | cons m ms ih =>
+    simp only [List.foldl_cons, List.filterMap_cons]
+    cases hl : latest inp set m with
+    | none => exact ih init
+    | some at_ =>
+      simp only [Option.map_some, List.foldl_cons]
+      rw [← ih]
+      congr 1
+      cases init with
+      | none => rfl
+      | some p => obtain ⟨held, x⟩ := p; simp only [laterStep]
+
+theorem setHolder_none {set : List String} {r : Gid} (h : setHolder inp live set r = none) :
+    ∀ m ∈ liveMembers inp live r, latest inp set m = none := by
+  rw [setHolder_eq] at h
+  have := (fold_laterStep_none _ _ none h).2
+  rw [List.filterMap_eq_nil_iff] at this
+  intro m hm
+  have := this m hm
+  cases hl : latest inp set m with
+  | none => rfl
+  | some _ => rw [hl] at this; cases this
+
+theorem setHolder_some {set : List String} {r : Gid} {at_ : Hlc} {m : Gid}
+    (h : setHolder inp live set r = some (at_, m)) :
+    m ∈ liveMembers inp live r ∧ latest inp set m = some at_ ∧
+      ∀ m' ∈ liveMembers inp live r, ∀ at', latest inp set m' = some at' → ¬ at_ < at' := by
+  rw [setHolder_eq] at h
+  obtain ⟨hm, hall, _⟩ := fold_laterStep_some _ _ none _ h
+  have mem : ∀ m' at', m' ∈ liveMembers inp live r → latest inp set m' = some at' →
+      (at', m') ∈ (liveMembers inp live r).filterMap fun m => (latest inp set m).map (·, m) :=
+    fun m' at' hm' hl => List.mem_filterMap.mpr ⟨m', hm', by simp [hl]⟩
+  refine ⟨?_, ?_, fun m' hm' at' hl => hall _ (mem m' at' hm' hl)⟩
+  · rcases hm with hm | hm
+    · cases hm
+    · obtain ⟨m', hm', he⟩ := List.mem_filterMap.mp hm
+      cases hl : latest inp set m' with
+      | none => rw [hl] at he; cases he
+      | some _ => rw [hl] at he; cases he; exact hm'
+  · rcases hm with hm | hm
+    · cases hm
+    · obtain ⟨m', _, he⟩ := List.mem_filterMap.mp hm
+      cases hl : latest inp set m' with
+      | none => rw [hl] at he; cases he
+      | some _ => rw [hl] at he; cases he; exact hl
+
+/-- Of the live members holding the latest clock across a set, the holder is the smallest. -/
+theorem setHolder_first {set : List String} {r : Gid} {at_ : Hlc} {m : Gid}
+    (sorted : inp.gids.Pairwise (· < ·)) (h : setHolder inp live set r = some (at_, m)) :
+    ∀ m' ∈ liveMembers inp live r, latest inp set m' = some at_ → m ≤ m' := by
+  rw [setHolder_eq] at h
+  have hs : (liveMembers inp live r).Pairwise (· < ·) :=
+    sorted.sublist List.filter_sublist
+  have hp : ((liveMembers inp live r).filterMap fun m => (latest inp set m).map (·, m)).Pairwise
+      (fun p q => p.2 < q.2) := by
+    rw [List.pairwise_filterMap]
+    exact hs.imp fun {a b} hab x hx y hy => by
+      obtain ⟨_, _, rfl⟩ := Option.map_eq_some_iff.mp hx
+      obtain ⟨_, _, rfl⟩ := Option.map_eq_some_iff.mp hy
+      exact hab
+  intro m' hm' hl
+  have hmem : (at_, m') ∈ (liveMembers inp live r).filterMap fun m => (latest inp set m).map (·, m) :=
+    List.mem_filterMap.mpr ⟨m', hm', by simp [hl]⟩
+  rcases fold_laterStep_first Prod.fst (fun p q => p.2 < q.2) _ none _ h hp (by simp) _ hmem rfl
+    with e | lt
+  · cases e; exact Nat.le_refl _
+  · exact Nat.le_of_lt lt
+
+theorem flatten_nodup_unique {l : List (List String)} (h : l.flatten.Nodup) {s s' : List String}
+    (hs : s ∈ l) (hs' : s' ∈ l) {x : String} (hx : x ∈ s) (hx' : x ∈ s') : s = s' := by
+  induction l with
+  | nil => cases hs
+  | cons a t ih =>
+    rw [List.flatten_cons, List.nodup_append] at h
+    obtain ⟨_, ht, hdis⟩ := h
+    rcases List.mem_cons.mp hs with h₁ | h₁ <;> rcases List.mem_cons.mp hs' with h₂ | h₂
+    · exact h₁.trans h₂.symm
+    · subst h₁; exact absurd rfl (hdis x hx x (List.mem_flatten.mpr ⟨s', h₂, hx'⟩))
+    · subst h₂; exact absurd rfl (hdis x hx' x (List.mem_flatten.mpr ⟨s, h₁, hx⟩))
+    · exact ih ht h₁ h₂
+
+/-- In a row, a field of a `together` set holds its set's value. -/
+theorem mem_row_set {c : Collection} (hnd : c.together.flatten.Nodup) {set : List String}
+    (hset : set ∈ c.together) {name : String} (hn : name ∈ set) {r : Gid} {v : Value}
+    (hv : (name, v) ∈ row inp live c r) : v = setValue inp live c set name r := by
+  rcases List.mem_append.mp hv with h | h
+  · obtain ⟨f, hf, he⟩ := List.mem_map.mp h
+    have hin := (List.mem_filter.mp hf).2
+    simp only [Prod.mk.injEq] at he
+    obtain ⟨rfl, _⟩ := he
+    have : c.inTogether f.name = true :=
+      List.any_eq_true.mpr ⟨set, hset, List.contains_iff_mem.mpr hn⟩
+    simp [this] at hin
+  · obtain ⟨set', hs', hm⟩ := List.mem_flatMap.mp h
+    obtain ⟨name', hn', he⟩ := List.mem_map.mp hm
+    simp only [Prod.mk.injEq] at he
+    obtain ⟨rfl, rfl⟩ := he
+    rw [flatten_nodup_unique hnd hs' hset hn' hn]
+
+end Holder
+
+section Registers
+
+variable (sc : Schema) (cs : List (Change Value))
+
+theorem home_of_mem_claimed {x : Change Value} (h : x ∈ claimed sc cs) :
+    home sc cs x.gid = some x.collection :=
+  of_decide_eq_true (List.mem_filter.mp h).2
+
+theorem mem_claimed_of_mem_accepted {x : Change Value} (h : x ∈ accepted sc cs) :
+    x ∈ claimed sc cs :=
+  (List.mem_filter.mp h).1
+
+theorem mem_of_mem_accepted {x : Change Value} (h : x ∈ accepted sc cs) : x ∈ cs :=
+  (List.mem_filter.mp (mem_claimed_of_mem_accepted sc cs h)).1
+
+theorem fold_lww_none {l : List (Entry Value)} (h : l.foldl (apply .lww) none = none) : l = [] := by
+  rw [show apply (V := Value) .lww = keep lwwCmp Entry.stamp from
+    funext fun h => funext fun e => apply_lww h e] at h
+  exact ((fold_keep_none l none).mp h).2
+
+theorem register_at {m : Gid} {coll name : String} (hh : home sc cs m = some coll) :
+    register (inputs sc cs) m name =
+      (entriesAt ((accepted sc cs).filter fun c => c.field ≠ ALIAS) (coll, m, name)).foldl
+        (apply (strategyAt sc.strategyOf (coll, m, name))) none := by
+  simp only [register, inputs, hh, registers, merged_at]
+
+theorem strategyAt_lww {coll name : String} {m : Gid} (hs : sc.strategyOf coll name = .lww) :
+    strategyAt sc.strategyOf (coll, m, name) = .lww := by
+  simp only [strategyAt, hs]; split <;> rfl
+
+/-- A register written to holds one of the changes that count at the latest clock among them,
+and of those at that clock the greatest value. -/
+theorem register_some {m : Gid} {coll name : String} {e : Entry Value}
+    (hh : home sc cs m = some coll) (hs : sc.strategyOf coll name = .lww) (hna : name ≠ ALIAS)
+    (h : register (inputs sc cs) m name = some e) :
+    (∃ x ∈ accepted sc cs, x.gid = m ∧ x.field = name ∧ x.clock = e.clock ∧ x.value = e.value) ∧
+      ∀ x ∈ accepted sc cs, x.gid = m → x.field = name →
+        x.clock < e.clock ∨ (x.clock = e.clock ∧ (compare x.value e.value).isLE) := by
+  rw [register_at sc cs hh, strategyAt_lww sc hs] at h
+  obtain ⟨hmem, hall⟩ := fold_lww_winner _ e h
+  refine ⟨?_, fun x hx hg hf => hall x.entry (mem_entriesAt.mpr ⟨x, ?_, ?_, rfl⟩)⟩
+  · obtain ⟨x, hx, hk, rfl⟩ := mem_entriesAt.mp hmem
+    simp only [Change.key, Prod.mk.injEq] at hk
+    exact ⟨x, (List.mem_filter.mp hx).1, hk.2.1, hk.2.2, rfl, rfl⟩
+  · exact List.mem_filter.mpr ⟨hx, by simp [hf, hna]⟩
+  · have := home_of_mem_claimed sc cs (mem_claimed_of_mem_accepted sc cs hx)
+    rw [hg, hh] at this
+    cases this
+    simp [Change.key, hg, hf]
+
+/-- A register not written to has no change that counts. -/
+theorem register_none {m : Gid} {coll name : String} (hh : home sc cs m = some coll)
+    (hs : sc.strategyOf coll name = .lww) (hna : name ≠ ALIAS)
+    (h : register (inputs sc cs) m name = none) :
+    ∀ x ∈ accepted sc cs, x.gid = m → x.field ≠ name := by
+  rw [register_at sc cs hh, strategyAt_lww sc hs] at h
+  have := fold_lww_none h
+  intro x hx hg hf
+  have : x.entry ∈ entriesAt ((accepted sc cs).filter fun c => c.field ≠ ALIAS) (coll, m, name) := by
+    refine mem_entriesAt.mpr ⟨x, List.mem_filter.mpr ⟨hx, by simp [hf, hna]⟩, ?_, rfl⟩
+    have := home_of_mem_claimed sc cs (mem_claimed_of_mem_accepted sc cs hx)
+    rw [hg, hh] at this
+    cases this
+    simp [Change.key, hg, hf]
+  rw [‹entriesAt _ _ = []›] at this
+  cases this
+
+/-! Members of one group belong to one collection. -/
+
+theorem joined_eq {P : Gid → Gid → Prop} {f : Gid → Option String}
+    (hP : ∀ a b, P a b → f a = f b) {a b : Gid} (h : Joined P a b) : f a = f b := by
+  induction h with
+  | refl => rfl
+  | edge he => exact hP _ _ he
+  | symm _ ih => exact ih.symm
+  | trans _ _ ih₁ ih₂ => exact ih₁.trans ih₂
+
+theorem home_eq_of_edge {a b : Gid} (h : (a, b) ∈ edges sc cs) : home sc cs a = home sc cs b := by
+  obtain ⟨c, hc, he⟩ := List.mem_filterMap.mp h
+  have hh := home_of_mem_claimed sc cs (mem_claimed_of_mem_accepted sc cs hc)
+  split at he
+  · split at he
+    · split at he
+      · rename_i hcond
+        cases he
+        exact hh.trans hcond.1.symm
+      · cases he
+    · cases he
+  · cases he
+
+theorem home_eq_of_groupedAt (k : Nat) {a b : Gid} (h : groupedAt sc cs k a b) :
+    home sc cs a = home sc cs b := by
+  cases k with
+  | zero => exact joined_eq (fun _ _ he => home_eq_of_edge sc cs he) h
+  | succ k =>
+    exact joined_eq (fun _ _ he => he.elim (home_eq_of_edge sc cs) fun hp => by
+      obtain ⟨_, _, _, _, hb, _⟩ := hp; exact hb.symm) h
+
+theorem grouped_canon (g : Gid) : Grouped sc cs g (canon sc cs g) := by
+  unfold canon
+  cases hf : (List.range (g + 1)).find? (fun h => decide (Grouped sc cs g h)) with
+  | none => exact ⟨0, .refl g⟩
+  | some h =>
+    have := List.find?_some hf
+    exact of_decide_eq_true this
+
+theorem home_canon (g : Gid) : home sc cs (canon sc cs g) = home sc cs g := by
+  obtain ⟨k, hk⟩ := grouped_canon sc cs g
+  exact (home_eq_of_groupedAt sc cs k hk).symm
+
+end Registers
+
+
+/-- `m` is a live member of the group whose canonical gid is `r`. -/
+def LiveMember (sc : Schema) (cs : List (Change Value)) (r m : Gid) : Prop :=
+  m ∈ (inputs sc cs).gids ∧ (inputs sc cs).canon m = r ∧ Live sc (inputs sc cs) m
+
+/-- **A `together` set shows one member's fields at one clock.** Of a row of a schema that
+`Restricted` accepts, either no live member of the group wrote to the set, and all its fields read
+null, or some live member `m` made, at clock `at_`, the latest write to the set by any live member,
+and each field of the set reads the greatest value `m` wrote to it at `at_`, or null if `m` wrote
+it nothing at `at_`. -/
+theorem together_shown (sc : Schema) (cs : List (Change Value)) (restricted : sc.Restricted)
+    {coll : String} {c : Collection} {r : Gid} {row : Row} {set : List String}
+    (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : present sc (inputs sc cs) coll r = some row) :
+    ((∀ x ∈ accepted sc cs, LiveMember sc cs r x.gid → x.field ∉ set) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, LiveMember sc cs r m ∧
+      (∃ x ∈ accepted sc cs, x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      (∀ x ∈ accepted sc cs, LiveMember sc cs r x.gid → x.field ∈ set → ¬ at_ < x.clock) ∧
+      (∀ x ∈ accepted sc cs, LiveMember sc cs r x.gid → x.field ∈ set → x.clock = at_ →
+        m ≤ x.gid) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row →
+        (∃ x ∈ accepted sc cs, x.gid = m ∧ x.field = name ∧ x.clock = at_ ∧ x.value = v ∧
+          ∀ y ∈ accepted sc cs, y.gid = m → y.field = name → y.clock = at_ →
+            (compare y.value v).isLE) ∨
+        (v = .null ∧ ∀ x ∈ accepted sc cs, x.gid = m → x.field = name → x.clock ≠ at_) := by
+  have hcmem : c ∈ sc.collections := List.mem_of_find?_eq_some hc
+  obtain ⟨_, hfields, _, _, hsets, hnd, _, _⟩ := restricted.2 c hcmem
+  -- the row is `row` of the live members
+  unfold present presentWith at hrow
+  rw [hc] at hrow
+  simp only at hrow
+  by_cases hcond : (inputs sc cs).home r = some coll ∧ ∃ m ∈ (inputs sc cs).gids, (inputs sc cs).canon m = r ∧ Live sc (inputs sc cs) m
+  · rw [ite_eq_left hcond] at hrow
+    cases hrow
+    have hhome : ∀ m, LiveMember sc cs r m → home sc cs m = some coll := by
+      intro m ⟨_, hcm, _⟩
+      have := home_canon sc cs m
+      rw [show canon sc cs m = r from hcm] at this
+      rw [← this]; exact hcond.1
+    have hmem : ∀ m, m ∈ liveMembers (inputs sc cs) (Live sc (inputs sc cs)) r ↔ LiveMember sc cs r m := by
+      intro m
+      simp only [liveMembers, List.mem_filter, decide_eq_true_eq, LiveMember]
+    have facts : ∀ name ∈ set, ∃ f, c.declared name = some f ∧ f.kind = .plain ∧
+        name ≠ ALIAS ∧ sc.strategyOf coll name = .lww := by
+      intro name hn
+      have hg := (hsets set hset).2 name hn
+      unfold Collection.groupable at hg
+      cases hd : c.declared name with
+      | none => rw [hd] at hg; exact hg.elim
+      | some f =>
+        rw [hd] at hg
+        have hf : f ∈ c.fields := List.mem_of_find?_eq_some hd
+        have hname : f.name = name := by
+          unfold Collection.declared at hd
+          have := List.find?_some hd
+          exact of_decide_eq_true this
+        refine ⟨f, rfl, hg.1, ?_, ?_⟩
+        · intro he
+          have := (hfields f hf).1
+          rw [hname, he] at this
+          simp [ALIAS] at this
+        · simp only [Schema.strategyOf, hc, hd, Option.map_some, Option.getD_some, hg.2]
+    cases hh : setHolder (inputs sc cs) (Live sc (inputs sc cs)) set r with
+    | none =>
+      refine .inl ⟨fun x hx hm hf => ?_, fun name hn v hv => ?_⟩
+      · have hl := setHolder_none (inputs sc cs) _ hh x.gid ((hmem _).mpr hm)
+        have hr := latest_none (inputs sc cs) hl x.field hf
+        obtain ⟨_, _, _, hna, hs⟩ := facts x.field hf
+        exact register_none sc cs (hhome _ hm) hs hna hr x hx rfl rfl
+      · rw [mem_row_set (inputs sc cs) _ hnd hset hn hv]
+        simp only [setValue, hh]
+    | some p =>
+      obtain ⟨at_, m⟩ := p
+      obtain ⟨hm, hl, hmax⟩ := setHolder_some (inputs sc cs) _ hh
+      have mm := (hmem m).mp hm
+      obtain ⟨⟨name₀, hn₀, e₀, hr₀, he₀⟩, hbelow⟩ := latest_some (inputs sc cs) hl
+      -- a live member's write to the set lies below its latest clock, which lies below `at_`
+      have bound : ∀ x ∈ accepted sc cs, LiveMember sc cs r x.gid → x.field ∈ set →
+          ∃ at', latest (inputs sc cs) set x.gid = some at' ∧ ¬ at' < x.clock ∧ ¬ at_ < at' := by
+        intro x hx hxm hf
+        obtain ⟨_, _, _, hna, hs⟩ := facts x.field hf
+        cases hr : register (inputs sc cs) x.gid x.field with
+        | none => exact absurd rfl (register_none sc cs (hhome _ hxm) hs hna hr x hx rfl)
+        | some e =>
+          have hxe : ¬ e.clock < x.clock := by
+            rcases (register_some sc cs (hhome _ hxm) hs hna hr).2 x hx rfl rfl with h | ⟨h, _⟩
+            · exact Hlc.not_lt_of_lt h
+            · rw [h]; exact Hlc.lt_irrefl _
+          cases hl' : latest (inputs sc cs) set x.gid with
+          | none => rw [latest_none (inputs sc cs) hl' x.field hf] at hr; cases hr
+          | some at' =>
+            have h₁ := (latest_some (inputs sc cs) hl').2 x.field hf e hr
+            exact ⟨at', rfl, Hlc.not_lt_trans hxe h₁, hmax x.gid ((hmem _).mpr hxm) at' hl'⟩
+      refine .inr ⟨m, at_, mm, ?_, ?_, ?_, fun name hn v hv => ?_⟩
+      · obtain ⟨_, _, _, hna, hs⟩ := facts name₀ hn₀
+        obtain ⟨⟨x, hx, hg, hf, hk, _⟩, _⟩ := register_some sc cs (hhome m mm) hs hna hr₀
+        exact ⟨x, hx, hg, hf ▸ hn₀, hk.trans he₀⟩
+      · intro x hx hxm hf
+        obtain ⟨at', _, h₁, h₂⟩ := bound x hx hxm hf
+        exact Hlc.not_lt_trans h₁ h₂
+      · intro x hx hxm hf hk
+        obtain ⟨at', hl', h₁, h₂⟩ := bound x hx hxm hf
+        rw [hk] at h₁
+        rw [← Hlc.eq_of_not_lt h₂ h₁] at hl'
+        exact setHolder_first (inputs sc cs) _ (sorted_gidSet _) hh x.gid ((hmem _).mpr hxm) hl'
+      · rw [mem_row_set (inputs sc cs) _ hnd hset hn hv]
+        obtain ⟨f, hd, hk, hna, hs⟩ := facts name hn
+        simp only [setValue, hh, hd]
+        cases hr : register (inputs sc cs) m name with
+        | none =>
+          exact .inr ⟨rfl, fun x hx hg hf _ => register_none sc cs (hhome m mm) hs hna hr x hx hg hf⟩
+        | some e =>
+          have hrs := register_some sc cs (hhome m mm) hs hna hr
+          by_cases hce : e.clock = at_
+          · simp only [hce, ↓reduceIte, read, hk]
+            obtain ⟨x, hx, hg, hf, hk', hv'⟩ := hrs.1
+            refine .inl ⟨x, hx, hg, hf, hk'.trans hce, hv', fun y hy hyg hyf hyc => ?_⟩
+            rcases hrs.2 y hy hyg hyf with h | ⟨_, h⟩
+            · rw [hyc, hce] at h; exact absurd h (Hlc.lt_irrefl _)
+            · exact h
+          · simp only [hce, ↓reduceIte]
+            refine .inr ⟨trivial, fun x hx hg hf hxc => ?_⟩
+            have hb := hbelow name hn e hr
+            rcases hrs.2 x hx hg hf with h | ⟨h, _⟩
+            · rw [hxc] at h; exact hb h
+            · rw [hxc] at h; exact hce h.symm
+  · rw [ite_eq_right hcond] at hrow
+    cases hrow
+
+/-- **Where clocks do not tie, a `together` set shows one write.** If no two changes to one
+register share a clock, then of a row of a schema that `Restricted` accepts, either no live member
+of the group has a write to the set that counts and every field of the set reads null; or some
+live member `m` made, at `at_`, the latest write to the set that counts by any live member (the
+smallest such member if several did), and each field of the set reads the one value `m` wrote to
+it at `at_`, or null where `m` wrote it nothing at `at_` that counts. -/
+theorem view_together_untied (sc : Schema) (cs : List (Change Value)) (restricted : sc.Restricted)
+    (untied : ∀ x ∈ cs, ∀ y ∈ cs, x.collection = y.collection → x.gid = y.gid →
+      x.field = y.field → x.clock = y.clock → x.value = y.value)
+    {coll : String} {c : Collection} {r : Gid} {row : Row} {set : List String}
+    (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : view sc cs coll r = some row) :
+    let counted := accepted sc (candidates sc cs)
+    let member := LiveMember sc (candidates sc cs) r
+    ((∀ x ∈ counted, member x.gid → x.field ∉ set) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, member m ∧ (∃ x ∈ counted, x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → ¬ at_ < x.clock) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → x.clock = at_ → m ≤ x.gid) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row →
+        (∃ x ∈ counted, x.gid = m ∧ x.field = name ∧ x.clock = at_ ∧ x.value = v ∧
+          ∀ y ∈ cs, y.collection = x.collection → y.gid = m → y.field = name →
+            y.clock = at_ → y.value = v) ∨
+        (v = .null ∧ ∀ x ∈ counted, x.gid = m → x.field = name → x.clock ≠ at_) := by
+  intro counted member
+  rcases together_shown sc (candidates sc cs) restricted hc hset hrow with
+    h | ⟨m, at_, hm, hw, hlat, hfirst, hval⟩
+  · exact .inl h
+  · refine .inr ⟨m, at_, hm, hw, hlat, hfirst, fun name hn v hv => ?_⟩
+    rcases hval name hn v hv with ⟨x, hx, hg, hf, hk, hv', _⟩ | h
+    · have hxcs : x ∈ cs := (List.mem_filter.mp (mem_of_mem_accepted sc _ hx)).1
+      refine .inl ⟨x, hx, hg, hf, hk, hv', fun y hy hyc hyg hyf hyk => ?_⟩
+      rw [← hv']
+      exact (untied x hxcs y hy hyc.symm (hg.trans hyg.symm) (hf.trans hyf.symm)
+        (hk.trans hyk.symm)).symm
+    · exact .inr h
+
+/-- Every declared field of a collection, and every field of its `together` sets, has a value in
+each of its rows. -/
+theorem view_row_fields (sc : Schema) (cs : List (Change Value)) {coll : String}
+    {c : Collection} {r : Gid} {row : Row} (hc : sc.find coll = some c)
+    (hrow : view sc cs coll r = some row) :
+    (∀ f ∈ c.fields, ∃ v, (f.name, v) ∈ row) ∧
+      ∀ set ∈ c.together, ∀ name ∈ set, ∃ v, (name, v) ∈ row := by
+  unfold view present presentWith at hrow
+  rw [hc] at hrow
+  simp only at hrow
+  split at hrow
+  · cases hrow
+    have sets : ∀ set ∈ c.together, ∀ name ∈ set, ∃ v, (name, v) ∈
+        row (inputs sc (candidates sc cs)) (Live sc (inputs sc (candidates sc cs))) c r :=
+      fun set hs name hn => ⟨_, List.mem_append_right _
+        (List.mem_flatMap.mpr ⟨set, hs, List.mem_map.mpr ⟨name, hn, rfl⟩⟩)⟩
+    refine ⟨fun f hf => ?_, sets⟩
+    cases ht : c.inTogether f.name with
+    | false =>
+      exact ⟨_, List.mem_append_left _
+        (List.mem_map.mpr ⟨f, List.mem_filter.mpr ⟨hf, by simp [ht]⟩, rfl⟩)⟩
+    | true =>
+      obtain ⟨set, hs, hn⟩ := List.any_eq_true.mp ht
+      exact sets set hs f.name (List.contains_iff_mem.mp hn)
+  · cases hrow
 
 end FongoSync.Full

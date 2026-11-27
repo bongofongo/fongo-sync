@@ -171,6 +171,67 @@ fn schema_cases() -> Vec<(&'static str, Vec<Collection>)> {
                 Collection::natural("b", &["a"]).reference("a", "a"),
             ],
         ),
+        (
+            "a collection declared twice",
+            vec![
+                Collection::minted("shelves").plain("name", Strategy::Lww),
+                Collection::minted("shelves").plain("name", Strategy::Lww),
+            ],
+        ),
+        (
+            "a field declared twice",
+            vec![things().plain("title", Strategy::Lww)],
+        ),
+        (
+            "a reserved field name",
+            vec![things().plain("$deleted", Strategy::Lww)],
+        ),
+        (
+            "a reference to an unknown collection",
+            vec![things().reference("link", "shelves")],
+        ),
+        (
+            "an owner in an unknown collection",
+            vec![things().owner("shelf", "shelves")],
+        ),
+        (
+            "an empty key",
+            vec![Collection::natural("things", &[]).plain("title", Strategy::Lww)],
+        ),
+        (
+            "an undeclared key field",
+            vec![Collection::natural("things", &["name"]).plain("title", Strategy::Lww)],
+        ),
+        (
+            "owners round two collections",
+            vec![
+                Collection::minted("a").owner("b", "b"),
+                Collection::minted("b").owner("a", "a"),
+            ],
+        ),
+        (
+            "owners round three collections",
+            vec![
+                Collection::minted("a").owner("b", "b"),
+                Collection::minted("b").owner("c", "c"),
+                Collection::minted("c").owner("a", "a"),
+            ],
+        ),
+        (
+            "an owner chain going down",
+            vec![
+                Collection::minted("a").owner("b", "b"),
+                Collection::minted("b").owner("c", "c"),
+                Collection::minted("c").plain("name", Strategy::Lww),
+            ],
+        ),
+        (
+            "an owner and a reference round two collections",
+            vec![
+                Collection::minted("a").owner("b", "b"),
+                Collection::minted("b").reference("a", "a"),
+            ],
+        ),
     ]
 }
 

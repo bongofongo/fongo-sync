@@ -257,10 +257,17 @@ theorem key_write_dropped_for_good {l₁ l₂ : List (Hlc × Value)} (sub : ∀ 
 
 /-- The view over several collections can be computed from computed inputs: `Full.runView` gives
 the rows of those inputs as `Full.view` gives the rows of its own, liveness computed in as many
-rounds as there are gids. That the computed inputs are `Full.view`'s is not proven here. -/
+rounds as there are gids. `full_view_runs` adds that the computed inputs are `Full.view`'s. -/
 theorem full_view_runs_from_inputs (sc : Full.Schema) (cs : List (Change Value)) :
     Full.runView sc cs = Full.present sc (Full.runInputs sc (Full.candidates sc cs)).toInputs :=
   Full.runView_eq sc cs
+
+/-- The view over several collections can be computed: `Full.runView`, which takes the first key
+that derives each natural gid and finds the groups and the live members each in as many rounds
+as there are gids, gives the same answer as `Full.view`. -/
+theorem full_view_runs (sc : Full.Schema) (cs : List (Change Value)) :
+    Full.runView sc cs = Full.view sc cs :=
+  Full.runView_eq_view sc cs
 
 /-- **The view over several collections depends only on the set of changes.** Where two changes
 to one register share a clock with different values, the greater value counts, so writes to a
@@ -269,6 +276,65 @@ theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}
     (same : ∀ c, c ∈ cs₁ ↔ c ∈ cs₂) :
     Full.view sc cs₁ = Full.view sc cs₂ :=
   Full.view_eq_of_mem_iff sc same
+
+/-- In a row of a schema that `Restricted` accepts, a `together` set shows one live member's
+fields at one clock. Either no live member of the group has a write to the set that counts, and
+every field of the set reads null; or some live member `m` made, at clock `at_`, the latest write
+to the set that counts by any live member, `m` the smallest of the live members that wrote to the
+set at `at_`, and each field of the set reads the greatest value `m` wrote to it at `at_`, or null
+where `m` wrote it nothing at `at_` that counts. So two writes to the set at one clock by one gid
+can show a mix, field by field the greater value; nothing else can. -/
+theorem full_view_together (sc : Full.Schema) (cs : List (Change Value))
+    (restricted : sc.Restricted) {coll : String} {c : Full.Collection} {r : Gid} {row : Full.Row}
+    {set : List String} (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : Full.view sc cs coll r = some row) :
+    let counted := Full.accepted sc (Full.candidates sc cs)
+    let member := Full.LiveMember sc (Full.candidates sc cs) r
+    ((∀ x ∈ counted, member x.gid → x.field ∉ set) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, member m ∧ (∃ x ∈ counted, x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → ¬ at_ < x.clock) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → x.clock = at_ → m ≤ x.gid) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row →
+        (∃ x ∈ counted, x.gid = m ∧ x.field = name ∧ x.clock = at_ ∧ x.value = v ∧
+          ∀ y ∈ counted, y.gid = m → y.field = name → y.clock = at_ →
+            (compare y.value v).isLE) ∨
+        (v = .null ∧ ∀ x ∈ counted, x.gid = m → x.field = name → x.clock ≠ at_) :=
+  Full.together_shown sc (Full.candidates sc cs) restricted hc hset hrow
+
+/-- Where no two changes to one register share a clock, a `together` set shows one write: as in
+`full_view_together`, and each field of the set reads the one value `m` wrote to it at `at_`,
+which every change in `cs` to that register at that clock holds, or null where `m` wrote it
+nothing at `at_` that counts. -/
+theorem full_view_together_untied (sc : Full.Schema) (cs : List (Change Value))
+    (restricted : sc.Restricted)
+    (untied : ∀ x ∈ cs, ∀ y ∈ cs, x.collection = y.collection → x.gid = y.gid →
+      x.field = y.field → x.clock = y.clock → x.value = y.value)
+    {coll : String} {c : Full.Collection} {r : Gid} {row : Full.Row} {set : List String}
+    (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : Full.view sc cs coll r = some row) :
+    let counted := Full.accepted sc (Full.candidates sc cs)
+    let member := Full.LiveMember sc (Full.candidates sc cs) r
+    ((∀ x ∈ counted, member x.gid → x.field ∉ set) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, member m ∧ (∃ x ∈ counted, x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → ¬ at_ < x.clock) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → x.clock = at_ → m ≤ x.gid) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row →
+        (∃ x ∈ counted, x.gid = m ∧ x.field = name ∧ x.clock = at_ ∧ x.value = v ∧
+          ∀ y ∈ cs, y.collection = x.collection → y.gid = m → y.field = name →
+            y.clock = at_ → y.value = v) ∨
+        (v = .null ∧ ∀ x ∈ counted, x.gid = m → x.field = name → x.clock ≠ at_) :=
+  Full.view_together_untied sc cs restricted untied hc hset hrow
+
+/-- A shown row has a value for every declared field of its collection and for every field of
+its `together` sets. -/
+theorem full_view_row_fields (sc : Full.Schema) (cs : List (Change Value)) {coll : String}
+    {c : Full.Collection} {r : Gid} {row : Full.Row} (hc : sc.find coll = some c)
+    (hrow : Full.view sc cs coll r = some row) :
+    (∀ f ∈ c.fields, ∃ v, (f.name, v) ∈ row) ∧
+      ∀ set ∈ c.together, ∀ name ∈ set, ∃ v, (name, v) ∈ row :=
+  Full.view_row_fields sc cs hc hrow
 
 /-- A change whose clock the text form cannot hold is ignored. -/
 theorem full_view_ignores_unencodable (sc : Full.Schema) (c : Change Value)
