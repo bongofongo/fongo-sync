@@ -1114,3 +1114,205 @@ async fn suspended_answers_on_an_older_layout() {
         assert_eq!(dump(&mut c).await, before);
     }
 }
+
+/// Whether any change sent removes an entity.
+fn removes(changes: &[Change]) -> bool {
+    changes
+        .iter()
+        .any(|c| c.field == fongo_sync_sqlite::core::DELETED && c.value == Value::Int(1))
+}
+
+/// Two books, each with a note, collected and sent; then `books` is renamed away, a new table of
+/// the name is filled from it with every title upper-cased, and `then` runs: writes the
+/// application makes to the old table, or the rest of a migration.
+async fn migrated_away(
+    world: &World,
+    before: &[&str],
+    then: &[&str],
+) -> (SqliteConnection, Replica) {
+    let mut c = database(world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(
+        &mut c,
+        "INSERT INTO books (title, isbn) VALUES ('Middlemarch', 'x'), ('Romola', 'y')",
+    )
+    .await;
+    run(
+        &mut c,
+        "INSERT INTO notes (book_id, body) VALUES (1, 'slow'), (2, 'quick')",
+    )
+    .await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    for sql in before {
+        run(&mut c, sql).await;
+    }
+    for sql in [
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA legacy_alter_table = ON",
+        "ALTER TABLE books RENAME TO books_old",
+        "PRAGMA legacy_alter_table = OFF",
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE, year INTEGER)",
+    ] {
+        run(&mut c, sql).await;
+    }
+    for sql in then {
+        run(&mut c, sql).await;
+    }
+    run(&mut c, "PRAGMA foreign_keys = ON").await;
+    (c, replica)
+}
+
+const COPY: &str =
+    "INSERT INTO books (id, title, isbn) SELECT id, upper(title), isbn FROM books_old";
+
+/// Writes the application makes to a table it renamed away and kept, before it resumes, are not
+/// the collection's: the travelled triggers mark them under the collection's name, and a resume
+/// takes nothing from those marks. What it sends or keeps is the new table against what was
+/// sent: an install is refused; with `Send` the migrated titles are sent once each, with
+/// `Baseline` they are kept; no book is removed or made again, and the notes keep their book.
+#[tokio::test]
+async fn writes_to_a_table_renamed_away_are_not_the_collections() {
+    let scripts: [(&str, &[&str]); 3] = [
+        (
+            "an update of the old table",
+            &[COPY, "UPDATE books_old SET isbn = isbn || '-old'"],
+        ),
+        ("the old table emptied", &[COPY, "DELETE FROM books_old"]),
+        (
+            "a migration in batches",
+            &[
+                "INSERT INTO books (id, title, isbn) SELECT id, upper(title), isbn FROM books_old WHERE id = 1",
+                "DELETE FROM books_old WHERE id = 1",
+                "INSERT INTO books (id, title, isbn) SELECT id, upper(title), isbn FROM books_old WHERE id = 2",
+                "DELETE FROM books_old WHERE id = 2",
+                "DROP TABLE books_old",
+            ],
+        ),
+    ];
+    for (what, then) in scripts {
+        for how in [Resume::Send, Resume::Baseline] {
+            let at = format!("{what}, {how:?}");
+            let world = World::new(17);
+            let (mut c, replica) = migrated_away(&world, &[], &[]).await;
+            let gids = [
+                replica.gid_of(&mut c, "books", 1).await.unwrap(),
+                replica.gid_of(&mut c, "books", 2).await.unwrap(),
+            ];
+            for sql in then {
+                run(&mut c, sql).await;
+            }
+            let installed = replica.install(&mut c).await;
+            assert!(
+                matches!(installed, Err(Error::Suspended)),
+                "{at}: {installed:?}"
+            );
+            replica.resume(&mut c, how).await.unwrap();
+            replica.collect(&mut c).await.unwrap();
+            let out = sent(&replica, &mut c).await;
+            assert!(!removes(&out), "{at}: {out:?}");
+            assert!(!out.iter().any(|ch| ch.field == "isbn"), "{at}: {out:?}");
+            let times = usize::from(how == Resume::Send);
+            for title in ["MIDDLEMARCH", "ROMOLA"] {
+                assert_eq!(sent_times(&out, "title", title), times, "{at}: {out:?}");
+            }
+            if how == Resume::Baseline {
+                assert_eq!(
+                    replica.inspect(&mut c).await.unwrap().pinned.len(),
+                    2,
+                    "{at}"
+                );
+            }
+            for (id, gid) in [1, 2].into_iter().zip(gids) {
+                assert_eq!(
+                    replica.gid_of(&mut c, "books", id).await.unwrap(),
+                    gid,
+                    "{at}"
+                );
+            }
+            assert_eq!(titles(&mut c).await, ["MIDDLEMARCH", "ROMOLA"], "{at}");
+            let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM notes")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            assert_eq!(notes, 2, "{at}");
+        }
+    }
+}
+
+/// The side taken where a mark cannot be trusted: an edit the triggers captured before the table
+/// was renamed away, and no collect took, cannot be told from a write to the old table, so a
+/// resume that keeps changes as a baseline keeps it too; `Send` sends it.
+#[tokio::test]
+async fn an_edit_captured_before_a_rename_away_is_kept_as_a_baseline() {
+    for how in [Resume::Send, Resume::Baseline] {
+        let world = World::new(18);
+        let (mut c, replica) = migrated_away(
+            &world,
+            &["UPDATE books SET title = 'Felix Holt' WHERE id = 1"],
+            &[COPY],
+        )
+        .await;
+        replica.resume(&mut c, how).await.unwrap();
+        replica.collect(&mut c).await.unwrap();
+        let out = sent(&replica, &mut c).await;
+        let times = usize::from(how == Resume::Send);
+        assert_eq!(
+            sent_times(&out, "title", "FELIX HOLT"),
+            times,
+            "{how:?}: {out:?}"
+        );
+        assert!(!removes(&out), "{how:?}: {out:?}");
+    }
+}
+
+/// A collection the registry gains while capture is suspended is adopted on resuming as an
+/// install adopts it: its rows are the oldest writes, at clock zero, and fill gaps rather than
+/// overwrite.
+#[tokio::test]
+async fn a_collection_gained_while_suspended_is_adopted_as_an_install_adopts_it() {
+    let adopted = async |resume: bool| {
+        let world = World::new(19);
+        let mut c = database(&world, 0).await;
+        let books = Replica::new(
+            Registry::new(vec![
+                Collection::minted("books", "books", "id")
+                    .field("title")
+                    .field("isbn")
+                    .identity(&["isbn"]),
+            ])
+            .unwrap(),
+        );
+        books.install(&mut c).await.unwrap();
+        run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+        run(
+            &mut c,
+            "INSERT INTO notes (book_id, body) VALUES (1, 'slow')",
+        )
+        .await;
+        books.collect(&mut c).await.unwrap();
+        sent(&books, &mut c).await;
+        let both = Replica::new(registry());
+        if resume {
+            books.suspend(&mut c).await.unwrap();
+            both.resume(&mut c, Resume::Send).await.unwrap();
+        } else {
+            both.install(&mut c).await.unwrap();
+        }
+        both.collect(&mut c).await.unwrap();
+        sent(&both, &mut c)
+            .await
+            .into_iter()
+            .filter(|ch| ch.collection == "notes")
+            .map(|ch| (ch.field, ch.value, ch.clock.wall_ms))
+            .collect::<Vec<_>>()
+    };
+    let installed = adopted(false).await;
+    assert!(!installed.is_empty());
+    assert!(
+        installed.iter().all(|(_, _, wall)| *wall == 0),
+        "{installed:?}"
+    );
+    assert_eq!(adopted(true).await, installed);
+}

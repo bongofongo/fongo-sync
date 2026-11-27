@@ -33,8 +33,9 @@ pub enum Resume {
     Send,
     /// They are this replica's own baseline: not sent, and kept in the row until this replica or
     /// another next writes the field. A row whose write the triggers captured before capture
-    /// stopped, and no collect took, is the application's edit instead: it is sent, with all it
-    /// differs by, also what changed in it while capture was off.
+    /// stopped, and no collect took, is the application's edit instead, where its mark can be
+    /// trusted (see [`Replica::resume`]): it is sent, with all it differs by, also what changed
+    /// in it while capture was off.
     Baseline,
 }
 
@@ -842,6 +843,14 @@ impl Replica {
         // would put the triggers back over rows written meanwhile, unrecorded.
         let kernel = read(db)?;
         let lost = self.lost(&kernel);
+        let untrusted: BTreeSet<usize> = lost
+            .iter()
+            .copied()
+            .filter(|idx| {
+                let c = self.collection(*idx);
+                !kernel.marks_trusted(&c.name, &c.table)
+            })
+            .collect();
         let resuming = match kernel.state {
             State::Current { suspended: true } => Some((resuming.ok_or(Error::Suspended)?, None)),
             State::Current { suspended: false } | State::Older(_) if !lost.is_empty() => {
@@ -881,6 +890,7 @@ impl Replica {
                 .is_empty()
             && !adopt::recorded(db)?;
         let mut to_record = Vec::new();
+        let mut fresh = BTreeSet::new();
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
             let fields = Value::Text(names.join(","));
@@ -893,6 +903,9 @@ impl Replica {
             let was_together = meta_get(db, &sets)?;
             meta_set(db, &known, fields)?;
             meta_set(db, &sets, together.clone())?;
+            if meta_get(db, &adoption)?.is_none() {
+                fresh.insert(idx);
+            }
             if meta_get(db, &adoption)?.is_none() && record {
                 to_record.push(idx);
                 meta_set(db, &adoption, Value::Int(1))?;
@@ -971,7 +984,7 @@ impl Replica {
             // What was written while suspended is told apart from images, so every found row
             // gets one first.
             cx.collected += self.adopt(&mut cx, None)?;
-            self.resume_in(db, how, only.as_ref())?;
+            self.resume_in(db, how, only.as_ref(), &untrusted, &fresh)?;
             db.exec(
                 "DELETE FROM fongo_meta WHERE key = ?1",
                 &[Value::Text(SUSPENDED.into())],
@@ -1253,6 +1266,17 @@ impl Replica {
     /// is laid again, on the registry's tables, so one taken along to another table captures
     /// nothing more there. When capture is intact, `resume` is [`Replica::install`]: rows
     /// written since the last collect are edits like any other, whichever `how`.
+    ///
+    /// The marks a collection's triggers left are trusted when a suspend is recorded, or when one
+    /// of its triggers is still on its table and none is on another. Otherwise they may stand for
+    /// writes to a table renamed away, which takes its triggers along until it is dropped, and
+    /// they are set aside: the collection's table is compared with the images alone. Then no row
+    /// the table holds is removed or made again, and an edit captured before capture was lost
+    /// and never collected is, with [`Resume::Baseline`], kept as a baseline like any other
+    /// change: it cannot be told from a write to the old table.
+    ///
+    /// A collection the registry gained meanwhile is adopted as an install adopts it: its rows
+    /// are the oldest writes, filling gaps but never overwriting.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| self.install_in(db, Some(how), None).map(|_| ()))
@@ -1260,8 +1284,17 @@ impl Replica {
         .await
     }
 
-    /// Compares the tables of the collections in `only`, or of every collection, with the images.
-    fn resume_in(&self, db: &Db, how: Resume, only: Option<&BTreeSet<usize>>) -> Result<()> {
+    /// Compares the tables of the collections in `only`, or of every collection, with the images,
+    /// but for those just adopted, `fresh`, whose rows are found rows. The marks of the
+    /// collections in `untrusted` are dropped first: they may stand for writes to another table.
+    fn resume_in(
+        &self,
+        db: &Db,
+        how: Resume,
+        only: Option<&BTreeSet<usize>>,
+        untrusted: &BTreeSet<usize>,
+        fresh: &BTreeSet<usize>,
+    ) -> Result<()> {
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut session = ev.session(&facts);
@@ -1280,8 +1313,14 @@ impl Replica {
             )
         };
         for (idx, c) in self.registry.collections().iter().enumerate() {
-            if only.is_some_and(|only| !only.contains(&idx)) {
+            if only.is_some_and(|only| !only.contains(&idx)) || fresh.contains(&idx) {
                 continue;
+            }
+            if untrusted.contains(&idx) {
+                db.exec(
+                    "DELETE FROM fongo_dirty WHERE collection = ?1",
+                    &[Value::Text(c.name.clone())],
+                )?;
             }
             let rows: BTreeMap<String, Row> = every_row(db, c)?.into_iter().collect();
             let mapped = db.query(

@@ -241,13 +241,29 @@ impl Kernel {
     /// suspend dropped them, or a build that recorded none, or the application rebuilt the
     /// table, or renamed it away and took them along.
     pub(crate) fn lost(&self, collection: &str, table: &str) -> bool {
-        self.adopted.contains(collection)
-            && CAPTURE.iter().any(|suffix| {
-                !self
-                    .triggers
+        self.adopted.contains(collection) && self.on(collection, table, false).len() < CAPTURE.len()
+    }
+
+    /// Whether the marks `collection`'s triggers left can be told from writes to another table:
+    /// a suspend is recorded, which dropped every trigger while each was on its own table, or
+    /// one of them is still on `table` and none elsewhere. Renaming a table moves its three
+    /// triggers with it, and dropping it drops them, so with none on `table` and none recorded,
+    /// they may have marked writes to a table renamed away before it went.
+    pub(crate) fn marks_trusted(&self, collection: &str, table: &str) -> bool {
+        self.on(collection, table, true).is_empty()
+            && (self.flagged || !self.on(collection, table, false).is_empty())
+    }
+
+    /// The capture triggers of `collection` on `table`, or with `elsewhere` on any other.
+    fn on(&self, collection: &str, table: &str, elsewhere: bool) -> Vec<&'static str> {
+        CAPTURE
+            .into_iter()
+            .filter(|suffix| {
+                self.triggers
                     .get(&format!("fongo_{collection}_{suffix}"))
-                    .is_some_and(|on| on.eq_ignore_ascii_case(table))
+                    .is_some_and(|on| on.eq_ignore_ascii_case(table) != elsewhere)
             })
+            .collect()
     }
 }
 

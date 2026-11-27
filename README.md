@@ -68,11 +68,13 @@ Capture also counts as suspended when a collection that was installed lacks any 
 on its table, as when a build that recorded no suspension dropped them, or the application
 rebuilt the table or renamed it away; `resume` then compares only those collections' tables.
 With `Resume::Baseline`, a row whose edit the triggers captured before capture stopped is still
-sent as an edit. While capture is suspended, `install`,
-`collect`, `apply` and their bounded forms fail with `Error::Suspended`, so an application that
-ends while suspended calls `resume` when it opens again, and `Replica::suspended` says whether
-it must. When capture is intact, `resume` is `install`. `uninstall` removes everything the kernel
-added.
+sent as an edit, unless capture was lost unrecorded in a way that may have left the triggers
+marking writes to a table renamed away; then the table is compared alone, and no row it holds is
+removed or made again. While capture is suspended, `install`, `collect`, `apply` and their
+bounded forms fail with `Error::Suspended`, so an application that ends while suspended calls
+`resume` when it opens again, and `Replica::suspended` says whether it must. When capture is
+intact, `resume` is `install`. `uninstall` removes everything the kernel added, and the client's
+tables with it.
 
 Each call that writes, made with no transaction open, takes SQLite's write lock with its first
 statement and so waits for another connection's write in the busy handler; made inside the
