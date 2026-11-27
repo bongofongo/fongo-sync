@@ -959,6 +959,35 @@ async fn redrawing_sets_leaves_a_partly_arrived_write_alone() {
     );
 }
 
+/// A set written in another order is the same set: an upgrade that only reorders it sends
+/// nothing, even where a write that has partly arrived leaves the set's fields at two clocks over
+/// an older write that holds a value for the part still on its way.
+#[tokio::test]
+async fn a_reorder_leaves_a_partly_arrived_write_over_an_older_one_alone() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, paired).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished) VALUES ('one', 'reading', 1)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[0]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    let sent = peers[0].push(&mut hub).await;
+    let half: Vec<Change> = sent.into_iter().filter(|c| c.field == "finished").collect();
+    peers[1].apply(&half).await;
+    upgrade(&mut peers[1], reordered()).await;
+    let sent = peers[1].push(&mut hub).await;
+    assert_eq!(sent, []);
+    upgrade(&mut peers[0], reordered()).await;
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one done 2 -"]
+    );
+}
+
 #[tokio::test]
 async fn a_redraw_sends_what_the_merge_holds_not_what_a_held_row_holds() {
     let mut hub = Vec::new();
