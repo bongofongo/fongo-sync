@@ -251,6 +251,11 @@ enum Steps {
     Resume,
     /// A suspend while a first install in steps has records waiting, which it adopts first.
     Suspend,
+    /// A suspend after a table was renamed away and written, whose marks it sets aside.
+    SuspendAway,
+    /// A resume after a table was renamed away and written, with no suspend: it sets the marks
+    /// aside and compares the table.
+    ResumeAway,
 }
 
 async fn begin(op: Steps) -> (SqliteConnection, Replica) {
@@ -267,7 +272,32 @@ async fn begin(op: Steps) -> (SqliteConnection, Replica) {
             assert!(replica.install_step(&mut conn, 1).await.unwrap().more);
             (conn, replica)
         }
+        Steps::SuspendAway | Steps::ResumeAway => away(&world).await,
     }
+}
+
+/// A replica whose `books` were collected, then edited without a collect, then renamed away and
+/// copied into a new table of the name, the old table kept and written: its capture triggers,
+/// gone with it, marked those writes as the collection's.
+async fn away(world: &World) -> (SqliteConnection, Replica) {
+    let (mut c, replica) = found(world, false).await;
+    replica.install(&mut c).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    for sql in [
+        "UPDATE books SET title = 'Daniel Deronda' WHERE id = 1",
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA legacy_alter_table = ON",
+        "ALTER TABLE books RENAME TO books_old",
+        "PRAGMA legacy_alter_table = OFF",
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE)",
+        "INSERT INTO books SELECT id, upper(title), isbn FROM books_old",
+        "UPDATE books_old SET isbn = 'old' WHERE id = 1",
+        "DELETE FROM books_old WHERE id = 3",
+        "PRAGMA foreign_keys = ON",
+    ] {
+        run(&mut c, sql).await;
+    }
+    (c, replica)
 }
 
 /// The `i`th call of `op`, and whether more follow it.
@@ -281,7 +311,16 @@ async fn call(op: Steps, i: usize, replica: &Replica, conn: &mut SqliteConnectio
                 .ok()
                 .map(|()| false);
         }
-        (Steps::Suspend, _) => return replica.suspend(conn).await.ok().map(|()| false),
+        (Steps::Suspend | Steps::SuspendAway, _) => {
+            return replica.suspend(conn).await.ok().map(|()| false);
+        }
+        (Steps::ResumeAway, _) => {
+            return replica
+                .resume(conn, fongo_sync_sqlite::Resume::Send)
+                .await
+                .ok()
+                .map(|()| false);
+        }
         _ => replica.collect_step(conn, 1).await,
     };
     done.ok().map(|collected| collected.more)
@@ -326,7 +365,7 @@ async fn suspended(
     conn: &mut SqliteConnection,
 ) -> Result<(), String> {
     let suspended = replica.suspended(conn).await.map_err(|e| e.to_string())?;
-    if suspended != matches!(op, Steps::Suspend) {
+    if suspended != matches!(op, Steps::Suspend | Steps::SuspendAway) {
         return Err(format!("{op:?} left capture suspended: {suspended}"));
     }
     Ok(())
@@ -404,7 +443,15 @@ async fn every_statement_of_every_step(op: Steps) -> u64 {
     }
     eprintln!("{op:?}: {calls} calls, {total} statements");
     assert!(
-        calls > 1 || matches!(op, Steps::Resume | Steps::First | Steps::Suspend),
+        calls > 1
+            || matches!(
+                op,
+                Steps::Resume
+                    | Steps::First
+                    | Steps::Suspend
+                    | Steps::SuspendAway
+                    | Steps::ResumeAway
+            ),
         "{op:?} took one step"
     );
     total
@@ -429,6 +476,13 @@ async fn a_resume_stopped_at_any_statement_changes_nothing_and_completes_when_ru
 #[tokio::test]
 async fn a_suspend_stopped_at_any_statement_changes_nothing_and_completes_when_run_again() {
     every_statement_of_every_step(Steps::Suspend).await;
+}
+
+#[tokio::test]
+async fn setting_marks_aside_stopped_at_any_statement_changes_nothing_and_completes_when_run_again()
+{
+    every_statement_of_every_step(Steps::SuspendAway).await;
+    every_statement_of_every_step(Steps::ResumeAway).await;
 }
 
 /// Polls `future` until it has been pending `polls` times, then drops it. Whether it finished.
@@ -493,6 +547,8 @@ async fn a_step_dropped_where_it_waits_is_whole_or_not_done_and_the_steps_finish
         Steps::First,
         Steps::Resume,
         Steps::Suspend,
+        Steps::SuspendAway,
+        Steps::ResumeAway,
     ] {
         every_suspension_of_every_step(op).await;
     }

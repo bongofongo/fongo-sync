@@ -1272,7 +1272,10 @@ impl Replica {
     /// and fields the registry gained meanwhile are adopted, and compares every table with the
     /// rows' images. A row added meanwhile is a new entity and a row removed is deleted,
     /// whichever `how`; a row whose local id was reused meanwhile is the old entity changed. A
-    /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline.
+    /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline. A row
+    /// found at a first install and still waiting to be adopted that the application edits
+    /// meanwhile is sent with the oldest clock, as found rows are: the kernel holds no image of a
+    /// waiting row to tell the edit by.
     ///
     /// Unlike [`Replica::install_step`], it collects every marked row before it returns, in the
     /// transaction that puts the triggers back: a row written back to its image before a later
@@ -1293,7 +1296,7 @@ impl Replica {
     /// applies the same test as it drops the triggers. Otherwise they may stand for writes to a
     /// table renamed away, which takes its triggers along until it is dropped, and they are set
     /// aside, but for those of found rows still waiting to be adopted: the collection's table is
-    /// compared with the images alone, and nothing the old table was written is sent. Setting
+    /// compared with the images alone, and nothing written to the old table is sent. Setting
     /// the marks aside has two consequences, both avoided by collecting before a migration:
     ///
     /// - a row removed and made again at the same minted id, captured and not collected, is the
