@@ -307,7 +307,7 @@ fn fault_of(
         (1, None) => LogFault::Behind { cursor: seq },
         (2, None) => LogFault::Rewritten { seq },
         (3, None) => LogFault::Diverged { seq },
-        (4, Some(read)) => LogFault::Reused { seq, read },
+        (4, Some(furthest)) => LogFault::Reused { seq, furthest },
         (5, None) => LogFault::AppendReplaced { seq },
         (6, None) => LogFault::AppendMissing { seq },
         _ => return Err(corrupt("a stored fault is of no kind this build knows")),
@@ -320,7 +320,7 @@ fn fault_columns(fault: LogFault) -> (i64, u64, Option<u64>) {
         LogFault::Behind { cursor } => (1, cursor, None),
         LogFault::Rewritten { seq } => (2, seq, None),
         LogFault::Diverged { seq } => (3, seq, None),
-        LogFault::Reused { seq, read } => (4, seq, Some(read)),
+        LogFault::Reused { seq, furthest } => (4, seq, Some(furthest)),
         LogFault::AppendReplaced { seq } => (5, seq, None),
         LogFault::AppendMissing { seq } => (6, seq, None),
     }
@@ -528,9 +528,11 @@ pub(crate) async fn record_fault(
     stored.ok_or(Error::ResolvedMeanwhile)
 }
 
-/// Whether an append of the envelope with `digest`, answered with `seq`, reuses a position: `seq`
-/// is at or before the stored cursor or a recorded append of this database, and no record says
-/// this envelope was there. Positions up to where records began cannot be told and pass.
+/// Whether an append of the envelope with `digest`, answered with `seq`, may reuse a position:
+/// `seq` is at or before the stored cursor or a recorded append of this database, and no record
+/// says this envelope was there. Positions up to where records began cannot be told and pass. It
+/// is proof of nothing yet: the server may hold a copy of the envelope there, as when two syncs
+/// appended it and their answers came back out of order.
 pub(crate) async fn reused(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -565,7 +567,10 @@ pub(crate) async fn reused(
     .fetch_optional(&mut *conn)
     .await?
     .is_some();
-    Ok((!there).then_some(LogFault::Reused { seq, read }))
+    Ok((!there).then_some(LogFault::Reused {
+        seq,
+        furthest: read,
+    }))
 }
 
 /// Records that an envelope with `digest`, covering the outbox through `through`, landed at `seq`.

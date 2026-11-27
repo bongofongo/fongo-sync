@@ -37,10 +37,10 @@ pub enum LogFault {
     /// Two syncs of this database read the log to `seq` and found different envelopes on the
     /// way: the server served two logs.
     Diverged { seq: u64 },
-    /// The server answered an append of this device with position `seq`, at or before `read`,
-    /// a position this device had already read or appended at, and `seq` did not hold this
-    /// envelope then: a position was used twice.
-    Reused { seq: u64, read: u64 },
+    /// The server answered an append of this device with position `seq`, at or before
+    /// `furthest`, the furthest position this device had read or appended at, and the envelope
+    /// read back at `seq` was not the one appended: the answer names a position used by another.
+    Reused { seq: u64, furthest: u64 },
     /// The envelope this device appended at `seq`, as the server answered, is not there: `seq`
     /// holds other bytes.
     AppendReplaced { seq: u64 },

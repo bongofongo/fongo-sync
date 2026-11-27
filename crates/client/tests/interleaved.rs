@@ -1,7 +1,8 @@
 //! Two or three syncs at once on one database, interleaved at random at every request they make
 //! and every gap between their transactions, while the application writes, one or two other
 //! devices write and sync, requests fail before the server sees them or lose their answers after,
-//! and syncs crash. The server is honest throughout, so no sync may find a fault in its log, and
+//! and syncs crash. The server stores an identical envelope again or not, and pages hold one to
+//! five envelopes, as each seed draws. The server is honest throughout, so no sync may find a fault in its log, and
 //! every device ends with the same fingerprint of it. A run is a function of its seed: one sync runs at a time, each until it reaches a point
 //! where it waits, and the databases' clocks and random bytes come from the seed. The clock stands
 //! still for many writes and sometimes steps back.
@@ -319,6 +320,13 @@ async fn run(seed: u64) {
     let dir = scratch(&format!("interleaved-{seed}"));
     let path = dir.join("x.db");
     let server = Arc::new(Server::new());
+    // A server may store an identical envelope again, and serves pages of its own size.
+    let again = rng.one_in(2);
+    let page = 1 + rng.below(5) as u32;
+    server.with(|s| {
+        s.store_again = again;
+        s.caps.max_page_batches = Some(page);
+    });
     let made = create_library(&*server, now).await.unwrap();
     let mut others = Vec::new();
     for _ in 0..1 + rng.below(2) {

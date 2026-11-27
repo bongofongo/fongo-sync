@@ -853,11 +853,14 @@ async fn run<T: Transport, A: Apply>(
             };
             let appended = match found {
                 Some(seq) => Ok(seq),
-                None => append(&rpc, credentials, sending.envelope.clone()).await,
+                None => {
+                    state::check_turn(conn, library, steps.resets).await?;
+                    append(&rpc, credentials, sending.envelope.clone()).await
+                }
             };
             match appended {
                 Ok(seq) => {
-                    acknowledge(conn, &mut steps, library, &sending, seq).await?;
+                    confirm(&rpc, credentials, conn, &mut steps, &sending, seq).await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
@@ -900,8 +903,9 @@ async fn run<T: Transport, A: Apply>(
                 break;
             }
         };
+        state::check_turn(conn, library, steps.resets).await?;
         let seq = append(&rpc, credentials, sending.envelope.clone()).await?;
-        acknowledge(conn, &mut steps, library, &sending, seq).await?;
+        confirm(&rpc, credentials, conn, &mut steps, &sending, seq).await?;
         report.sent += count;
         report.head = report.head.max(seq);
     }
@@ -1793,20 +1797,25 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
 /// when the server answers with an earlier copy of the same envelope; otherwise by the pull that
 /// reads past it. The record of the envelope being sent is cleared only if it still holds these
 /// bytes: another sync may have found them first and recorded the next.
+///
+/// An answer at or before what this device read or appended, with no record that this envelope
+/// is there, is not acknowledged unless `verified`: it returns the fault it would be, for the
+/// caller to read the envelope back at `seq` and call again verified, or report it.
 async fn acknowledge<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
     sending: &Sending,
     seq: u64,
-) -> Result<(), Error> {
+    verified: bool,
+) -> Result<Option<LogFault>, Error> {
     let replica = steps.replica;
     let through = sending.through;
     let digest = state::digest(&sending.envelope);
     let (mut tx, began) = steps.begin(conn).await?;
     let written = async {
-        if let Some(fault) = state::reused(&mut tx, library, seq, digest).await? {
-            return Err(Error::LogFault(fault));
+        if !verified && let Some(fault) = state::reused(&mut tx, library, seq, digest).await? {
+            return Ok(Some(fault));
         }
         let cursor = state::stored_cursor(&mut tx, library).await?;
         let follows = Some(seq) == cursor.checked_add(1);
@@ -1822,15 +1831,48 @@ async fn acknowledge<A: Apply>(
         if let Some(through) = state::read_past(&mut tx, library, read).await? {
             replica.release_bases(&mut tx, through).await?;
         }
-        Ok(())
+        Ok(None)
     }
     .await;
-    if let Err(error) = written {
-        return Err(abandon(tx, error).await);
+    match written {
+        Err(error) => Err(abandon(tx, error).await),
+        Ok(Some(unproven)) => {
+            tx.rollback().await?;
+            Ok(Some(unproven))
+        }
+        Ok(None) => {
+            tx.commit().await?;
+            steps.committed(began);
+            Ok(None)
+        }
     }
-    tx.commit().await?;
-    steps.committed(began);
-    Ok(())
+}
+
+/// [`acknowledge`], reading the envelope back at `seq` first when the answer is at or before what
+/// this device read or appended: a server may hold a copy there. Fails with [`LogFault::Reused`]
+/// when it holds other bytes or none, and with the transport's error when the read fails, leaving
+/// the envelope recorded as being sent and its changes in the outbox, so the next sync appends
+/// it again.
+async fn confirm<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
+    rpc: &Rpc<'_, T, N>,
+    credentials: &Credentials,
+    conn: &mut SqliteConnection,
+    steps: &mut Steps<'_, A>,
+    sending: &Sending,
+    seq: u64,
+) -> Result<(), Error> {
+    let library = credentials.library_id();
+    let Some(suspect) = acknowledge(conn, steps, library, sending, seq, false).await? else {
+        return Ok(());
+    };
+    let page = read_page(rpc, credentials, seq - 1, 1).await?;
+    match page.batches.first() {
+        Some(there) if there.seq == seq && there.envelope == sending.envelope => {
+            acknowledge(conn, steps, library, sending, seq, true).await?;
+            Ok(())
+        }
+        _ => Err(Error::LogFault(suspect)),
+    }
 }
 
 /// How many of `changes`, from the front, seal into an envelope of at most `max` bytes.

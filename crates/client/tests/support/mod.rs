@@ -354,6 +354,35 @@ impl Server {
         })
     }
 
+    /// Every change in the log, opened with the library's keys, taking copies of one envelope once.
+    pub fn changes_once(&self, keys: &LibraryKeys) -> Vec<Change> {
+        let log = self.log(keys.id);
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        for (i, bytes) in log.iter().enumerate() {
+            if seen.insert(bytes.clone()) {
+                kept.push(i);
+            }
+        }
+        self.with(|s| {
+            let library = &s.libraries[&keys.id];
+            let mut changes = Vec::new();
+            for i in kept {
+                let opened = open(&library.log[i], keys, |id| {
+                    library
+                        .devices
+                        .iter()
+                        .find(|d| !d.recovery && DeviceId::of(&d.public_key) == id)
+                        .map(|d| d.public_key)
+                });
+                if let Ok(opened) = opened {
+                    changes.extend(opened.changes);
+                }
+            }
+            changes
+        })
+    }
+
     pub fn count(&self, method: Method, path: &str) -> usize {
         self.with(|s| {
             s.requests
@@ -872,9 +901,10 @@ pub async fn assert_converged(peers: &mut [Peer]) -> Vec<String> {
     first
 }
 
-/// No change sits in the log twice: nothing was sealed into two different envelopes.
+/// No change sits in the log twice but in copies of one envelope: nothing was sealed into two
+/// different envelopes.
 pub fn assert_no_change_sent_twice(server: &Server, keys: &LibraryKeys) {
-    let changes = server.changes(keys);
+    let changes = server.changes_once(keys);
     let mut seen = HashSet::new();
     for change in &changes {
         let key = (

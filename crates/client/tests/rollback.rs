@@ -220,8 +220,11 @@ async fn an_acknowledged_append_replaced_in_the_log_is_found() {
     stays_stopped(&mut a, &server, replaced).await;
 }
 
+/// Rolled back after a pull and before the append, which lands at a position the device read
+/// past. The answer names the envelope where it is, so it is acknowledged; the next sync finds the
+/// log ends before the cursor.
 #[tokio::test]
-async fn an_append_answered_at_a_position_already_read_is_reuse() {
+async fn an_append_into_a_rolled_back_log_is_found_by_the_next_sync() {
     let server = Server::new();
     let [mut a, mut b] = pair(&server).await;
     let id = a.credentials.library_id();
@@ -230,7 +233,6 @@ async fn an_append_answered_at_a_position_already_read_is_reuse() {
     }
     a.sync(&server).await.unwrap();
     a.run("INSERT INTO settings VALUES ('a', 'x')").await;
-    // Rolled back after `a`'s pull and before its append, which lands at 2.
     let hold = server.hold_if(is_append, false);
     let syncing = a.sync(&server);
     let meanwhile = async {
@@ -238,16 +240,92 @@ async fn an_append_answered_at_a_position_already_read_is_reuse() {
         server.roll_back(id, 1);
         hold.release();
     };
-    let (found, ()) = tokio::join!(syncing, meanwhile);
-    let reused = LogFault::Reused { seq: 2, read: 3 };
+    let (synced, ()) = tokio::join!(syncing, meanwhile);
+    assert!(synced.unwrap().sent > 0);
+    assert_eq!(server.log(id).len(), 2);
+    stays_stopped_after_finding(&mut a, &server, LogFault::Behind { cursor: 3 }).await;
+}
+
+/// Answers every append with position `at`, wherever the server stored it.
+struct AnswersAt<'a> {
+    server: &'a Server,
+    at: u64,
+}
+
+impl fongo_sync_client::Transport for AnswersAt<'_> {
+    async fn send(
+        &self,
+        request: fongo_sync_client::Request,
+    ) -> Result<fongo_sync_client::Response, fongo_sync_client::TransportError> {
+        let append = is_append(&request);
+        let mut response = fongo_sync_client::Transport::send(self.server, request).await?;
+        if append && response.status == 200 {
+            let answer = fongo_sync_client::protocol::api::Appended { seq: self.at };
+            response.body = serde_json::to_vec(&answer).unwrap();
+        }
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn an_append_answered_at_a_position_holding_other_bytes_is_reuse() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    a.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('a', 'x')").await;
+    let wrong = AnswersAt {
+        server: &server,
+        at: 2,
+    };
+    let found = sync(&mut a.conn, &a.replica, &wrong, &a.credentials, now).await;
+    let reused = LogFault::Reused {
+        seq: 2,
+        furthest: 3,
+    };
     assert!(
         matches!(found, Err(Error::LogFault(f)) if f == reused),
         "{found:?}"
     );
-    assert_eq!(server.log(id).len(), 2);
+    assert_eq!(server.log(id).len(), 4);
     // Not acknowledged: the changes stay in the outbox.
     assert_eq!(outbox_len(&mut a).await, 3);
     stays_stopped(&mut a, &server, reused).await;
+}
+
+/// The read that would prove reuse fails: no fault, nothing acknowledged, and the next sync
+/// appends the envelope again.
+#[tokio::test]
+async fn a_failed_read_of_an_answered_position_is_no_fault() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for key in ["b1", "b2", "b3"] {
+        send(&mut b, &server, key).await;
+    }
+    a.sync(&server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('a', 'x')").await;
+    let wrong = AnswersAt {
+        server: &server,
+        at: 2,
+    };
+    let mut appended = false;
+    server.fail_if(move |r| {
+        let after_append = appended && is_read(r);
+        appended |= is_append(r);
+        after_append
+    });
+    let failed = sync(&mut a.conn, &a.replica, &wrong, &a.credentials, now).await;
+    assert!(matches!(failed, Err(Error::Transport(_))), "{failed:?}");
+    server.behave();
+    assert_eq!(stored(&mut a).await, None);
+    assert_eq!(outbox_len(&mut a).await, 3);
+    assert!(a.sync(&server).await.unwrap().sent > 0);
+    assert_eq!(server.log(id).len(), 4);
+    assert_eq!(outbox_len(&mut a).await, 0);
 }
 
 #[tokio::test]
@@ -717,4 +795,122 @@ async fn the_fingerprint_hashes_every_envelope_read_whatever_was_done_with_it() 
         assert_eq!(print.seq, 4);
         assert_eq!(print.digest, chain(id.0, &log));
     }
+}
+
+/// Lets every request through but an append, which waits for one permit.
+struct GateAppends<'a> {
+    server: &'a Server,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    reached: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl fongo_sync_client::Transport for GateAppends<'_> {
+    async fn send(
+        &self,
+        request: fongo_sync_client::Request,
+    ) -> Result<fongo_sync_client::Response, fongo_sync_client::TransportError> {
+        if is_append(&request) {
+            self.reached.notify_one();
+            self.permits.acquire().await.unwrap().forget();
+        }
+        fongo_sync_client::Transport::send(self.server, request).await
+    }
+}
+
+/// A server that stores an identical envelope again, as the protocol allows. Two syncs of one
+/// database both append the envelope a failed sync left recorded; the answer placing the first
+/// copy comes back after the second copy was acknowledged.
+#[tokio::test]
+async fn copies_of_one_envelope_answered_out_of_order_are_no_fault() {
+    let dir = scratch("copies-out-of-order");
+    let path = dir.join("a.db");
+    let server = Server::new();
+    server.with(|s| s.store_again = true);
+    let made = create_library(&server, now).await.unwrap();
+    let joined = join_library(&server, &made.recovery_code(), now)
+        .await
+        .unwrap();
+    let mut x = Peer::new_at(&path, made.clone()).await;
+    let mut y = Peer::open(&path, made).await;
+    let mut b = Peer::new(joined).await;
+    for k in 0..2 {
+        b.run(&format!("INSERT INTO settings VALUES ('b{k}', 'x')"))
+            .await;
+        b.sync(&server).await.unwrap();
+    }
+    x.sync(&server).await.unwrap();
+    // A sync records an envelope and fails before its append reaches the server.
+    x.run("INSERT INTO settings VALUES ('a1', 'x')").await;
+    server.fail_if(is_append);
+    assert!(matches!(x.sync(&server).await, Err(Error::Transport(_))));
+    server.behave();
+    server.with(|s| s.store_again = true);
+    let gate = GateAppends {
+        server: &server,
+        permits: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut ys = Box::pin(sync(&mut y.conn, &y.replica, &gate, &y.credentials, now));
+    tokio::select! {
+        _ = &mut ys => panic!("y's append was not gated"),
+        _ = gate.reached.notified() => {}
+    }
+    // x appends the recorded envelope: stored at 3, its answer held.
+    let hold = server.hold_if(is_append, true);
+    let mut xs = Box::pin(sync(&mut x.conn, &x.replica, &server, &x.credentials, now));
+    tokio::select! {
+        _ = &mut xs => panic!("x's append was not held"),
+        _ = hold.reached() => {}
+    }
+    // y appends the same bytes: a copy at 4, acknowledged.
+    gate.permits.add_permits(1);
+    let r = (&mut ys).await;
+    assert!(r.is_ok(), "y: {r:?}");
+    hold.release();
+    let r = xs.await;
+    assert!(r.is_ok(), "x: {r:?}");
+}
+
+/// A conflict the device was told of before the fault is not reported again when it reads the
+/// whole log after resending, nor is one with an edit it had not sent yet.
+#[tokio::test]
+async fn reading_the_log_again_after_a_resend_reports_no_conflict_again() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    b.run("UPDATE notes SET body = 'theirs'").await;
+    a.run("UPDATE notes SET body = 'mine'").await;
+    b.sync(&server).await.unwrap();
+    let told = a.sync(&server).await.unwrap();
+    assert_eq!(told.applied.conflicts.len(), 1, "{told:#?}");
+    b.sync(&server).await.unwrap();
+    // Edits not sent yet when the fault is found, one of them to the field that conflicted.
+    a.run("INSERT INTO settings VALUES ('unsent', 'x')").await;
+    a.run("UPDATE notes SET body = 'mine, again'").await;
+    server.roll_back(id, 0);
+    assert!(matches!(a.sync(&server).await, Err(Error::LogFault(_))));
+    resend_all(&mut a.conn, &a.replica, id).await.unwrap();
+    for _ in 0..3 {
+        let report = a.sync(&server).await.unwrap();
+        assert_eq!(report.applied.conflicts, [], "{report:#?}");
+    }
+    assert!(matches!(b.sync(&server).await, Err(Error::LogFault(_))));
+    resend_all(&mut b.conn, &b.replica, id).await.unwrap();
+    for _ in 0..3 {
+        for peer in [&mut a, &mut b] {
+            let report = peer.sync(&server).await.unwrap();
+            assert_eq!(report.applied.conflicts, [], "{report:#?}");
+        }
+    }
+    let rows = assert_converged(&mut [a, b]).await;
+    assert!(
+        rows.iter().any(|r| r.contains("setting unsent=x")),
+        "{rows:#?}"
+    );
 }
