@@ -190,6 +190,14 @@ impl Collection {
     /// writes it, merged by clock, never part of a key, and never unmarked: a replica that does
     /// not know the field counts what it holds of it as last-writer-wins, and it can be relied on
     /// only while that is what the field is. See [`crate::Replica::refers`].
+    ///
+    /// What a database can tell it enforces: `install`, `install_step` and `resume` refuse
+    /// ([`Error::FileKind`]) a registry that marks a field any registry the database was
+    /// installed under declared otherwise, or declares otherwise a field one marked, even after
+    /// a registry in between left the field out; a field none declared may be marked. Undetected
+    /// are declarations made on other databases, those removed with an `uninstall`, and, on a
+    /// database upgraded from layout 3 or 4, those of any registry but the last installed under
+    /// the older layout, which recorded only that registry's fields.
     pub fn file(mut self, name: &str) -> Collection {
         self.fields.push(Field {
             name: name.into(),

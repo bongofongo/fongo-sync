@@ -107,7 +107,9 @@
 //!
 //! - a field marked as naming files is marked so in every version of the application that
 //!   writes it, merged by clock, never part of a key, and never unmarked. A replica that does
-//!   not know the field keeps only its winner by clock.
+//!   not know the field keeps only its winner by clock. An install refuses what it can tell
+//!   breaks this, a field that a registry it was installed under declared otherwise
+//!   ([`Error::FileKind`]).
 //! - a device retires a file only with a `through` at or before which it has merged every
 //!   envelope: one that skipped, refused or stepped past an envelope at or below `through`
 //!   holds none of its changes, and cannot know whether they refer to the file. It retires only

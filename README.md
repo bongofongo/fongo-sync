@@ -200,8 +200,10 @@ any value held names it, at any size.
   its winner by clock, and changes to a collection it lacks are held whole. So a replica whose
   registry predates a field marked as naming files never reports a content that field refers
   to as unreferred, as long as every field ever marked as naming files is marked so, merged by
-  clock and outside any key in every version that writes it. Rows held back and fields kept as
-  this replica's own on resuming count too. A listing is not a snapshot: writes between its
+  clock and outside any key in every version that writes it; an install or resume refuses a
+  registry that marks a field a registry the database was installed under declared otherwise,
+  or the reverse, since a plain field's references were sent with no claim on their files.
+  Rows held back and fields kept as this replica's own on resuming count too. A listing is not a snapshot: writes between its
   pages can keep it from naming a file referred to throughout, so it serves to show files and
   find candidates, never to decide that one may be retired; that is `refers`, asked while
   `nothing_pending` holds.

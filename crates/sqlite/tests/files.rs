@@ -962,9 +962,7 @@ async fn one_content_held_at_two_sizes_is_one_file() {
 #[tokio::test]
 async fn rows_found_under_an_older_registry_are_checked_and_reported_under_the_current_one() {
     let older = Registry::new(vec![
-        Collection::minted("books", "books", "id")
-            .field("title")
-            .field("cover"),
+        Collection::minted("books", "books", "id").field("title"),
     ])
     .unwrap();
     for bad in [false, true] {
@@ -1010,9 +1008,10 @@ async fn rows_found_under_an_older_registry_are_checked_and_reported_under_the_c
             more = step.more;
         }
         added.sort_by_key(|f| f.encode());
-        // The first row was adopted under the older registry, before `cover` named files.
+        // The first row was adopted under the older registry, which did not declare `cover`:
+        // the install that declares it adopts its value, as of every row adopted before.
         let last = if bad { 5 } else { 6 };
-        let mut expected: Vec<FileRef> = (1..last).map(file).collect();
+        let mut expected: Vec<FileRef> = (0..last).map(file).collect();
         expected.sort_by_key(|f| f.encode());
         assert_eq!(added, expected);
     }
@@ -1619,5 +1618,192 @@ async fn every_page_moves_on_whatever_the_sources_hold() {
         );
         let listed: BTreeSet<ContentHash> = values.iter().chain(&held).map(|f| f.hash).collect();
         assert_eq!(listed, says, "pages of {limit}");
+    }
+}
+
+/// Two values of a field at one clock, which only two databases writing as one node or a crafted
+/// change give: a replica that lacks the collection keeps the greater, as one that has it shows
+/// the greater, so a reference replaced by a greater value of any kind is referred to by
+/// neither, and whatever the replica that has it refers to, the one that lacks it does too.
+#[tokio::test]
+async fn a_foreign_value_replaced_at_one_clock_refers_as_the_field_would() {
+    let at = |value: Value| change("notes", 4, "scan", value, 7);
+    let blob = |n: u8| Value::Blob(file(n).encode());
+    // Pairs at one clock, each applied in both orders.
+    let pairs = [
+        (blob(1), Value::Blob(vec![2])),
+        (blob(1), blob(2)),
+        (blob(1), Value::Text("a path".into())),
+        (Value::Int(5), blob(3)),
+    ];
+    let world = World::new(32);
+    let mut n = 0;
+    for (one, other) in pairs {
+        for (first, second) in [(&one, &other), (&other, &one)] {
+            let batch = |v: &Value| {
+                vec![
+                    change("notes", 4, DELETED, Value::Int(0), 1),
+                    change("notes", 4, "book_id", Value::Ref(Gid([3; 16])), 2),
+                    at(v.clone()),
+                ]
+            };
+            let lacks = Replica::new(registry(0));
+            let has = Replica::new(registry(2));
+            let mut c = database(&world, n, &lacks).await;
+            let mut b = database(&world, n + 1, &has).await;
+            n += 2;
+            for (replica, conn) in [(&lacks, &mut c), (&has, &mut b)] {
+                replica.apply(conn, &batch(first)).await.unwrap();
+                replica.apply(conn, &batch(second)).await.unwrap();
+            }
+            let asked: Vec<ContentHash> = (0..=4).map(hash).collect();
+            let theirs = has.refers(&mut b, &asked).await.unwrap();
+            let ours = lacks.refers(&mut c, &asked).await.unwrap();
+            let greater = if first.total_cmp(second).is_gt() {
+                first
+            } else {
+                second
+            };
+            let expected: Vec<bool> = (0..=4).map(|i| *greater == blob(i)).collect();
+            assert_eq!(theirs, expected, "{first:?} then {second:?}");
+            assert_eq!(ours, expected, "{first:?} then {second:?}");
+            // Upgraded, the replica that lacked it holds what the other does.
+            has.install(&mut c).await.unwrap();
+            assert_eq!(has.refers(&mut c, &asked).await.unwrap(), expected);
+        }
+    }
+}
+
+/// Books whose cover is declared as a plain field, as naming files, or not at all.
+fn cover(how: Option<bool>) -> Replica {
+    let books = Collection::minted("books", "books", "id").field("title");
+    Replica::new(
+        Registry::new(vec![match how {
+            None => books,
+            Some(false) => books.field("cover"),
+            Some(true) => books.file("cover"),
+        }])
+        .unwrap(),
+    )
+}
+
+/// Requires `outcome` to be the refusal of `books.cover` as naming files or not.
+fn refused<T: std::fmt::Debug>(outcome: Result<T, Error>, names_files: bool) {
+    match outcome {
+        Err(Error::FileKind {
+            collection,
+            field,
+            names_files: asked,
+        }) => assert_eq!(
+            (collection.as_str(), field.as_str(), asked),
+            ("books", "cover", names_files)
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A field a registry this database was installed under declared as plain is never marked as
+/// naming files, nor is a field one marked declared otherwise, even after a registry that left
+/// it out: install, a stepped install and resume refuse, leaving the database as it was, and the
+/// registry before still installs. A field no registry declared may be marked.
+#[tokio::test]
+async fn a_field_never_becomes_or_stops_being_one_that_names_files() {
+    let world = World::new(33);
+    let fresh = async |n: u64| {
+        let mut c = world.connect(n).await;
+        run(
+            &mut c,
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, cover BLOB)",
+        )
+        .await;
+        with_file(
+            &mut c,
+            "INSERT INTO books (title, cover) VALUES ('Middlemarch', ?1)",
+            file(1),
+        )
+        .await;
+        c
+    };
+    let (plain, none, marked) = (cover(Some(false)), cover(None), cover(Some(true)));
+    let every = async |replica: &Replica, c: &mut SqliteConnection, names_files: bool| {
+        let before = dump(c).await;
+        refused(replica.install(c).await, names_files);
+        refused(replica.install_step(c, 1).await, names_files);
+        assert_eq!(dump(c).await, before);
+    };
+
+    // Declared plain, then marked; and declared plain, left out, then marked.
+    for leave_out in [false, true] {
+        let mut c = fresh(u64::from(leave_out)).await;
+        plain.install(&mut c).await.unwrap();
+        sent(&plain, &mut c).await;
+        if leave_out {
+            none.install(&mut c).await.unwrap();
+        }
+        every(&marked, &mut c, true).await;
+        plain.install(&mut c).await.unwrap();
+        run(&mut c, "UPDATE books SET title = 'Romola'").await;
+        plain.collect(&mut c).await.unwrap();
+        let out = sent(&plain, &mut c).await;
+        assert!(out.iter().any(|c| c.field == "title"), "{out:?}");
+        plain.suspend(&mut c).await.unwrap();
+        let before = dump(&mut c).await;
+        refused(
+            marked.resume(&mut c, fongo_sync_sqlite::Resume::Send).await,
+            true,
+        );
+        assert_eq!(dump(&mut c).await, before);
+        plain
+            .resume(&mut c, fongo_sync_sqlite::Resume::Send)
+            .await
+            .unwrap();
+    }
+
+    // Marked, then declared plain, directly or after a registry that left it out.
+    let mut c = fresh(2).await;
+    marked.install(&mut c).await.unwrap();
+    every(&plain, &mut c, false).await;
+    none.install(&mut c).await.unwrap();
+    every(&plain, &mut c, false).await;
+    marked.install(&mut c).await.unwrap();
+    assert!(refers(&marked, &mut c, file(1)).await);
+
+    // Declared by no registry before, whether or not a row holds it: marked.
+    let mut c = fresh(3).await;
+    none.install(&mut c).await.unwrap();
+    marked.install(&mut c).await.unwrap();
+    assert_eq!(every_file(&marked, &mut c, 10).await, [(file(1), true)]);
+
+    // A stepped install whose found rows wait under a registry that declared the field plain:
+    // marking it is refused, and the steps under that registry go on.
+    let mut c = fresh(4).await;
+    run(&mut c, "INSERT INTO books (title) VALUES ('Romola')").await;
+    assert!(plain.install_step(&mut c, 1).await.unwrap().more);
+    every(&marked, &mut c, true).await;
+    while plain.collect_step(&mut c, 1).await.unwrap().more {}
+    let out = sent(&plain, &mut c).await;
+    assert!(out.iter().any(|c| c.field == "cover"), "{out:?}");
+
+    // Upgraded from layout 4, which had no file fields: every field its last registry declared
+    // was plain, and one it did not declare may be marked.
+    for (n, older) in [(5, &plain), (6, &none)] {
+        let mut c = fresh(n).await;
+        older.install(&mut c).await.unwrap();
+        for sql in [
+            "DROP INDEX fongo_shadow_files",
+            "DROP INDEX fongo_foreign_files",
+            "DROP INDEX fongo_pins_files",
+            "ALTER TABLE fongo_pins DROP COLUMN shown",
+            "DELETE FROM fongo_meta WHERE key IN ('files:books', 'plain:books')",
+            "UPDATE fongo_meta SET value = 4 WHERE key = 'layout'",
+        ] {
+            run(&mut c, sql).await;
+        }
+        if n == 5 {
+            every(&marked, &mut c, true).await;
+            plain.install(&mut c).await.unwrap();
+        } else {
+            marked.install(&mut c).await.unwrap();
+        }
     }
 }

@@ -334,6 +334,30 @@ fn made_here(kind: &str, name: &str, sql: &str, client: bool) -> bool {
     }
 }
 
+/// The fields of `collection` that registries this database was installed under declared as
+/// naming files, and those they declared otherwise. Both records only grow; layouts 3 and 4,
+/// which had no file fields, recorded only the last registry's fields.
+fn declared_before(db: &Db, collection: &str) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let list = |key: String| -> Result<BTreeSet<String>> {
+        Ok(match meta_get(db, &key)? {
+            Some(Value::Text(names)) => names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => BTreeSet::new(),
+        })
+    };
+    let files = list(format!("files:{collection}"))?;
+    let mut other = list(format!("plain:{collection}"))?;
+    other.extend(
+        list(format!("fields:{collection}"))?
+            .into_iter()
+            .filter(|f| !files.contains(f)),
+    );
+    Ok((files, other))
+}
+
 /// Refuses where a trigger of the application's has the name of a capture trigger `registry`
 /// needs, which creating the kernel's would fail on.
 fn capture_names_free(db: &Db, registry: &Registry) -> Result<()> {
@@ -1080,6 +1104,9 @@ impl Replica {
             }
         };
         capture_names_free(db, &self.registry)?;
+        if kernel.state != State::Absent {
+            self.kinds_kept(db)?;
+        }
         if matches!(kernel.state, State::Older(_)) {
             self.show_pins(db)?;
         }
@@ -1125,6 +1152,21 @@ impl Replica {
             let known = format!("fields:{}", c.name);
             let sets = format!("together:{}", c.name);
             let adoption = format!("adopted:{}", c.name);
+            let (mut files, mut other) = declared_before(db, &c.name)?;
+            for f in &c.fields {
+                match f.kind {
+                    Kind::File => files.insert(f.name.clone()),
+                    _ => other.insert(f.name.clone()),
+                };
+            }
+            for (key, names) in [("files", files), ("plain", other)] {
+                let names: Vec<String> = names.into_iter().collect();
+                meta_set(
+                    db,
+                    &format!("{key}:{}", c.name),
+                    Value::Text(names.join(",")),
+                )?;
+            }
             let was_known = meta_get(db, &known)?;
             let was_together = meta_get(db, &sets)?;
             meta_set(db, &known, fields)?;
@@ -1232,6 +1274,26 @@ impl Replica {
             touched: self.touched_rows(cx.touched),
             files,
         })
+    }
+
+    /// Refuses a registry that declares as naming files a field a registry this database was
+    /// installed under declared otherwise, or the reverse.
+    fn kinds_kept(&self, db: &Db) -> Result<()> {
+        for c in self.registry.collections() {
+            let (files, other) = declared_before(db, &c.name)?;
+            for f in &c.fields {
+                let names_files = matches!(f.kind, Kind::File);
+                let was = if names_files { &other } else { &files };
+                if was.contains(&f.name) {
+                    return Err(Error::FileKind {
+                        collection: c.name.clone(),
+                        field: f.name.clone(),
+                        names_files,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Gives the pins of an older layout the column layout 5 added: the value each pinned field

@@ -28,6 +28,20 @@ pub enum Error {
     /// install or resume refused it before changing anything; renaming the trigger lets it run.
     #[error("the trigger `{name}` has a name reserved to the sync kernel's capture triggers")]
     Reserved { name: String },
+    /// The registry declares `collection.field` as naming files where a registry this database
+    /// was installed under declared it as a field that names none, or the reverse
+    /// (`names_files` says which the registry asks for). A version that wrote references to a
+    /// plain field sent them with no claim on their files, so a field never becomes one that
+    /// names files, nor stops being one: use a new field. `install`, `install_step` and `resume`
+    /// refuse before changing anything; see [`crate::Collection::file`] for what is recorded.
+    #[error(
+        "`{collection}.{field}` was declared otherwise by a registry this database was installed under; a field never becomes or stops being one that names files, so use a new field"
+    )]
+    FileKind {
+        collection: String,
+        field: String,
+        names_files: bool,
+    },
     #[error("sync state is corrupt: {0}")]
     Corrupt(String),
     /// The database holds none of the kernel's tables: it was never installed, or was
