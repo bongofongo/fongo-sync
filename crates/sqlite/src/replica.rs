@@ -239,6 +239,16 @@ fn now_ms(db: &Db) -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// Drops the marks of `collection` that a trigger left, which may stand for writes to another
+/// table; those of found rows waiting to be adopted, at time 0, are the kernel's own and stay.
+fn set_aside(db: &Db, collection: &str) -> Result<()> {
+    db.exec(
+        "DELETE FROM fongo_dirty WHERE collection = ?1 AND at <> 0",
+        &[Value::Text(collection.into())],
+    )?;
+    Ok(())
+}
+
 /// Drops every object of a type the kernel made: its triggers, or its tables.
 fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
     let names = db.query(
@@ -843,14 +853,7 @@ impl Replica {
         // would put the triggers back over rows written meanwhile, unrecorded.
         let kernel = read(db)?;
         let lost = self.lost(&kernel);
-        let untrusted: BTreeSet<usize> = lost
-            .iter()
-            .copied()
-            .filter(|idx| {
-                let c = self.collection(*idx);
-                !kernel.marks_trusted(&c.name, &c.table)
-            })
-            .collect();
+        let untrusted = self.untrusted(&kernel);
         let resuming = match kernel.state {
             State::Current { suspended: true } => Some((resuming.ok_or(Error::Suspended)?, None)),
             State::Current { suspended: false } | State::Older(_) if !lost.is_empty() => {
@@ -1187,7 +1190,8 @@ impl Replica {
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
-                match state(db)? {
+                let kernel = read(db)?;
+                match kernel.state {
                     State::Absent => return Ok(()),
                     other if other.current()? => return Ok(()),
                     _ => {}
@@ -1197,6 +1201,11 @@ impl Replica {
                     cx.collected += self.adopt_as_recorded(&mut cx)?;
                     cx.collected += self.adopt(&mut cx, None)?;
                     cx.finish()?;
+                }
+                // Once recorded, the suspension vouches for every mark, so those that may stand
+                // for writes to another table go now, as a resume without the record drops them.
+                for idx in self.untrusted(&kernel) {
+                    set_aside(db, &self.collection(idx).name)?;
                 }
                 drop_kernel(db, "trigger")?;
                 meta_set(db, SUSPENDED, Value::Int(1))
@@ -1220,6 +1229,18 @@ impl Replica {
             })
         })
         .await
+    }
+
+    /// The collections of the registry whose capture is lost and whose marks
+    /// [`Kernel::marks_trusted`] does not trust.
+    fn untrusted(&self, kernel: &Kernel) -> BTreeSet<usize> {
+        self.lost(kernel)
+            .into_iter()
+            .filter(|idx| {
+                let c = self.collection(*idx);
+                !kernel.marks_trusted(&c.name, &c.table)
+            })
+            .collect()
     }
 
     /// The collections of the registry whose capture [`Kernel::lost`] finds lost.
@@ -1267,13 +1288,20 @@ impl Replica {
     /// nothing more there. When capture is intact, `resume` is [`Replica::install`]: rows
     /// written since the last collect are edits like any other, whichever `how`.
     ///
-    /// The marks a collection's triggers left are trusted when a suspend is recorded, or when one
-    /// of its triggers is still on its table and none is on another. Otherwise they may stand for
-    /// writes to a table renamed away, which takes its triggers along until it is dropped, and
-    /// they are set aside: the collection's table is compared with the images alone. Then no row
-    /// the table holds is removed or made again, and an edit captured before capture was lost
-    /// and never collected is, with [`Resume::Baseline`], kept as a baseline like any other
-    /// change: it cannot be told from a write to the old table.
+    /// The marks a collection's triggers left are trusted when one of its triggers is still on
+    /// its table and none is on another, or when a suspend is recorded: [`Replica::suspend`]
+    /// applies the same test as it drops the triggers. Otherwise they may stand for writes to a
+    /// table renamed away, which takes its triggers along until it is dropped, and they are set
+    /// aside, but for those of found rows still waiting to be adopted: the collection's table is
+    /// compared with the images alone, and nothing the old table was written is sent. Setting
+    /// the marks aside has two consequences, both avoided by collecting before a migration:
+    ///
+    /// - a row removed and made again at the same minted id, captured and not collected, is the
+    ///   old entity changed, so with [`Resume::Send`] its new values are sent and the removal is
+    ///   not (a natural key's row is the same entity either way);
+    /// - with [`Resume::Baseline`], an edit captured before capture was lost and not collected
+    ///   is kept as a baseline like any other change, as it is after an unrecorded suspend by a
+    ///   build that recorded none: it cannot be told from a write to the old table.
     ///
     /// A collection the registry gained meanwhile is adopted as an install adopts it: its rows
     /// are the oldest writes, filling gaps but never overwriting.
@@ -1317,10 +1345,7 @@ impl Replica {
                 continue;
             }
             if untrusted.contains(&idx) {
-                db.exec(
-                    "DELETE FROM fongo_dirty WHERE collection = ?1",
-                    &[Value::Text(c.name.clone())],
-                )?;
+                set_aside(db, &c.name)?;
             }
             let rows: BTreeMap<String, Row> = every_row(db, c)?.into_iter().collect();
             let mapped = db.query(
@@ -1387,8 +1412,14 @@ impl Replica {
                     }
                 }
             }
+            // A mark already there stays as it is: a found row waiting at the oldest time keeps it.
             for key in rows.keys().filter(|k| !known.contains(*k)) {
-                mark(&c.name, key, false)?;
+                db.exec(
+                    &format!(
+                        "INSERT OR IGNORE INTO fongo_dirty (collection, key, at) VALUES (?1, ?2, {NOW})"
+                    ),
+                    &[Value::Text(c.name.clone()), Value::Text(key.clone())],
+                )?;
             }
         }
         db.check()

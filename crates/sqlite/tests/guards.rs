@@ -1316,3 +1316,220 @@ async fn a_collection_gained_while_suspended_is_adopted_as_an_install_adopts_it(
     );
     assert_eq!(adopted(true).await, installed);
 }
+
+/// The same writes to a table renamed away while capture runs, and only then a suspend: the
+/// suspend finds the triggers away from the collection's table, so the resume trusts none of the
+/// marks they left, as when no suspend is recorded.
+#[tokio::test]
+async fn writes_to_a_table_renamed_away_before_a_suspend_are_not_the_collections() {
+    let scripts: [(&str, &[&str]); 2] = [
+        (
+            "an update of the old table",
+            &[COPY, "UPDATE books_old SET isbn = isbn || '-old'"],
+        ),
+        ("the old table emptied", &[COPY, "DELETE FROM books_old"]),
+    ];
+    for (what, then) in scripts {
+        for how in [Resume::Send, Resume::Baseline] {
+            let at = format!("{what}, {how:?}");
+            let world = World::new(20);
+            let (mut c, replica) = migrated_away(&world, &[], then).await;
+            let gids = [
+                replica.gid_of(&mut c, "books", 1).await.unwrap(),
+                replica.gid_of(&mut c, "books", 2).await.unwrap(),
+            ];
+            replica.suspend(&mut c).await.unwrap();
+            replica.suspend(&mut c).await.unwrap();
+            replica.resume(&mut c, how).await.unwrap();
+            replica.collect(&mut c).await.unwrap();
+            let out = sent(&replica, &mut c).await;
+            assert!(!removes(&out), "{at}: {out:?}");
+            assert!(!out.iter().any(|ch| ch.field == "isbn"), "{at}: {out:?}");
+            let times = usize::from(how == Resume::Send);
+            for title in ["MIDDLEMARCH", "ROMOLA"] {
+                assert_eq!(sent_times(&out, "title", title), times, "{at}: {out:?}");
+            }
+            for (id, gid) in [1, 2].into_iter().zip(gids) {
+                assert_eq!(
+                    replica.gid_of(&mut c, "books", id).await.unwrap(),
+                    gid,
+                    "{at}"
+                );
+            }
+        }
+    }
+}
+
+/// Two collections' tables swapped by renames while capture runs, a row deleted from one, and
+/// then a suspend: each collection's triggers marked the other's rows, so nothing is taken from
+/// those marks; the entity whose row is still in its collection's table is neither removed nor
+/// made again.
+#[tokio::test]
+async fn tables_swapped_before_a_suspend_take_nothing_from_the_marks() {
+    let schema = [
+        "CREATE TABLE ta (id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE tb (id INTEGER PRIMARY KEY, v TEXT)",
+    ];
+    let registry = || {
+        Registry::new(vec![
+            Collection::minted("a", "ta", "id").field("v"),
+            Collection::minted("b", "tb", "id").field("v"),
+        ])
+        .unwrap()
+    };
+    for how in [Resume::Send, Resume::Baseline] {
+        let world = World::new(21);
+        let mut c = world.connect(0).await;
+        for sql in schema {
+            run(&mut c, sql).await;
+        }
+        let replica = Replica::new(registry());
+        replica.install(&mut c).await.unwrap();
+        run(&mut c, "INSERT INTO ta (v) VALUES ('a1'), ('a2')").await;
+        run(&mut c, "INSERT INTO tb (v) VALUES ('b1'), ('b2')").await;
+        replica.collect(&mut c).await.unwrap();
+        sent(&replica, &mut c).await;
+        let a2 = replica.gid_of(&mut c, "a", 2).await.unwrap();
+        for sql in [
+            "ALTER TABLE ta RENAME TO swap",
+            "ALTER TABLE tb RENAME TO ta",
+            "ALTER TABLE swap RENAME TO tb",
+            "DELETE FROM tb WHERE id = 2",
+        ] {
+            run(&mut c, sql).await;
+        }
+        replica.suspend(&mut c).await.unwrap();
+        replica.resume(&mut c, how).await.unwrap();
+        replica.collect(&mut c).await.unwrap();
+        let out = sent(&replica, &mut c).await;
+        assert!(
+            !out.iter().any(|ch| ch.collection == "a"
+                && ch.field == fongo_sync_sqlite::core::DELETED
+                && ch.value == Value::Int(1)),
+            "{how:?}: {out:?}"
+        );
+        assert_eq!(replica.gid_of(&mut c, "a", 2).await.unwrap(), a2, "{how:?}");
+    }
+}
+
+/// A suspend made while every trigger is on its own table, and a table renamed away only then:
+/// the marks were left by the collection's own triggers, so a captured edit is still sent on a
+/// baseline resume.
+#[tokio::test]
+async fn a_rename_after_a_suspend_keeps_the_marks_trusted() {
+    let world = World::new(22);
+    let mut c = database(&world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(
+        &mut c,
+        "INSERT INTO books (title) VALUES ('Middlemarch'), ('Romola')",
+    )
+    .await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    run(&mut c, "UPDATE books SET title = 'Felix Holt' WHERE id = 1").await;
+    replica.suspend(&mut c).await.unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA legacy_alter_table = ON",
+        "ALTER TABLE books RENAME TO books_old",
+        "PRAGMA legacy_alter_table = OFF",
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE)",
+        "INSERT INTO books SELECT id, title, isbn FROM books_old",
+        "PRAGMA foreign_keys = ON",
+    ] {
+        run(&mut c, sql).await;
+    }
+    replica.resume(&mut c, Resume::Baseline).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    let out = sent(&replica, &mut c).await;
+    assert_eq!(sent_times(&out, "title", "Felix Holt"), 1, "{out:?}");
+    assert!(replica.inspect(&mut c).await.unwrap().pinned.is_empty());
+}
+
+/// Marks set aside: a row removed and made again at its minted id, captured and not collected,
+/// is then the old entity changed: nothing is removed, and its new values are sent.
+#[tokio::test]
+async fn a_row_made_again_before_marks_are_set_aside_is_the_old_entity_changed() {
+    let world = World::new(23);
+    let mut c = database(&world, 0).await;
+    let replica = Replica::new(registry());
+    replica.install(&mut c).await.unwrap();
+    run(&mut c, "INSERT INTO books (title) VALUES ('Middlemarch')").await;
+    replica.collect(&mut c).await.unwrap();
+    sent(&replica, &mut c).await;
+    let gid = replica.gid_of(&mut c, "books", 1).await.unwrap();
+    run(&mut c, "DELETE FROM books WHERE id = 1").await;
+    run(&mut c, "INSERT INTO books (id, title) VALUES (1, 'Romola')").await;
+    drop_triggers(&mut c, "fongo%").await;
+    replica.resume(&mut c, Resume::Send).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    let out = sent(&replica, &mut c).await;
+    assert!(!removes(&out), "{out:?}");
+    assert_eq!(sent_times(&out, "title", "Romola"), 1, "{out:?}");
+    assert_eq!(replica.gid_of(&mut c, "books", 1).await.unwrap(), gid);
+}
+
+/// A row found when its collection is first installed that cannot be adopted yet, a note naming
+/// a book the kernel has no entity for, waits marked as the oldest write. A resume, whether it
+/// trusts the marks or sets them aside, leaves it so: once it can be collected it is adopted at
+/// clock zero, as it would have been without the resume.
+#[tokio::test]
+async fn a_found_row_that_waits_keeps_the_oldest_clock_through_a_resume() {
+    let adopted = async |lose: Option<bool>| {
+        let world = World::new(24);
+        let mut c = database(&world, 0).await;
+        let books = Replica::new(
+            Registry::new(vec![
+                Collection::minted("books", "books", "id")
+                    .field("title")
+                    .field("isbn")
+                    .identity(&["isbn"]),
+            ])
+            .unwrap(),
+        );
+        books.install(&mut c).await.unwrap();
+        // As the kernel's own writes are, so the book is neither marked nor mapped.
+        for sql in [
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 1)",
+            "INSERT INTO books (id, title) VALUES (9, 'Middlemarch')",
+            "INSERT OR REPLACE INTO fongo_meta (key, value) VALUES ('applying', 0)",
+            "INSERT INTO notes (book_id, body) VALUES (9, 'waiting')",
+        ] {
+            run(&mut c, sql).await;
+        }
+        let replica = Replica::new(registry());
+        replica.install(&mut c).await.unwrap();
+        assert_eq!(replica.uncollected_rows(&mut c, 10).await.unwrap(), 1);
+        match lose {
+            Some(true) => drop_triggers(&mut c, "fongo%").await,
+            Some(false) => replica.suspend(&mut c).await.unwrap(),
+            None => {}
+        }
+        if lose.is_some() {
+            replica.resume(&mut c, Resume::Send).await.unwrap();
+        }
+        run(
+            &mut c,
+            "UPDATE books SET title = 'Middlemarch!' WHERE id = 9",
+        )
+        .await;
+        replica.collect(&mut c).await.unwrap();
+        sent(&replica, &mut c)
+            .await
+            .into_iter()
+            .filter(|ch| ch.collection == "notes")
+            .map(|ch| (ch.field, ch.clock.wall_ms))
+            .collect::<Vec<_>>()
+    };
+    let installed = adopted(None).await;
+    assert!(!installed.is_empty());
+    assert!(
+        installed.iter().all(|(_, wall)| *wall == 0),
+        "{installed:?}"
+    );
+    for lose in [false, true] {
+        assert_eq!(adopted(Some(lose)).await, installed, "lost by hand: {lose}");
+    }
+}
