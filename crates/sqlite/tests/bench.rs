@@ -240,8 +240,8 @@ async fn file_costs(books: i64) -> Vec<(u64, u64)> {
     replica.collect(&mut a).await.unwrap();
     let deleted = drain(&replica, &mut a).await;
     replica.apply(&mut b, &deleted).await.unwrap();
-    let asked: Vec<fongo_sync_sqlite::FileRef> = (0..10u8)
-        .map(|i| fongo_sync_sqlite::FileRef::of(&[i]))
+    let asked: Vec<fongo_sync_sqlite::ContentHash> = (0..10u8)
+        .map(|i| fongo_sync_sqlite::FileRef::of(&[i]).hash)
         .collect();
     let statements = Statements::watch(&mut b).await;
     let work = count_work(&mut b).await;
@@ -253,12 +253,31 @@ async fn file_costs(books: i64) -> Vec<(u64, u64)> {
         match what {
             0 => drop(replica.refers(&mut b, &asked).await.unwrap()),
             1 => {
-                let page = replica.files(&mut b, None, 10).await.unwrap();
-                assert_eq!(page.files.len(), 10);
-                let next = replica.files(&mut b, page.next.as_ref(), 10).await.unwrap();
-                assert_eq!(next.files.len(), 10);
+                // Every page, the costliest kept: a late one must cost what the first does.
+                let (mut from, mut most, mut first, mut listed) = (None, (0, 0), None, 0);
+                loop {
+                    statements.reset();
+                    work.store(0, Ordering::Relaxed);
+                    let page = replica.files(&mut b, from.as_ref(), 10).await.unwrap();
+                    let cost = (statements.count(), work.load(Ordering::Relaxed));
+                    texts.extend(statements.texts());
+                    listed += page.files.len();
+                    let first = *first.get_or_insert(cost);
+                    assert!(
+                        cost.0 <= first.0 + 2 && cost.1 <= first.1 + first.1 / 2 + 10,
+                        "a page after {listed} references costs {cost:?}, the first {first:?}"
+                    );
+                    most = most.max(cost);
+                    match page.next {
+                        Some(next) => from = Some(next),
+                        None => break,
+                    }
+                }
+                assert_eq!(listed, books as usize);
+                costs.push(most);
+                continue;
             }
-            2 => drop(replica.held_files(&mut b).await.unwrap()),
+            2 => drop(replica.files_to_claim(&mut b).await.unwrap()),
             _ => {
                 let step = replica
                     .purge_step(&mut b, u64::MAX, None, 100)
@@ -278,7 +297,7 @@ async fn file_costs(books: i64) -> Vec<(u64, u64)> {
 async fn questions_about_files_cost_no_more_in_a_larger_library() {
     let small = file_costs(500).await;
     let large = file_costs(4_000).await;
-    for ((what, s), l) in ["refers", "files", "held_files", "purge_step"]
+    for ((what, s), l) in ["refers", "files, any page", "files_to_claim", "purge_step"]
         .iter()
         .zip(small)
         .zip(large)
@@ -622,8 +641,8 @@ async fn timings_with(files: bool) -> Table {
             continue;
         }
         // The questions about files, in the larger library, and clearing the deleted rows' files.
-        let asked: Vec<fongo_sync_sqlite::FileRef> = (0..1000u32)
-            .map(|i| fongo_sync_sqlite::FileRef::of(&i.to_be_bytes()))
+        let asked: Vec<fongo_sync_sqlite::ContentHash> = (0..1000u32)
+            .map(|i| fongo_sync_sqlite::FileRef::of(&i.to_be_bytes()).hash)
             .collect();
         let started = Instant::now();
         replica.refers(&mut b, &asked).await.unwrap();
@@ -717,5 +736,53 @@ async fn idle_calls_in_a_large_schema() {
                 format!("{what}, {} more objects", 3 * extra)
             );
         }
+    }
+}
+
+/// What the questions about files cost while 10,000 rows are held back, each showing a cover
+/// the merge has replaced: every one of them reads every row held back. `make bench` prints it.
+#[tokio::test]
+#[ignore = "a benchmark: make bench"]
+async fn questions_about_files_with_rows_held_back() {
+    const HELD: i64 = 10_000;
+    let replica = Replica::new(registry_with(true));
+    let (mut a, mut b) = library(&replica, HELD).await;
+    run(&mut b, "CREATE TABLE locked (on_ INTEGER)").await;
+    run(&mut b, "INSERT INTO locked VALUES (1)").await;
+    run(
+        &mut b,
+        "CREATE TRIGGER no_cover BEFORE UPDATE OF cover ON books
+          WHEN (SELECT on_ FROM locked) BEGIN SELECT RAISE(ABORT, 'locked'); END",
+    )
+    .await;
+    run(
+        &mut a,
+        &format!("UPDATE books SET cover = {}", cover("id + 1000000")),
+    )
+    .await;
+    replica.collect(&mut a).await.unwrap();
+    let changes = drain(&replica, &mut a).await;
+    let mut table = Table(Vec::new());
+    let started = Instant::now();
+    let applied = replica.apply(&mut b, &changes).await.unwrap();
+    table.time("apply holding back 10,000 rows", started);
+    assert_eq!(applied.waiting as i64, HELD);
+    let one = [fongo_sync_sqlite::FileRef::of(b"Middlemarch").hash];
+    let started = Instant::now();
+    replica.refers(&mut b, &one).await.unwrap();
+    table.time("refers, one content", started);
+    let started = Instant::now();
+    replica.files(&mut b, None, 1000).await.unwrap();
+    table.time("files, one page of 1,000", started);
+    let started = Instant::now();
+    let claimed = replica.files_to_claim(&mut b).await.unwrap();
+    table.time("files_to_claim", started);
+    assert_eq!(claimed.len() as i64, HELD);
+    let started = Instant::now();
+    replica.apply(&mut b, &[]).await.unwrap();
+    table.time("apply of nothing, retrying every row held", started);
+    println!("\n{:<60} {:>12}", "with 10,000 rows held back", "ms");
+    for (what, took) in &table.0 {
+        println!("{what:<60} {:>12.1}", took.as_secs_f64() * 1000.0);
     }
 }

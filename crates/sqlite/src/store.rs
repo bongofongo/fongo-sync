@@ -54,17 +54,21 @@ use crate::error::{Error, Result};
 ///
 /// `fongo_shadow_files` and `fongo_foreign_files` index, by value, every kept value and every
 /// change held for a collection this registry lacks that is a blob whose first byte is a
-/// [`FileRef`](fongo_sync_protocol::FileRef)'s format, whatever its collection and field, so
-/// that whether anything held may name a file is one lookup, and the files held are read in
-/// order without reading anything else. A value that is not a reference is cheap to index and
-/// skipped where it is read.
+/// [`FileRef`](fongo_sync_protocol::FileRef)'s format, whatever its collection and field, and
+/// `fongo_pins_files` the values pinned fields show, so that whether anything held names a
+/// content is one range lookup (the references to one content, at every size, are adjacent),
+/// and the files held are read in order without reading anything else. A value that is not a
+/// reference is cheap to index and skipped where it is read.
 ///
 /// # Upgrades
 ///
 /// Layouts 3 and 4 are upgraded in place by the next install. Layout 3 gains the empty
 /// `fongo_found` table and the index of marks in collecting order; both gain the indexes of
-/// values that may name files; everything else is kept as it was. The move is one way: a build
-/// of layout 3 or 4 refuses to install over layout 5, as over any layout it does not know. Such a
+/// values that may name files, and the column `shown` of `fongo_pins`, filled from the rows,
+/// with its index; everything else is kept as it was. The move is one way: a build of layout 3
+/// or 4 refuses to install over layout 5, as over any layout it does not know. It must: besides
+/// the indexes, the registry recorded with found rows (`found_registry`) may now hold a field of
+/// the file kind, which an older build cannot read, and pins it would write leave `shown` empty. Such a
 /// build calling `collect` or `apply` without installing first is not refused; an application
 /// installs at every open. This build refuses every call on a later layout, and every call but
 /// an install, a resume, an uninstall or asking whether capture is suspended on layouts 3 and 4.
@@ -146,7 +150,11 @@ pub(crate) const TABLES: &[&str] = &[
         field TEXT NOT NULL,
         against,
         is_ref INTEGER NOT NULL DEFAULT 0,
+        shown,
         PRIMARY KEY (collection, key, field))",
+    // What a pinned field shows, where it may be a file reference.
+    "CREATE INDEX IF NOT EXISTS fongo_pins_files ON fongo_pins (shown, collection, field)
+        WHERE shown >= x'01' AND shown < x'02'",
     // A found row a first install in steps records: its batch (-1 once adopted, kept until
     // every one is), the gid and the counter of the adoption clock a whole install would give
     // it, and its values when the install began.
@@ -238,7 +246,7 @@ pub(crate) fn kernel_tables() -> impl Iterator<Item = &'static str> {
     })
 }
 
-/// The table layout 4 added to layout 3; layout 5 added only indexes.
+/// The table layout 4 added to layout 3; layout 5 added indexes and a column of `fongo_pins`.
 const ADDED: &str = "fongo_found";
 
 /// The suffixes of the three triggers that capture a collection's writes, named

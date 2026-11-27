@@ -84,6 +84,7 @@ pub struct Outbox {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Applied {
     /// Incoming changes that replaced what this replica held.
     pub accepted: usize,
@@ -647,7 +648,7 @@ impl Replica {
             return Ok(Ok(BTreeSet::new()));
         }
         if local {
-            self.only_files(cx.db, changes)?;
+            self.only_files(cx, changes)?;
         }
         let ev = self.evaluator();
         let facts = Facts { db: cx.db };
@@ -944,12 +945,20 @@ impl Replica {
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
     /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
-    /// layout 3 is upgraded in place. Refuses with [`Error::Suspended`] while capture is
+    /// layouts 3 and 4 are upgraded in place. Where there are no kernel tables, any table whose
+    /// name begins `fongo_`, such as the client's, is removed first: it describes a state that
+    /// is gone. Refuses with [`Error::Suspended`] while capture is
     /// suspended: only [`Replica::resume`] puts the triggers back then, having compared the
     /// tables with what the kernel last saw of them.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
+        self.install_reported(conn).await.map(drop)
+    }
+
+    /// [`Replica::install`], reporting what it did as [`Replica::install_step`] does, with
+    /// [`Collected::more`] false.
+    pub async fn install_reported(&self, conn: &mut SqliteConnection) -> Result<Collected> {
         with_db(conn, |db| {
-            db.atomically_writing(|db| self.install_in(db, None, None).map(|_| ()))
+            db.atomically_writing(|db| self.install_in(db, None, None))
         })
         .await
     }
@@ -1006,6 +1015,13 @@ impl Replica {
                 None
             }
         };
+        if matches!(kernel.state, State::Older(_)) {
+            self.show_pins(db)?;
+        }
+        // The client's tables, left without the kernel's, describe a state that is gone.
+        if kernel.state == State::Absent {
+            drop_kernel(db, "table")?;
+        }
         for sql in TABLES {
             db.exec(sql, &[])?;
         }
@@ -1151,6 +1167,31 @@ impl Replica {
             touched: self.touched_rows(cx.touched),
             files,
         })
+    }
+
+    /// Gives the pins of an older layout the column layout 5 added: the value each pinned field
+    /// shows, read from its row.
+    fn show_pins(&self, db: &Db) -> Result<()> {
+        let columns = db.query("SELECT name FROM pragma_table_info('fongo_pins')", &[])?;
+        if columns.is_empty() || columns.iter().any(|r| r[0] == Value::Text("shown".into())) {
+            return Ok(());
+        }
+        db.exec("ALTER TABLE fongo_pins ADD COLUMN shown", &[])?;
+        for r in db.query("SELECT collection, key, field FROM fongo_pins", &[])? {
+            let (name, key, field) = (as_text(&r[0])?, as_text(&r[1])?, as_text(&r[2])?);
+            let Some(idx) = self.registry.index(name) else {
+                continue;
+            };
+            if let Some(row) = read_row(db, self.collection(idx), key)?
+                && let Some(value) = row.get(field)
+            {
+                db.exec(
+                    "UPDATE fongo_pins SET shown = ?4 WHERE collection = ?1 AND key = ?2 AND field = ?3",
+                    &[r[0].clone(), r[1].clone(), r[2].clone(), stored(value).0],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Records the values rows hold for fields new to an adopted collection, as the oldest
@@ -1336,18 +1377,27 @@ impl Replica {
     /// again. Suspending again changes nothing, and with no kernel tables there is nothing to
     /// suspend.
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
+        self.suspend_reported(conn).await.map(drop)
+    }
+
+    /// [`Replica::suspend`], reporting what adopting the rows a first install in steps found
+    /// did to the files referred to.
+    pub async fn suspend_reported(&self, conn: &mut SqliteConnection) -> Result<FileChanges> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
                 let kernel = read(db)?;
                 match kernel.state {
-                    State::Absent => return Ok(()),
-                    other if other.current()? => return Ok(()),
+                    State::Absent => return Ok(FileChanges::default()),
+                    other if other.current()? => return Ok(FileChanges::default()),
                     _ => {}
                 }
+                let mut files = FileChanges::default();
                 if adopt::recorded(db)? {
                     let mut cx = Ctx::begin(db)?;
+                    self.watch_files(&mut cx)?;
                     cx.collected += self.adopt_as_recorded(&mut cx)?;
                     cx.collected += self.adopt(&mut cx, None)?;
+                    files = self.file_changes(&mut cx)?;
                     cx.finish()?;
                 }
                 // Once recorded, the suspension vouches for every mark, so those that may stand
@@ -1356,7 +1406,8 @@ impl Replica {
                     set_aside(db, &self.collection(idx).name)?;
                 }
                 drop_kernel(db, "trigger")?;
-                meta_set(db, SUSPENDED, Value::Int(1))
+                meta_set(db, SUSPENDED, Value::Int(1))?;
+                Ok(files)
             })
         })
         .await
@@ -1457,8 +1508,18 @@ impl Replica {
     /// A collection the registry gained meanwhile is adopted as an install adopts it: its rows
     /// are the oldest writes, filling gaps but never overwriting.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
+        self.resume_reported(conn, how).await.map(drop)
+    }
+
+    /// [`Replica::resume`], reporting what it did as [`Replica::install_step`] does, with
+    /// [`Collected::more`] false.
+    pub async fn resume_reported(
+        &self,
+        conn: &mut SqliteConnection,
+        how: Resume,
+    ) -> Result<Collected> {
         with_db(conn, |db| {
-            db.atomically_writing(|db| self.install_in(db, Some(how), None).map(|_| ()))
+            db.atomically_writing(|db| self.install_in(db, Some(how), None))
         })
         .await
     }
@@ -1547,14 +1608,15 @@ impl Replica {
                                 .unwrap_or(Value::Null);
                             let (against, kind) = stored(&against);
                             db.exec(
-                                "INSERT OR REPLACE INTO fongo_pins (collection, key, field, against, is_ref)
-                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                "INSERT OR REPLACE INTO fongo_pins (collection, key, field, against, is_ref, shown)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                                 &[
                                     Value::Text(c.name.clone()),
                                     Value::Text(key.clone()),
                                     Value::Text(f.to_string()),
                                     against,
                                     kind,
+                                    stored(&row[f]).0,
                                 ],
                             )?;
                             image.insert(f.to_string(), row[f].clone());
@@ -1601,13 +1663,28 @@ impl Replica {
     /// Turns the local writes made since the last call into changes in the outbox, and brings
     /// the rows they affect up to date. Returns how many changes were produced.
     pub async fn collect(&self, conn: &mut SqliteConnection) -> Result<usize> {
+        Ok(self.collect_reported(conn).await?.produced)
+    }
+
+    /// [`Replica::collect`], reporting what it did as a step of [`Replica::collect_step`] does,
+    /// with [`Collected::more`] false.
+    pub async fn collect_reported(&self, conn: &mut SqliteConnection) -> Result<Collected> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
                 self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
+                self.watch_files(&mut cx)?;
                 self.step(&mut cx, &[], BTreeSet::new(), None)?;
+                let files = self.file_changes(&mut cx)?;
                 cx.finish()?;
-                Ok(cx.produced)
+                Ok(Collected {
+                    produced: cx.produced,
+                    rows: cx.collected,
+                    abandoned: cx.abandoned,
+                    more: false,
+                    touched: self.touched_rows(cx.touched),
+                    files,
+                })
             })
         })
         .await

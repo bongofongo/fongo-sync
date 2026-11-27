@@ -182,6 +182,8 @@ struct Peer {
     node: Gid,
     /// The files it reported at its last check.
     files: support::files::Reported,
+    /// The changes its purges sent, which must never show.
+    purged: Vec<Change>,
 }
 
 impl Peer {
@@ -221,6 +223,7 @@ impl Peer {
             origins: None,
             node: Gid([0; 16]),
             files: Default::default(),
+            purged: Vec::new(),
         };
         peer.install().await.unwrap();
         let node = peer.replica.inspect(&mut peer.conn).await.unwrap().node;
@@ -250,6 +253,7 @@ impl Peer {
             pushes: self.pushes,
             node: self.node,
             files: self.files.clone(),
+            purged: self.purged.clone(),
         }
     }
 
@@ -362,6 +366,7 @@ impl Peer {
                 return Err(format!("a purge step sent {cleared:?}, reporting {step:?}"));
             }
             self.writes.asked(cleared);
+            self.purged.extend(cleared.iter().cloned());
             self.collected().await?;
             support::files::reported(&before, &self.files, &step.files, None)
                 .map_err(|e| format!("purging: {e}"))?;
@@ -1285,6 +1290,13 @@ async fn check(peers: &mut [Peer], copied: bool) -> Result<(), String> {
         peer.writes
             .kept(peer.replica.registry(), &everything)
             .map_err(|e| format!("peer {i}: {e}"))?;
+    }
+    // A purge's clearing is written only to a member that never shows again.
+    let merged = fongo_sync_sqlite::core::model::merge(&registry(true).model_schema(), &everything);
+    for clearing in peers.iter().flat_map(|p| &p.purged) {
+        if merged.entities.get(&clearing.gid).is_some_and(|e| e.live) {
+            return Err(format!("a purge cleared a member that shows: {clearing:?}"));
+        }
     }
     let mut first: Option<fongo_sync_sqlite::core::model::View> = None;
     for (i, peer) in peers.iter_mut().enumerate() {

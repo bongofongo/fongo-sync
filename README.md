@@ -179,28 +179,38 @@ with all test binaries at once, and [Lean](#verification) through `elan`.
 A replica answers, from the changes it holds, what the protocol's rules for deleting files ask of
 a device. The protocol's definition: a set of changes refers to a file when, for some field
 marked as naming files and some collection and gid, the field's winner among the set's changes
-to it is a reference to the file, whatever the row's liveness or group.
+to it is a reference to the file, whatever the row's liveness or group. A server names a file by
+its content hash alone, so every answer is about a content hash: a content is referred to while
+any value held names it, at any size.
 
 - `Registry::files_set` gives the files the changes of one outgoing batch set, the ids to claim
   with it; it is a function of the registry and the changes, so a batch sealed or sent again
   claims the same.
-- `Replica::refers` says whether the replica's state may refer to each of a list of files, and
-  `Replica::files` lists every such file in pages, each marked as named by a field this registry
-  declares or only by data it cannot interpret. Both count any value held that is a file
-  reference, in any collection and field: a field this registry does not declare, of a
-  collection it does, keeps its winner by clock, and changes to a collection it lacks are held
-  whole. So a replica whose registry predates a field marked as naming files never reports a
-  file that field refers to as unreferred, as long as every field ever marked as naming files is
-  merged by clock in every version. Rows held back and fields kept as this replica's own on
-  resuming count too.
-- `Replica::held_files` names the files rows held back show, which a device claims before it
-  reports that it has settled.
-- `Applied::files`, and `Collected::files` of a bounded step, say which files the operation made
-  the state refer to (to fetch) and which nothing refers to any more (to consider retiring).
+- `Replica::refers` says whether the replica's state may refer to each of a list of contents,
+  and `Replica::files` lists every reference held in pages, each marked as named by a field this
+  registry declares or only by data it cannot interpret; one content held at two sizes is
+  listed twice, side by side. Both count any value held that is a file reference, in any
+  collection and field: a field this registry does not declare, of a collection it does, keeps
+  its winner by clock, and changes to a collection it lacks are held whole. So a replica whose
+  registry predates a field marked as naming files never reports a content that field refers
+  to as unreferred, as long as every field ever marked as naming files is marked so, merged by
+  clock and outside any key in every version that writes it. Rows held back and fields kept as
+  this replica's own on resuming count too.
+- `Replica::files_to_claim` names the files rows held back and fields kept as this replica's
+  own show, which a device claims before it reports that it has settled.
+- `Applied::files`, and `Collected::files` of a step or of `collect_reported`,
+  `install_reported` and `resume_reported`, say which files the operation made the state refer
+  to (to fetch) and which contents nothing refers to any more (to consider retiring).
+- `Replica::nothing_pending` says whether the state is exactly what the replica has merged, with
+  nothing of its own pending; a device retires only while it holds, with `through` the last
+  envelope it merged. A device that skipped, refused or stepped past an envelope at or below
+  `through` holds none of its changes and must not retire with it.
 - Deleting a row does not clear its file fields, which would change what is sent and merged: a
   deleted row refers to its file until the field is written. `Replica::purge_step` clears, in
-  bounded steps, the file fields of entities deleted before a time the application chooses, as
-  local writes sent like any other.
+  bounded steps, the file fields of minted entities deleted before a time the application
+  chooses, as local writes sent like any other, and only where the clearing can never show.
+  Natural collections are left alone, since a row made again at the same key is the same
+  entity again; their deleted rows keep their files.
 
 Values that may be file references are indexed in the kernel's tables, so each of these is a
 few indexed lookups per file and a read of the rows held back, never a scan of the library.
@@ -279,8 +289,8 @@ One chain, each link checked against the one above it:
    protocol's definition gives over the changes it holds under its registry, with its rows held
    back and kept as its own, never fewer than the definition gives under a later registry that
    marks a field it does not know, and changed by each apply, collect and purge only as that
-   operation reports and only through a change that sets a reference (`tests/files.rs` holds the
-   directed cases). The tests read
+   operation reports and only through a change that sets a reference; and no member a purge
+   cleared is live once everything is exchanged (`tests/files.rs` holds the directed cases). The tests read
    the kernel only through `Replica::inspect` and the public lookups, so they hold any
    implementation to the same account, and `Registry::model_schema` gives the model's schema; a
    registry the model cannot answer for is refused. Random scripts run in `tests/property.rs`,

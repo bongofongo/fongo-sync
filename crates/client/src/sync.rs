@@ -966,12 +966,10 @@ impl<A: Apply> Steps<'_, A> {
             self.committed(began);
             left = left.saturating_sub(collected.rows.max(1));
             if !collected.touched.is_empty() {
-                let applied = Applied {
-                    touched: collected.touched,
-                    waiting: report.applied.waiting,
-                    held: report.applied.held.clone(),
-                    ..Applied::default()
-                };
+                let mut applied = Applied::default();
+                applied.touched = collected.touched;
+                applied.waiting = report.applied.waiting;
+                applied.held = report.applied.held.clone();
                 merge_applied(&mut report.applied, applied);
             }
             if !collected.more {
@@ -1710,18 +1708,17 @@ mod tests {
     }
 
     fn touched(entries: &[(&str, u8, bool)]) -> Applied {
-        Applied {
-            touched: entries
-                .iter()
-                .map(|&(key, gid, deleted)| Touched {
-                    collection: "books".into(),
-                    key: key.into(),
-                    gid: Gid([gid; 16]),
-                    deleted,
-                })
-                .collect(),
-            ..Applied::default()
-        }
+        let mut applied = Applied::default();
+        applied.touched = entries
+            .iter()
+            .map(|&(key, gid, deleted)| Touched {
+                collection: "books".into(),
+                key: key.into(),
+                gid: Gid([gid; 16]),
+                deleted,
+            })
+            .collect();
+        applied
     }
 
     #[test]
@@ -1803,12 +1800,13 @@ mod tests {
                 &[(1, "m1", "t2"), (1, "m1", "t2")],
             ),
         ];
-        let applied = |list: &[(u8, &str, &str)]| Applied {
-            conflicts: list
+        let applied = |list: &[(u8, &str, &str)]| {
+            let mut applied = Applied::default();
+            applied.conflicts = list
                 .iter()
                 .map(|&(gid, local, remote)| conflict(gid, local, remote))
-                .collect(),
-            ..Applied::default()
+                .collect();
+            applied
         };
         for (first, second, want) in cases {
             let mut report = Applied::default();

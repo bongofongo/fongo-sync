@@ -1353,6 +1353,8 @@ async fn a_sync_refuses_a_database_not_installed_or_of_layout_three() {
                 "DROP TABLE fongo_found",
                 "DROP INDEX fongo_shadow_files",
                 "DROP INDEX fongo_foreign_files",
+                "DROP INDEX fongo_pins_files",
+                "ALTER TABLE fongo_pins DROP COLUMN shown",
                 "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
             ][..],
             "OlderLayout { found: 3, known: 5 }",
@@ -1377,5 +1379,58 @@ async fn a_sync_refuses_a_database_not_installed_or_of_layout_three() {
         peer.replica.install(&mut peer.conn).await.unwrap();
         peer.sync(&server).await.unwrap();
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Uninstalling removes the client's tables with the kernel's, so no cursor says the log was
+/// merged through a point the kernel's state no longer holds: after installing again, the
+/// cursor is 0 and the next sync reads the whole log again.
+#[tokio::test]
+async fn an_uninstall_leaves_no_cursor_past_what_the_kernel_holds() {
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let dir = scratch("reinstalled");
+    let mut peer = Peer::new_at(&dir.join("peer.db"), made).await;
+    peer.run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peer.sync(&server).await.unwrap();
+    assert!(peer.cursor().await > 0);
+    peer.replica.uninstall(&mut peer.conn).await.unwrap();
+    assert!(
+        peer.lines("SELECT name FROM sqlite_master WHERE name LIKE 'fongo%'")
+            .await
+            .is_empty()
+    );
+    assert_eq!(peer.cursor().await, 0);
+    peer.replica.install(&mut peer.conn).await.unwrap();
+    assert_eq!(peer.cursor().await, 0);
+    let report = peer.sync(&server).await.unwrap();
+    assert!(report.received > 0, "{report:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Kernel tables dropped by hand leave the client's behind; the install that lays the kernel's
+/// down afresh removes them too, so their cursor does not outlive the state it stood for.
+#[tokio::test]
+async fn a_fresh_install_removes_client_tables_left_without_the_kernel() {
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let dir = scratch("kernel-dropped");
+    let mut peer = Peer::new_at(&dir.join("peer.db"), made).await;
+    peer.run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peer.sync(&server).await.unwrap();
+    assert!(peer.cursor().await > 0);
+    for table in peer
+        .lines(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fongo%'
+              AND name NOT LIKE 'fongo_client%'",
+        )
+        .await
+    {
+        peer.run(&format!("DROP TABLE \"{table}\"")).await;
+    }
+    peer.replica.install(&mut peer.conn).await.unwrap();
+    assert_eq!(peer.cursor().await, 0);
     let _ = std::fs::remove_dir_all(dir);
 }

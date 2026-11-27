@@ -11,13 +11,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_sqlite::core::{Change, Gid, Hlc, Strategy, Value, wins};
-use fongo_sync_sqlite::{FileChanges, FileRef, FilesFrom, Registry, Replica};
+use fongo_sync_sqlite::{ContentHash, FileChanges, FileRef, FilesFrom, Registry, Replica};
 use sqlx::SqliteConnection;
 
 use super::{key_columns, quoted, rows};
 
-/// Encoded references, the form the replica orders them in.
-pub type Files = BTreeSet<Vec<u8>>;
+/// Contents, by hash: a server names a file by its hash alone, so the questions are about
+/// hashes.
+pub type Files = BTreeSet<ContentHash>;
 
 /// What a replica reports: every file, and those a declared field among the changes held or a
 /// row held back names.
@@ -27,9 +28,9 @@ pub struct Reported {
     pub named: Files,
 }
 
-fn bytes(value: &Value) -> Option<Vec<u8>> {
+fn bytes(value: &Value) -> Option<ContentHash> {
     match value {
-        Value::Blob(b) if FileRef::decode(b).is_ok() => Some(b.clone()),
+        Value::Blob(b) => FileRef::decode(b).ok().map(|f| f.hash),
         _ => None,
     }
 }
@@ -55,13 +56,14 @@ pub fn referred(registry: &Registry, changes: &[Change]) -> Files {
     winners.values().filter_map(|(v, _)| bytes(v)).collect()
 }
 
-/// Pages through `files` `limit` at a time, requiring each file once and in order.
+/// Pages through `files` `limit` at a time, requiring each reference once and in order, and one
+/// answer of whether it is declared for every reference to one content.
 pub async fn listed(
     conn: &mut SqliteConnection,
     replica: &Replica,
     limit: usize,
-) -> Result<BTreeMap<Vec<u8>, bool>, String> {
-    let mut out: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
+) -> Result<BTreeMap<ContentHash, bool>, String> {
+    let mut out: BTreeMap<ContentHash, bool> = BTreeMap::new();
     let mut from: Option<FilesFrom> = None;
     let mut last: Option<Vec<u8>> = None;
     loop {
@@ -78,7 +80,12 @@ pub async fn listed(
                 return Err("files listed out of order or twice".into());
             }
             last = Some(b.clone());
-            out.insert(b, r.declared);
+            if out
+                .insert(r.file.hash, r.declared)
+                .is_some_and(|d| d != r.declared)
+            {
+                return Err("two references to one content listed as declared and not".into());
+            }
         }
         match page.next {
             Some(next) => from = Some(next),
@@ -140,14 +147,14 @@ pub async fn check(
     let declared: Files = listed
         .iter()
         .filter(|(_, d)| **d)
-        .map(|(b, _)| b.clone())
+        .map(|(b, _)| *b)
         .collect();
-    let held: Files = replica
-        .held_files(conn)
+    let claimed: Files = replica
+        .files_to_claim(conn)
         .await
         .map_err(|e| e.to_string())?
         .iter()
-        .map(FileRef::encode)
+        .map(|f| f.hash)
         .collect();
     let inspection = replica.inspect(conn).await.map_err(|e| e.to_string())?;
     let pinned_cells: BTreeSet<(String, String, String)> =
@@ -169,18 +176,18 @@ pub async fn check(
     }
     let shown_held = shown(conn, replica, &held_rows, None).await;
     let exact = referred(replica.registry(), seen);
-    let name = |f: &Files| -> Vec<String> {
-        f.iter()
-            .map(|b| format!("{:?}", FileRef::decode(b).unwrap().hash))
-            .collect()
-    };
-    if !held.is_subset(&shown_held) {
+    let name = |f: &Files| -> Vec<String> { f.iter().map(|h| format!("{h:?}")).collect() };
+    let mut shown_apart = shown_held.clone();
+    shown_apart.extend(pinned.iter().copied());
+    if !claimed.is_subset(&shown_apart) || !pinned.is_subset(&claimed) {
         return Err(format!(
-            "held_files names {:?}, rows held back show {:?}",
-            name(&held),
-            name(&shown_held)
+            "files_to_claim names {:?}, rows held back show {:?} and fields kept {:?}",
+            name(&claimed),
+            name(&shown_held),
+            name(&pinned)
         ));
     }
+    let held: Files = claimed.intersection(&shown_held).copied().collect();
     if !exact.is_subset(&declared) {
         return Err(format!(
             "the changes held refer to {:?}, declared as referred are {:?}",
@@ -218,18 +225,16 @@ pub async fn check(
             ));
         }
     }
-    let mut asked: Vec<Vec<u8>> = carried(seen).into_iter().collect();
-    asked.push(FileRef::of(b"held by nobody").encode());
-    let files: Vec<FileRef> = asked.iter().map(|b| FileRef::decode(b).unwrap()).collect();
+    let mut asked: Vec<ContentHash> = carried(seen).into_iter().collect();
+    asked.push(FileRef::of(b"held by nobody").hash);
     let answers = replica
-        .refers(conn, &files)
+        .refers(conn, &asked)
         .await
         .map_err(|e| e.to_string())?;
-    for (b, refers) in asked.iter().zip(answers) {
-        if refers != all.contains(b) {
+    for (h, refers) in asked.iter().zip(answers) {
+        if refers != all.contains(h) {
             return Err(format!(
-                "refers says {refers} of {:?}, the list says otherwise",
-                name(&Files::from([b.clone()]))
+                "refers says {refers} of {h:?}, the list says otherwise"
             ));
         }
     }
@@ -248,8 +253,8 @@ pub fn reported(
     did: &FileChanges,
     brought: Option<&Files>,
 ) -> Result<(), String> {
-    let set = |files: &[FileRef]| -> Files { files.iter().map(FileRef::encode).collect() };
-    let (added, dropped) = (set(&did.added), set(&did.dropped));
+    let added: Files = did.added.iter().map(|f| f.hash).collect();
+    let dropped: Files = did.dropped.iter().copied().collect();
     let newly: Files = after.named.difference(&before.named).cloned().collect();
     if added != newly {
         return Err(format!(

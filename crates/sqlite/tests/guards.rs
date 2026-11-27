@@ -292,6 +292,7 @@ enum Call {
     Files,
     Refers,
     HeldFiles,
+    NothingPending,
     PurgeStep,
 }
 
@@ -321,6 +322,7 @@ const CALLS: &[Call] = &[
     Call::Files,
     Call::Refers,
     Call::HeldFiles,
+    Call::NothingPending,
     Call::PurgeStep,
 ];
 
@@ -384,10 +386,11 @@ async fn call(call: Call, replica: &Replica, conn: &mut SqliteConnection) -> Str
         Call::Inspect => replica.inspect(conn).await.map(|_| String::new()),
         Call::Files => replica.files(conn, None, 10).await.map(|_| String::new()),
         Call::Refers => replica
-            .refers(conn, &[fongo_sync_sqlite::FileRef::of(b"Middlemarch")])
+            .refers(conn, &[fongo_sync_sqlite::FileRef::of(b"Middlemarch").hash])
             .await
             .map(|_| String::new()),
-        Call::HeldFiles => replica.held_files(conn).await.map(|_| String::new()),
+        Call::HeldFiles => replica.files_to_claim(conn).await.map(|_| String::new()),
+        Call::NothingPending => replica.nothing_pending(conn).await.map(|v| v.to_string()),
         Call::PurgeStep => replica
             .purge_step(conn, u64::MAX, None, 10)
             .await
@@ -474,11 +477,15 @@ async fn laid(state: Laid) -> (SqliteConnection, Replica) {
             "DROP TABLE fongo_found",
             "DROP INDEX fongo_shadow_files",
             "DROP INDEX fongo_foreign_files",
+            "DROP INDEX fongo_pins_files",
+            "ALTER TABLE fongo_pins DROP COLUMN shown",
             "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
         ],
         Laid::OlderFour => &[
             "DROP INDEX fongo_shadow_files",
             "DROP INDEX fongo_foreign_files",
+            "DROP INDEX fongo_pins_files",
+            "ALTER TABLE fongo_pins DROP COLUMN shown",
             "UPDATE fongo_meta SET value = 4 WHERE key = 'layout'",
         ],
         Laid::Unknown => &["UPDATE fongo_meta SET value = 2 WHERE key = 'layout'"],
@@ -514,6 +521,7 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
         Laid::Installed => match call {
             Installed | Suspended => (format!("Ok({})", call == Installed), true),
             UncollectedRows => ("Ok(1)".into(), true),
+            NothingPending => ("Ok(false)".into(), true),
             _ => ok(read),
         },
         Laid::Suspended | Laid::TriggersLost | Laid::OddFlag => match call {
@@ -521,6 +529,7 @@ fn expected(state: Laid, call: Call) -> (String, bool) {
                 refused("Suspended")
             }
             Installed | Suspended => ("Ok(true)".into(), true),
+            NothingPending => ("Ok(false)".into(), true),
             // Without a record, suspending records one.
             Suspend => ok(!matches!(state, Laid::TriggersLost)),
             _ => ok(read),
@@ -874,6 +883,8 @@ async fn capture_lost_without_a_record_is_resumed_as_a_suspension() {
             if layout < 5 {
                 run(&mut c, "DROP INDEX fongo_shadow_files").await;
                 run(&mut c, "DROP INDEX fongo_foreign_files").await;
+                run(&mut c, "DROP INDEX fongo_pins_files").await;
+                run(&mut c, "ALTER TABLE fongo_pins DROP COLUMN shown").await;
                 run(
                     &mut c,
                     &format!("UPDATE fongo_meta SET value = {layout} WHERE key = 'layout'"),

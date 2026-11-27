@@ -648,6 +648,8 @@ fn layouts_three_and_four_are_upgraded_in_place() {
             let mut downgrade = vec![
                 "DROP INDEX fongo_shadow_files",
                 "DROP INDEX fongo_foreign_files",
+                "DROP INDEX fongo_pins_files",
+                "ALTER TABLE fongo_pins DROP COLUMN shown",
                 set.as_str(),
             ];
             if layout == 3 {
@@ -672,12 +674,13 @@ fn layouts_three_and_four_are_upgraded_in_place() {
             assert_eq!(now, 5);
             let objects: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM sqlite_master WHERE name IN ('fongo_found', 'fongo_found_batch',
-                    'fongo_dirty_order', 'fongo_shadow_files', 'fongo_foreign_files')",
+                    'fongo_dirty_order', 'fongo_shadow_files', 'fongo_foreign_files',
+                    'fongo_pins_files')",
             )
             .fetch_one(&mut a)
             .await
             .unwrap();
-            assert_eq!(objects, 5);
+            assert_eq!(objects, 6);
             replica.collect(&mut a).await.unwrap();
             let after = (
                 replica.outbox(&mut a, u32::MAX).await.unwrap().changes,

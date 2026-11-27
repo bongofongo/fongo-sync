@@ -1,43 +1,48 @@
 //! The files the changes a replica holds name, read from the facts by the indexes of values that
 //! may be file references (see [`crate::store::TABLES`]). Nothing here decides anything a merge
 //! decides: what refers to a file is read from what merging kept.
+//!
+//! A server stores a file under a name derived from its content hash alone, so every answer here
+//! is about a content hash: a file is referred to while any value held names that hash, at any
+//! size.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::{Change, DELETED, Gid, Strategy, Value, wins};
-use fongo_sync_protocol::FileRef;
+use fongo_sync_protocol::{ContentHash, FILE_REF_FORMAT, FileRef};
 use sqlx::SqliteConnection;
 
 use crate::db::{Db, as_gid, as_text, loaded};
 use crate::error::{Error, Result};
-use crate::registry::{Collection, Kind, file_of};
+use crate::registry::{Collection, Key, Kind, file_of};
 use crate::replica::{Ctx, Replica, rows_of, with_db};
 use crate::store::{Facts, MAY_NAME_A_FILE, as_clock, state};
 use crate::tables::read_row;
 
-/// What an operation did to the files this replica refers to, each list in the order of the
-/// references' encoded bytes.
+/// What an operation did to the files this replica refers to, as [`Replica::refers`] counts them,
+/// by content hash.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileChanges {
-    /// Files that a field declared as naming files refers to after the operation, among the
-    /// changes held or in a row held back, and did not before it: files to fetch. A file a field
-    /// kept as this replica's own on resuming showed already may be among them.
+    /// References to contents that a field declared as naming files, among the changes held or
+    /// in a row held back, names after the operation and none did before it: files to fetch.
+    /// Every reference the operation met to such a content is listed, in the order of their
+    /// encoded bytes, so one content met at two sizes is listed twice. A content a field kept as
+    /// this replica's own on resuming showed already may be among them.
     pub added: Vec<FileRef>,
-    /// Files that the state referred to before the operation, as [`Replica::refers`] counts, and
-    /// does not after it: files to consider retiring. Every such file that a field declared as
-    /// naming files or a row held back named before the operation is reported; one that only
-    /// data this registry cannot interpret, or a field kept as this replica's own, named may not
-    /// be.
-    pub dropped: Vec<FileRef>,
+    /// Contents that the state referred to before the operation, at any size, and does not after
+    /// it: files to consider retiring. Every such content that a field declared as naming files
+    /// or a row held back named before the operation is reported; one that only data this
+    /// registry cannot interpret, or a field kept as this replica's own, named may not be.
+    pub dropped: Vec<ContentHash>,
 }
 
-/// One file of [`Replica::files`].
+/// One reference of [`Replica::files`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Referred {
     pub file: FileRef,
     /// Whether a field this registry declares as naming files, among the changes held or in a
-    /// row held back or kept as this replica's own, names it; otherwise only data this registry
-    /// cannot interpret may.
+    /// row held back or kept as this replica's own, names this content at any size; otherwise
+    /// only data this registry cannot interpret may.
     pub declared: bool,
 }
 
@@ -73,73 +78,147 @@ pub struct Purged {
     pub files: FileChanges,
 }
 
-/// Whether, when an operation first met a file, something held referred to it: a field declared
-/// as naming files or a row held back (`declared`), or anything at all (`any`).
-#[derive(Debug, Clone, Copy)]
+/// What, when an operation first met a content, referred to it: a field declared as naming files
+/// or a row held back (`declared`), or anything at all (`any`); and the references to it met.
+#[derive(Debug, Clone)]
 struct Seen {
     declared: bool,
     any: bool,
+    met: BTreeSet<Vec<u8>>,
 }
 
-/// The files an operation met, each with what referred to it before the operation touched it.
-#[derive(Default)]
+/// The contents an operation met, each with what referred to it before the operation touched it,
+/// and the fields of the registry of the operation, which an adoption under an older registry
+/// still answers to.
 pub(crate) struct FileWatch {
-    seen: BTreeMap<Vec<u8>, Seen>,
+    fields: BTreeSet<(String, String)>,
+    seen: BTreeMap<ContentHash, Seen>,
 }
 
-fn bytes_of(value: &Value) -> Option<&[u8]> {
-    match value {
-        Value::Blob(bytes) if FileRef::decode(bytes).is_ok() => Some(bytes),
-        _ => None,
+impl FileWatch {
+    fn names_files(&self, change: &Change) -> bool {
+        self.fields
+            .contains(&(change.collection.clone(), change.field.clone()))
     }
 }
 
-/// Whether any value held, of any collection and field, is `bytes`.
-fn held_anywhere(db: &Db, bytes: &[u8]) -> Result<bool> {
+/// The content a value names, if it is an encoded [`FileRef`].
+fn hash_of(value: &Value) -> Option<ContentHash> {
+    file_of(value).map(|f| f.hash)
+}
+
+/// The encoded references to `hash`, of any size, are those from the first value to before the
+/// second.
+fn span(hash: &ContentHash) -> (Value, Value) {
+    let mut from = Vec::with_capacity(33);
+    from.push(FILE_REF_FORMAT);
+    from.extend_from_slice(&hash.0);
+    let mut to = from.clone();
+    for b in to.iter_mut().rev() {
+        let (next, carry) = b.overflowing_add(1);
+        *b = next;
+        if !carry {
+            break;
+        }
+    }
+    (Value::Blob(from), Value::Blob(to))
+}
+
+/// The values read of one content before the answer is taken to be yes: a value that begins
+/// as a reference to it and is not one is kept only where something wrote it on purpose.
+const AT_MOST: i64 = 16;
+
+/// Whether `rows`, values that begin as references to one content, name it: one of them is a
+/// reference, or there are too many to tell.
+fn names(rows: &[Vec<Value>]) -> bool {
+    rows.len() as i64 >= AT_MOST || rows.iter().any(|r| file_of(&r[0]).is_some())
+}
+
+/// Whether any value held, of any collection and field, names `hash`.
+fn held_anywhere(db: &Db, hash: &ContentHash) -> Result<bool> {
+    let (from, to) = span(hash);
     for table in [
         "fongo_shadow INDEXED BY fongo_shadow_files",
         "fongo_foreign INDEXED BY fongo_foreign_files",
     ] {
         let found = db.query(
-            &format!("SELECT 1 FROM {table} WHERE value = ?1 AND {MAY_NAME_A_FILE} LIMIT 1"),
-            &[Value::Blob(bytes.to_vec())],
+            &format!(
+                "SELECT DISTINCT value FROM {table}
+                  WHERE value >= ?1 AND value < ?2 AND {MAY_NAME_A_FILE} LIMIT {AT_MOST}"
+            ),
+            &[from.clone(), to.clone()],
         )?;
-        if !found.is_empty() {
+        if names(&found) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
+/// Whether the entry kept of one of `fields` names `hash`, for some entity.
+fn declared_holds<'f>(
+    db: &Db,
+    fields: impl IntoIterator<Item = (&'f str, &'f str)>,
+    hash: &ContentHash,
+) -> Result<bool> {
+    let (from, to) = span(hash);
+    for (collection, field) in fields {
+        let found = db.query(
+            &format!(
+                "SELECT DISTINCT value FROM fongo_shadow INDEXED BY fongo_shadow_value
+                  WHERE collection = ?1 AND field = ?2 AND value >= ?3 AND value < ?4
+                    AND is_ref = 0 LIMIT {AT_MOST}"
+            ),
+            &[
+                Value::Text(collection.into()),
+                Value::Text(field.into()),
+                from.clone(),
+                to.clone(),
+            ],
+        )?;
+        if names(&found) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+const PINNED: &str = "shown >= x'01' AND shown < x'02'";
+
 impl Replica {
-    fn file_set(&self) -> BTreeSet<(&str, &str)> {
-        self.registry.file_fields().into_iter().collect()
+    fn file_set(&self) -> BTreeSet<(String, String)> {
+        self.registry
+            .file_fields()
+            .into_iter()
+            .map(|(c, f)| (c.to_string(), f.to_string()))
+            .collect()
     }
 
-    /// Whether the entry kept of a field declared as naming files is `bytes`, for some entity.
-    fn declared_holds(&self, db: &Db, bytes: &[u8]) -> Result<bool> {
-        for (collection, field) in self.registry.file_fields() {
-            let found = db.query(
-                "SELECT 1 FROM fongo_shadow INDEXED BY fongo_shadow_value
-                  WHERE collection = ?1 AND field = ?2 AND value = ?3 AND is_ref = 0 LIMIT 1",
-                &[
-                    Value::Text(collection.into()),
-                    Value::Text(field.into()),
-                    Value::Blob(bytes.to_vec()),
-                ],
-            )?;
-            if !found.is_empty() {
+    /// Whether a field kept as this replica's own on resuming, declared as naming files, shows
+    /// `hash`.
+    fn pinned_holds(&self, db: &Db, hash: &ContentHash) -> Result<bool> {
+        let (from, to) = span(hash);
+        let mut read = 0;
+        for r in db.query(
+            &format!(
+                "SELECT shown, collection, field FROM fongo_pins INDEXED BY fongo_pins_files
+                  WHERE shown >= ?1 AND shown < ?2 AND {PINNED} LIMIT {AT_MOST}"
+            ),
+            &[from, to],
+        )? {
+            read += 1;
+            if file_of(&r[0]).is_some() && self.registry.is_file(as_text(&r[1])?, as_text(&r[2])?) {
                 return Ok(true);
             }
         }
-        Ok(false)
+        Ok(read >= AT_MOST)
     }
 
-    /// The files the rows of entities held back show in fields declared as naming files.
-    fn held_back(&self, db: &Db) -> Result<BTreeSet<Vec<u8>>> {
-        let mut out = BTreeSet::new();
+    /// Calls `each` with every reference the rows of entities held back show in fields declared
+    /// as naming files. Reads every row held back.
+    fn held_back(&self, db: &Db, mut each: impl FnMut(Vec<u8>)) -> Result<()> {
         if self.registry.file_fields().is_empty() {
-            return Ok(out);
+            return Ok(());
         }
         for r in db.query("SELECT collection, gid FROM fongo_held", &[])? {
             let name = as_text(&r[0])?;
@@ -151,94 +230,68 @@ impl Replica {
                 continue;
             }
             for (key, _) in rows_of(db, name, as_gid(&r[1])?)? {
-                self.row_files(db, c, &key, None, &mut out)?;
-            }
-        }
-        Ok(out)
-    }
-
-    /// The files fields kept as this replica's own on resuming show, of those declared as naming
-    /// files.
-    fn pinned(&self, db: &Db) -> Result<BTreeSet<Vec<u8>>> {
-        let mut out = BTreeSet::new();
-        if self.registry.file_fields().is_empty()
-            || db
-                .query("SELECT 1 FROM fongo_pins LIMIT 1", &[])?
-                .is_empty()
-        {
-            return Ok(out);
-        }
-        for r in db.query("SELECT collection, key, field FROM fongo_pins", &[])? {
-            let (name, key, field) = (as_text(&r[0])?, as_text(&r[1])?, as_text(&r[2])?);
-            if let Some(idx) = self.registry.index(name)
-                && self.registry.is_file(name, field)
-            {
-                self.row_files(db, self.collection(idx), key, Some(field), &mut out)?;
-            }
-        }
-        Ok(out)
-    }
-
-    /// The files the row at `key` shows in its fields declared as naming files, or in `only`.
-    fn row_files(
-        &self,
-        db: &Db,
-        c: &Collection,
-        key: &str,
-        only: Option<&str>,
-        out: &mut BTreeSet<Vec<u8>>,
-    ) -> Result<()> {
-        let Some(row) = read_row(db, c, key)? else {
-            return Ok(());
-        };
-        for f in &c.fields {
-            if matches!(f.kind, Kind::File)
-                && only.is_none_or(|o| o == f.name)
-                && let Some(bytes) = row.get(&f.name).and_then(bytes_of)
-            {
-                out.insert(bytes.to_vec());
+                let Some(row) = read_row(db, c, &key)? else {
+                    continue;
+                };
+                for f in c.fields.iter().filter(|f| matches!(f.kind, Kind::File)) {
+                    if let Some(file) = row.get(&f.name).and_then(file_of) {
+                        each(file.encode());
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn held_hashes(&self, db: &Db) -> Result<BTreeSet<ContentHash>> {
+        let mut out = BTreeSet::new();
+        self.held_back(db, |b| {
+            if let Ok(f) = FileRef::decode(&b) {
+                out.insert(f.hash);
+            }
+        })?;
+        Ok(out)
     }
 
     /// Begins watching what an operation does to the files referred to, when any field names
-    /// files.
+    /// files. Every operation that merges begins so: a local write is checked against the
+    /// fields this registry declares as naming files only while it watches.
     pub(crate) fn watch_files(&self, cx: &mut Ctx) -> Result<()> {
-        if self.registry.file_fields().is_empty() {
+        let fields = self.file_set();
+        if fields.is_empty() {
             return Ok(());
         }
         let seen = self
-            .held_back(cx.db)?
+            .held_hashes(cx.db)?
             .into_iter()
-            .map(|bytes| {
+            .map(|hash| {
                 let seen = Seen {
                     declared: true,
                     any: true,
+                    met: BTreeSet::new(),
                 };
-                (bytes, seen)
+                (hash, seen)
             })
             .collect();
-        cx.files = Some(FileWatch { seen });
+        cx.files = Some(FileWatch { fields, seen });
         Ok(())
     }
 
-    /// Refuses local changes that put anything but a file reference or NULL in a field that
-    /// names files.
-    pub(crate) fn only_files(&self, db: &Db, changes: &[Change]) -> Result<()> {
-        let files = self.file_set();
-        if files.is_empty() {
+    /// Refuses local changes that put anything but a file reference or NULL in a field the
+    /// operation's registry declares as naming files.
+    pub(crate) fn only_files(&self, cx: &Ctx, changes: &[Change]) -> Result<()> {
+        let Some(watch) = &cx.files else {
             return Ok(());
-        }
+        };
         for change in changes {
-            if files.contains(&(change.collection.as_str(), change.field.as_str()))
+            if watch.names_files(change)
                 && change.value != Value::Null
                 && file_of(&change.value).is_none()
             {
                 return Err(Error::NotAFile {
                     collection: change.collection.clone(),
                     field: change.field.clone(),
-                    key: rows_of(db, &change.collection, change.gid)?
+                    key: rows_of(cx.db, &change.collection, change.gid)?
                         .into_iter()
                         .next()
                         .map(|(k, _)| k),
@@ -253,30 +306,39 @@ impl Replica {
         let Some(watch) = &cx.files else {
             return Ok(());
         };
-        let Some(bytes) = bytes_of(&change.value) else {
+        let (Some(file), true) = (file_of(&change.value), watch.names_files(change)) else {
             return Ok(());
         };
-        if watch.seen.contains_key(bytes)
-            || !self.registry.is_file(&change.collection, &change.field)
-        {
-            return Ok(());
+        if !watch.seen.contains_key(&file.hash) {
+            let fields = watch.fields.iter().map(|(c, f)| (c.as_str(), f.as_str()));
+            let declared = declared_holds(cx.db, fields, &file.hash)?;
+            let any = declared
+                || held_anywhere(cx.db, &file.hash)?
+                || self.pinned_holds(cx.db, &file.hash)?;
+            let seen = Seen {
+                declared,
+                any,
+                met: BTreeSet::new(),
+            };
+            if let Some(watch) = &mut cx.files {
+                watch.seen.insert(file.hash, seen);
+            }
         }
-        let declared = self.declared_holds(cx.db, bytes)?;
-        let any = declared || held_anywhere(cx.db, bytes)?;
-        if let Some(watch) = &mut cx.files {
-            watch.seen.insert(bytes.to_vec(), Seen { declared, any });
+        if let Some(seen) = cx.files.as_mut().and_then(|w| w.seen.get_mut(&file.hash)) {
+            seen.met.insert(file.encode());
         }
         Ok(())
     }
 
     /// Notes a file a kept fact replaced in a field naming files: it was referred to until then.
     pub(crate) fn saw_replaced(&self, cx: &mut Ctx, change: &Change, replaced: &Value) {
-        if let (Some(watch), Some(bytes)) = (&mut cx.files, bytes_of(replaced))
-            && self.registry.is_file(&change.collection, &change.field)
+        if let (Some(watch), Some(hash)) = (&mut cx.files, hash_of(replaced))
+            && watch.names_files(change)
         {
-            watch.seen.entry(bytes.to_vec()).or_insert(Seen {
+            watch.seen.entry(hash).or_insert(Seen {
                 declared: true,
                 any: true,
+                met: BTreeSet::new(),
             });
         }
     }
@@ -287,39 +349,41 @@ impl Replica {
             return Ok(FileChanges::default());
         };
         let db = cx.db;
-        let held = self.held_back(db)?;
+        let held = self.held_hashes(db)?;
+        let fields: Vec<(&str, &str)> = self.registry.file_fields();
         let mut out = FileChanges::default();
-        // Read only when a file would drop: a field kept as this replica's own may still show it.
-        let mut pinned: Option<BTreeSet<Vec<u8>>> = None;
-        for (bytes, before) in watch.seen {
-            let declared = held.contains(&bytes) || self.declared_holds(db, &bytes)?;
-            let mut any = declared || held_anywhere(db, &bytes)?;
-            if before.any && !any {
-                if pinned.is_none() {
-                    pinned = Some(self.pinned(db)?);
-                }
-                any = pinned.as_ref().is_some_and(|p| p.contains(&bytes));
-            }
-            let file = FileRef::decode(&bytes)
-                .map_err(|_| Error::Corrupt("a file reference does not decode".into()))?;
+        for (hash, before) in watch.seen {
+            let declared = held.contains(&hash) || declared_holds(db, fields.clone(), &hash)?;
+            let any = declared || held_anywhere(db, &hash)? || self.pinned_holds(db, &hash)?;
             if declared && !before.declared {
-                out.added.push(file);
+                for b in &before.met {
+                    if let Ok(file) = FileRef::decode(b) {
+                        out.added.push(file);
+                    }
+                }
             }
             if before.any && !any {
-                out.dropped.push(file);
+                out.dropped.push(hash);
             }
         }
+        out.added.sort_by_key(FileRef::encode);
         Ok(out)
     }
 
-    /// The files the changes this replica holds may refer to, in pages of at most `limit`, in
-    /// the order of their encoded references, each once; see [`Replica::refers`] for what counts.
-    /// `from` is the [`FilePage::next`] of the page before, `None` for the first.
+    /// Every reference the changes this replica holds may refer to, in pages of at most `limit`,
+    /// in the order of their encoded bytes, each once; see [`Replica::refers`] for what counts.
+    /// One content held at two sizes is listed twice, next to each other: whether it is referred
+    /// to is a question about its hash. `from` is the [`FilePage::next`] of the page before, `None`
+    /// for the first.
     ///
-    /// A page reads at most `limit` distinct values in each of the two indexes of values that may
-    /// name files, looks each file it returns up in every field declared as naming files, and
-    /// reads the rows held back and the fields kept as this replica's own; it reads nothing else.
-    /// A read that writes nothing; it answers while capture is suspended too.
+    /// A page reads at most `limit` values from each of the indexes of values held and fields kept
+    /// as this replica's own that may name files, starting at `from`, so each page costs the same
+    /// wherever it starts; looks each content it returns up in every field declared as naming
+    /// files; and reads every row held back, keeping at most `limit` of what they show. The pages
+    /// are not a snapshot: a page reflects the state when it is read, and what was written
+    /// between pages may be listed or missed. A read that writes nothing. It answers while
+    /// capture is suspended, when what the application wrote meanwhile is not known: see
+    /// [`Replica::nothing_pending`].
     pub async fn files(
         &self,
         conn: &mut SqliteConnection,
@@ -338,10 +402,24 @@ impl Replica {
     fn files_in(&self, db: &Db, from: Option<&FilesFrom>, limit: usize) -> Result<FilePage> {
         let after = from.map(|f| f.0.clone()).unwrap_or_default();
         let n = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut candidates: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
-        // Each index is read up to `limit` values: past the least last value of one that had
+        let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
+        // Each source is read up to `limit` values: past the least last value of one that had
         // more, what the others hold may be missing from the page.
         let mut bound: Option<Vec<u8>> = None;
+        let mut cut = |rows: Vec<Vec<Value>>, candidates: &mut BTreeSet<Vec<u8>>| {
+            let full = rows.len() == limit;
+            let mut last = None;
+            for r in rows {
+                if let Value::Blob(bytes) = &r[0] {
+                    candidates.insert(bytes.clone());
+                    last = Some(bytes.clone());
+                }
+            }
+            if full && let Some(last) = last {
+                bound = Some(bound.take().map_or(last.clone(), |b: Vec<u8>| b.min(last)));
+            }
+        };
+        // The cursor comes first: SQLite bounds the range by the first lower bound it is given.
         for table in [
             "fongo_shadow INDEXED BY fongo_shadow_files",
             "fongo_foreign INDEXED BY fongo_foreign_files",
@@ -349,40 +427,77 @@ impl Replica {
             let rows = db.query(
                 &format!(
                     "SELECT DISTINCT value FROM {table}
-                      WHERE {MAY_NAME_A_FILE} AND value > ?1 ORDER BY value LIMIT ?2"
+                      WHERE value > ?1 AND {MAY_NAME_A_FILE} ORDER BY value LIMIT ?2"
                 ),
                 &[Value::Blob(after.clone()), Value::Int(n)],
             )?;
-            let cut = rows.len() == limit;
-            let mut last = None;
-            for r in rows {
-                if let Value::Blob(bytes) = &r[0] {
-                    candidates.entry(bytes.clone()).or_insert(false);
-                    last = Some(bytes.clone());
+            cut(rows, &mut candidates);
+        }
+        let mut pinned = Vec::new();
+        for r in db.query(
+            &format!(
+                "SELECT shown, collection, field FROM fongo_pins INDEXED BY fongo_pins_files
+                  WHERE shown > ?1 AND {PINNED} ORDER BY shown LIMIT ?2"
+            ),
+            &[Value::Blob(after.clone()), Value::Int(n)],
+        )? {
+            // Every row read bounds the page, whether or not its field names files.
+            let named = self.registry.is_file(as_text(&r[1])?, as_text(&r[2])?);
+            pinned.push((r, named));
+        }
+        let mut kept = BTreeSet::new();
+        let named: BTreeSet<Vec<u8>> = pinned
+            .iter()
+            .filter(|(_, named)| *named)
+            .filter_map(|(r, _)| match &r[0] {
+                Value::Blob(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        cut(pinned.into_iter().map(|(r, _)| r).collect(), &mut kept);
+        candidates.extend(kept.into_iter().filter(|b| named.contains(b)));
+        // Of the rows held back, only the least `limit` past the cursor are kept.
+        let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
+        self.held_back(db, |b| {
+            if b > after {
+                held.insert(b);
+                if held.len() > limit {
+                    held.pop_last();
                 }
             }
-            if cut && let Some(last) = last {
-                bound = Some(bound.map_or(last.clone(), |b: Vec<u8>| b.min(last)));
-            }
-        }
-        let mut shown = self.held_back(db)?;
-        shown.extend(self.pinned(db)?);
-        for bytes in shown.into_iter().filter(|b| *b > after) {
-            candidates.insert(bytes, true);
-        }
+        })?;
+        candidates.extend(held);
         let mut page = FilePage::default();
         let mut last: Option<Vec<u8>> = None;
         let mut stopped = false;
-        for (bytes, shown) in candidates {
+        for bytes in candidates {
             if page.files.len() == limit || bound.as_ref().is_some_and(|b| bytes > *b) {
                 stopped = true;
                 break;
             }
             if let Ok(file) = FileRef::decode(&bytes) {
-                let declared = shown || self.declared_holds(db, &bytes)?;
-                page.files.push(Referred { file, declared });
+                page.files.push(Referred {
+                    file,
+                    declared: false,
+                });
             }
             last = Some(bytes);
+        }
+        let asked: BTreeSet<ContentHash> = page.files.iter().map(|r| r.file.hash).collect();
+        let mut held_shown = BTreeSet::new();
+        self.held_back(db, |b| {
+            if let Ok(f) = FileRef::decode(&b)
+                && asked.contains(&f.hash)
+            {
+                held_shown.insert(f.hash);
+            }
+        })?;
+        let fields = self.registry.file_fields();
+        for r in &mut page.files {
+            let hash = r.file.hash;
+            r.declared = held_shown.contains(&hash)
+                || declared_holds(db, fields.clone(), &hash)?
+                || self.pinned_holds(db, &hash)?;
         }
         page.next = match (stopped, bound) {
             (true, _) => last.map(FilesFrom),
@@ -392,39 +507,51 @@ impl Replica {
         Ok(page)
     }
 
-    /// Whether this replica's state may refer to each of `files`, in their order. It may when any
-    /// value it holds is the file's encoded reference, whatever the collection and field and
-    /// whether it is a field's winner, or a row it holds back, or a field it keeps as its own on
-    /// resuming, shows the file in a field declared as naming files.
+    /// Whether this replica's state may refer to each content of `hashes`, in their order. It
+    /// may when any value it holds is a reference to the content, at any size, whatever the
+    /// collection and field and whether it is a field's winner, or a row it holds back, or a
+    /// field it keeps as its own on resuming, shows the content in a field declared as naming
+    /// files.
     ///
     /// That is a superset of what the protocol's definition of a set of changes referring to a
     /// file gives for the changes this replica holds (`fongo_sync_protocol::api`, "Deleting
     /// files"), under this registry and under any registry a later version of the application
-    /// has, given that a field once marked as naming files stays so and merged by clock. For a
-    /// field this registry declares as naming files, the entry kept is the field's winner among
-    /// every change held to it. For a field it does not declare, of a collection it does, the
-    /// entry kept is the winner by clock, the same as that field's winner wherever it names
-    /// files. Changes to a collection it does not declare are held whole, every one counted.
-    /// Rows written since the last collect are not read: collect first.
+    /// has, given that a field once marked as naming files stays so in every version that writes
+    /// it, merged by clock and never part of a key. For a field this registry declares as naming
+    /// files, the entry kept is the field's winner among every change held to it. For a field
+    /// it does not declare, of a collection it does, the entry kept is the winner by clock, the
+    /// same as that field's winner wherever it names files. Changes to a collection it does not
+    /// declare are held whole, every one counted.
     ///
-    /// Each file costs two indexed lookups; the call reads the rows held back and the fields
-    /// kept as this replica's own once. A read that writes nothing; it answers while capture is
-    /// suspended too.
+    /// It answers about what this replica holds now: rows written since the last collect are
+    /// not read, and while capture is suspended what the application wrote meanwhile is not
+    /// known. A device retires a file only when [`Replica::nothing_pending`] holds.
+    ///
+    /// Each content costs a few indexed lookups; the call reads every row held back once. A read
+    /// that writes nothing.
     pub async fn refers(
         &self,
         conn: &mut SqliteConnection,
-        files: &[FileRef],
+        hashes: &[ContentHash],
     ) -> Result<Vec<bool>> {
         with_db(conn, |db| {
             db.atomically(|db| {
                 state(db)?.current()?;
-                let mut shown = self.held_back(db)?;
-                shown.extend(self.pinned(db)?);
-                files
+                let asked: BTreeSet<ContentHash> = hashes.iter().copied().collect();
+                let mut shown = BTreeSet::new();
+                self.held_back(db, |b| {
+                    if let Ok(f) = FileRef::decode(&b)
+                        && asked.contains(&f.hash)
+                    {
+                        shown.insert(f.hash);
+                    }
+                })?;
+                hashes
                     .iter()
-                    .map(|file| {
-                        let bytes = file.encode();
-                        Ok(shown.contains(&bytes) || held_anywhere(db, &bytes)?)
+                    .map(|hash| {
+                        Ok(shown.contains(hash)
+                            || held_anywhere(db, hash)?
+                            || self.pinned_holds(db, hash)?)
                     })
                     .collect()
             })
@@ -432,36 +559,89 @@ impl Replica {
         .await
     }
 
-    /// The files that rows this replica holds back show in fields declared as naming files, in
-    /// the order of their encoded references: those a device claims before each report that it
-    /// has settled. Reads every row held back. A read that writes nothing.
-    pub async fn held_files(&self, conn: &mut SqliteConnection) -> Result<Vec<FileRef>> {
+    /// The references that rows this replica holds back, and fields it keeps as its own on
+    /// resuming, show in fields declared as naming files, in the order of their encoded bytes:
+    /// they name files no change this replica holds may set, and a device claims them before
+    /// each report that it has settled. Reads every row held back and every field kept as this
+    /// replica's own that may name a file. A read that writes nothing.
+    pub async fn files_to_claim(&self, conn: &mut SqliteConnection) -> Result<Vec<FileRef>> {
         with_db(conn, |db| {
             db.atomically(|db| {
                 state(db)?.current()?;
-                Ok(self
-                    .held_back(db)?
-                    .iter()
-                    .filter_map(|b| FileRef::decode(b).ok())
-                    .collect())
+                let mut out = BTreeSet::new();
+                self.held_back(db, |b| {
+                    out.insert(b);
+                })?;
+                for r in db.query(
+                    &format!(
+                        "SELECT shown, collection, field FROM fongo_pins INDEXED BY fongo_pins_files
+                          WHERE {PINNED}"
+                    ),
+                    &[],
+                )? {
+                    if let (Value::Blob(b), true) = (
+                        &r[0],
+                        self.registry.is_file(as_text(&r[1])?, as_text(&r[2])?),
+                    ) && FileRef::decode(b).is_ok()
+                    {
+                        out.insert(b.clone());
+                    }
+                }
+                Ok(out.iter().filter_map(|b| FileRef::decode(b).ok()).collect())
+            })
+        })
+        .await
+    }
+
+    /// Whether this replica's state is exactly the changes it has merged with nothing of its
+    /// own pending: capture is not suspended, no row is written and not yet collected, no row a
+    /// first install in steps found waits to be adopted, and the outbox is empty. A device may
+    /// retire a file only while this holds, with `through` the last envelope it has merged, its
+    /// own included; [`Replica::refers`] then answers about exactly the changes through it. A
+    /// few indexed reads; a read that writes nothing.
+    pub async fn nothing_pending(&self, conn: &mut SqliteConnection) -> Result<bool> {
+        with_db(conn, |db| {
+            db.atomically(|db| {
+                if let Err(e) = self.ready(db).and_then(|s| s.current()) {
+                    return match e {
+                        Error::Suspended => Ok(false),
+                        e => Err(e),
+                    };
+                }
+                for sql in [
+                    "SELECT 1 FROM fongo_dirty LIMIT 1",
+                    "SELECT 1 FROM fongo_found WHERE batch >= 0 LIMIT 1",
+                    "SELECT 1 FROM fongo_outbox LIMIT 1",
+                ] {
+                    if !db.query(sql, &[])?.is_empty() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             })
         })
         .await
     }
 
     /// Sets to NULL, as a local write that is sent as any other, each field naming files of
-    /// entities deleted before `before` (milliseconds since the Unix epoch, by the clock of the
-    /// winning deletion), so that they no longer refer to their files. A deleted row keeps
+    /// minted entities deleted before `before` (milliseconds since the Unix epoch, by the clock
+    /// of the winning deletion), so that they no longer refer to their files. A deleted row keeps
     /// referring to its file until then: deleting does not clear it, since what is sent and
     /// merged would change.
     ///
-    /// An entity counts as deleted when its own deletion wins and its group shows no row; none
-    /// of the group's members may have a row here, held back or given up. A row deleted only
-    /// with its owner, which no change deleted itself, is not cleared. Should the entity come back,
-    /// its fields read NULL unless written again after the clearing.
+    /// A clearing never shows: it is written only to a member whose own deletion wins, whose
+    /// group shows no row and none of whose group's members has a row here, held back or given
+    /// up. Such a member never shows again, so neither does its NULL: a group shows only the
+    /// fields of its live members, a member whose own deletion wins is not live while that
+    /// deletion wins, and only making a row writes a member's deletion back to 0, which for a
+    /// minted collection makes a new entity. A row deleted only with its owner, which no change
+    /// deleted itself, is not cleared. Natural collections are not cleared at all: a row made
+    /// again at the same key anywhere is the same entity again, which a clearing could empty.
+    /// Their deleted rows keep their files; an application that wants them gone clears a file
+    /// field itself before it deletes the row.
     ///
-    /// A step looks at about `rows` deleted entities, of collections with fields naming files, in
-    /// the order of their collections' names and their ids, starting from `from` (the
+    /// A step looks at about `rows` deleted entities, of minted collections with fields naming
+    /// files, in the order of their collections' names and their ids, starting from `from` (the
     /// [`Purged::next`] of the step before, `None` for the first), and is a transaction of its
     /// own. A run of steps until `next` is `None` looks at every deleted entity once. Its writes
     /// are merged as a collect merges them, and none needs a row written. Refused while capture
@@ -499,6 +679,7 @@ impl Replica {
             .registry
             .collections()
             .iter()
+            .filter(|c| matches!(c.key, Key::Minted { .. }))
             .filter(|c| c.fields.iter().any(|f| matches!(f.kind, Kind::File)))
             .collect();
         collections.sort_by(|a, b| a.name.cmp(&b.name));

@@ -19,6 +19,7 @@ pub enum Key {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Kind {
     Plain,
     /// Holds the local id of a row in a minted collection, translated to its global id in transit.

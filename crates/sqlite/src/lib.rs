@@ -58,14 +58,41 @@
 //! A field declared with [`Collection::file`] holds an encoded [`FileRef`] or NULL; merging treats
 //! it as a plain field merged by clock. The kernel answers, from the changes it holds, what the
 //! protocol's rules for deleting files (`fongo_sync_protocol::api`, "Deleting files") ask of a
-//! device: [`Registry::files_set`], the files an outgoing batch sets and so claims;
-//! [`Replica::refers`] and [`Replica::files`], the files the state may refer to, counted beyond
-//! the protocol's definition for data the registry cannot interpret, so that a replica of an
-//! older registry never reports as unreferred a file a later one's field names;
-//! [`Replica::held_files`], the files rows held back show; [`Applied::files`] and
-//! [`Collected::files`], what an operation did to those files; and [`Replica::purge_step`],
-//! which clears, as local writes, the file fields of entities deleted long enough ago. The
-//! values that may name files are indexed, so none of these reads the library whole.
+//! device. A server names a file by its content hash alone, so every answer is about a
+//! [`ContentHash`]: a content is referred to while any value held names it, at any size.
+//!
+//! - [`Registry::files_set`]: the files an outgoing batch sets, the ids to claim with it.
+//! - [`Replica::refers`] and [`Replica::files`]: the contents the state may refer to, counted
+//!   beyond the protocol's definition for data the registry cannot interpret, so that a replica
+//!   of an older registry never reports as unreferred a content a later one's field names.
+//! - [`Replica::files_to_claim`]: the files rows held back and fields kept as this replica's own
+//!   show, which no change it holds may set, to claim before each report that it has settled.
+//! - [`Applied::files`] and [`Collected::files`]: what an operation did to the contents referred
+//!   to. Every operation that can change them reports it: `apply`, `collect_step`,
+//!   `install_step` and `purge_step` always; a whole collect, install or resume through
+//!   [`Replica::collect_reported`], [`Replica::install_reported`] and
+//!   [`Replica::resume_reported`], and a suspend through [`Replica::suspend_reported`]. An
+//!   install that newly declares a field over values already held does not report them: read
+//!   [`Replica::files`] after it.
+//! - [`Replica::nothing_pending`]: whether the state is exactly what the replica has merged,
+//!   with nothing of its own pending. The answers above are about what it holds now; only while
+//!   this holds are they about the changes through the last envelope it merged.
+//! - [`Replica::purge_step`]: clears, as local writes, the file fields of minted entities
+//!   deleted long enough ago, in a way that never changes what any row shows.
+//!
+//! The values that may name files are indexed, so none of these reads the library whole; those
+//! that ask about rows held back read every such row.
+//!
+//! Two rules make these answers sound, and this crate cannot enforce them:
+//!
+//! - a field marked as naming files is marked so in every version of the application that
+//!   writes it, merged by clock, never part of a key, and never unmarked. A replica that does
+//!   not know the field keeps only its winner by clock.
+//! - a device retires a file only with a `through` at or before which it has merged every
+//!   envelope: one that skipped, refused or stepped past an envelope at or below `through`
+//!   holds none of its changes, and cannot know whether they refer to the file. It retires only
+//!   while [`Replica::nothing_pending`] holds, with `through` the last envelope it merged, its
+//!   own appends included.
 //!
 //! # What is supported and tested
 //!
@@ -96,7 +123,7 @@ mod tables;
 pub use error::{Error, Result};
 pub use files::{FileChanges, FilePage, FilesFrom, PurgeFrom, Purged, Referred};
 pub use fongo_sync_core as core;
-pub use fongo_sync_protocol::FileRef;
+pub use fongo_sync_protocol::{ContentHash, FileRef};
 pub use registry::{Collection, Field, Key, Kind, LocalDefault, Registry};
 pub use replica::{
     Applied, COLLECT_ROWS, Collected, Conflict, Held, Inspection, Made, Outbox, Replica, Resume,
