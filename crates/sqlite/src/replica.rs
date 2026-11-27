@@ -14,7 +14,7 @@ use fongo_sync_core::eval::{Evaluator, Origin};
 use fongo_sync_core::model::{Row, Schema};
 use fongo_sync_core::plan::{self, FieldEdit};
 use fongo_sync_core::source::{admit, well_formed};
-use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
+use fongo_sync_core::{ALIAS, Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::adopt;
@@ -1722,15 +1722,23 @@ impl Replica {
     }
 
     /// Puts in the outbox again every change this replica keeps: the winning entry of every
-    /// field, each kept entry of a natural key's field, and every change to a collection its
-    /// registry lacks, each with its own clock. Returns how many. For a server that lost changes:
-    /// sent, they make its log hold again everything this replica merged, and applying a change
-    /// twice changes nothing.
+    /// field, each kept entry of a natural key's field, every change to a collection its registry
+    /// lacks, each with its own clock, and every alias, that two entities are one. Returns how
+    /// many changes it put there. For a server that lost changes; `fongo-sync-client` calls it
+    /// through its `resend_all`, which also reads the log again from its start.
     ///
-    /// It is not every change the replica merged. A change that lost to a later one is not kept,
-    /// so where it was the earliest of an entity's changes in a collection, the entity's first
-    /// clock is later on a replica that has only what this sends, which can change what
-    /// [`Replica::made`] answers there. That two entities are one is kept with no clock and is not
+    /// The kernel keeps no clock for an alias, so each is sent at the earliest clock among the
+    /// facts of the entity it is written on, in that collection: no later than the alias was
+    /// written, so a replica given only what this sends places that entity in the same
+    /// collection at the same first clock as this one, and one that already holds the alias
+    /// changes nothing. Which entities are one does not depend on an alias's clock.
+    ///
+    /// What a replica that takes only what this sends can show otherwise than this one: changes
+    /// that lost to later ones are not kept, so not sent. Where such a change was the earliest of
+    /// an entity's facts in a collection, the entity's first clock there is later on the other
+    /// replica; that decides only which collection an id belongs to when it has facts in more than
+    /// one, which ids minted apart never have. Values the application kept as this replica's own
+    /// when resuming, and rows held back for a clash, are this replica's alone and were never
     /// sent.
     pub async fn resend(&self, conn: &mut SqliteConnection) -> Result<usize> {
         with_db(conn, |db| {
@@ -1748,7 +1756,15 @@ impl Replica {
                     )?;
                     sent += usize::try_from(n).unwrap_or(usize::MAX);
                 }
-                Ok(sent)
+                let aliases = db.exec(
+                    "INSERT INTO fongo_outbox (collection, gid, field, value, is_ref, clock)
+                     SELECT a.collection, a.a, ?1, a.b, 1, c.first
+                       FROM fongo_alias a
+                       JOIN fongo_claims c ON c.gid = a.a AND c.collection = a.collection
+                      ORDER BY c.first, a.collection, a.a, a.b",
+                    &[Value::Text(ALIAS.into())],
+                )?;
+                Ok(sent + usize::try_from(aliases).unwrap_or(usize::MAX))
             })
         })
         .await

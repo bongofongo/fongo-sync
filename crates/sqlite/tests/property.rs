@@ -1246,12 +1246,75 @@ fn run_back(
             done.map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
             agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
+        for (who, peer) in peers.iter_mut().enumerate() {
+            resent_shows_the_same(peer, schema, seed, &mut databases)
+                .await
+                .map_err(|e| format!("peer {who} resending what it holds: {e}"))?;
+        }
         finish(&mut peers, &mut hub)
             .await
             .map_err(|e| format!("while exchanging everything: {e}"))?;
         check(&mut peers, copied).await
     });
     outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
+}
+
+/// A copy of `peer`'s database collects what was written and resends everything it holds; a new
+/// replica that takes only that must show the same rows, but for entities either holds back.
+async fn resent_shows_the_same(
+    peer: &mut Peer,
+    schema: &[&str],
+    seed: u64,
+    databases: &mut u64,
+) -> Result<(), String> {
+    *databases += 1;
+    let mut from = peer.copy(*databases).await;
+    if from.replica.suspended(&mut from.conn).await.unwrap() {
+        return Ok(());
+    }
+    from.replica.collect(&mut from.conn).await.unwrap();
+    let before = from.replica.outbox(&mut from.conn, u32::MAX).await.unwrap();
+    let sent = from.replica.resend(&mut from.conn).await.unwrap();
+    let outbox = from.replica.outbox(&mut from.conn, u32::MAX).await.unwrap();
+    if outbox.changes.len() != before.changes.len() + sent {
+        return Err(format!(
+            "resend reported {sent} changes, the outbox grew by {}",
+            outbox.changes.len() - before.changes.len()
+        ));
+    }
+    *databases += 1;
+    let mut fresh = Peer::new(&from.world, *databases, schema, &[], seed, Some(None)).await;
+    if from.upgraded {
+        fresh.upgraded = true;
+        fresh.replica = Replica::new(registry(true));
+        fresh.replica.install(&mut fresh.conn).await.unwrap();
+    }
+    fresh
+        .replica
+        .apply(&mut fresh.conn, &outbox.changes)
+        .await
+        .unwrap();
+    let mut shown = support::read(&mut from.conn, &from.replica).await;
+    let mut taken = support::read(&mut fresh.conn, &fresh.replica).await;
+    let held: BTreeSet<(String, Gid)> = shown
+        .pending
+        .iter()
+        .chain(&taken.pending)
+        .map(|(c, g)| (c.clone(), shown.canonical(c, *g)))
+        .collect();
+    for view in [&mut shown.view, &mut taken.view] {
+        for (collection, rows) in view.collections.iter_mut() {
+            rows.retain(|gid, _| !held.contains(&(collection.clone(), *gid)));
+        }
+        view.collections.retain(|_, rows| !rows.is_empty());
+    }
+    if shown.view != taken.view {
+        return Err(format!(
+            "a replica given only what was resent shows other rows:\n{:#?}\n{:#?}",
+            shown.view, taken.view
+        ));
+    }
+    Ok(())
 }
 
 /// Replaces peer `to`'s database with a copy of peer `from`'s; then, with the clock held, each
