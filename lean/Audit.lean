@@ -48,6 +48,7 @@ import FongoSync
 #print axioms FongoSync.Laws.full_view_set
 #print axioms FongoSync.Laws.full_view_together
 #print axioms FongoSync.Laws.full_view_together_untied
+#print axioms FongoSync.Laws.full_view_row_fields
 #print axioms FongoSync.Laws.full_view_ignores_unencodable
 #print axioms FongoSync.Laws.full_view_ignores_unknown_collection
 #print axioms FongoSync.Laws.full_view_ignores_bad_alias
