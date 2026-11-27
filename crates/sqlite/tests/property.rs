@@ -2507,3 +2507,51 @@ async fn a_tag_on_a_book_found_to_be_one_is_one_tag_in_steps() {
     same_as_whole(start, &whole, &stepped).unwrap();
 }
 
+/// Found by a long run (seed 20261127). The application removes a series and makes another at
+/// its id, which a resume collects, finds to be one with an older series and removes; a delivered
+/// series then takes the id. What the application wrote is carried by the entity the resume
+/// minted for the removed row, which the test never saw, and not by the entities rows at that
+/// id stood for before or after it.
+#[test]
+fn a_series_made_at_an_id_merged_away_at_a_resume_and_taken_by_a_delivery_is_sent() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(async {
+            let world = World::new(0);
+            let mut hub = Vec::new();
+            let mut peers = Vec::new();
+            for n in 0..2 {
+                peers.push(Peer::new(&world, n, SCHEMA, &[], 0, Some(None)).await);
+            }
+            let [a, b] = &mut peers[..] else {
+                unreachable!()
+            };
+            a.run("INSERT INTO series (code, name) VALUES ('c1', 'name0')")
+                .await;
+            a.run("INSERT INTO series (code, name) VALUES ('c0', 'name0')")
+                .await;
+            a.push(&mut hub).await?;
+            a.run("DELETE FROM series WHERE id = 2").await;
+            a.run("INSERT INTO series (code, name) VALUES ('c1', 'name1')")
+                .await;
+            perform(a, Op::Suspended(0, 0), &mut hub).await?;
+            assert_eq!(
+                a.one("SELECT count(*) FROM series WHERE id = 2").await,
+                Some(0)
+            );
+            b.run("INSERT INTO series (code, name) VALUES (NULL, 'name2')")
+                .await;
+            b.push(&mut hub).await?;
+            a.deliver(&hub, |_| true, false, false).await?;
+            assert_eq!(
+                a.one("SELECT count(*) FROM series WHERE id = 2 AND name = 'name2'")
+                    .await,
+                Some(1)
+            );
+            finish(&mut peers, &mut hub).await?;
+            check(&mut peers, false).await
+        })
+        .unwrap();
+}

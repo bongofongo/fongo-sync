@@ -37,6 +37,8 @@ pub struct Writes {
     written: BTreeSet<(String, String, String)>,
     /// Rows the application made since the last send, at a new key or one a removed row held.
     made: BTreeSet<(String, String)>,
+    /// Rows made since the last kernel step, with the entities rows at their keys held before.
+    earlier: BTreeMap<(String, String), BTreeSet<Gid>>,
     /// Rows the application deleted since the last send, by collection and key, with the
     /// members of the entity's group marked live when it did.
     removed: BTreeMap<(String, String), BTreeSet<Gid>>,
@@ -185,6 +187,15 @@ impl Writes {
         let fresh: BTreeSet<&(String, String)> = current
             .keys()
             .filter(|at| !self.after.contains_key(*at) || remade.contains(*at))
+            .collect();
+        self.earlier = fresh
+            .iter()
+            .map(|at| {
+                (
+                    (*at).clone(),
+                    self.gids.get(*at).cloned().unwrap_or_default(),
+                )
+            })
             .collect();
         for (at, values) in &current {
             let Some(c) = registry.collections().iter().find(|c| c.name == at.0) else {
@@ -521,10 +532,15 @@ impl Writes {
 
     /// What was owed of a row the install collected and then removed, merging its entity into
     /// another's row, before anything here saw the entity: owed still, but by value, since the
-    /// row's key could be given to another entity before the next send.
+    /// row's key could be given to another entity before the next send. A row made since the
+    /// last step may sit at a key earlier rows held: their entities are not its own.
     fn gone_with_install(&mut self) {
         let gone = |at: &(String, String)| {
-            !self.after.contains_key(at) && self.gids.get(at).is_none_or(BTreeSet::is_empty)
+            !self.after.contains_key(at)
+                && self.gids.get(at).is_none_or(|held| {
+                    held.iter()
+                        .all(|g| self.earlier.get(at).is_some_and(|e| e.contains(g)))
+                })
         };
         let cells: Vec<(String, String, String)> = self
             .owed
