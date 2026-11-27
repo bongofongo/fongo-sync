@@ -182,9 +182,9 @@ async fn sync_via(via: Via, peer: &mut Peer, server: &Server) -> String {
         Via::Default => sync_hooked(peer, server, &mut ()).await,
     };
     // How long it held the lock is a matter of timing.
-    let result = result.map(|report| SyncReport {
-        held: Duration::ZERO,
-        ..report
+    let result = result.map(|mut report| {
+        report.held = Duration::ZERO;
+        report
     });
     format!("{result:?}")
 }

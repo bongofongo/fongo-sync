@@ -31,6 +31,7 @@ pub fn now() -> u64 {
 
 type Tamper = Box<dyn FnMut(BatchPage) -> Vec<u8> + Send>;
 type Respond = Box<dyn FnMut(&Request) -> Option<Response> + Send>;
+type Lose = Box<dyn FnMut(&Request) -> bool + Send>;
 
 pub struct Library {
     pub devices: Vec<DeviceRecord>,
@@ -44,6 +45,12 @@ pub struct State {
     seen: HashSet<(DeviceId, [u8; 16])>,
     /// Every request that reached the server, as method and target.
     pub requests: Vec<(Method, String)>,
+    /// The length of the body answering each request in `requests`, whether or not it arrived.
+    pub answered: Vec<usize>,
+    /// An append of bytes the log already holds stores them again, as the protocol allows.
+    pub store_again: bool,
+    /// Loses the response to each request it returns true for, once handled.
+    lose_if: Option<Lose>,
     counted: usize,
     /// The n-th request from when it was set never reaches the server.
     fail_at: Option<usize>,
@@ -118,6 +125,9 @@ impl Server {
                 libraries: HashMap::new(),
                 seen: HashSet::new(),
                 requests: Vec::new(),
+                answered: Vec::new(),
+                store_again: false,
+                lose_if: None,
                 counted: 0,
                 fail_at: None,
                 lose_at: None,
@@ -178,6 +188,23 @@ impl Server {
         self.with(|s| s.tamper = Some(Box::new(f)));
     }
 
+    pub fn lose_if(&self, f: impl FnMut(&Request) -> bool + Send + 'static) {
+        self.with(|s| s.lose_if = Some(Box::new(f)));
+    }
+
+    /// Bytes of the bodies answering requests to targets starting with `path`, from request
+    /// number `from` on.
+    pub fn bytes_since(&self, from: usize, path: &str) -> usize {
+        self.with(|s| {
+            s.requests[from..]
+                .iter()
+                .zip(&s.answered[from..])
+                .filter(|((_, t), _)| t.starts_with(path))
+                .map(|(_, n)| n)
+                .sum()
+        })
+    }
+
     pub fn respond(&self, f: impl FnMut(&Request) -> Option<Response> + Send + 'static) {
         self.with(|s| s.respond = Some(Box::new(f)));
     }
@@ -189,6 +216,8 @@ impl Server {
             s.hang_at = None;
             s.tamper = None;
             s.respond = None;
+            s.lose_if = None;
+            s.store_again = false;
             s.stale_devices = false;
             s.hidden.clear();
         });
@@ -286,11 +315,13 @@ impl Server {
             Some(response) => response,
             None => state.handle(&request).unwrap_or_else(error),
         };
+        state.answered.push(response.body.len());
         if state.hang_at == Some((n, true)) {
             state.hang();
             return None;
         }
-        if state.lose_at == Some(n) {
+        let lose = state.lose_if.as_mut().is_some_and(|f| f(&request));
+        if state.lose_at == Some(n) || lose {
             return Some(Err(TransportError::new("connection reset")));
         }
         Some(Ok(response))
@@ -434,7 +465,8 @@ impl State {
                     return Err(ErrorCode::EnvelopeWrongLibrary);
                 }
                 let log = &mut self.libraries.get_mut(&id).unwrap().log;
-                let seq = match log.iter().position(|stored| *stored == request.body) {
+                let stored = log.iter().position(|stored| *stored == request.body);
+                let seq = match stored.filter(|_| !self.store_again) {
                     Some(at) => at + 1,
                     None => {
                         log.push(request.body.clone());

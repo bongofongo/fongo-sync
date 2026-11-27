@@ -17,7 +17,7 @@ use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 use crate::credentials::Credentials;
 use crate::error::Error;
 use crate::rpc::{Body, Rpc, json};
-use crate::state::{self, Sending};
+use crate::state::{self, Digest32, Sending};
 use crate::transport::{Method, Transport};
 
 /// Envelopes asked for per page when the server states no maximum.
@@ -137,6 +137,7 @@ async fn pause(duration: Duration) {
 /// Why an envelope from the server's log was skipped instead of applied. An envelope this build
 /// cannot read because a later version may have written it is not skipped; see [`Newer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Refusal {
     /// It does not decode as an envelope of the format this build writes, and does not name a
     /// later format; or what it decrypts to does not decode as a batch, for a reason other than
@@ -155,6 +156,9 @@ pub enum Refusal {
     /// It does not decrypt under the library's key for its epoch, which is no later than this
     /// device's ([`Credentials::epoch`]), so whoever wrote it lacks the library secret.
     Undecryptable,
+    /// The pull stopped at it, and the application chose to step past it with
+    /// [`crate::step_past`]. Its changes are given up on this device.
+    SteppedPast,
 }
 
 /// What an envelope the pull stopped at holds that this build does not know. Each is what a later
@@ -193,15 +197,24 @@ pub enum Unknown {
 /// While a sync reports this, change notifications past the cursor still say a sync is worth
 /// running ([`crate::worth_syncing`]), but this build reads no further: a sync is then worth
 /// running only to send what this device writes. A sync that has nothing to send appends
-/// nothing, so syncing on each notification does not feed itself. Each sync reads one page of the
-/// log from this envelope on.
+/// nothing, so syncing on each notification does not feed itself. The client records where it
+/// stopped and what bytes it found there, so each later sync reads that one envelope again, to see
+/// whether it can now read it or the server now holds other bytes there, and reads on if so.
+///
+/// An envelope no build will ever read, such as one damaged in the server's storage, stops every
+/// device of the library for good. [`crate::step_past`], called with [`Newer::seq`] and
+/// [`Newer::digest`], lets the next sync skip it and read on, giving up its changes on this
+/// device; it is for the application to offer, and only on the user's say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Newer {
     pub seq: u64,
     /// The device the envelope names; `None` for [`Unknown::EnvelopeFormat`], whose layout this
     /// build cannot read.
     pub device: Option<DeviceId>,
     pub unknown: Unknown,
+    /// A SHA-256 of the envelope's bytes, which [`crate::step_past`] takes.
+    pub digest: [u8; 32],
 }
 
 /// One envelope skipped and never applied. It does not stop the sync, and the cursor moves past
@@ -227,6 +240,7 @@ pub struct Blocked {
 
 /// What one [`sync`] did.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SyncReport {
     /// Changes received from other devices and applied, whether or not they won.
     pub received: usize,
@@ -304,14 +318,21 @@ pub struct SyncReport {
 /// Each envelope to send is recorded in the database before it is appended, and the outbox
 /// acknowledged and the record cleared in one transaction once the server confirms. When a sync
 /// stops between the two, whether or not the server stored the envelope, the next sync appends
-/// the same recorded bytes again before anything new, unless its pull found them in the log, in
-/// which case they are not sent again; a server that stores an identical envelope
-/// once makes that harmless, and otherwise the duplicate is applied idempotently by every device.
-/// Changes are not re-sealed into a second, different envelope, with one exception: when the
-/// server refuses the recorded envelope itself, as too large or not one it accepts, the record is
-/// dropped and its changes, still in the outbox because they were never acknowledged, are sealed
-/// afresh under the server's current limits. Should the server in fact hold the earlier envelope,
-/// its changes then arrive twice, which every device applies idempotently.
+/// the same recorded bytes again before anything new, unless it finds them in the log: by its
+/// pull, or, when the pull stopped before the end of the log, by reading the log after the head it
+/// knew when it recorded them, comparing bytes only. Found, they are not sent again.
+///
+/// A copy of an envelope can still reach the log: when the recorded bytes are not within the
+/// pages one call reads, or from a server that stores an identical envelope twice of its own
+/// accord. Every device applies the copy idempotently, and this device takes the first copy it
+/// reads as where its envelope landed, whichever copy the server named. Changes are not re-sealed
+/// into a second, different envelope, with one exception: when the server refuses the recorded
+/// envelope itself, as too large or not one it accepts, the record is dropped and its changes,
+/// still in the outbox because they were never acknowledged, are sealed afresh under the server's
+/// current limits. Should the server in fact hold the earlier envelope, its changes then arrive
+/// twice, which every device applies idempotently; but this device knows only where the second
+/// landed, so a remote change between the two that edits a field reporting conflicts is reported
+/// as a conflict with this device's edit, though it may have been made knowing it.
 ///
 /// Envelopes this device signed are applied like any other: applying a change already held is a
 /// no-op, and a database restored from a backup, or a second database sharing these credentials,
@@ -605,6 +626,7 @@ async fn run<T: Transport, A: Apply>(
     if replica.suspended(conn).await? {
         return Err(fongo_sync_sqlite::Error::Suspended.into());
     }
+    state::check(conn).await?;
     let rpc = Rpc {
         transport,
         now: &now,
@@ -624,13 +646,24 @@ async fn run<T: Transport, A: Apply>(
     let mut keys = Keys::new(credentials);
     let mut report = SyncReport::default();
 
+    let mut own: HashMap<Digest32, Vec<u64>> = HashMap::new();
+    for &(seq, digest) in &saved.appended {
+        if let Some(digest) = digest {
+            own.entry(digest).or_default().push(seq);
+        }
+    }
     let mut pull = Pull {
         read: cursor,
         held: Vec::new(),
         applied: false,
-        appended: saved.appended,
+        appended: saved.appended.iter().map(|&(seq, _)| seq).collect(),
+        own,
+        moved: Vec::new(),
         sending: saved.sending,
         landed: None,
+        stopped_at: saved.stopped.map(|(seq, _)| seq),
+        stopped: None,
+        passing: saved.passing,
     };
     let mut steps = Steps {
         replica,
@@ -695,9 +728,22 @@ async fn run<T: Transport, A: Apply>(
                 Some(credentials.device().verifying_key())
             })
             .map_or(0, |opened| opened.changes.len());
-            match append(&rpc, credentials, sending.envelope).await {
+            let digest = state::digest(&sending.envelope);
+            let read_all = report.blocked.is_none() && report.newer.is_none() && !report.more;
+            let found = if read_all {
+                None
+            } else {
+                let after = pull.read.max(sending.after.unwrap_or(0));
+                find(&rpc, credentials, limit, after, &sending.envelope).await?
+            };
+            let appended = match found {
+                Some(seq) => Ok(seq),
+                None => append(&rpc, credentials, sending.envelope).await,
+            };
+            match appended {
                 Ok(seq) => {
-                    acknowledge(conn, &mut steps, library, sending.through, seq, &mut cursor)
+                    let through = sending.through;
+                    acknowledge(conn, &mut steps, library, through, seq, digest, &mut cursor)
                         .await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
@@ -755,13 +801,24 @@ async fn run<T: Transport, A: Apply>(
         let sending = Sending {
             through: outbox.through,
             envelope,
+            after: Some(report.head),
         };
         steps.turn(conn).await?;
         let began = Instant::now();
         state::record_sending(conn, library, &sending).await?;
         steps.committed(began);
+        let digest = state::digest(&sending.envelope);
         let seq = append(&rpc, credentials, sending.envelope).await?;
-        acknowledge(conn, &mut steps, library, sending.through, seq, &mut cursor).await?;
+        acknowledge(
+            conn,
+            &mut steps,
+            library,
+            sending.through,
+            seq,
+            digest,
+            &mut cursor,
+        )
+        .await?;
         report.sent += outbox.changes.len();
         report.head = report.head.max(seq);
     }
@@ -980,10 +1037,20 @@ struct Pull {
     held: Vec<Change>,
     applied: bool,
     appended: BTreeSet<u64>,
+    /// The appends past `read` by the digest of the envelope, where it was recorded.
+    own: HashMap<Digest32, Vec<u64>>,
+    /// Appends found at an earlier copy than the one recorded, and where, to record so.
+    moved: Vec<(Digest32, u64)>,
     /// The envelope recorded before an append whose answer never came, until the pull finds it.
     sending: Option<Sending>,
-    /// The outbox position the recorded envelope covers, once found at `read`.
-    landed: Option<i64>,
+    /// The outbox position and digest of the recorded envelope, once found at `read`.
+    landed: Option<(i64, Digest32)>,
+    /// Where the last sync's pull stopped at a later version's envelope.
+    stopped_at: Option<u64>,
+    /// Where this one did, and the digest of what it stopped at.
+    stopped: Option<(u64, Digest32)>,
+    /// An envelope the application chose to step past.
+    passing: Option<(u64, Digest32)>,
 }
 
 impl Pull {
@@ -1013,10 +1080,17 @@ impl Pull {
                 None
             };
             state::advance(&mut tx, library, self.read).await?;
-            if let Some(through) = self.landed {
+            if let Some((through, digest)) = self.landed {
                 replica.acknowledge(&mut tx, through).await?;
                 state::clear_sending(&mut tx, library).await?;
-                state::record_appended(&mut tx, library, self.read, through).await?;
+                state::record_appended(&mut tx, library, self.read, through, digest).await?;
+            }
+            for &(digest, seq) in &self.moved {
+                state::land_at(&mut tx, library, digest, seq).await?;
+            }
+            state::record_stop(&mut tx, library, self.stopped).await?;
+            if self.passing.is_some_and(|(seq, _)| seq <= self.read) {
+                state::clear_passing(&mut tx, library).await?;
             }
             if let Some(through) = state::read_past(&mut tx, library, self.read).await? {
                 replica.release_bases(&mut tx, through).await?;
@@ -1031,6 +1105,10 @@ impl Pull {
         tx.commit().await?;
         steps.committed(began);
         self.landed = None;
+        self.moved.clear();
+        if self.passing.is_some_and(|(seq, _)| seq <= self.read) {
+            self.passing = None;
+        }
         if let Some(applied) = applied {
             self.applied = true;
             report.received += self.held.len();
@@ -1055,7 +1133,14 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     report: &mut SyncReport,
 ) -> Result<(), Error> {
     let library = keys.credentials.library_id();
-    for _ in 0..MAX_PAGES {
+    for page_number in 0..MAX_PAGES {
+        // Where the last sync stopped at a later version's envelope, one is enough to see whether
+        // it still does.
+        let limit = if page_number == 0 && pull.stopped_at == Some(pull.read + 1) {
+            1
+        } else {
+            limit
+        };
         let query = ReadBatches {
             after: pull.read,
             limit: Some(limit),
@@ -1075,7 +1160,18 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             let landed = pull
                 .sending
                 .take_if(|sending| sending.envelope == batch.envelope);
-            let opened = keys.open(rpc, batch).await?;
+            let passing = pull.passing.is_some_and(|(seq, digest)| {
+                seq == batch.seq && digest == state::digest(&batch.envelope)
+            });
+            let opened = if passing {
+                Opened::Refused(Refused {
+                    seq: batch.seq,
+                    device: Envelope::decode(&batch.envelope).ok().map(|e| e.device),
+                    reason: Refusal::SteppedPast,
+                })
+            } else {
+                keys.open(rpc, batch).await?
+            };
             if let Opened::Changes(changes) = &opened
                 && !pull.held.is_empty()
                 && pull.held.len() + changes.len() > steps.pace.apply
@@ -1099,6 +1195,7 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
                     return Ok(());
                 }
                 Opened::Newer(newer) => {
+                    pull.stopped = Some((newer.seq, newer.digest));
                     report.newer = Some(newer);
                     return Ok(());
                 }
@@ -1108,8 +1205,22 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             // appended here, and must not be appended again.
             if let Some(sending) = landed {
                 report.sent += pull.held.len() - before;
-                pull.landed = Some(sending.through);
+                pull.landed = Some((sending.through, state::digest(&sending.envelope)));
                 pull.appended.insert(batch.seq);
+            }
+            // The first copy of an envelope this device appended is where it landed, whichever
+            // copy it recorded.
+            if !pull.own.is_empty()
+                && let digest = state::digest(&batch.envelope)
+                && let Some(recorded) = pull.own.remove(&digest)
+            {
+                for seq in &recorded {
+                    pull.appended.remove(seq);
+                }
+                pull.appended.insert(batch.seq);
+                if recorded != [batch.seq] {
+                    pull.moved.push((digest, batch.seq));
+                }
             }
             // A change after this device's own envelope may have been made knowing its edits,
             // so what came before is compared with their bases, and then the bases released.
@@ -1126,6 +1237,46 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     }
     report.more = true;
     Ok(())
+}
+
+/// Where `envelope` is in the log after `after`, comparing bytes only, reading at most as many pages
+/// as a pull; `None` when it is not there, or not within those pages.
+async fn find<T: Transport, N: Fn() -> u64 + Sync>(
+    rpc: &Rpc<'_, T, N>,
+    credentials: &Credentials,
+    limit: u32,
+    mut after: u64,
+    envelope: &[u8],
+) -> Result<Option<u64>, Error> {
+    let library = credentials.library_id();
+    for _ in 0..MAX_PAGES {
+        let query = ReadBatches {
+            after,
+            limit: Some(limit),
+        };
+        let body = rpc
+            .call(
+                Method::Get,
+                query.target(library),
+                Body::Empty,
+                Some(credentials.device()),
+            )
+            .await?;
+        let page = BatchPage::decode(&body)
+            .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
+        check_page(&page, after, limit)?;
+        if let Some(batch) = page.batches.iter().find(|b| b.envelope == envelope) {
+            return Ok(Some(batch.seq));
+        }
+        let Some(last) = page.batches.last() else {
+            return Ok(None);
+        };
+        if !page.more {
+            return Ok(None);
+        }
+        after = last.seq;
+    }
+    Ok(None)
 }
 
 /// Refuses a page that does not continue the log from `after` one sequence number at a time, or
@@ -1209,6 +1360,7 @@ impl<'a> Keys<'a> {
                 seq: batch.seq,
                 device,
                 unknown,
+                digest: state::digest(&batch.envelope),
             }))
         };
         let envelope = match Envelope::decode(&batch.envelope) {
@@ -1359,6 +1511,7 @@ async fn acknowledge<A: Apply>(
     library: fongo_sync_protocol::LibraryId,
     through: i64,
     seq: u64,
+    digest: Digest32,
     cursor: &mut u64,
 ) -> Result<(), Error> {
     let follows = Some(seq) == cursor.checked_add(1);
@@ -1367,7 +1520,7 @@ async fn acknowledge<A: Apply>(
     let written = async {
         replica.acknowledge(&mut tx, through).await?;
         state::clear_sending(&mut tx, library).await?;
-        state::record_appended(&mut tx, library, seq, through).await?;
+        state::record_appended(&mut tx, library, seq, through, digest).await?;
         if follows {
             state::advance(&mut tx, library, seq).await?;
         }

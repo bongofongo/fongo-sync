@@ -46,6 +46,14 @@ pub enum Error {
     Randomness,
     #[error("database: {0}")]
     Database(#[from] fongo_sync_sqlite::Error),
+    /// The client's own tables in the database are of a later layout than this build knows,
+    /// written by a later build. Nothing was read from the server or written.
+    #[error("the sync client's tables are of layout {found}; this build knows layout {known}")]
+    NewerClientTables { found: i64, known: i64 },
+    /// [`crate::step_past`] was asked to step past an envelope the pull is not stopped at, or
+    /// with other bytes than it stopped at. Nothing changed.
+    #[error("the pull is not stopped at envelope {seq} with those bytes")]
+    NotStoppedAt { seq: u64 },
     /// The application's own step, given through [`crate::Apply`], failed.
     #[error("the application's step failed: {0}")]
     Application(#[source] Box<dyn std::error::Error + Send + Sync>),

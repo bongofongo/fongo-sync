@@ -16,7 +16,11 @@ const MIN_CHANGE_LEN: usize = 1 + 16 + 1 + 1 + 8 + 4 + 16;
 /// (0 null, 1 int, 2 real, 3 text, 4 blob, 5 ref) then its 8 bytes, text, blob or 16-byte gid.
 ///
 /// A later version may write a later format, set flags or add tags. A reader meeting one cannot
-/// tell what the batch holds, and should not take it as damaged and skip it.
+/// tell what the batch holds, and should not take it as damaged and skip it. A later version that
+/// gives meaning to a change a merge ignores, such as a `$deleted` value other than 0 or 1, an
+/// `$alias` that is not a reference, a clock above the largest a merge accepts or a text or blob
+/// longer than a replica can store, must change the format, since a reader of this one decodes
+/// such a change and its merge drops it.
 pub fn encode_batch(changes: &[Change]) -> Vec<u8> {
     let mut out = vec![BATCH_FORMAT, 0];
     put_varint(&mut out, changes.len() as u64);

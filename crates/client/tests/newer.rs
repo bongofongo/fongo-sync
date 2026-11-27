@@ -4,7 +4,7 @@
 #[allow(dead_code)]
 mod support;
 
-use fongo_sync_client::protocol::api::{BatchPage, ReadBatches, batches_path};
+use fongo_sync_client::protocol::api::{Appended, BatchPage, ReadBatches, batches_path};
 use fongo_sync_client::protocol::{
     BATCH_FORMAT, DeviceId, ENVELOPE_FORMAT, Envelope, LibraryId, LibraryKeys, SigningKey,
     encode_batch, generate_signing_key, random_nonce, seal,
@@ -12,14 +12,24 @@ use fongo_sync_client::protocol::{
 use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
-    Apply, Error, Method, Newer, Refusal, Unknown, add_device, create_library, join_library,
-    sync_with,
+    Apply, Credentials, Error, Method, Newer, Refusal, Request, Response, Transport,
+    TransportError, Unknown, add_device, create_library, join_library, sync_with,
 };
 use sqlx::SqliteConnection;
 use support::{
     Peer, Server, assert_converged, assert_no_change_sent_twice, batch_as, batch_with_value, now,
     re_signed, seal_as,
 };
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// What a report says of where it stopped.
+fn seen(newer: Option<Newer>) -> Option<(u64, Option<DeviceId>, Unknown, [u8; 32])> {
+    newer.map(|n| (n.seq, n.device, n.unknown, n.digest))
+}
 
 async fn pair(server: &Server) -> [Peer; 2] {
     let made = create_library(server, now).await.unwrap();
@@ -152,22 +162,24 @@ async fn stops_at_and_reads_on_from(later: Later) {
             .await;
         b.sync(&server).await.unwrap();
     }
-    server.inject(id, (later.write)(&setting("later"), &keys, &writer));
-    let newer = Newer {
-        seq: 6,
-        device: later.named.then(|| DeviceId::of(&writer.verifying_key())),
-        unknown: later.unknown,
-    };
+    let unreadable = (later.write)(&setting("later"), &keys, &writer);
+    server.inject(id, unreadable.clone());
+    let newer = Some((
+        6,
+        later.named.then(|| DeviceId::of(&writer.verifying_key())),
+        later.unknown,
+        digest(&unreadable),
+    ));
 
     // A device of this version that also writes after it stops there too, and still sends.
     b.run("INSERT INTO settings VALUES ('after', 'x')").await;
     let report = b.sync(&server).await.unwrap();
-    assert_eq!(report.newer, Some(newer));
+    assert_eq!(seen(report.newer), newer);
     assert!(report.sent > 0);
 
     a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
     let report = a.sync(&server).await.unwrap();
-    assert_eq!(report.newer, Some(newer), "{report:#?}");
+    assert_eq!(seen(report.newer), newer, "{report:#?}");
     assert_eq!(report.blocked, None);
     assert!(report.refused.is_empty(), "{report:#?}");
     assert!(!report.more);
@@ -189,18 +201,18 @@ async fn stops_at_and_reads_on_from(later: Later) {
         "this device's own write went up"
     );
 
-    // Each later sync of this build reads one page from where it stopped, stops there again,
+    // Each later sync of this build reads the one envelope it stopped at, stops there again,
     // and with nothing of its own to send appends nothing.
     let page = ReadBatches {
         after: 5,
-        limit: Some(4),
+        limit: Some(1),
     }
     .target(id);
     let appends = server.count(Method::Post, &batches_path(id));
     for _ in 0..3 {
         let before = server.with(|s| s.requests.len());
         let report = a.sync(&server).await.unwrap();
-        assert_eq!(report.newer, Some(newer));
+        assert_eq!(seen(report.newer), newer);
         assert_eq!((report.received, report.sent), (0, 0), "{report:#?}");
         assert_eq!(a.cursor().await, 5);
         let pages: Vec<String> = server.with(|s| {
@@ -218,7 +230,7 @@ async fn stops_at_and_reads_on_from(later: Later) {
     a.run("INSERT INTO settings VALUES ('meanwhile', 'x')")
         .await;
     let report = a.sync(&server).await.unwrap();
-    assert_eq!(report.newer, Some(newer));
+    assert_eq!(seen(report.newer), newer);
     assert!(report.sent > 0);
     assert_eq!(a.cursor().await, 5);
 
@@ -373,12 +385,11 @@ async fn a_server_that_passes_an_envelope_off_as_later_stops_a_device_only_visib
     a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
     for _ in 0..2 {
         let report = a.sync(&server).await.unwrap();
-        let newer = Newer {
-            seq: 1,
-            device: None,
-            unknown: Unknown::EnvelopeFormat(9),
-        };
-        assert_eq!(report.newer, Some(newer));
+        let marked = report.newer.unwrap();
+        assert_eq!(
+            (marked.seq, marked.device, marked.unknown),
+            (1, None, Unknown::EnvelopeFormat(9))
+        );
         assert_eq!(a.settings().await, ["mine=x"]);
         assert_eq!(a.cursor().await, 0);
     }
@@ -544,4 +555,348 @@ async fn damaged_or_forged_envelopes_are_skipped_and_counted_and_never_stop_the_
     }
     assert_eq!(a.settings().await, ["real=x"]);
     assert_eq!(a.cursor().await, damaged.len() as u64 + 1);
+}
+
+/// Loses the answer to the next append, once.
+fn lose_next_append(server: &Server) {
+    let mut once = true;
+    server.lose_if(move |r| r.method == Method::Post && std::mem::take(&mut once));
+}
+
+/// No envelope sits in the log twice.
+fn assert_no_envelope_twice(server: &Server, id: LibraryId) {
+    let log = server.log(id);
+    let distinct: std::collections::HashSet<&Vec<u8>> = log.iter().collect();
+    assert_eq!(distinct.len(), log.len(), "an envelope was appended twice");
+}
+
+/// A device whose append answer was lost while its pull stops before the envelope it appended,
+/// then another device that reads that edit and edits after it, on a server that stores an
+/// identical envelope again. `stop` puts what the first device stops at into the log, given the
+/// second device's signing key, and `heal` lets it read on.
+async fn a_lost_answer_while_stopped(
+    server: Server,
+    b_credentials: impl FnOnce(Credentials) -> Credentials,
+    stop: impl FnOnce(&Server, &LibraryKeys, &SigningKey),
+    heal: impl FnOnce(&Server, &LibraryKeys),
+) {
+    server.with(|s| s.store_again = true);
+    let [mut a, made] = pair(&server).await;
+    let mut b = Peer::new(b_credentials(made.credentials.clone())).await;
+    let keys = a.credentials.library().clone();
+    let id = keys.id;
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    stop(&server, &keys, b.credentials.device());
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.newer.is_some() || report.blocked.is_some());
+
+    a.run("UPDATE notes SET body = 'A1'").await;
+    lose_next_append(&server);
+    assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+    b.sync(&server).await.unwrap();
+    assert_eq!(b.lines("SELECT body FROM notes").await, ["A1"]);
+    b.run("UPDATE notes SET body = 'B2'").await;
+    b.sync(&server).await.unwrap();
+
+    let report = a.sync(&server).await.unwrap();
+    assert!(report.newer.is_some() || report.blocked.is_some());
+    assert_no_envelope_twice(&server, id);
+
+    heal(&server, &keys);
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!((report.newer, report.blocked), (None, None));
+    assert_eq!(report.applied.conflicts, [], "{report:#?}");
+    assert_no_envelope_twice(&server, id);
+    b.sync(&server).await.unwrap();
+    assert_eq!(a.lines("SELECT body FROM notes").await, ["B2"]);
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn an_append_whose_answer_was_lost_while_stopped_is_found_past_the_stop() {
+    let writer = generate_signing_key().unwrap();
+    let listed = writer.verifying_key();
+    let rotated = writer.clone();
+    a_lost_answer_while_stopped(
+        Server::new(),
+        // The second device seals under epoch 1, so it skips what the first stops at.
+        |credentials| credentials.with_epoch(1),
+        move |server, keys, _| {
+            server.register(keys.id, listed);
+            let other = LibraryKeys::new(keys.id, [0x77; 32]);
+            server.inject(keys.id, seal(&[], &other, 1, &rotated, nonce()));
+        },
+        move |server, keys| server.replace(keys.id, 2, seal(&[], keys, 0, &writer, nonce())),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_append_whose_answer_was_lost_while_blocked_is_found_past_the_block() {
+    let hidden = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let unhide = hidden.clone();
+    a_lost_answer_while_stopped(
+        Server::new(),
+        |credentials| credentials,
+        // The second device signs what blocks the first, and is left out of every list.
+        move |server, keys, b| {
+            server.inject(keys.id, seal(&[], keys, 0, b, nonce()));
+            server.with(|s| s.hidden.push(b.verifying_key()));
+            *hidden.lock().unwrap() = Some(b.verifying_key());
+        },
+        move |server, _| {
+            let key = unhide.lock().unwrap().take().unwrap();
+            server.with(|s| s.hidden.retain(|k| *k != key));
+        },
+    )
+    .await;
+}
+
+/// Forwards to the server, but answers an append by storing, after the envelope, `between` and
+/// then the envelope again, and naming that later copy.
+struct AnswersWithALaterCopy<'a> {
+    server: &'a Server,
+    id: LibraryId,
+    between: Vec<u8>,
+}
+
+impl Transport for AnswersWithALaterCopy<'_> {
+    async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        let append = request.method == Method::Post;
+        let body = request.body.clone();
+        let response = self.server.send(request).await?;
+        if !append {
+            return Ok(response);
+        }
+        self.server.inject(self.id, self.between.clone());
+        self.server.inject(self.id, body);
+        let seq = self.server.log(self.id).len() as u64;
+        Ok(Response {
+            body: serde_json::to_vec(&Appended { seq }).unwrap(),
+            ..response
+        })
+    }
+}
+
+#[tokio::test]
+async fn this_devices_envelope_is_read_back_at_the_first_copy_whichever_it_recorded() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    a.run("INSERT INTO books (title) VALUES ('Middlemarch')")
+        .await;
+    a.run("INSERT INTO notes (book_id, body) VALUES (1, 'base')")
+        .await;
+    a.sync(&server).await.unwrap();
+    b.sync(&server).await.unwrap();
+    let note = a
+        .replica
+        .gid_of(&mut a.conn, "notes", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    // A change that lands after this device's edit, and so may have been made knowing it.
+    let after = Change {
+        collection: "notes".into(),
+        gid: note,
+        field: "body".into(),
+        value: Value::Text("B2".into()),
+        clock: Hlc {
+            wall_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 3_600_000,
+            counter: 0,
+            node: Gid([9; 16]),
+        },
+    };
+    let later_copy = AnswersWithALaterCopy {
+        server: &server,
+        id: keys.id,
+        between: seal(&[after], &keys, 0, b.credentials.device(), nonce()),
+    };
+    a.run("UPDATE notes SET body = 'A1'").await;
+    fongo_sync_client::sync(&mut a.conn, &a.replica, &later_copy, &a.credentials, now)
+        .await
+        .unwrap();
+
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.applied.conflicts, [], "{report:#?}");
+    assert_eq!(a.lines("SELECT body FROM notes").await, ["B2"]);
+}
+
+#[tokio::test]
+async fn a_stopped_sync_reads_one_envelope() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(256));
+    let [mut a, mut b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    let id = keys.id;
+    let writer = generate_signing_key().unwrap();
+    server.register(id, writer.verifying_key());
+    b.run("INSERT INTO settings VALUES ('s1', 'x')").await;
+    b.sync(&server).await.unwrap();
+    let junk = (LATER_ENVELOPE_FORMAT.write)(&setting("later"), &keys, &writer);
+    server.inject(id, junk.clone());
+    for n in 0..300 {
+        let mut changes = setting(&format!("big{n}"));
+        changes[1].value = Value::Text("x".repeat(4_000));
+        server.inject(
+            id,
+            seal(&changes, &keys, 0, b.credentials.device(), nonce()),
+        );
+    }
+    let pages = batches_path(id);
+
+    let from = server.with(|s| s.requests.len());
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.newer.map(|n| n.seq), Some(2));
+    let first = server.bytes_since(from, &pages);
+
+    for _ in 0..3 {
+        let from = server.with(|s| s.requests.len());
+        let report = a.sync(&server).await.unwrap();
+        assert_eq!(report.newer.map(|n| n.seq), Some(2));
+        let requests: Vec<(Method, String)> = server.with(|s| s.requests[from..].to_vec());
+        let read = ReadBatches {
+            after: 1,
+            limit: Some(1),
+        }
+        .target(id);
+        let reads: Vec<&String> = requests
+            .iter()
+            .filter(|(m, t)| *m == Method::Get && t.starts_with(&pages))
+            .map(|(_, t)| t)
+            .collect();
+        let bytes = server.bytes_since(from, &pages);
+        assert_eq!(
+            reads,
+            [&read],
+            "first stopped sync: {first} bytes; {requests:?}"
+        );
+        assert!(
+            bytes <= junk.len() + 32,
+            "first stopped sync: {first} bytes; this one: {bytes}"
+        );
+        assert_eq!(requests.len(), 2, "{requests:?}");
+    }
+}
+
+/// Two devices of this version, and at sequence 2, after a setting from the second, bytes whose
+/// first byte names a later envelope format: junk no build reads.
+async fn stopped_at_junk(server: &Server) -> ([Peer; 2], Vec<u8>) {
+    let [mut a, mut b] = pair(server).await;
+    let id = a.credentials.library_id();
+    b.run("INSERT INTO settings VALUES ('s1', 'x')").await;
+    b.sync(server).await.unwrap();
+    let junk = b"\x02 damaged in storage".to_vec();
+    server.inject(id, junk.clone());
+    b.run("INSERT INTO settings VALUES ('s3', 'x')").await;
+    b.sync(server).await.unwrap();
+    a.run("INSERT INTO settings VALUES ('mine', 'x')").await;
+    let report = a.sync(server).await.unwrap();
+    assert_eq!(
+        seen(report.newer),
+        Some((2, None, Unknown::EnvelopeFormat(2), digest(&junk)))
+    );
+    ([a, b], junk)
+}
+
+async fn step_past(peer: &mut Peer, seq: u64, digest: [u8; 32]) -> Result<(), Error> {
+    let id = peer.credentials.library_id();
+    fongo_sync_client::step_past(&mut peer.conn, id, seq, digest).await
+}
+
+#[tokio::test]
+async fn stepping_past_junk_gives_up_only_that_envelope_and_reads_on() {
+    let server = Server::new();
+    let ([mut a, mut b], junk) = stopped_at_junk(&server).await;
+    // Until stepped past, it is read again each time.
+    let again = a.sync(&server).await.unwrap();
+    assert_eq!(again.newer.map(|n| n.seq), Some(2));
+
+    for peer in [&mut a, &mut b] {
+        step_past(peer, 2, digest(&junk)).await.unwrap();
+        let report = peer.sync(&server).await.unwrap();
+        assert_eq!(report.newer, None, "{report:#?}");
+        let refused: Vec<_> = report
+            .refused
+            .iter()
+            .map(|r| (r.seq, r.device, r.reason))
+            .collect();
+        assert_eq!(refused, [(2, None, Refusal::SteppedPast)]);
+    }
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.settings().await, ["mine=x", "s1=x", "s3=x"]);
+    assert_converged(&mut [a, b]).await;
+}
+
+#[tokio::test]
+async fn stepping_past_other_bytes_or_another_place_is_refused_and_changes_nothing() {
+    let server = Server::new();
+    let ([mut a, _b], junk) = stopped_at_junk(&server).await;
+    for (seq, named) in [(2, [0; 32]), (3, digest(&junk)), (1, digest(&junk))] {
+        let refused = step_past(&mut a, seq, named).await;
+        assert!(
+            matches!(refused, Err(Error::NotStoppedAt { seq: s }) if s == seq),
+            "{refused:?}"
+        );
+    }
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.newer.map(|n| n.seq), Some(2));
+    assert_eq!(a.cursor().await, 1);
+}
+
+#[tokio::test]
+async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
+    let server = Server::new();
+    let ([mut a, b], junk) = stopped_at_junk(&server).await;
+    let id = a.credentials.library_id();
+    let keys = a.credentials.library().clone();
+    server.replace(
+        id,
+        2,
+        seal(
+            &setting("repaired"),
+            &keys,
+            0,
+            b.credentials.device(),
+            nonce(),
+        ),
+    );
+    step_past(&mut a, 2, digest(&junk)).await.unwrap();
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!((report.newer, report.refused_total), (None, 0));
+    assert_eq!(
+        a.settings().await,
+        ["mine=x", "repaired=repaired", "s1=x", "s3=x"]
+    );
+}
+
+#[tokio::test]
+async fn an_envelope_stepped_past_stays_skipped_after_a_build_that_reads_it() {
+    let server = Server::new();
+    let [mut a, b] = pair(&server).await;
+    let keys = a.credentials.library().clone();
+    let later = (LATER_ENVELOPE_FORMAT.write)(&setting("later"), &keys, b.credentials.device());
+    server.inject(keys.id, later.clone());
+    a.sync(&server).await.unwrap();
+    step_past(&mut a, 1, digest(&later)).await.unwrap();
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 1);
+
+    server.replace(
+        keys.id,
+        1,
+        seal(&setting("later"), &keys, 0, b.credentials.device(), nonce()),
+    );
+    let report = a.sync(&server).await.unwrap();
+    assert_eq!(report.received, 0);
+    assert_eq!(a.settings().await, Vec::<String>::new());
 }
