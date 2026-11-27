@@ -543,7 +543,9 @@ impl Writes {
                 .iter()
                 .filter_map(|f| winner(&members, f).map(|(_, k)| k))
                 .max();
+            // Past wall 0, where adoptions are numbered, the next millisecond serves.
             let next = latest.map(|k| match k.counter.checked_add(1) {
+                Some(_) if k.wall_ms == 0 => (1, 0),
                 Some(counter) => (k.wall_ms, counter),
                 None => (k.wall_ms + 1, 0),
             });
