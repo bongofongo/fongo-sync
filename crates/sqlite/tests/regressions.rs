@@ -1143,6 +1143,48 @@ async fn widening_after_a_downgrade_keeps_an_edit_the_installer_has_not_pulled()
     );
 }
 
+fn plain_rating() -> Registry {
+    Registry::new(vec![
+        Collection::minted("books", "books", "id")
+            .field("title")
+            .field("status")
+            .field("finished")
+            .field("rating")
+            .together(&["status", "finished"]),
+    ])
+    .unwrap()
+}
+
+/// A field that leaves a set shows its own latest write again: a row that showed it NULL under
+/// the wider set, because a later write to the set did not carry it, takes its value back on
+/// install, and nothing is sent.
+#[tokio::test]
+async fn a_field_that_leaves_a_set_shows_its_own_value_again() {
+    let mut hub = Vec::new();
+    let mut peers = make(2, WIDE, plain_rating).await;
+    peers[0]
+        .run("INSERT INTO books (title, status, finished, rating) VALUES ('one', 'reading', 1, 4)")
+        .await;
+    settle(&mut peers, &mut hub).await;
+    upgrade(&mut peers[0], widened()).await;
+    settle(&mut peers, &mut hub).await;
+    later();
+    peers[1]
+        .run("UPDATE books SET status = 'done', finished = 2")
+        .await;
+    peers[1].push(&mut hub).await;
+    peers[0].pull(&hub).await;
+    assert_eq!(peers[0].lines(WIDE_ROWS).await, ["one done 2 -"]);
+    upgrade(&mut peers[0], plain_rating()).await;
+    assert_eq!(peers[0].lines(WIDE_ROWS).await, ["one done 2 4"]);
+    assert_eq!(peers[0].push(&mut hub).await, []);
+    settle(&mut peers, &mut hub).await;
+    assert_eq!(
+        same_everywhere(&mut peers, WIDE_ROWS).await,
+        ["one done 2 4"]
+    );
+}
+
 const WIDER: &[&str] = &[
     "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, status TEXT,
                                               finished INTEGER, rating INTEGER, note TEXT)",
