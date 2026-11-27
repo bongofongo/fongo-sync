@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fongo_sync_client::protocol::api::{
     AddDevice, Appended, BatchPage, Capabilities, CreateLibrary, DeviceRecord, Devices, ErrorBody,
@@ -72,6 +72,32 @@ pub struct State {
     pub stale_devices: bool,
     /// Keys every device list leaves out.
     pub hidden: Vec<VerifyingKey>,
+    /// Holds the first request it returns true for, before the server handles it or, when set,
+    /// after, until released.
+    hold: Option<(Lose, bool, Arc<Hold>)>,
+}
+
+/// A request held in the transport: [`Hold::reached`] returns once it is, and [`Hold::release`]
+/// lets it go on.
+#[derive(Default)]
+pub struct Hold {
+    reached: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+}
+
+impl Hold {
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets whoever waits in [`Hold::reached`] go on, as though the request had been held.
+    pub fn reach(&self) {
+        self.reached.notify_one();
+    }
+
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
 }
 
 pub struct Server {
@@ -141,6 +167,7 @@ impl Server {
                 respond: None,
                 stale_devices: false,
                 hidden: Vec::new(),
+                hold: None,
             }),
         }
     }
@@ -212,6 +239,18 @@ impl Server {
         })
     }
 
+    /// Holds the first request from now that `f` returns true for: before the server handles it,
+    /// or with `handled` after, so that it is stored and only its answer waits.
+    pub fn hold_if(
+        &self,
+        f: impl FnMut(&Request) -> bool + Send + 'static,
+        handled: bool,
+    ) -> Arc<Hold> {
+        let hold = Arc::new(Hold::default());
+        self.with(|s| s.hold = Some((Box::new(f), handled, hold.clone())));
+        hold
+    }
+
     pub fn respond(&self, f: impl FnMut(&Request) -> Option<Response> + Send + 'static) {
         self.with(|s| s.respond = Some(Box::new(f)));
     }
@@ -228,6 +267,7 @@ impl Server {
             s.store_again = false;
             s.stale_devices = false;
             s.hidden.clear();
+            s.hold = None;
         });
     }
 
@@ -296,7 +336,32 @@ impl Server {
 
 impl Transport for Server {
     async fn send(&self, request: Request) -> Result<Response, TransportError> {
-        match self.exchange(request) {
+        let held = self.with(|s| match s.hold.take() {
+            Some((mut f, handled, hold)) => {
+                if f(&request) {
+                    Some((handled, hold))
+                } else {
+                    s.hold = Some((f, handled, hold));
+                    None
+                }
+            }
+            None => None,
+        });
+        let answer = match held {
+            Some((false, hold)) => {
+                hold.reach();
+                hold.released.notified().await;
+                self.exchange(request)
+            }
+            Some((true, hold)) => {
+                let answer = self.exchange(request);
+                hold.reach();
+                hold.released.notified().await;
+                answer
+            }
+            None => self.exchange(request),
+        };
+        match answer {
             Some(answer) => answer,
             None => std::future::pending().await,
         }
@@ -700,6 +765,16 @@ impl Peer {
         self.lines("SELECT key || '=' || value FROM settings ORDER BY key")
             .await
     }
+}
+
+/// Whether `request` appends an envelope.
+pub fn is_append(request: &Request) -> bool {
+    request.method == Method::Post && request.target.ends_with("/batches")
+}
+
+/// Whether `request` reads the log.
+pub fn is_read(request: &Request) -> bool {
+    request.method == Method::Get && request.target.contains("/batches")
 }
 
 /// A directory of its own for one test's files.

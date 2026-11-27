@@ -421,6 +421,7 @@ dependencies = [
  "fongo-sync-protocol",
  "fongo-sync-sqlite",
  "hkdf",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sha2",
