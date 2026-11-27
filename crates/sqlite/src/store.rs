@@ -1,7 +1,7 @@
 //! The facts `fongo_sync_core::source` describes, kept in the kernel's tables and read back
 //! through the indexed questions of [`Source`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fongo_sync_core::model::Schema;
 use fongo_sync_core::source::{Alias, Body, Claim, Entry, Fact, Slot, Source, keep};
@@ -53,7 +53,9 @@ use crate::error::{Error, Result};
 /// the index of marks in collecting order, and keeps everything else as it was. The move is one
 /// way: a build of layout 3 refuses to install over layout 4, as over any layout it does not
 /// know. Such a build calling `collect` or `apply` without installing first is not refused, and
-/// would leave records waiting unadopted; an application installs at every open.
+/// would leave records waiting unadopted; an application installs at every open. This build
+/// refuses every call on a later layout, and every call but an install, a resume, an uninstall
+/// or asking whether capture is suspended on layout 3.
 pub(crate) const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS fongo_meta (key TEXT PRIMARY KEY, value)",
     // The smallest clock among a gid's facts in each collection.
@@ -161,6 +163,196 @@ pub(crate) const LAYOUT: i64 = 4;
 
 /// Earlier layouts the next install upgrades in place, adding what `TABLES` adds.
 pub(crate) const UPGRADES: &[i64] = &[3];
+
+/// The `fongo_meta` key that records that capture is suspended: set by `suspend` with dropping
+/// the triggers, removed by `resume` with putting them back.
+pub(crate) const SUSPENDED: &str = "suspended";
+
+/// What the kernel's tables are, as every operation reads them before anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
+    /// There are none.
+    Absent,
+    /// [`LAYOUT`], and whether suspending was recorded.
+    Current { suspended: bool },
+    /// An earlier layout in [`UPGRADES`].
+    Older(i64),
+    /// A layout later than [`LAYOUT`].
+    Newer(i64),
+    /// An earlier layout this build does not upgrade, or none recorded.
+    Unknown(Option<i64>),
+    /// Some of the tables of the layout recorded, or the record itself, are missing.
+    Partial,
+}
+
+impl State {
+    /// Whether suspending was recorded, for an operation that needs the tables at [`LAYOUT`].
+    pub(crate) fn current(self) -> Result<bool> {
+        match self {
+            State::Current { suspended } => Ok(suspended),
+            State::Absent => Err(Error::NotInstalled),
+            State::Older(found) => Err(Error::OlderLayout {
+                found,
+                known: LAYOUT,
+            }),
+            State::Newer(found) => Err(Error::NewerLayout {
+                found,
+                known: LAYOUT,
+            }),
+            State::Unknown(found) => Err(Error::UnknownLayout {
+                found,
+                known: LAYOUT,
+            }),
+            State::Partial => Err(Error::Corrupt(
+                "some of the kernel's tables are missing; uninstall them".into(),
+            )),
+        }
+    }
+}
+
+/// The tables [`TABLES`] makes.
+pub(crate) fn kernel_tables() -> impl Iterator<Item = &'static str> {
+    TABLES.iter().filter_map(|sql| {
+        sql.strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split([' ', '(']).next())
+    })
+}
+
+/// The table layout 4 added to layout 3.
+const ADDED: &str = "fongo_found";
+
+/// The suffixes of the three triggers that capture a collection's writes, named
+/// `fongo_<collection>_<suffix>`.
+const CAPTURE: [&str; 3] = ["ai", "au", "ad"];
+
+/// What [`read`] finds of the kernel in the database.
+pub(crate) struct Kernel {
+    pub state: State,
+    /// Whether a suspension is recorded, whatever the layout.
+    pub flagged: bool,
+    /// The collections ever adopted.
+    adopted: BTreeSet<String>,
+    /// The kernel's triggers, by name, with the table each is on.
+    triggers: BTreeMap<String, String>,
+}
+
+impl Kernel {
+    /// Whether `collection` was adopted and lacks any of its capture triggers on `table`: a
+    /// suspend dropped them, or a build that recorded none, or the application rebuilt the
+    /// table, or renamed it away and took them along.
+    pub(crate) fn lost(&self, collection: &str, table: &str) -> bool {
+        self.adopted.contains(collection) && self.on(collection, table, false).len() < CAPTURE.len()
+    }
+
+    /// Whether the marks `collection`'s triggers left can be told from writes to another table:
+    /// a suspend is recorded, which dropped every trigger while each was on its own table, or
+    /// one of them is still on `table` and none elsewhere. Renaming a table moves its three
+    /// triggers with it, and dropping it drops them, so with none on `table` and none recorded,
+    /// they may have marked writes to a table renamed away before it went.
+    pub(crate) fn marks_trusted(&self, collection: &str, table: &str) -> bool {
+        self.on(collection, table, true).is_empty()
+            && (self.flagged || !self.on(collection, table, false).is_empty())
+    }
+
+    /// The capture triggers of `collection` on `table`, or with `elsewhere` on any other.
+    fn on(&self, collection: &str, table: &str, elsewhere: bool) -> Vec<&'static str> {
+        CAPTURE
+            .into_iter()
+            .filter(|suffix| {
+                self.triggers
+                    .get(&format!("fongo_{collection}_{suffix}"))
+                    .is_some_and(|on| on.eq_ignore_ascii_case(table) != elsewhere)
+            })
+            .collect()
+    }
+}
+
+/// Reads [`Kernel`] in one statement: indexed reads of `fongo_meta` and one pass over the
+/// schema for the kernel's tables and triggers.
+pub(crate) fn read(db: &Db) -> Result<Kernel> {
+    let rows = match db.query(
+        "SELECT 'meta', key, value FROM fongo_meta WHERE key IN ('layout', 'suspended')
+         UNION ALL
+         SELECT 'meta', key, value FROM fongo_meta WHERE key > 'adopted:' AND key < 'adopted;'
+         UNION ALL
+         SELECT type, name, tbl_name FROM sqlite_master
+          WHERE type IN ('table', 'trigger') AND name LIKE 'fongo!_%' ESCAPE '!'",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let tables = db.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'fongo!_%' ESCAPE '!'",
+                &[],
+            )?;
+            let mut there = BTreeSet::new();
+            for r in &tables {
+                there.insert(as_text(&r[0])?.to_string());
+            }
+            if there.contains("fongo_meta") {
+                return Err(e);
+            }
+            let state = if kernel_tables().any(|t| there.contains(t)) {
+                State::Partial
+            } else {
+                State::Absent
+            };
+            return Ok(Kernel {
+                state,
+                flagged: false,
+                adopted: BTreeSet::new(),
+                triggers: BTreeMap::new(),
+            });
+        }
+    };
+    let (mut layout, mut flagged) = (None, false);
+    let mut adopted = BTreeSet::new();
+    let mut tables = BTreeSet::new();
+    let mut triggers = BTreeMap::new();
+    for r in rows {
+        let name = as_text(&r[1])?;
+        match as_text(&r[0])? {
+            "meta" if name == "layout" => layout = Some(r[2].clone()),
+            "meta" if name == SUSPENDED => flagged = true,
+            "meta" => {
+                if let Some(collection) = name.strip_prefix("adopted:") {
+                    adopted.insert(collection.to_string());
+                }
+            }
+            "table" => {
+                tables.insert(name.to_string());
+            }
+            _ => {
+                triggers.insert(name.to_string(), as_text(&r[2])?.to_string());
+            }
+        }
+    }
+    let core = kernel_tables()
+        .filter(|t| *t != ADDED)
+        .all(|t| tables.contains(t));
+    let state = match layout {
+        Some(Value::Int(LAYOUT)) if core && tables.contains(ADDED) => {
+            State::Current { suspended: flagged }
+        }
+        Some(Value::Int(LAYOUT)) => State::Partial,
+        Some(Value::Int(found)) if found > LAYOUT => State::Newer(found),
+        Some(Value::Int(found)) if UPGRADES.contains(&found) && core => State::Older(found),
+        Some(Value::Int(found)) if UPGRADES.contains(&found) => State::Partial,
+        Some(Value::Int(found)) => State::Unknown(Some(found)),
+        _ => State::Unknown(None),
+    };
+    Ok(Kernel {
+        state,
+        flagged,
+        adopted,
+        triggers,
+    })
+}
+
+/// [`State`], read in one statement.
+pub(crate) fn state(db: &Db) -> Result<State> {
+    Ok(read(db)?.state)
+}
 
 pub(crate) fn as_clock(value: &Value) -> Result<Hlc> {
     Hlc::decode(as_text(value)?).ok_or_else(|| Error::Corrupt("a clock does not parse".into()))

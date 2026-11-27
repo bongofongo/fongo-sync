@@ -631,6 +631,11 @@ fn layout_three_is_upgraded_in_place() {
             let replica = Replica::new(registry());
             replica.install(&mut a).await.unwrap();
             library::run(&mut a, "UPDATE books SET title = 'kept' WHERE id = 3").await;
+            // Read before the downgrade: no call but an install works on layout 3.
+            let before = (
+                replica.outbox(&mut a, u32::MAX).await.unwrap().changes,
+                replica.inspect(&mut a).await.unwrap(),
+            );
             // As layout 3 laid its tables down.
             let mut downgrade = vec![
                 "DROP TABLE fongo_found",
@@ -642,10 +647,6 @@ fn layout_three_is_upgraded_in_place() {
             for sql in downgrade {
                 sqlx::query(sql).execute(&mut a).await.unwrap();
             }
-            let before = (
-                replica.outbox(&mut a, u32::MAX).await.unwrap().changes,
-                replica.inspect(&mut a).await.unwrap(),
-            );
             if stepped {
                 replica.install_step(&mut a, 3).await.unwrap();
             } else {

@@ -23,7 +23,7 @@ use crate::db::{Db, as_gid, as_int, as_text, loaded, quoted, stored};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::registry::{Collection, Key, Kind, Registry};
-use crate::store::{Facts, LAYOUT, TABLES, UPGRADES, as_clock};
+use crate::store::{Facts, Kernel, LAYOUT, SUSPENDED, State, TABLES, as_clock, read, state};
 use crate::tables::{self, NOW, every_row, read_row};
 
 /// What [`Replica::resume`] makes of rows changed while the triggers were suspended.
@@ -32,7 +32,10 @@ pub enum Resume {
     /// They are the application's edits, sent like any other.
     Send,
     /// They are this replica's own baseline: not sent, and kept in the row until this replica or
-    /// another next writes the field.
+    /// another next writes the field. A row whose write the triggers captured before capture
+    /// stopped, and no collect took, is the application's edit instead, where its mark can be
+    /// trusted (see [`Replica::resume`]): it is sent, with all it differs by, also what changed
+    /// in it while capture was off.
     Baseline,
 }
 
@@ -236,6 +239,16 @@ fn now_ms(db: &Db) -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// Drops the marks of `collection` that a trigger left, which may stand for writes to another
+/// table; those of found rows waiting to be adopted, at time 0, are the kernel's own and stay.
+fn set_aside(db: &Db, collection: &str) -> Result<()> {
+    db.exec(
+        "DELETE FROM fongo_dirty WHERE collection = ?1 AND at <> 0",
+        &[Value::Text(collection.into())],
+    )?;
+    Ok(())
+}
+
 /// Drops every object of a type the kernel made: its triggers, or its tables.
 fn drop_kernel(db: &Db, kind: &str) -> Result<()> {
     let names = db.query(
@@ -261,6 +274,19 @@ async fn with_db<T>(conn: &mut SqliteConnection, work: impl FnOnce(&Db) -> Resul
     let out = work(&db);
     drop(db);
     out
+}
+
+/// Whether the kernel's tables are in the database, at the layout this build uses: `false` when
+/// there are none; [`Error::NewerLayout`], [`Error::OlderLayout`] or [`Error::UnknownLayout`] when
+/// they are of another layout. A read that writes nothing.
+pub async fn installed(conn: &mut SqliteConnection) -> Result<bool> {
+    with_db(conn, |db| {
+        db.atomically(|db| match state(db)? {
+            State::Absent => Ok(false),
+            other => other.current().map(|_| true),
+        })
+    })
+    .await
 }
 
 /// A local row: what the kernel last knew of it.
@@ -777,10 +803,12 @@ impl Replica {
     /// possible writes, so they fill gaps in a library but never overwrite it. Refuses a
     /// registry whose tables lack a column it names, or whose natural key columns accept NULL,
     /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
-    /// layout 3 is upgraded in place.
+    /// layout 3 is upgraded in place. Refuses with [`Error::Suspended`] while capture is
+    /// suspended: only [`Replica::resume`] puts the triggers back then, having compared the
+    /// tables with what the kernel last saw of them.
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
-            db.atomically(|db| self.install_in(db, None, None).map(|_| ()))
+            db.atomically_writing(|db| self.install_in(db, None, None).map(|_| ()))
         })
         .await
     }
@@ -821,23 +849,22 @@ impl Replica {
         resuming: Option<Resume>,
         take: Option<usize>,
     ) -> Result<Collected> {
-        let installed = !db
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_meta'",
-                &[],
-            )?
-            .is_empty();
-        if installed {
-            match meta_get(db, "layout")? {
-                Some(Value::Int(LAYOUT)) => {}
-                Some(Value::Int(old)) if UPGRADES.contains(&old) => {}
-                other => {
-                    return Err(Error::Corrupt(format!(
-                        "the kernel's tables are of layout {other:?}, not {LAYOUT}; uninstall them first"
-                    )));
-                }
+        // Only a resume compares the tables whose capture was off with the images; an install
+        // would put the triggers back over rows written meanwhile, unrecorded.
+        let kernel = read(db)?;
+        let lost = self.lost(&kernel);
+        let untrusted = self.untrusted(&kernel);
+        let resuming = match kernel.state {
+            State::Current { suspended: true } => Some((resuming.ok_or(Error::Suspended)?, None)),
+            State::Current { suspended: false } | State::Older(_) if !lost.is_empty() => {
+                Some((resuming.ok_or(Error::Suspended)?, Some(lost)))
             }
-        }
+            State::Current { suspended: false } | State::Absent | State::Older(_) => None,
+            other => {
+                other.current()?;
+                None
+            }
+        };
         for sql in TABLES {
             db.exec(sql, &[])?;
         }
@@ -866,6 +893,7 @@ impl Replica {
                 .is_empty()
             && !adopt::recorded(db)?;
         let mut to_record = Vec::new();
+        let mut fresh = BTreeSet::new();
         for (idx, c) in self.registry.collections().iter().enumerate() {
             let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
             let fields = Value::Text(names.join(","));
@@ -878,6 +906,9 @@ impl Replica {
             let was_together = meta_get(db, &sets)?;
             meta_set(db, &known, fields)?;
             meta_set(db, &sets, together.clone())?;
+            if meta_get(db, &adoption)?.is_none() {
+                fresh.insert(idx);
+            }
             if meta_get(db, &adoption)?.is_none() && record {
                 to_record.push(idx);
                 meta_set(db, &adoption, Value::Int(1))?;
@@ -952,11 +983,15 @@ impl Replica {
             }
         }
         set.extend(self.merge(&mut cx, &foreign, false)?);
-        if let Some(how) = resuming {
+        if let Some((how, only)) = resuming {
             // What was written while suspended is told apart from images, so every found row
             // gets one first.
             cx.collected += self.adopt(&mut cx, None)?;
-            self.resume_in(db, how)?;
+            self.resume_in(db, how, only.as_ref(), &untrusted, &fresh)?;
+            db.exec(
+                "DELETE FROM fongo_meta WHERE key = ?1",
+                &[Value::Text(SUSPENDED.into())],
+            )?;
         }
         self.record_found(db, &to_record)?;
         let more = self.step(&mut cx, &[], set, take)?;
@@ -1145,39 +1180,152 @@ impl Replica {
     /// changed while suspended never meets them. Suspending in the middle of such an install
     /// holds the write lock for the rest of its adoption, as long as a whole install of those
     /// rows.
+    ///
+    /// That capture is suspended is recorded with the triggers' removal, in the same
+    /// transaction, and stays recorded until [`Replica::resume`]: meanwhile `install`,
+    /// `install_step`, `collect`, `collect_step`, `apply` and `uncollected_rows` refuse with
+    /// [`Error::Suspended`], so an application that ends while suspended resumes when it opens
+    /// again. Suspending again changes nothing, and with no kernel tables there is nothing to
+    /// suspend.
     pub async fn suspend(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
-            db.atomically(|db| {
+            db.atomically_writing(|db| {
+                let kernel = read(db)?;
+                match kernel.state {
+                    State::Absent => return Ok(()),
+                    other if other.current()? => return Ok(()),
+                    _ => {}
+                }
                 if adopt::recorded(db)? {
                     let mut cx = Ctx::begin(db)?;
                     cx.collected += self.adopt_as_recorded(&mut cx)?;
                     cx.collected += self.adopt(&mut cx, None)?;
                     cx.finish()?;
                 }
-                drop_kernel(db, "trigger")
+                // Once recorded, the suspension vouches for every mark, so those that may stand
+                // for writes to another table go now, as a resume without the record drops them.
+                for idx in self.untrusted(&kernel) {
+                    set_aside(db, &self.collection(idx).name)?;
+                }
+                drop_kernel(db, "trigger")?;
+                meta_set(db, SUSPENDED, Value::Int(1))
             })
         })
         .await
+    }
+
+    /// Whether capture is suspended, as [`Replica::resume`] defines it: a suspend is recorded,
+    /// or a collection that was installed lacks a trigger on its table. Answers too on a layout
+    /// that [`Replica::resume`] upgrades, changing nothing. Fails as every other call does where
+    /// the kernel's tables are missing or of a layout this build cannot upgrade.
+    pub async fn suspended(&self, conn: &mut SqliteConnection) -> Result<bool> {
+        with_db(conn, |db| {
+            db.atomically(|db| {
+                let kernel = read(db)?;
+                if !matches!(kernel.state, State::Older(_)) {
+                    kernel.state.current()?;
+                }
+                Ok(kernel.flagged || !self.lost(&kernel).is_empty())
+            })
+        })
+        .await
+    }
+
+    /// The collections of the registry whose capture is lost and whose marks
+    /// [`Kernel::marks_trusted`] does not trust.
+    fn untrusted(&self, kernel: &Kernel) -> BTreeSet<usize> {
+        self.lost(kernel)
+            .into_iter()
+            .filter(|idx| {
+                let c = self.collection(*idx);
+                !kernel.marks_trusted(&c.name, &c.table)
+            })
+            .collect()
+    }
+
+    /// The collections of the registry whose capture [`Kernel::lost`] finds lost.
+    fn lost(&self, kernel: &Kernel) -> BTreeSet<usize> {
+        self.registry
+            .collections()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| kernel.lost(&c.name, &c.table))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Fails unless the kernel's tables are of this build's layout with capture running: not
+    /// suspended, and every collection ever adopted with its triggers in place; or there are
+    /// none, which it returns for the caller to decide.
+    fn ready(&self, db: &Db) -> Result<State> {
+        let kernel = read(db)?;
+        if kernel.state == State::Absent {
+            return Ok(kernel.state);
+        }
+        if kernel.state.current()? || !self.lost(&kernel).is_empty() {
+            return Err(Error::Suspended);
+        }
+        Ok(kernel.state)
     }
 
     /// Puts the triggers back after [`Replica::suspend`], installing again so that collections
     /// and fields the registry gained meanwhile are adopted, and compares every table with the
     /// rows' images. A row added meanwhile is a new entity and a row removed is deleted,
     /// whichever `how`; a row whose local id was reused meanwhile is the old entity changed. A
-    /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline.
+    /// row changed meanwhile is, by `how`, an edit to send, or the replica's own baseline. A row
+    /// found at a first install and still waiting to be adopted that the application edits
+    /// meanwhile is sent with the oldest clock, as found rows are: the kernel holds no image of a
+    /// waiting row to tell the edit by.
     ///
     /// Unlike [`Replica::install_step`], it collects every marked row before it returns, in the
     /// transaction that puts the triggers back: a row written back to its image before a later
     /// collect would otherwise lose both writes. It is as long as the rows changed meanwhile are
     /// many; collecting with [`Replica::collect_step`] before suspending leaves it only those.
+    ///
+    /// Capture is suspended when a suspend is recorded, or when a collection of the registry
+    /// that was installed lacks any of its triggers on its table: a build that recorded no
+    /// suspension left them dropped, the application rebuilt the collection's table, which drops
+    /// its triggers with it, or renamed the table away, which takes them along. Without a
+    /// record, only the tables of those collections are compared. Every trigger of the kernel's
+    /// is laid again, on the registry's tables, so one taken along to another table captures
+    /// nothing more there. When capture is intact, `resume` is [`Replica::install`]: rows
+    /// written since the last collect are edits like any other, whichever `how`.
+    ///
+    /// The marks a collection's triggers left are trusted when one of its triggers is still on
+    /// its table and none is on another, or when a suspend is recorded: [`Replica::suspend`]
+    /// applies the same test as it drops the triggers. Otherwise they may stand for writes to a
+    /// table renamed away, which takes its triggers along until it is dropped, and they are set
+    /// aside, but for those of found rows still waiting to be adopted: the collection's table is
+    /// compared with the images alone, and nothing written to the old table is sent. Setting
+    /// the marks aside has two consequences, both avoided by collecting before a migration:
+    ///
+    /// - a row removed and made again at the same minted id, captured and not collected, is the
+    ///   old entity changed, so with [`Resume::Send`] its new values are sent and the removal is
+    ///   not (a natural key's row is the same entity either way);
+    /// - with [`Resume::Baseline`], an edit captured before capture was lost and not collected
+    ///   is kept as a baseline like any other change, as it is after an unrecorded suspend by a
+    ///   build that recorded none: it cannot be told from a write to the old table.
+    ///
+    /// A collection the registry gained meanwhile is adopted as an install adopts it: its rows
+    /// are the oldest writes, filling gaps but never overwriting.
     pub async fn resume(&self, conn: &mut SqliteConnection, how: Resume) -> Result<()> {
         with_db(conn, |db| {
-            db.atomically(|db| self.install_in(db, Some(how), None).map(|_| ()))
+            db.atomically_writing(|db| self.install_in(db, Some(how), None).map(|_| ()))
         })
         .await
     }
 
-    fn resume_in(&self, db: &Db, how: Resume) -> Result<()> {
+    /// Compares the tables of the collections in `only`, or of every collection, with the images,
+    /// but for those just adopted, `fresh`, whose rows are found rows. The marks of the
+    /// collections in `untrusted` are dropped first: they may stand for writes to another table.
+    fn resume_in(
+        &self,
+        db: &Db,
+        how: Resume,
+        only: Option<&BTreeSet<usize>>,
+        untrusted: &BTreeSet<usize>,
+        fresh: &BTreeSet<usize>,
+    ) -> Result<()> {
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut session = ev.session(&facts);
@@ -1195,7 +1343,13 @@ impl Replica {
                 ],
             )
         };
-        for c in self.registry.collections() {
+        for (idx, c) in self.registry.collections().iter().enumerate() {
+            if only.is_some_and(|only| !only.contains(&idx)) || fresh.contains(&idx) {
+                continue;
+            }
+            if untrusted.contains(&idx) {
+                set_aside(db, &c.name)?;
+            }
             let rows: BTreeMap<String, Row> = every_row(db, c)?.into_iter().collect();
             let mapped = db.query(
                 "SELECT key, gid, image, doomed FROM fongo_ids WHERE collection = ?1",
@@ -1225,8 +1379,13 @@ impl Replica {
                 if changed.is_empty() {
                     continue;
                 }
+                // A marked row holds an edit the triggers captured, which no baseline takes.
+                let captured = marked_at(db, &c.name, &key)?.is_some();
                 match how {
                     Resume::Send => {
+                        mark(&c.name, &key, false)?;
+                    }
+                    Resume::Baseline if captured => {
                         mark(&c.name, &key, false)?;
                     }
                     Resume::Baseline => {
@@ -1256,8 +1415,14 @@ impl Replica {
                     }
                 }
             }
+            // A mark already there stays as it is: a found row waiting at the oldest time keeps it.
             for key in rows.keys().filter(|k| !known.contains(*k)) {
-                mark(&c.name, key, false)?;
+                db.exec(
+                    &format!(
+                        "INSERT OR IGNORE INTO fongo_dirty (collection, key, at) VALUES (?1, ?2, {NOW})"
+                    ),
+                    &[Value::Text(c.name.clone()), Value::Text(key.clone())],
+                )?;
             }
         }
         db.check()
@@ -1266,9 +1431,18 @@ impl Replica {
     /// Removes the triggers and every table the kernel keeps, leaving the application's own.
     /// Installing again afterwards is a fresh join: every row becomes a new entity, so syncing
     /// with replicas that knew the old ones gives two copies of each row that has no identity.
+    /// Ends a suspension with the rest. Removes tables of an earlier layout too, whatever it
+    /// was, but refuses those of a later one ([`Error::NewerLayout`]), which may hold what this
+    /// build does not know to remove.
     pub async fn uninstall(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
-            db.atomically(|db| {
+            db.atomically_writing(|db| {
+                if let State::Newer(found) = state(db)? {
+                    return Err(Error::NewerLayout {
+                        found,
+                        known: LAYOUT,
+                    });
+                }
                 drop_kernel(db, "trigger")?;
                 drop_kernel(db, "table")
             })
@@ -1280,7 +1454,8 @@ impl Replica {
     /// the rows they affect up to date. Returns how many changes were produced.
     pub async fn collect(&self, conn: &mut SqliteConnection) -> Result<usize> {
         with_db(conn, |db| {
-            db.atomically(|db| {
+            db.atomically_writing(|db| {
+                self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
                 self.step(&mut cx, &[], BTreeSet::new(), None)?;
                 cx.finish()?;
@@ -1353,6 +1528,7 @@ impl Replica {
     ) -> Result<Collected> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
+                self.ready(db)?.current()?;
                 let mut cx = Ctx::begin(db)?;
                 let more = self.step(&mut cx, &[], BTreeSet::new(), Some(rows))?;
                 cx.finish()?;
@@ -1370,67 +1546,71 @@ impl Replica {
 
     /// How many rows are still to be collected, counting at most `at_most`: those marked as
     /// written since the last collect, rows that cannot be collected yet among them, and rows a
-    /// first install in steps found and has not adopted yet. A read that writes nothing.
+    /// first install in steps found and has not adopted yet. A read that writes nothing. 0 with
+    /// no kernel tables; refused while capture is suspended, when what was written meanwhile is
+    /// not known.
     pub async fn uncollected_rows(
         &self,
         conn: &mut SqliteConnection,
         at_most: usize,
     ) -> Result<usize> {
         with_db(conn, |db| {
-            let installed = !db
-                .query(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fongo_dirty'",
-                    &[],
-                )?
-                .is_empty();
-            if !installed {
-                return Ok(0);
-            }
-            let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
-            let rows = db.query(
-                "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
-                &[Value::Int(limit)],
-            )?;
-            let marked = rows
-                .first()
-                .and_then(|r| as_int(&r[0]).ok())
-                .map_or(0, |n| usize::try_from(n).unwrap_or(0));
-            let left = i64::try_from(at_most.saturating_sub(marked)).unwrap_or(i64::MAX);
-            Ok(marked + adopt::recorded_rows(db, left)?)
+            db.atomically(|db| {
+                if self.ready(db)? == State::Absent {
+                    return Ok(0);
+                }
+                let limit = i64::try_from(at_most).unwrap_or(i64::MAX);
+                let rows = db.query(
+                    "SELECT count(*) FROM (SELECT 1 FROM fongo_dirty LIMIT ?1)",
+                    &[Value::Int(limit)],
+                )?;
+                let marked = rows
+                    .first()
+                    .and_then(|r| as_int(&r[0]).ok())
+                    .map_or(0, |n| usize::try_from(n).unwrap_or(0));
+                let left = i64::try_from(at_most.saturating_sub(marked)).unwrap_or(i64::MAX);
+                Ok(marked + adopt::recorded_rows(db, left)?)
+            })
         })
         .await
     }
 
     pub async fn outbox(&self, conn: &mut SqliteConnection, limit: u32) -> Result<Outbox> {
         with_db(conn, |db| {
-            let rows = db.query(
-                "SELECT seq, collection, gid, field, value, is_ref, clock
-                 FROM fongo_outbox ORDER BY seq LIMIT ?1",
-                &[Value::Int(i64::from(limit))],
-            )?;
-            let mut outbox = Outbox::default();
-            for r in rows {
-                outbox.through = as_int(&r[0])?;
-                outbox.changes.push(Change {
-                    collection: as_text(&r[1])?.to_string(),
-                    gid: as_gid(&r[2])?,
-                    field: as_text(&r[3])?.to_string(),
-                    value: loaded(&r[4], &r[5])?,
-                    clock: as_clock(&r[6])?,
-                });
-            }
-            Ok(outbox)
+            db.atomically(|db| {
+                state(db)?.current()?;
+                let rows = db.query(
+                    "SELECT seq, collection, gid, field, value, is_ref, clock
+                     FROM fongo_outbox ORDER BY seq LIMIT ?1",
+                    &[Value::Int(i64::from(limit))],
+                )?;
+                let mut outbox = Outbox::default();
+                for r in rows {
+                    outbox.through = as_int(&r[0])?;
+                    outbox.changes.push(Change {
+                        collection: as_text(&r[1])?.to_string(),
+                        gid: as_gid(&r[2])?,
+                        field: as_text(&r[3])?.to_string(),
+                        value: loaded(&r[4], &r[5])?,
+                        clock: as_clock(&r[6])?,
+                    });
+                }
+                Ok(outbox)
+            })
         })
         .await
     }
 
     pub async fn acknowledge(&self, conn: &mut SqliteConnection, through: i64) -> Result<()> {
         with_db(conn, |db| {
-            db.exec(
-                "DELETE FROM fongo_outbox WHERE seq <= ?1",
-                &[Value::Int(through)],
-            )?;
-            Ok(())
+            db.atomically_writing(|db| {
+                state(db)?.current()?;
+                db.exec(
+                    "DELETE FROM fongo_outbox WHERE seq <= ?1",
+                    &[Value::Int(through)],
+                )?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1438,7 +1618,13 @@ impl Replica {
     /// Merges changes from other replicas and brings the application's tables in line. Local
     /// writes are collected first, so each has a clock to be compared by.
     pub async fn apply(&self, conn: &mut SqliteConnection, changes: &[Change]) -> Result<Applied> {
-        with_db(conn, |db| db.atomically(|db| self.apply_in(db, changes))).await
+        with_db(conn, |db| {
+            db.atomically_writing(|db| {
+                self.ready(db)?.current()?;
+                self.apply_in(db, changes)
+            })
+        })
+        .await
     }
 
     fn apply_in(&self, db: &Db, changes: &[Change]) -> Result<Applied> {
@@ -1671,11 +1857,14 @@ impl Replica {
     /// change it meets was made knowing those edits, so is not a conflict with them.
     pub async fn release_bases(&self, conn: &mut SqliteConnection, through: i64) -> Result<()> {
         with_db(conn, |db| {
-            db.exec(
-                "DELETE FROM fongo_bases WHERE seq <= ?1",
-                &[Value::Int(through)],
-            )?;
-            Ok(())
+            db.atomically_writing(|db| {
+                state(db)?.current()?;
+                db.exec(
+                    "DELETE FROM fongo_bases WHERE seq <= ?1",
+                    &[Value::Int(through)],
+                )?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1691,29 +1880,34 @@ impl Replica {
         gid: Gid,
     ) -> Result<BTreeMap<String, Value>> {
         with_db(conn, |db| {
-            let Some(c) = self.schema.collection(collection) else {
-                return Ok(BTreeMap::new());
-            };
-            let ev = self.evaluator();
-            let facts = Facts { db };
-            let Ok(target) = ev.target(&facts, collection, gid) else {
-                return Ok(BTreeMap::new());
-            };
-            let members = if target.live.is_empty() {
-                target.members.clone()
-            } else {
-                target.live.clone()
-            };
-            let mut out = BTreeMap::new();
-            let mut fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
-            fields.push(fongo_sync_core::DELETED);
-            for f in fields {
-                if let Some((value, _)) = facts.register(&self.schema, collection, &members, f)? {
-                    out.insert(f.to_string(), value);
+            db.atomically(|db| {
+                state(db)?.current()?;
+                let Some(c) = self.schema.collection(collection) else {
+                    return Ok(BTreeMap::new());
+                };
+                let ev = self.evaluator();
+                let facts = Facts { db };
+                let Ok(target) = ev.target(&facts, collection, gid) else {
+                    return Ok(BTreeMap::new());
+                };
+                let members = if target.live.is_empty() {
+                    target.members.clone()
+                } else {
+                    target.live.clone()
+                };
+                let mut out = BTreeMap::new();
+                let mut fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+                fields.push(fongo_sync_core::DELETED);
+                for f in fields {
+                    if let Some((value, _)) =
+                        facts.register(&self.schema, collection, &members, f)?
+                    {
+                        out.insert(f.to_string(), value);
+                    }
                 }
-            }
-            db.check()?;
-            Ok(out)
+                db.check()?;
+                Ok(out)
+            })
         })
         .await
     }
@@ -1754,6 +1948,7 @@ impl Replica {
     ) -> Result<Option<Made>> {
         with_db(conn, |db| {
             db.atomically(|db| {
+                state(db)?.current()?;
                 let Some(origin) = self.origin_in(db, collection, gid)? else {
                     return Ok(None);
                 };
@@ -1812,6 +2007,7 @@ impl Replica {
     ) -> Result<Option<bool>> {
         with_db(conn, |db| {
             db.atomically(|db| {
+                state(db)?.current()?;
                 if let Some(c) = self.registry.index(collection).map(|i| self.collection(i))
                     && let Some(f) = fields
                         .iter()
@@ -1851,10 +2047,14 @@ impl Replica {
         collection: &str,
         key: &str,
     ) -> Result<Option<Gid>> {
-        with_db(conn, |db| self.gid_for_key_in(db, collection, key)).await
+        with_db(conn, |db| {
+            db.atomically(|db| self.gid_for_key_in(db, collection, key))
+        })
+        .await
     }
 
     fn gid_for_key_in(&self, db: &Db, collection: &str, key: &str) -> Result<Option<Gid>> {
+        state(db)?.current()?;
         if self.registry.index(collection).is_none() {
             return Ok(None);
         }
@@ -1890,25 +2090,30 @@ impl Replica {
         gid: Gid,
     ) -> Result<(Gid, Option<String>)> {
         with_db(conn, |db| {
-            if self.registry.index(collection).is_none() {
-                return Ok((gid, None));
-            }
-            let ev = self.evaluator();
-            let facts = Facts { db };
-            let mut canonical = gid;
-            let mut candidates = vec![gid];
-            if let Ok(t) = ev.target(&facts, collection, gid) {
-                canonical = t.canonical;
-                candidates.insert(0, t.canonical);
-                candidates.extend(t.members);
-            }
-            db.check()?;
-            for g in candidates {
-                if let Some((key, _)) = rows_of(db, collection, g)?.into_iter().find(|(_, d)| !d) {
-                    return Ok((canonical, Some(key)));
+            db.atomically(|db| {
+                state(db)?.current()?;
+                if self.registry.index(collection).is_none() {
+                    return Ok((gid, None));
                 }
-            }
-            Ok((canonical, None))
+                let ev = self.evaluator();
+                let facts = Facts { db };
+                let mut canonical = gid;
+                let mut candidates = vec![gid];
+                if let Ok(t) = ev.target(&facts, collection, gid) {
+                    canonical = t.canonical;
+                    candidates.insert(0, t.canonical);
+                    candidates.extend(t.members);
+                }
+                db.check()?;
+                for g in candidates {
+                    if let Some((key, _)) =
+                        rows_of(db, collection, g)?.into_iter().find(|(_, d)| !d)
+                    {
+                        return Ok((canonical, Some(key)));
+                    }
+                }
+                Ok((canonical, None))
+            })
         })
         .await
     }
@@ -1921,15 +2126,19 @@ impl Replica {
         local_id: i64,
     ) -> Result<Option<Gid>> {
         let key = tables::minted_key(local_id);
-        with_db(conn, |db| self.gid_for_key_in(db, collection, &key)).await
+        with_db(conn, |db| {
+            db.atomically(|db| self.gid_for_key_in(db, collection, &key))
+        })
+        .await
     }
 
     /// Everything this replica holds that decides what its rows show; see [`Inspection`].
     pub async fn inspect(&self, conn: &mut SqliteConnection) -> Result<Inspection> {
-        with_db(conn, |db| self.inspect_in(db)).await
+        with_db(conn, |db| db.atomically(|db| self.inspect_in(db))).await
     }
 
     fn inspect_in(&self, db: &Db) -> Result<Inspection> {
+        state(db)?.current()?;
         let mut out = Inspection {
             node: meta_get(db, "node")?.map(|n| as_gid(&n)).transpose()?,
             ..Inspection::default()
@@ -2033,13 +2242,9 @@ impl Replica {
                 .map_or(gid, |t| t.canonical);
             out.held.push((collection, canonical));
         }
-        let found = if adopt::laid(db)? {
-            " UNION SELECT collection, key FROM fongo_found WHERE batch >= 0"
-        } else {
-            ""
-        };
         for r in db.query(
-            &format!("SELECT collection, key FROM fongo_dirty{found}"),
+            "SELECT collection, key FROM fongo_dirty
+             UNION SELECT collection, key FROM fongo_found WHERE batch >= 0",
             &[],
         )? {
             out.uncollected

@@ -26,7 +26,12 @@ millisecond are collected together. The rows found in a collection's tables when
 installed in steps are recorded by that install and adopted by the steps after it, in batches,
 as a whole install at that moment would adopt them; what the application writes meanwhile is
 collected after them as its edits. The kernel's tables are of layout 4: a build that knows only
-layout 3 refuses them, and this one upgrades layout 3 in place at its next install.
+layout 3 refuses to install over them, and this one upgrades layout 3 in place at its next
+install. Every call reads the layout first: this build refuses tables of a later layout in every
+call, and layout 3 in every call but `install`, `install_step`, `resume`, `uninstall` and
+`Replica::suspended`; with no kernel tables, a call that needs them fails with
+`Error::NotInstalled`, and with some of them missing every call but `uninstall` fails with
+`Error::Corrupt`.
 
 Each collection in the registry is a table with a key: minted (a local integer id the kernel maps
 to a global one) or natural (key fields every replica derives the same id from). Its fields are
@@ -58,7 +63,25 @@ waits for it needs its own way on.
 `Replica::suspend` and `resume` let an application migrate its schema without each write being
 collected; on resuming, rows changed meanwhile are sent as edits or kept as this replica's own, as
 the application asks. Suspending in the middle of a first install in steps adopts the rest of what
-it found first, in one transaction. `uninstall` removes everything the kernel added.
+it found first, in one transaction. The suspension is recorded in the database until `resume`.
+Capture also counts as suspended when a collection that was installed lacks any of its triggers
+on its table, as when a build that recorded no suspension dropped them, or the application
+rebuilt the table or renamed it away; `resume` then compares only those collections' tables.
+With `Resume::Baseline`, a row whose edit the triggers captured before capture stopped is still
+sent as an edit, unless the triggers may have marked writes to a table renamed away, which a
+resume, or a suspend as it drops them, finds by where they are. Then the table is compared alone:
+no row it holds is removed or made again, a row removed and made again at its minted id before
+capture stopped is the old entity changed, and with `Resume::Baseline` an edit captured and not
+collected is kept rather than sent; collecting before a migration avoids these two. While
+capture is suspended, `install`, `collect`, `apply` and their bounded forms fail with
+`Error::Suspended`, so an application that ends while suspended calls `resume` when it opens
+again, and `Replica::suspended` says whether it must. When capture is intact, `resume` is
+`install`. `uninstall` removes everything the kernel added, and the client's tables with it.
+
+Each call that writes, made with no transaction open, takes SQLite's write lock with its first
+statement and so waits for another connection's write in the busy handler; made inside the
+application's own transaction, it relies on that transaction having been begun with
+`BEGIN IMMEDIATE`.
 
 What replicas must converge to is stated twice, once to run and once to prove; see
 [Verification](#verification).
@@ -83,7 +106,9 @@ this yet.
 
 `fongo-sync-client` drives a `Replica` against such a server: `sync` reads what devices appended
 after its cursor, refuses envelopes it cannot trust, waits at one from a signer the device list
-does not hold yet, applies the rest, then seals and appends the outbox. Credentials stay with the application; the client stores only its cursor,
+does not hold yet, applies the rest, then seals and appends the outbox. It refuses, before reading
+or writing anything, a database whose capture is suspended or whose kernel tables are missing or
+of another layout. Credentials stay with the application; the client stores only its cursor,
 the envelope it is sending and where its recent envelopes landed, in tables of its own.
 `sync_with` takes an `Apply` that applies each batch in the client's transaction, so what an
 application derives from the rows an apply touched is committed with them and the cursor, and that
@@ -184,9 +209,12 @@ One chain, each link checked against the one above it:
    collecting in steps to send, hold and show what one collect does, and `tests/placings.rs`
    what collects placed between the same writes do. `tests/departures.rs`
    holds the ways an earlier adapter was seen to depart from the model; `tests/crash.rs` stops an
-   apply, a collect, a resume and every step of a bounded install or collect at every statement
-   and requires the database unchanged and the rest to complete; `tests/bench.rs` requires a
-   small batch to run the same statements in a large library as in a small one.
+   apply, a collect, a suspend, a resume and every step of a bounded install or collect at every
+   statement and requires the database unchanged and the rest to complete; `tests/guards.rs`
+   calls every entry point with no kernel tables, with capture suspended and with tables of
+   other layouts, and makes another connection write in the middle of every call that writes;
+   `tests/bench.rs` requires a small batch to run the same statements in a large library as in a
+   small one.
    Where the core plans no write (rows that wait on each other through columns none of which
    accepts NULL), rows wait for the application: ignored tests in `crates/core/tests/plan.rs`,
    `tests/converge.rs` and `tests/property.rs` show it.

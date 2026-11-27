@@ -1,5 +1,5 @@
-//! An apply or a collect ended at any statement leaves the database as it was, and doing it again
-//! gives what it would have given had it never been interrupted. Each run is made from one seed,
+//! An apply, a collect, a suspend or a resume ended at any statement leaves the database as it
+//! was, and doing it again gives what it would have given had it never been interrupted. Each run is made from one seed,
 //! so the run interrupted at the `n`th statement starts from the same state as every other.
 
 mod support;
@@ -42,15 +42,19 @@ async fn run(conn: &mut SqliteConnection, sql: &str) {
     sqlx::query(sql).execute(conn).await.unwrap();
 }
 
-/// Every row of every table, the kernel's included.
+/// Every object in the schema and every row of every table, the kernel's included.
 async fn dump(conn: &mut SqliteConnection) -> Vec<String> {
+    let mut out: Vec<String> = support::rows(conn, "SELECT * FROM sqlite_master", &[])
+        .await
+        .into_iter()
+        .map(|row| format!("sqlite_master {row:?}"))
+        .collect();
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY 1",
     )
     .fetch_all(&mut *conn)
     .await
     .unwrap();
-    let mut out = Vec::new();
     for t in tables {
         for row in support::rows(conn, &format!("SELECT * FROM \"{t}\""), &[]).await {
             out.push(format!("{t} {row:?}"));
@@ -245,6 +249,13 @@ enum Steps {
     First,
     /// A resume, which collects whole.
     Resume,
+    /// A suspend while a first install in steps has records waiting, which it adopts first.
+    Suspend,
+    /// A suspend after a table was renamed away and written, whose marks it sets aside.
+    SuspendAway,
+    /// A resume after a table was renamed away and written, with no suspend: it sets the marks
+    /// aside and compares the table.
+    ResumeAway,
 }
 
 async fn begin(op: Steps) -> (SqliteConnection, Replica) {
@@ -256,7 +267,37 @@ async fn begin(op: Steps) -> (SqliteConnection, Replica) {
         }
         Steps::First => found(&world, false).await,
         Steps::Resume => found(&world, true).await,
+        Steps::Suspend => {
+            let (mut conn, replica) = found(&world, false).await;
+            assert!(replica.install_step(&mut conn, 1).await.unwrap().more);
+            (conn, replica)
+        }
+        Steps::SuspendAway | Steps::ResumeAway => away(&world).await,
     }
+}
+
+/// A replica whose `books` were collected, then edited without a collect, then renamed away and
+/// copied into a new table of the name, the old table kept and written: its capture triggers,
+/// gone with it, marked those writes as the collection's.
+async fn away(world: &World) -> (SqliteConnection, Replica) {
+    let (mut c, replica) = found(world, false).await;
+    replica.install(&mut c).await.unwrap();
+    replica.collect(&mut c).await.unwrap();
+    for sql in [
+        "UPDATE books SET title = 'Daniel Deronda' WHERE id = 1",
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA legacy_alter_table = ON",
+        "ALTER TABLE books RENAME TO books_old",
+        "PRAGMA legacy_alter_table = OFF",
+        "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, isbn TEXT UNIQUE)",
+        "INSERT INTO books SELECT id, upper(title), isbn FROM books_old",
+        "UPDATE books_old SET isbn = 'old' WHERE id = 1",
+        "DELETE FROM books_old WHERE id = 3",
+        "PRAGMA foreign_keys = ON",
+    ] {
+        run(&mut c, sql).await;
+    }
+    (c, replica)
 }
 
 /// The `i`th call of `op`, and whether more follow it.
@@ -264,6 +305,16 @@ async fn call(op: Steps, i: usize, replica: &Replica, conn: &mut SqliteConnectio
     let done = match (op, i) {
         (Steps::Install | Steps::First, 0) => replica.install_step(conn, 1).await,
         (Steps::Resume, _) => {
+            return replica
+                .resume(conn, fongo_sync_sqlite::Resume::Send)
+                .await
+                .ok()
+                .map(|()| false);
+        }
+        (Steps::Suspend | Steps::SuspendAway, _) => {
+            return replica.suspend(conn).await.ok().map(|()| false);
+        }
+        (Steps::ResumeAway, _) => {
             return replica
                 .resume(conn, fongo_sync_sqlite::Resume::Send)
                 .await
@@ -307,9 +358,23 @@ async fn finish(op: Steps, from: usize, replica: &Replica, conn: &mut SqliteConn
     }
 }
 
+/// Whether capture is suspended as `op` leaves it once finished.
+async fn suspended(
+    op: Steps,
+    replica: &Replica,
+    conn: &mut SqliteConnection,
+) -> Result<(), String> {
+    let suspended = replica.suspended(conn).await.map_err(|e| e.to_string())?;
+    if suspended != matches!(op, Steps::Suspend | Steps::SuspendAway) {
+        return Err(format!("{op:?} left capture suspended: {suspended}"));
+    }
+    Ok(())
+}
+
 /// Stops each call of `op` at each of its statements in turn: a call stopped changes nothing,
 /// and the calls that follow, that one first, finish with the rows and sent changes of a run never
-/// stopped, nothing left to collect. Returns the statements counted.
+/// stopped, nothing left to collect, and capture suspended only by a suspend. Returns the
+/// statements counted.
 async fn every_statement_of_every_step(op: Steps) -> u64 {
     let (mut conn, replica) = begin(op).await;
     let calls = finish(op, 0, &replica, &mut conn).await;
@@ -323,6 +388,7 @@ async fn every_statement_of_every_step(op: Steps) -> u64 {
             .is_empty(),
         "{op:?} left rows to collect"
     );
+    suspended(op, &replica, &mut conn).await.unwrap();
     let mut total = 0;
     for i in 0..calls {
         let (mut conn, replica) = begin(op).await;
@@ -370,11 +436,22 @@ async fn every_statement_of_every_step(op: Steps) -> u64 {
                     .is_empty(),
                 "{op:?} call {i} stopped at statement {n} left rows to collect"
             );
+            suspended(op, &replica, &mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("call {i} stopped at statement {n}: {e}"));
         }
     }
     eprintln!("{op:?}: {calls} calls, {total} statements");
     assert!(
-        calls > 1 || matches!(op, Steps::Resume | Steps::First),
+        calls > 1
+            || matches!(
+                op,
+                Steps::Resume
+                    | Steps::First
+                    | Steps::Suspend
+                    | Steps::SuspendAway
+                    | Steps::ResumeAway
+            ),
         "{op:?} took one step"
     );
     total
@@ -394,6 +471,18 @@ async fn a_step_of_installing_stopped_at_any_statement_changes_nothing_and_the_s
 #[tokio::test]
 async fn a_resume_stopped_at_any_statement_changes_nothing_and_completes_when_run_again() {
     every_statement_of_every_step(Steps::Resume).await;
+}
+
+#[tokio::test]
+async fn a_suspend_stopped_at_any_statement_changes_nothing_and_completes_when_run_again() {
+    every_statement_of_every_step(Steps::Suspend).await;
+}
+
+#[tokio::test]
+async fn setting_marks_aside_stopped_at_any_statement_changes_nothing_and_completes_when_run_again()
+{
+    every_statement_of_every_step(Steps::SuspendAway).await;
+    every_statement_of_every_step(Steps::ResumeAway).await;
 }
 
 /// Polls `future` until it has been pending `polls` times, then drops it. Whether it finished.
@@ -443,13 +532,24 @@ async fn every_suspension_of_every_step(op: Steps) {
                 expected,
                 "{op:?} call {i} dropped after {polls} polls"
             );
+            suspended(op, &replica, &mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("call {i} dropped after {polls} polls: {e}"));
         }
     }
 }
 
 #[tokio::test]
 async fn a_step_dropped_where_it_waits_is_whole_or_not_done_and_the_steps_finish() {
-    for op in [Steps::Collect, Steps::Install, Steps::First, Steps::Resume] {
+    for op in [
+        Steps::Collect,
+        Steps::Install,
+        Steps::First,
+        Steps::Resume,
+        Steps::Suspend,
+        Steps::SuspendAway,
+        Steps::ResumeAway,
+    ] {
         every_suspension_of_every_step(op).await;
     }
 }

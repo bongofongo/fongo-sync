@@ -160,8 +160,20 @@ async fn logs_read_one_device_before_another_do_not_revert_a_move() {
 
 // Applying while the triggers are off.
 
+/// An apply while suspended is refused, changing nothing.
+async fn refused_while_suspended(peer: &mut Peer, hub: &[Change]) {
+    let applied = peer
+        .replica
+        .apply(&mut peer.conn, &hub[peer.cursor..])
+        .await;
+    assert!(
+        matches!(applied, Err(fongo_sync_sqlite::Error::Suspended)),
+        "{applied:?}"
+    );
+}
+
 /// A write made while suspended is the application's, sent on resuming as asked; an apply in
-/// the meantime must neither overwrite it nor fail.
+/// the meantime must not overwrite it, and is refused until the resume.
 #[tokio::test]
 async fn an_apply_while_suspended_keeps_the_applications_write() {
     for how in [Resume::Send, Resume::Baseline] {
@@ -171,7 +183,7 @@ async fn an_apply_while_suspended_keeps_the_applications_write() {
         peers[1].run("UPDATE books SET title = 'quiet'").await;
         peers[0].run("UPDATE books SET status = 'done'").await;
         peers[0].push(&mut hub).await;
-        peers[1].pull(&hub).await;
+        refused_while_suspended(&mut peers[1], &hub).await;
         assert_eq!(
             peers[1].lines("SELECT title FROM books").await,
             ["quiet"],
@@ -202,8 +214,8 @@ async fn an_apply_while_suspended_keeps_the_applications_write() {
     }
 }
 
-/// While suspended, the application deletes a book; a book made elsewhere arrives and must not
-/// be mistaken for the one deleted.
+/// While suspended, the application deletes a book; a book made elsewhere arrives, is refused
+/// until the resume, and must not be mistaken for the one deleted.
 #[tokio::test]
 async fn an_apply_while_suspended_into_a_freed_id() {
     let mut hub = Vec::new();
@@ -221,7 +233,7 @@ async fn an_apply_while_suspended_into_a_freed_id() {
         .run("INSERT INTO books (id, shelf_id, title) VALUES (3, 1, 'C')")
         .await;
     peers[0].push(&mut hub).await;
-    peers[1].pull(&hub).await;
+    refused_while_suspended(&mut peers[1], &hub).await;
     peers[1].resume(Resume::Send).await;
     settle(&mut peers, &mut hub).await;
     assert_eq!(

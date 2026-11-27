@@ -1245,8 +1245,8 @@ async fn edits_of_entities_merged_part_way_through_a_pull_are_reported_once_each
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Ends the sync unable to look a conflict's entity up: `caught_up` moves the kernel's table of
-/// rows away.
+/// Ends the sync unable to look a conflict's entity up: `caught_up` stores the keys of the
+/// kernel's rows as blobs, which no lookup reads as keys.
 struct HidesRows;
 
 impl Apply for HidesRows {
@@ -1255,7 +1255,7 @@ impl Apply for HidesRows {
         conn: &mut SqliteConnection,
         _: &Replica,
     ) -> Result<Option<Applied>, Error> {
-        sqlx::query("ALTER TABLE fongo_ids RENAME TO fongo_ids_away")
+        sqlx::query("UPDATE fongo_ids SET key = CAST(key AS BLOB)")
             .execute(&mut *conn)
             .await?;
         Ok(None)
@@ -1279,8 +1279,7 @@ async fn a_conflict_that_cannot_be_looked_up_at_the_end_keeps_what_its_apply_sai
     a.sync(&server).await.unwrap();
     let note = b.replica.gid_of(&mut b.conn, "notes", 1).await.unwrap();
     let report = sync_hooked(&mut b, &server, &mut HidesRows).await.unwrap();
-    b.run("ALTER TABLE fongo_ids_away RENAME TO fongo_ids")
-        .await;
+    b.run("UPDATE fongo_ids SET key = CAST(key AS TEXT)").await;
     assert_eq!(report.sent, 1);
     assert_eq!(report.applied.conflicts.len(), 1);
     let conflict = &report.applied.conflicts[0];

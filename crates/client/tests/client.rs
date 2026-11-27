@@ -1258,3 +1258,104 @@ fn every_future_is_send(
     assert_send(join_library(server, "", now));
     assert_send(add_device(server, credentials, &key, now));
 }
+
+/// A sync refuses a database whose capture is suspended, or whose kernel tables are of a later
+/// layout, before it reaches the server or changes the file; the cursor refuses the later layout
+/// too, and is read as usual while capture is suspended.
+#[tokio::test]
+async fn a_sync_refuses_a_suspended_or_newer_kernel_before_reaching_the_server() {
+    use fongo_sync_client::sqlite::{Error as Kernel, Resume};
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let dir = scratch("refused");
+    let path = dir.join("peer.db");
+    let mut peer = Peer::new_at(&path, made).await;
+    peer.run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peer.sync(&server).await.unwrap();
+    let cursor = peer.cursor().await;
+    peer.replica.suspend(&mut peer.conn).await.unwrap();
+    peer.run("UPDATE books SET year = 1872").await;
+    let requests = server.with(|s| s.requests.len());
+    let file = std::fs::read(&path).unwrap();
+    let refused = peer.sync(&server).await;
+    assert!(
+        matches!(refused, Err(Error::Database(Kernel::Suspended))),
+        "{refused:?}"
+    );
+    assert_eq!(server.with(|s| s.requests.len()), requests);
+    assert_eq!(std::fs::read(&path).unwrap(), file);
+    assert_eq!(peer.cursor().await, cursor);
+    peer.replica
+        .resume(&mut peer.conn, Resume::Send)
+        .await
+        .unwrap();
+    assert!(peer.sync(&server).await.unwrap().sent > 0);
+
+    peer.run("UPDATE fongo_meta SET value = 5 WHERE key = 'layout'")
+        .await;
+    let requests = server.with(|s| s.requests.len());
+    let file = std::fs::read(&path).unwrap();
+    let refused = peer.sync(&server).await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Database(Kernel::NewerLayout { found: 5, known: 4 }))
+        ),
+        "{refused:?}"
+    );
+    let read = fongo_sync_client::cursor(&mut peer.conn, peer.credentials.library_id()).await;
+    assert!(
+        matches!(
+            read,
+            Err(Error::Database(Kernel::NewerLayout { found: 5, known: 4 }))
+        ),
+        "{read:?}"
+    );
+    assert_eq!(server.with(|s| s.requests.len()), requests);
+    assert_eq!(std::fs::read(&path).unwrap(), file);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A sync refuses a database the kernel is not installed in, or whose tables are of layout 3
+/// until an install upgrades them, before it reaches the server or changes the file.
+#[tokio::test]
+async fn a_sync_refuses_a_database_not_installed_or_of_layout_three() {
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let dir = scratch("uninstalled");
+    let path = dir.join("peer.db");
+    let mut peer = Peer::new_at(&path, made).await;
+    peer.run("INSERT INTO books (title, year) VALUES ('Middlemarch', 1871)")
+        .await;
+    peer.sync(&server).await.unwrap();
+    for (setup, refusal) in [
+        (
+            &[
+                "DROP TABLE fongo_found",
+                "UPDATE fongo_meta SET value = 3 WHERE key = 'layout'",
+            ][..],
+            "OlderLayout { found: 3, known: 4 }",
+        ),
+        (&[][..], "NotInstalled"),
+    ] {
+        if setup.is_empty() {
+            peer.replica.uninstall(&mut peer.conn).await.unwrap();
+        }
+        for sql in setup {
+            peer.run(sql).await;
+        }
+        let requests = server.with(|s| s.requests.len());
+        let file = std::fs::read(&path).unwrap();
+        let refused = peer.sync(&server).await;
+        match &refused {
+            Err(Error::Database(e)) => assert_eq!(format!("{e:?}"), refusal),
+            other => panic!("{refusal}: {other:?}"),
+        }
+        assert_eq!(server.with(|s| s.requests.len()), requests, "{refusal}");
+        assert_eq!(std::fs::read(&path).unwrap(), file, "{refusal}");
+        peer.replica.install(&mut peer.conn).await.unwrap();
+        peer.sync(&server).await.unwrap();
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

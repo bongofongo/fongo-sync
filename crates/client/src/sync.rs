@@ -284,6 +284,12 @@ pub struct SyncReport {
 /// [`check_connection`], and otherwise fails with [`Error::ConnectionUnsound`] before reading or
 /// writing anything.
 ///
+/// It needs the kernel installed, of the layout this build uses, with capture running: it asks
+/// [`fongo_sync_sqlite::installed`] and [`Replica::suspended`] next, before reaching the server,
+/// and otherwise fails with
+/// [`Error::Database`] carrying the kernel's refusal, such as
+/// [`fongo_sync_sqlite::Error::Suspended`] after a suspend that no resume has ended.
+///
 /// A sync that returns `Ok`, or any error other than [`Error::ConnectionUnsound`], leaves the
 /// connection sound. [`Error::ConnectionUnsound`] means it cannot be trusted: sqlx may count a
 /// transaction SQLite has ended, or SQLite may hold one nothing will end, and what is written on
@@ -525,6 +531,12 @@ async fn run<T: Transport, A: Apply>(
     settles: bool,
 ) -> Result<SyncReport, Error> {
     check_connection(conn).await?;
+    if !fongo_sync_sqlite::installed(conn).await? {
+        return Err(fongo_sync_sqlite::Error::NotInstalled.into());
+    }
+    if replica.suspended(conn).await? {
+        return Err(fongo_sync_sqlite::Error::Suspended.into());
+    }
     let rpc = Rpc {
         transport,
         now: &now,
