@@ -162,7 +162,8 @@ impl Collection {
     /// millisecond as that latest write, as is any part of that write still on its way, or it is
     /// older than that write and wrote a field of the new set that the write did not, which the
     /// new set hides anyway. Replicas that do this apart agree on one of their values. Sets
-    /// removed, narrowed or reordered send nothing. A replica with an edit to a field of the
+    /// removed, narrowed or reordered send nothing; a field that leaves a set shows its own
+    /// latest write again, which the install writes into the rows. A replica with an edit to a field of the
     /// set that reports conflicts, not yet sent, is told of such a record as a
     /// [`crate::Conflict`] whose remote value is the base, and keeps its edit.
     ///

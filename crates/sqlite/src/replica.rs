@@ -1108,26 +1108,43 @@ impl Replica {
                 adopted.extend(changes);
                 set.extend(more);
             }
-            let drawn: Vec<usize> = match &was_together {
-                Some(Value::Text(was)) => {
-                    let old: Vec<BTreeSet<&str>> = was
-                        .split(',')
+            let old: Option<Vec<BTreeSet<&str>>> = match &was_together {
+                Some(Value::Text(was)) => Some(
+                    was.split(',')
                         .filter(|s| !s.is_empty())
                         .map(|s| s.split('+').collect())
-                        .collect();
-                    (0..c.together.len())
-                        .filter(|&s| {
-                            !old.iter()
-                                .any(|o| c.together[s].iter().all(|f| o.contains(f.as_str())))
-                        })
-                        .collect()
-                }
-                _ => (0..c.together.len()).collect(),
+                        .collect(),
+                ),
+                _ => None,
+            };
+            let within =
+                |set: &BTreeSet<&str>, of: &[String]| set.iter().all(|f| of.iter().any(|g| g == f));
+            let drawn: Vec<usize> = match &old {
+                Some(old) => (0..c.together.len())
+                    .filter(|&s| {
+                        !old.iter()
+                            .any(|o| c.together[s].iter().all(|f| o.contains(f.as_str())))
+                    })
+                    .collect(),
+                None => (0..c.together.len()).collect(),
             };
             if !drawn.is_empty() {
                 let (changes, more) = self.complete_sets(&mut cx, idx, &drawn, &added)?;
                 adopted.extend(changes);
                 set.extend(more);
+            }
+            // A field that leaves a set shows its own latest write again, where the wider set
+            // showed it NULL: the rows are written again from what the merge holds.
+            let parted = old
+                .as_ref()
+                .is_some_and(|old| old.iter().any(|o| !c.together.iter().any(|s| within(o, s))));
+            if parted {
+                for r in db.query(
+                    "SELECT gid FROM fongo_ids WHERE collection = ?1",
+                    &[Value::Text(c.name.clone())],
+                )? {
+                    set.insert((c.name.clone(), as_gid(&r[0])?));
+                }
             }
         }
         set.extend(self.merge(&mut cx, &adopted, true)?);
