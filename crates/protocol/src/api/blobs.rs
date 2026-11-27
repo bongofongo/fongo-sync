@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
+use thiserror::Error;
+
 use crate::file::{BlobId, CHUNK_OVERHEAD, FileLayout, SEALED_CHUNK_LEN, SealedChunk, padme};
 use crate::hex::serde_digest;
 use crate::keys::DeviceId;
@@ -74,9 +78,10 @@ impl From<FileLayout> for BlobInfo {
 /// Until a blob is complete, a server replaces a chunk when the same index is uploaded again; once
 /// it is complete, nothing about it changes. A device resuming an upload skips a chunk only when
 /// the server's hash of it equals [`SealedChunk::sha256`] of the chunk this device sealed for that
-/// index ([`HaveChunk::holds`]), and uploads every other chunk again. Sealing is deterministic and
-/// each chunk has one stored form, so a device that completes a blob this way has checked every
-/// chunk against its own copy of the file.
+/// index ([`HaveChunk::holds`]), and uploads every other chunk again. It completes with the
+/// [`BlobDigest`] of the chunks it sealed ([`CompleteBlob`]), which the server checks against the
+/// chunks it holds. Sealing is deterministic and each chunk has one stored form, so a device that
+/// completes a blob has checked every chunk against its own copy of the file.
 ///
 /// What this does not cover: a device that completes a blob with the wrong content, by intent or
 /// through a bug, leaves that content hash unreadable, since this version has no way to replace a
@@ -108,6 +113,81 @@ impl HaveChunk {
     /// Whether the server holds exactly `chunk`, so that uploading it again can be skipped.
     pub fn holds(&self, chunk: &SealedChunk) -> bool {
         self.n == chunk.index && self.sha256 == chunk.sha256()
+    }
+}
+
+/// The body that completes an upload at [`BLOB_COMPLETE_PATH`](super::BLOB_COMPLETE_PATH): the
+/// [`BlobDigest`] of the chunks the uploader sealed, as 64 lowercase hex digits.
+///
+/// The server computes the digest of the chunks it holds at that moment, atomically with marking
+/// the blob complete, and answers [`ErrorCode::BlobMismatch`](super::ErrorCode::BlobMismatch),
+/// leaving the blob incomplete, if the two differ. A chunk another device replaced after this
+/// device's begin therefore cannot be completed in. An uploader that gets that answer begins
+/// again and uploads each chunk whose hash differs from its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteBlob {
+    #[serde(with = "serde_digest")]
+    pub digest: [u8; 32],
+}
+
+/// The digest of a blob's stored chunks: SHA-256 over the concatenation, in index order, of each
+/// stored chunk's 32-byte SHA-256. Chunks or their hashes may be added in any order; adding an
+/// index again replaces it.
+///
+/// It keeps 32 bytes per index added, so a server bounds the chunk count (by
+/// [`Capabilities::max_blob_bytes`](super::Capabilities::max_blob_bytes)) before using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobDigest {
+    chunks: u64,
+    hashes: BTreeMap<u64, [u8; 32]>,
+}
+
+/// Why a [`BlobDigest`] refused a chunk or could not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DigestError {
+    #[error("chunk {index} is out of range: the blob has {count} chunks")]
+    IndexOutOfRange { index: u64, count: u64 },
+    #[error("chunk {index} is missing")]
+    Missing { index: u64 },
+}
+
+impl BlobDigest {
+    /// The digest of a blob of `chunks` chunks, with none added yet.
+    pub fn new(chunks: u64) -> BlobDigest {
+        BlobDigest {
+            chunks,
+            hashes: BTreeMap::new(),
+        }
+    }
+
+    /// Adds chunk `index` by the SHA-256 of its stored bytes.
+    pub fn add(&mut self, index: u64, sha256: [u8; 32]) -> Result<(), DigestError> {
+        if index >= self.chunks {
+            return Err(DigestError::IndexOutOfRange {
+                index,
+                count: self.chunks,
+            });
+        }
+        self.hashes.insert(index, sha256);
+        Ok(())
+    }
+
+    /// Adds a chunk this device sealed.
+    pub fn add_chunk(&mut self, chunk: &SealedChunk) -> Result<(), DigestError> {
+        self.add(chunk.index, chunk.sha256())
+    }
+
+    /// The digest, once every index from 0 to the chunk count has been added.
+    pub fn finish(&self) -> Result<[u8; 32], DigestError> {
+        let mut digest = Sha256::new();
+        for index in 0..self.chunks {
+            let hash = self
+                .hashes
+                .get(&index)
+                .ok_or(DigestError::Missing { index })?;
+            digest.update(hash);
+        }
+        Ok(digest.finalize().into())
     }
 }
 
@@ -334,6 +414,42 @@ mod tests {
                 .is_err()
         );
         assert!(serde_json::from_value::<HaveChunk>(json!({"n": 0, "sha256": "ab"})).is_err());
+    }
+
+    #[test]
+    fn a_digest_is_the_hash_of_the_chunk_hashes_in_order() {
+        let hashes = [[1u8; 32], [2; 32], [3; 32]];
+        let mut digest = BlobDigest::new(3);
+        assert_eq!(digest.finish(), Err(DigestError::Missing { index: 0 }));
+        for i in [2, 0] {
+            digest.add(i as u64, hashes[i]).unwrap();
+        }
+        assert_eq!(digest.finish(), Err(DigestError::Missing { index: 1 }));
+        digest.add(1, [9; 32]).unwrap();
+        let replaced = digest.finish().unwrap();
+        digest.add(1, hashes[1]).unwrap();
+        let whole = digest.finish().unwrap();
+        assert_ne!(whole, replaced);
+        assert_eq!(whole, <[u8; 32]>::from(Sha256::digest(hashes.concat())));
+        assert_eq!(
+            digest.add(3, [0; 32]),
+            Err(DigestError::IndexOutOfRange { index: 3, count: 3 })
+        );
+        assert_eq!(
+            BlobDigest::new(0).finish(),
+            Ok(<[u8; 32]>::from(Sha256::digest(b"")))
+        );
+
+        let body = CompleteBlob { digest: whole };
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value, json!({ "digest": crate::hex::encode(&whole) }));
+        assert_eq!(serde_json::from_value::<CompleteBlob>(value).unwrap(), body);
+        assert!(
+            serde_json::from_value::<CompleteBlob>(
+                json!({ "digest": crate::hex::encode(&whole).to_uppercase() })
+            )
+            .is_err()
+        );
     }
 
     #[test]

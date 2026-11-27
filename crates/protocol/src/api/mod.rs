@@ -22,8 +22,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 pub use blobs::{
-    BlobIds, BlobInfo, BlobState, CompleteBlobs, Entitlement, HaveChunk, LibraryStatus,
-    MissingBlobs, RemoveDevice, RetireBlobs, Settled,
+    BlobDigest, BlobIds, BlobInfo, BlobState, CompleteBlob, CompleteBlobs, DigestError,
+    Entitlement, HaveChunk, LibraryStatus, MissingBlobs, RemoveDevice, RetireBlobs, Settled,
 };
 pub use error::{ErrorBody, ErrorCode};
 pub use notify::{NOTIFICATION_FORMAT, Notification};
@@ -55,11 +55,13 @@ pub const BLOB_PATH: &str = "/v1/libraries/{library}/blobs/{id}";
 /// index; see [`BlobState`]. `GET`: the stored chunk (binary) of a complete blob. `{n}` is the chunk
 /// index in decimal.
 pub const BLOB_CHUNK_PATH: &str = "/v1/libraries/{library}/blobs/{id}/chunks/{n}";
-/// `POST` with no body: [`BlobInfo`], or [`ErrorCode::BlobIncomplete`] unless every chunk is
-/// stored. From then on the blob is readable and never changes. Idempotent.
+/// `POST` [`CompleteBlob`]: [`BlobInfo`], or [`ErrorCode::BlobIncomplete`] unless every chunk is
+/// stored, or [`ErrorCode::BlobMismatch`] if the chunks stored are not those the digest names,
+/// leaving the blob incomplete. From then on the blob is readable and never changes. Idempotent.
 pub const BLOB_COMPLETE_PATH: &str = "/v1/libraries/{library}/blobs/{id}/complete";
 /// `POST` the only stored chunk (binary) of a one-chunk blob: [`BlobInfo`]. Begins, stores and
-/// completes in one request.
+/// completes in one request; it needs no [`CompleteBlob`], since the request itself holds the
+/// chunk it completes with.
 pub const BLOB_WHOLE_PATH: &str = "/v1/libraries/{library}/blobs/{id}/whole";
 /// `POST` [`BlobIds`]: [`CompleteBlobs`].
 pub const BLOBS_QUERY_PATH: &str = "/v1/libraries/{library}/blobs/query";

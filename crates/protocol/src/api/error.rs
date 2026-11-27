@@ -76,7 +76,7 @@ codes! {
     LibraryExists = "library_exists", 409, "a library with this id already exists";
     BlobIncomplete = "blob_incomplete", 409, "the blob does not have all its chunks yet";
     BlobMismatch = "blob_mismatch", 409,
-        "the blob was begun with a different size or chunk count";
+        "the blob was begun with another size or chunk count, or holds other chunks";
     TooLarge = "too_large", 413, "the request body is larger than this server accepts";
     BlobTooLarge = "blob_too_large", 413, "the blob is larger than this server accepts";
     EnvelopeWrongLibrary = "envelope_wrong_library", 422,

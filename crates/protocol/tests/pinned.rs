@@ -5,8 +5,8 @@ use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use fongo_sync_core::{Change, Gid, Hlc, Value};
 use fongo_sync_protocol::api::{
-    AddDevice, Appended, BatchPage, Capabilities, CreateLibrary, DeviceRecord, Devices, ErrorBody,
-    ErrorCode, Notification, ReadBatches, StoredBatch,
+    AddDevice, Appended, BatchPage, BlobDigest, Capabilities, CreateLibrary, DeviceRecord, Devices,
+    ErrorBody, ErrorCode, Notification, ReadBatches, StoredBatch,
 };
 use fongo_sync_protocol::{
     ContentHash, DeviceId, FILE_CHUNK_LEN, FileHasher, FileOpener, FileRef, FileSealer,
@@ -573,4 +573,39 @@ fn sealed_files_do_not_drift() {
         })
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_blob_digest_does_not_drift() {
+    let bytes: Vec<u8> = (0..FILE_CHUNK_LEN + 1).map(|i| (i % 251) as u8).collect();
+    let mut sealer = FileSealer::new(&keys(), FileRef::of(&bytes)).unwrap();
+    let mut chunks = Vec::new();
+    let mut rest = &bytes[..];
+    while !rest.is_empty() {
+        let took = sealer.feed(rest).unwrap();
+        rest = &rest[took..];
+        while let Some(chunk) = sealer.next_chunk().unwrap() {
+            chunks.push(chunk);
+        }
+    }
+    while let Some(chunk) = sealer.next_chunk().unwrap() {
+        chunks.push(chunk);
+    }
+    sealer.finish().unwrap();
+    assert_eq!(chunks.len(), 2);
+
+    let mut digest = BlobDigest::new(2);
+    for chunk in chunks.iter().rev() {
+        digest.add_chunk(chunk).unwrap();
+    }
+    let digest = digest.finish().unwrap();
+    let mut by_hand = Sha256::new();
+    for chunk in &chunks {
+        by_hand.update(Sha256::digest(&chunk.bytes));
+    }
+    assert_eq!(digest[..], by_hand.finalize()[..]);
+    assert_eq!(
+        hex(&digest),
+        "ad4b3c00a266c6cb31d389764c56bbb0e33add2fc8801210faa5b5947536218c"
+    );
 }
