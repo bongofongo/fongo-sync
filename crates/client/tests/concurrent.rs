@@ -8,14 +8,15 @@ mod support;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use fongo_sync_client::protocol::api::{ReadBatches, Route};
 use fongo_sync_client::protocol::{ENVELOPE_FORMAT, encode_batch, random_nonce};
 use fongo_sync_client::sqlite::core::{Change, Gid, Hlc, Value};
 use fongo_sync_client::sqlite::{Applied, Replica};
 use fongo_sync_client::{
-    Apply, Error, Refusal, Request, SyncReport, create_library, join_library, step_past, sync,
-    sync_with,
+    Apply, Error, Pace, Refusal, Request, SyncReport, create_library, join_library, step_past,
+    sync, sync_with,
 };
 use sqlx::SqliteConnection;
 use support::{
@@ -512,4 +513,73 @@ async fn a_failed_pull_keeps_the_stop_another_sync_recorded() {
     assert_eq!(past.refused[0].reason, Refusal::SteppedPast);
     assert_eq!(a.cursor().await, 5);
     assert_eq!(b.cursor().await, 5);
+}
+
+/// Seals envelopes of one change each, without pausing.
+struct OneByOne;
+
+impl Apply for OneByOne {
+    fn pace(&self) -> Pace {
+        Pace {
+            seal: 1,
+            pause: Duration::ZERO,
+            ..Pace::default()
+        }
+    }
+}
+
+/// Three syncs really at once, each on a thread and a connection of its own to one database file:
+/// every one succeeds, and no change is sealed into two envelopes, however their statements fall.
+#[test]
+fn syncs_on_threads_of_their_own_seal_each_change_once() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    for round in 0..10 {
+        let dir = scratch(&format!("threads-{round}"));
+        let path = dir.join("x.db");
+        let server = Server::new();
+        let made = runtime().block_on(async {
+            let made = create_library(&server, now).await.unwrap();
+            let mut first = Peer::new_at(&path, made.clone()).await;
+            for k in 0..30 {
+                first
+                    .run(&format!(
+                        "INSERT INTO books (title, year) VALUES ('b{k}', {k})"
+                    ))
+                    .await;
+            }
+            made
+        });
+        std::thread::scope(|scope| {
+            let syncs: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        runtime().block_on(async {
+                            let mut peer = Peer::open(&path, made.clone()).await;
+                            for _ in 0..3 {
+                                sync_with(
+                                    &mut peer.conn,
+                                    &peer.replica,
+                                    &server,
+                                    &peer.credentials,
+                                    now,
+                                    &mut OneByOne,
+                                )
+                                .await
+                                .unwrap();
+                            }
+                        })
+                    })
+                })
+                .collect();
+            for sync in syncs {
+                sync.join().unwrap();
+            }
+        });
+        assert_no_change_sent_twice(&server, made.library());
+    }
 }
