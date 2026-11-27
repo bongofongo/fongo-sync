@@ -143,7 +143,7 @@ pub use blobs::{
     Settled,
 };
 pub use error::{ErrorBody, ErrorCode};
-pub use notify::{NOTIFICATION_FORMAT, Notification};
+pub use notify::{CLOSE_DEVICE_REMOVED, CLOSE_SUPERSEDED, NOTIFICATION_FORMAT, Notification};
 pub use route::{MalformedQuery, Route};
 
 use crate::hex::{serde_key, serde_sig};
