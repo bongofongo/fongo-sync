@@ -219,9 +219,12 @@ One chain, each link checked against the one above it:
    changes to one register at one clock the greater value wins, and a register holds the greatest
    of what it was given in the order its strategy names; the
    view depends on nothing but registers, the gids seen and the groups; which writes to a natural
-   key field count depends only on the set of writes; and every `Clock::tick` is later than every
-   reading issued or observed before it, for a clock that ignores observed readings in or past
-   the last millisecond `Hlc::encode` holds and has not yet issued the last reading it holds.
+   key field count depends only on the set of writes; a `together` set shows the fields one live
+   member wrote at the latest clock any live member wrote to the set, one write where no two
+   changes to a register share a clock and otherwise, field by field, the greater value; and
+   every `Clock::tick` is later than every reading issued or observed before it, for a clock that
+   ignores observed readings in or past the last millisecond `Hlc::encode` holds and has not yet
+   issued the last reading it holds.
    The Lean values have no reals: that an integer and a real compare exactly is checked in Rust,
    against a comparison of the two by integer arithmetic.
    `make lean` builds the proofs and fails if any law rests on an unproven step; `make check`

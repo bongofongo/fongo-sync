@@ -277,6 +277,48 @@ theorem full_view_set (sc : Full.Schema) {cs₁ cs₂ : List (Change Value)}
     Full.view sc cs₁ = Full.view sc cs₂ :=
   Full.view_eq_of_mem_iff sc same
 
+/-- In a row of a schema that `Restricted` accepts, a `together` set shows one live member's
+fields at one clock. Either no live member of the group has a write to the set that counts, and
+every field of the set reads null; or some live member `m` made, at clock `at_`, the latest write
+to the set by any live member, and each field of the set reads the greatest value `m` wrote to it
+at `at_`, or null where `m` wrote it nothing at `at_`. So two writes to the set at one clock by
+one gid can show a mix, field by field the greater value; nothing else can. -/
+theorem full_view_together (sc : Full.Schema) (cs : List (Change Value))
+    (restricted : sc.Restricted) {coll : String} {c : Full.Collection} {r : Gid} {row : Full.Row}
+    {set : List String} (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : Full.view sc cs coll r = some row) :
+    let counted := Full.accepted sc (Full.candidates sc cs)
+    let member := Full.LiveMember sc (Full.candidates sc cs) r
+    ((∀ x ∈ counted, member x.gid → x.field ∉ set) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, member m ∧ (∃ x ∈ counted, x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      (∀ x ∈ counted, member x.gid → x.field ∈ set → ¬ at_ < x.clock) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row →
+        (∃ x ∈ counted, x.gid = m ∧ x.field = name ∧ x.clock = at_ ∧ x.value = v ∧
+          ∀ y ∈ counted, y.gid = m → y.field = name → y.clock = at_ →
+            (compare y.value v).isLE) ∨
+        (v = .null ∧ ∀ x ∈ counted, x.gid = m → x.field = name → x.clock ≠ at_) :=
+  Full.together_shown sc (Full.candidates sc cs) restricted hc hset hrow
+
+/-- Where no two changes to one register share a clock, a `together` set shows one write: of a
+row of a schema that `Restricted` accepts, either every field of the set reads null, or some live
+member `m` wrote to the set at a clock `at_`, and each field of the set reads null or the one value
+`m` wrote to it at `at_`. -/
+theorem full_view_together_untied (sc : Full.Schema) (cs : List (Change Value))
+    (restricted : sc.Restricted)
+    (untied : ∀ x ∈ cs, ∀ y ∈ cs, x.collection = y.collection → x.gid = y.gid →
+      x.field = y.field → x.clock = y.clock → x.value = y.value)
+    {coll : String} {c : Full.Collection} {r : Gid} {row : Full.Row} {set : List String}
+    (hc : sc.find coll = some c) (hset : set ∈ c.together)
+    (hrow : Full.view sc cs coll r = some row) :
+    (∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null) ∨
+    ∃ m at_, Full.LiveMember sc (Full.candidates sc cs) r m ∧
+      (∃ x ∈ cs, x.collection = coll ∧ x.gid = m ∧ x.field ∈ set ∧ x.clock = at_) ∧
+      ∀ name ∈ set, ∀ v, (name, v) ∈ row → v = .null ∨
+        ∀ y ∈ cs, y.collection = coll → y.gid = m → y.field = name → y.clock = at_ →
+          y.value = v :=
+  Full.view_together_untied sc cs restricted untied hc hset hrow
+
 /-- A change whose clock the text form cannot hold is ignored. -/
 theorem full_view_ignores_unencodable (sc : Full.Schema) (c : Change Value)
     (cs : List (Change Value)) (h : ¬ c.clock.encodable) :
