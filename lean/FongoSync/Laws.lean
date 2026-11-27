@@ -257,10 +257,17 @@ theorem key_write_dropped_for_good {l₁ l₂ : List (Hlc × Value)} (sub : ∀ 
 
 /-- The view over several collections can be computed from computed inputs: `Full.runView` gives
 the rows of those inputs as `Full.view` gives the rows of its own, liveness computed in as many
-rounds as there are gids. That the computed inputs are `Full.view`'s is not proven here. -/
+rounds as there are gids. `full_view_runs` adds that the computed inputs are `Full.view`'s. -/
 theorem full_view_runs_from_inputs (sc : Full.Schema) (cs : List (Change Value)) :
     Full.runView sc cs = Full.present sc (Full.runInputs sc (Full.candidates sc cs)).toInputs :=
   Full.runView_eq sc cs
+
+/-- The view over several collections can be computed: `Full.runView`, which takes the first key
+that derives each natural gid and finds the groups and the live members each in as many rounds
+as there are gids, gives the same answer as `Full.view`. -/
+theorem full_view_runs (sc : Full.Schema) (cs : List (Change Value)) :
+    Full.runView sc cs = Full.view sc cs :=
+  Full.runView_eq_view sc cs
 
 /-- **The view over several collections depends only on the set of changes.** Where two changes
 to one register share a clock with different values, the greater value counts, so writes to a

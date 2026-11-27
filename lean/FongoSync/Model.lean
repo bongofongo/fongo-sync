@@ -15,7 +15,8 @@ collection, the rule for which collection a gid belongs to, the changes ignored 
    changes to each key field of a gid only those among the `KEY_ENTRIES` smallest
    `(clock, value)` pairs count (`earliest`). A gid is verified if some key derives it: one value
    per key field, each written to that field by a change that counts, whose `derive` is the gid.
-   A change to a key field is ignored unless it counts and its value is part of that key.
+   A change to a key field is ignored unless it counts and its value is part of the first such
+   key, comparing keys field by field (only a hash collision lets two keys derive one gid).
 2. Each (collection, gid, field) holds the winner among its changes; `$deleted` and undeclared
    fields merge `Lww`.
 3. An alias whose target belongs to the same collection joins the two gids, unless either is
@@ -164,13 +165,21 @@ def Derives (g : Gid) (c : Collection) (fields : List String) (k : List Value) :
     (∀ p ∈ fields.zip k, ∃ w ∈ earliest (keyWrites sc cs g p.1), w.2 = p.2) ∧
     sc.derive c.name k = g
 
-/-- The key that derives a natural gid, if any. The Rust takes the first in sorted order; the two
-agree unless two keys derive one gid, which takes a hash collision. -/
+/-- Keys compare field by field, each by the value order. -/
+def KeyLt : List Value → List Value → Prop := List.Lex fun a b => compare a b = .lt
+
+/-- `k` is the first key, comparing keys field by field, that derives `g`, as the Rust takes it.
+Only a hash collision lets two keys derive one gid. -/
+def FirstKey (g : Gid) (c : Collection) (fields : List String) (k : List Value) : Prop :=
+  Derives sc cs g c fields k ∧ ∀ k', Derives sc cs g c fields k' → k = k' ∨ KeyLt k k'
+
+/-- The first key that derives a natural gid, if any. -/
 noncomputable def key (g : Gid) : Option (List Value) :=
   match homeCollection sc cs g with
   | some c =>
     match c.natural with
-    | some fields => if h : ∃ k, Derives sc cs g c fields k then some (Classical.choose h) else none
+    | some fields =>
+      if h : ∃ k, FirstKey sc cs g c fields k then some (Classical.choose h) else none
     | none => none
   | none => none
 
@@ -422,7 +431,7 @@ theorem derives_eq : Derives sc cs₁ = Derives sc cs₂ := by
 
 theorem key_eq : key sc cs₁ = key sc cs₂ := by
   funext g
-  unfold key
+  unfold key FirstKey
   rw [homeCollection_eq sc same, derives_eq sc same]
 
 theorem unverified_eq : Unverified sc cs₁ = Unverified sc cs₂ := by
