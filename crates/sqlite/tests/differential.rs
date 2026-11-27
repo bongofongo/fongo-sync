@@ -15,8 +15,11 @@
 //! - A minted row inserted since the last collect is named by the insert that made it, not by
 //!   the gid mapped to its local id: SQLite may reuse the id of a row whose removal is not yet
 //!   collected, and the sim never does.
-//! - Gids are renamed (see `Names`) before comparing: the sim mints in collection-name and
-//!   local-key order within one collect, the adapter in its own order.
+//! - Gids are renamed (see `Names`) before comparing. Both sides mint in the order the rows were
+//!   written, so the n-th gid of a collect goes to the same row on both, and raw gid order, which
+//!   picks a group's canonical member, agrees; rows written at one instant may still be minted in
+//!   different orders, since the sim's wall is the step and the database's clock may move
+//!   within one.
 //! - `$alias` changes are compared by the groups they join, not pair by pair: when three or more
 //!   entities clash at once the sim aliases every pair and the adapter only enough pairs. So that
 //!   the logs stay aligned, a batch's aliases are delivered together.
@@ -1259,11 +1262,9 @@ fn a_natural_row_removed_and_made_again_sends_the_fields_it_left_null() {
     });
 }
 
-/// Found by a long run (seed 23); a limit of this harness. Two books minted in one collect whose
-/// rows a merge moved in the same step are named by rank, and the two sides mint in different
-/// orders, so the names cross.
+/// Found by a long run (seed 23). Two books minted in one collect whose rows a merge moved in
+/// the same step are named by rank, so both sides must mint them in the order they were written.
 #[test]
-#[ignore = "harness: gids named by rank cross when both sides mint in different orders"]
 fn two_books_minted_together_and_named_by_rank() {
     use Op::*;
     let script = vec![
@@ -1351,11 +1352,9 @@ fn two_books_minted_together_and_named_by_rank() {
     run(3, 0, &script).unwrap();
 }
 
-/// Found by a long run (seed 7); a limit of this harness. Two shelves from one replica end in one
-/// group, whose canonical gid is the lower raw gid; the sides mint them in different orders, so
-/// the canonical member differs though both agree with the model.
+/// Found by a long run (seed 7). Two shelves from one replica end in one group, whose canonical
+/// gid is the lower raw gid, so both sides must mint them in the order they were written.
 #[test]
-#[ignore = "harness: a group's canonical member follows raw gid order, which renaming does not keep"]
 fn a_group_of_two_shelves_from_one_replica() {
     use Op::*;
     let script = vec![

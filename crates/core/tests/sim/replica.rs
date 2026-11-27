@@ -424,7 +424,10 @@ impl<'s> Replica<'s> {
                 .chain(&fresh)
                 .map(|(k, g)| (k.clone(), *g))
                 .collect();
-            for (c, k) in dirty.clone() {
+            // In the order the application wrote the rows, as an adapter mints.
+            let mut in_order: Vec<(String, Key)> = dirty.iter().cloned().collect();
+            in_order.sort_by_key(|at| (self.written.get(at).copied().unwrap_or(0), at.clone()));
+            for (c, k) in in_order {
                 let at = (c.clone(), k);
                 let Some(row) = self.tables[&c].get(&k) else {
                     continue;
