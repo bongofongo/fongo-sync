@@ -210,24 +210,24 @@
 //! holds those, so one that refers to the file holds a later change setting a reference to it. If
 //! that change was appended with its claim, the claim is at a sequence number above `through`,
 //! which voids the retirement; a claim recorded for a recognised copy of the envelope is at or
-//! above the envelope's number, and so above `through` too. If it was appended without its claim while the server was not
-//! offering blobs, the floor raised when it began again is above `through` and voids the
-//! retirement in the same way. Otherwise it was appended without its claim, or is not yet
-//! appended, and its device has not settled since making it: a device claims what it appended
+//! above the envelope's number, and so above `through` too. If it was appended without its claim
+//! while the server was not offering blobs, the floor raised when it began again is above `through`
+//! and voids the retirement in the same way. Otherwise it was appended without its claim, or is not
+//! yet appended, and its device has not settled since making it: a device claims what it appended
 //! without claims before it next settles, and a device holding unsent changes does not settle.
-//! Every device that counts has settled at or above `through`, so that device made the change
-//! after settling.
+//! Every device that counts has settled at or above `through`, so that device made the change after
+//! settling.
 //!
 //! The limits:
 //!
-//! - any change a device makes after its [`Settled`] at or above `through` that refers to the
-//!   file, and that it sends without its claim or after the deletion, can find the file deleted
-//!   before its claim arrives: a claiming append refused with [`ErrorCode::LibraryFull`] and sent
-//!   plainly, or one sent plainly because the device read [`Capabilities::blobs`] as false just
-//!   before the server began to offer it, is claimed only later. The device recovers the file only
-//!   if it still holds it, by uploading it again; if not, the file is unavailable. The same holds for a removed device
-//!   that joins again and sends changes it had not sent. A device that refers anew to a file it
-//!   does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
+//! - any change a device makes after its [`Settled`] at or above `through` that refers to the file,
+//!   and that it sends without its claim or after the deletion, can find the file deleted before
+//!   its claim arrives: a claiming append refused with [`ErrorCode::LibraryFull`] and sent plainly,
+//!   or one sent plainly because the device read [`Capabilities::blobs`] as false just before the
+//!   server began to offer it, is claimed only later. The device recovers the file only if it still
+//!   holds it, by uploading it again; if not, the file is unavailable. The same holds for a removed
+//!   device that joins again and sends changes it had not sent. A device that refers anew to a file
+//!   it does not hold can narrow the window by claiming it at [`BLOBS_CLAIM_PATH`] at once.
 //! - a device catching up, newly joined or restored, passes through states that refer to files
 //!   rightly deleted since. Fetching one answers [`ErrorCode::BlobNotFound`], which is not an error
 //!   in the library.

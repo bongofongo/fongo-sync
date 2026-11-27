@@ -199,8 +199,7 @@ impl BlobDigest {
 /// atomic step records each id as claimed at the envelope's sequence number; it answers
 /// [`Appended`](super::Appended). A server may recognise an envelope identical to one it already
 /// holds; see [the module documentation](super#appending-an-envelope-twice) for what it does then.
-/// A request that names an id needing a record
-/// the library has no room for is refused with
+/// A request that names an id needing a record the library has no room for is refused with
 /// [`ErrorCode::LibraryFull`](super::ErrorCode::LibraryFull) and appends nothing. The ids count
 /// against [`Capabilities::max_query_ids`](super::Capabilities::max_query_ids), and not against
 /// [`Capabilities::max_batch_bytes`](super::Capabilities::max_batch_bytes).

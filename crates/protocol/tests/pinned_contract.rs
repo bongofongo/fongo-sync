@@ -1,7 +1,7 @@
-//! The contract between devices and a server, pinned beside `pinned.rs`: the error body, the
-//! header values, the paths and their methods, every JSON field name of every message, the binary
-//! bodies and the close codes. A change here breaks deployed peers, so it needs a new protocol version, not an updated
-//! expectation.
+//! The contract between devices and a server, pinned beside `pinned.rs`: the error body, the header
+//! values, the paths and their methods, every JSON field name of every message, the binary bodies
+//! and the close codes. A change here breaks deployed peers, so it needs a new protocol version,
+//! not an updated expectation.
 
 use fongo_sync_protocol::api::{
     AddDevice, Appended, BATCHES_CLAIMING_PATH, BATCHES_PATH, BINARY_CONTENT_TYPE, BLOB_CHUNK_PATH,
