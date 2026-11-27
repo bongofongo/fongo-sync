@@ -1721,6 +1721,39 @@ impl Replica {
         .await
     }
 
+    /// Puts in the outbox again every change this replica keeps: the winning entry of every
+    /// field, each kept entry of a natural key's field, and every change to a collection its
+    /// registry lacks, each with its own clock. Returns how many. For a server that lost changes:
+    /// sent, they make its log hold again everything this replica merged, and applying a change
+    /// twice changes nothing.
+    ///
+    /// It is not every change the replica merged. A change that lost to a later one is not kept,
+    /// so where it was the earliest of an entity's changes in a collection, the entity's first
+    /// clock is later on a replica that has only what this sends, which can change what
+    /// [`Replica::made`] answers there. That two entities are one is kept with no clock and is not
+    /// sent; a replica finds it again from their identities.
+    pub async fn resend(&self, conn: &mut SqliteConnection) -> Result<usize> {
+        with_db(conn, |db| {
+            db.atomically_writing(|db| {
+                self.ready(db)?.current()?;
+                let mut sent = 0;
+                for table in ["fongo_shadow", "fongo_foreign"] {
+                    let n = db.exec(
+                        &format!(
+                            "INSERT INTO fongo_outbox (collection, gid, field, value, is_ref, clock)
+                             SELECT collection, gid, field, value, is_ref, clock FROM {table}
+                             ORDER BY clock, collection, gid, field"
+                        ),
+                        &[],
+                    )?;
+                    sent += usize::try_from(n).unwrap_or(usize::MAX);
+                }
+                Ok(sent)
+            })
+        })
+        .await
+    }
+
     pub async fn acknowledge(&self, conn: &mut SqliteConnection, through: i64) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
