@@ -1246,11 +1246,6 @@ fn run_back(
             done.map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
             agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
-        // One replica a script, as the seed picks: each check makes four databases more.
-        let who = (seed % peers.len() as u64) as usize;
-        resent_shows_the_same(&mut peers[who], schema, seed, copied, &mut databases)
-            .await
-            .map_err(|e| format!("peer {who} resending what it holds: {e}"))?;
         finish(&mut peers, &mut hub)
             .await
             .map_err(|e| format!("while exchanging everything: {e}"))?;
@@ -1288,8 +1283,9 @@ async fn shown(
     (kernel.view, held)
 }
 
-/// Rows `got` shows as `want` does, but for entities `want` holds back and rows naming them, and
-/// holds back nothing else.
+/// Rows `got` shows as `want` does, but for entities `want` holds back; `got` holds back nothing
+/// else but rows naming those, which wait on them where written afresh, and every such row it
+/// shows is compared too.
 fn same_rows(
     want: &(
         fongo_sync_sqlite::core::model::View,
@@ -1332,19 +1328,31 @@ fn same_rows(
             got.1, want.1
         ));
     }
-    let strip = |view: &fongo_sync_sqlite::core::model::View| {
-        let mut view = view.clone();
-        for (collection, rows) in view.collections.iter_mut() {
-            rows.retain(|gid, _| !held.contains(&(collection.clone(), *gid)));
-        }
-        view.collections.retain(|_, rows| !rows.is_empty());
-        view
+    // Every row either shows is compared, but for what `want` holds back and what `got` holds
+    // back of the rows naming it.
+    let skip = |collection: &str, gid: &Gid| {
+        let at = (collection.to_string(), *gid);
+        want.1.contains(&at) || got.1.contains(&at)
     };
-    if strip(&want.0) != strip(&got.0) {
-        return Err(format!(
-            "{who} shows other rows:\n{:#?}\n{:#?}",
-            want.0, got.0
-        ));
+    let rows = |view: &fongo_sync_sqlite::core::model::View| {
+        view.collections
+            .iter()
+            .flat_map(|(c, rows)| {
+                rows.iter()
+                    .map(move |(g, row)| ((c.clone(), *g), row.clone()))
+            })
+            .filter(|((c, g), _)| !skip(c, g))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (want_rows, got_rows) = (rows(&want.0), rows(&got.0));
+    if want_rows != got_rows {
+        let differ: Vec<_> = want_rows
+            .keys()
+            .chain(got_rows.keys())
+            .filter(|k| want_rows.get(*k) != got_rows.get(*k))
+            .map(|k| (k, want_rows.get(k), got_rows.get(k)))
+            .collect();
+        return Err(format!("{who} shows other rows: {differ:#?}"));
     }
     Ok(())
 }
@@ -1360,6 +1368,7 @@ async fn resent_shows_the_same(
     schema: &[&str],
     seed: u64,
     copied: bool,
+    aliased_twice: bool,
     databases: &mut u64,
 ) -> Result<(), String> {
     *databases += 1;
@@ -1378,6 +1387,15 @@ async fn resent_shows_the_same(
         ));
     }
     let resent = &outbox.changes[before.changes.len()..];
+    if aliased_twice {
+        let mut aliases: std::collections::BTreeMap<(&str, Gid), usize> = Default::default();
+        for c in resent.iter().filter(|c| c.field == "$alias") {
+            *aliases.entry((&c.collection, c.gid)).or_default() += 1;
+        }
+        if !aliases.values().any(|&n| n > 1) {
+            return Err("no entity resent with two aliases".into());
+        }
+    }
     if !copied {
         let mut at: std::collections::BTreeMap<
             (&str, Gid, &str, fongo_sync_sqlite::core::Hlc),
@@ -1466,6 +1484,59 @@ async fn resent_shows_the_same(
     Ok(())
 }
 
+/// Three replicas each make one shelf of one name; each pair of them is found to be one by a
+/// replica of its own, and replica 1 takes all of it. The entity with the greatest id is written
+/// an alias to each of the two others, so replica 1 holds an entity with two aliases.
+fn two_aliases_first() -> Vec<(usize, Op)> {
+    use Op::*;
+    vec![
+        (0, AddShelf(0)),
+        (0, Push),
+        (1, AddShelf(0)),
+        (1, Push),
+        (2, AddShelf(0)),
+        (2, Push),
+        (3, Log(0, false)),
+        (3, Log(1, false)),
+        (3, Push),
+        (4, Log(1, false)),
+        (4, Log(2, false)),
+        (4, Push),
+        (0, Log(2, false)),
+        (0, Push),
+        (1, Log(0, false)),
+        (1, Log(2, false)),
+        (1, Log(3, false)),
+        (1, Log(4, false)),
+    ]
+}
+
+/// Runs [`two_aliases_first`] and then `script` on five peers, and has replica 1 resend what it
+/// holds, as [`resent_shows_the_same`] checks.
+fn run_resending(seed: u64, every: u64, back: u64, script: &[(usize, Op)]) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let world = World::stepping_back(seed, every, back);
+        let mut hub = Vec::new();
+        let mut peers = Vec::new();
+        for n in 0..5 {
+            peers.push(Peer::new(&world, n, SCHEMA, &[], seed, None).await);
+        }
+        let mut databases = 5;
+        let steps = two_aliases_first().into_iter().chain(script.iter().cloned());
+        for (step, (who, op)) in steps.enumerate() {
+            perform(&mut peers[who], op, &mut hub)
+                .await
+                .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
+        }
+        resent_shows_the_same(&mut peers[1], SCHEMA, seed, false, true, &mut databases)
+            .await
+            .map_err(|e| format!("peer 1 resending what it holds: {e}\n\nseed {seed}, every {every}, back {back}, script {script:?}"))
+    })
+}
+
 /// Replaces peer `to`'s database with a copy of peer `from`'s; then, with the clock held, each
 /// titles its `book`th book with a title of its own and sends it.
 async fn copy(
@@ -1528,6 +1599,15 @@ fn cases() -> u32 {
 }
 
 /// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
+/// Cases of the resend property: fewer than [`cases`] by default, as each resends and builds three
+/// replicas more; `PROPTEST_CASES` sets both.
+fn resend_cases() -> u32 {
+    match std::env::var("PROPTEST_CASES") {
+        Ok(_) => cases(),
+        Err(_) => 8,
+    }
+}
+
 fn sharing_cases() -> u32 {
     match std::env::var("PROPTEST_CASES") {
         Ok(_) => cases(),
@@ -1584,6 +1664,30 @@ proptest! {
     ) {
         let outcome = run_back(SCHEMA, false, seed, every, back, &script, None);
         if let Err(error) = outcome {
+            prop_assert!(false, "{}", error);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: resend_cases(),
+        rng_seed: rng_seed(),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    /// A replica that holds an entity with two aliases and whatever a script leaves it resends
+    /// everything it holds: no two resent changes share a field and clock with different values,
+    /// and replicas given them, new, of an older version, or holding what it took, report no
+    /// shared node and show its rows.
+    #[test]
+    fn what_a_replica_resends_shows_its_rows_elsewhere(
+        seed in any::<u64>(),
+        every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
+        back in prop_oneof![Just(0u64), Just(1), Just(2), Just(40)],
+        script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
+    ) {
+        if let Err(error) = run_resending(seed, every, back, &script) {
             prop_assert!(false, "{}", error);
         }
     }

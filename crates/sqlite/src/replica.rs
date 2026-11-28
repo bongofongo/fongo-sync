@@ -1741,8 +1741,11 @@ impl Replica {
     /// - the same on every replica that holds the alias and the entity's first fact, so two that
     ///   resend one state send the same changes.
     ///
-    /// A replica that already holds the alias changes nothing for it. Which entities are one does
-    /// not depend on an alias's clock.
+    /// The node is `Gid::derive("fongo-sync/v1/resent-alias", [collection, entity, other])`, the
+    /// two entities as references: an id no device owns or issues clocks as. A replica that takes
+    /// the change treats that node as any other, and its own clock reads the clock as it reads
+    /// every clock it receives. A replica that already holds the alias changes nothing for it.
+    /// Which entities are one does not depend on an alias's clock.
     ///
     /// What a replica that takes only what this sends can show otherwise than this one: changes
     /// that lost to later ones are not kept, so not sent. Where such a change was the earliest of

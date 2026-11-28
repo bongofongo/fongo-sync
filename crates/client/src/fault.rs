@@ -157,9 +157,11 @@ pub async fn fingerprint(
 /// changing nothing, when no fault is stored.
 ///
 /// In one transaction: every change the replica keeps, its own and those it merged from other
-/// devices, including changes to collections its registry lacks and which entities are one, is put
-/// in its outbox, as [`Replica::resend`] does; the cursor goes back to 0; the record of an envelope being sent, of
-/// where its appends landed and of where its pull stopped is dropped; and the fault is cleared. The
+/// devices, including changes to collections its registry lacks and which entities are one, is
+/// put in its outbox, as [`Replica::resend`] does, an alias at a clock on a node no device owns,
+/// derived from the alias, which every device takes as it takes any other; the cursor goes back
+/// to 0; the record of an envelope being sent, of where its appends landed and of where its pull
+/// stopped is dropped; and the fault is cleared. The
 /// next syncs read the whole log and apply it again, which changes nothing already held, and send
 /// the outbox. Once they have sent it, the server's log holds every change this device held: what
 /// the server lost from any device is restored as far as this device had it. Applying a change
