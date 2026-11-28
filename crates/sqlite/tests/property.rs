@@ -39,6 +39,7 @@ const SCHEMA: &[&str] = &[
         status TEXT,
         finished INTEGER,
         extra TEXT,
+        rating INTEGER,
         seen INTEGER NOT NULL)",
     "CREATE TABLE notes (
         id INTEGER PRIMARY KEY,
@@ -66,7 +67,7 @@ const SCHEMA: &[&str] = &[
         title TEXT)",
 ];
 
-/// The registry before and after an upgrade that adds a field.
+/// The registry before and after an upgrade that adds a field and widens a set with another.
 fn registry(upgraded: bool) -> Registry {
     let mut books = Collection::minted("books", "books", "id")
         .owner("shelf_id", "shelves")
@@ -75,16 +76,20 @@ fn registry(upgraded: bool) -> Registry {
         .reference("author_id", "authors")
         .field("status")
         .field("finished")
-        .together(&["status", "finished"])
         .identity(&["isbn"])
         .local_default(
             "seen",
             LocalDefault::Sql("SELECT COALESCE(max(seen), 0) + 1 FROM books".into()),
         )
         .local_dependent("covers", "book_id");
-    if upgraded {
-        books = books.field("extra");
-    }
+    books = if upgraded {
+        books
+            .field("extra")
+            .field("rating")
+            .together(&["status", "finished", "rating"])
+    } else {
+        books.together(&["status", "finished"])
+    };
     Registry::new(vec![
         Collection::minted("shelves", "shelves", "id")
             .field("name")
@@ -684,6 +689,7 @@ enum Op {
     SetStatus(usize, u8),
     SetAuthor(usize, usize),
     SetExtra(usize, u8),
+    SetRating(usize, u8),
     DeleteBook(usize),
     MoveBookDeleteShelf(usize, usize),
     MoveNoteDeleteShelf(usize, usize),
@@ -739,6 +745,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
         3 => (n.clone(), 0u8..4).prop_map(|(a, b)| Op::SetStatus(a, b)),
         2 => (n.clone(), n.clone()).prop_map(|(a, b)| Op::SetAuthor(a, b)),
         3 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetExtra(a, b)),
+        2 => (n.clone(), v.clone()).prop_map(|(a, b)| Op::SetRating(a, b)),
         1 => n.clone().prop_map(Op::DeleteBook),
         1 => (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveBookDeleteShelf(a, b)),
         1 => (n.clone(), n.clone()).prop_map(|(a, b)| Op::MoveNoteDeleteShelf(a, b)),
@@ -880,6 +887,10 @@ async fn perform(peer: &mut Peer, op: Op, hub: &mut Vec<Change>) -> Result<(), S
         },
         Op::SetExtra(n, v) => match peer.pick("books", n).await {
             Some(id) => format!("UPDATE books SET extra = 'x{v}' WHERE id = {id}"),
+            None => return Ok(()),
+        },
+        Op::SetRating(n, v) => match peer.pick("books", n).await {
+            Some(id) => format!("UPDATE books SET rating = {v} WHERE id = {id}"),
             None => return Ok(()),
         },
         Op::DeleteBook(n) => match peer.pick("books", n).await {

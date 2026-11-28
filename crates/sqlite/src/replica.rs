@@ -151,6 +151,15 @@ pub struct Held {
 /// A local edit not yet sent and a remote edit to the same field, neither made after seeing the
 /// other. The field's strategy has already chosen between them; the application may combine the
 /// two, for instance by a three-way merge of text, and write the result as a new edit.
+///
+/// The remote edit is the latest by clock of those made elsewhere that an apply brings, later
+/// than the value the local edit replaced and than any reported before for that edit, whatever
+/// its value. So a remote edit that sets the field back to `base` is reported, with `remote`
+/// equal to `base`. So is the field written again unchanged, by a write to another field of its
+/// set or by an upgrade that records a redrawn set again (see [`Collection::together`]); such a
+/// report can come even where nobody else edited the field. A three-way merge of `base`,
+/// `local` and a `remote` equal to `base` gives `local` back, so these reports are harmless;
+/// `remote` equal to `base` is not an error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conflict {
     pub collection: String,
@@ -525,6 +534,36 @@ impl<'d> Ctx<'d> {
     fn shared_at(&mut self, clock: Hlc) {
         let earliest = self.shared.entry(clock.node).or_insert(clock);
         *earliest = (*earliest).min(clock);
+    }
+
+    /// The least reading of this replica's node later than `latest` that it may issue, which
+    /// the clock then observes so that no later reading equals it. Past a write at wall 0, whose
+    /// counters number adoptions, that is the first reading of wall 1, so that a counter from
+    /// elsewhere never moves this replica's own numbering. `None` past the last millisecond the
+    /// clock observes.
+    pub(crate) fn successor(&mut self, latest: Hlc) -> Option<Hlc> {
+        let (wall_ms, counter) = if latest.wall_ms == 0 {
+            (1, 0)
+        } else {
+            match latest.counter.checked_add(1) {
+                Some(counter) => (latest.wall_ms, counter),
+                None => (latest.wall_ms.saturating_add(1), 0),
+            }
+        };
+        let next = Hlc {
+            wall_ms,
+            counter,
+            node: self.node,
+        };
+        let room = Hlc {
+            wall_ms: wall_ms.saturating_add(1),
+            ..next
+        };
+        if !room.encodable() {
+            return None;
+        }
+        self.clock.observe(&next);
+        Some(next)
     }
 
     pub(crate) fn touch(&mut self, idx: usize, key: &str, gid: Gid, deleted: bool) {
@@ -925,7 +964,10 @@ impl Replica {
     /// and kernel tables of a layout it cannot upgrade, which [`Replica::uninstall`] removes;
     /// layout 3 is upgraded in place. Refuses with [`Error::Suspended`] while capture is
     /// suspended: only [`Replica::resume`] puts the triggers back then, having compared the
-    /// tables with what the kernel last saw of them.
+    /// tables with what the kernel last saw of them. An install whose registry narrows a set of
+    /// fields that change together, or removes one, writes every row of that collection again,
+    /// which for a hundred thousand rows takes seconds with the write lock held (see
+    /// [`Collection::together`]).
     pub async fn install(&self, conn: &mut SqliteConnection) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| self.install_in(db, None, None).map(|_| ()))
@@ -933,19 +975,20 @@ impl Replica {
         .await
     }
 
-    /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction.
-    /// What it adopts of the registry for collections installed before (new fields, sets now
-    /// written together), and every row that brings up to date, is done whole, as `install`
-    /// does it; records an install under another registry left waiting are first adopted whole,
-    /// under the registry they were recorded with, as by that install. The rows found in the tables of a collection installed for the first time are
-    /// recorded, with their values as they stand, and later steps adopt them from the records;
-    /// what the application writes to them meanwhile is collected once every record is adopted,
-    /// as an edit made after a whole install. Recording reads every found row in this one
-    /// transaction. Where rows written before this install are still to be collected, or an
-    /// earlier install's records still wait, the found rows are instead adopted whole by the
-    /// next step. A collect or an apply made while records wait adopts the rest first, whole:
-    /// a caller that wants the lock held briefly takes steps until [`Collected::more`] is false
-    /// before it applies anything. The adoptions are the changes a whole install would send,
+    /// [`Replica::install`] and a first step of [`Replica::collect_step`], in one transaction. What
+    /// it adopts of the registry for collections installed before (new fields, sets now written
+    /// together, sets narrowed, whose collections' rows are all written again), and every row that
+    /// brings up to date, is done whole in this first step, as `install` does it; records an
+    /// install under another registry left waiting are first adopted whole, under the registry they
+    /// were recorded with, as by that install. The rows found in the tables of a collection
+    /// installed for the first time are recorded, with their values as they stand, and later steps
+    /// adopt them from the records; what the application writes to them meanwhile is collected once
+    /// every record is adopted, as an edit made after a whole install. Recording reads every found
+    /// row in this one transaction. Where rows written before this install are still to be
+    /// collected, or an earlier install's records still wait, the found rows are instead adopted
+    /// whole by the next step. A collect or an apply made while records wait adopts the rest first,
+    /// whole: a caller that wants the lock held briefly takes steps until [`Collected::more`] is
+    /// false before it applies anything. The adoptions are the changes a whole install would send,
     /// with the same gids and clocks, but in the outbox in the order of their batches rather than
     /// of their collections and keys. The design is set out with the kernel's tables, in
     /// `store.rs`.
@@ -1069,14 +1112,43 @@ impl Replica {
                 adopted.extend(changes);
                 set.extend(more);
             }
-            let regrouped = match was_together {
-                Some(was) => was != together,
-                None => !c.together.is_empty(),
+            let old: Option<Vec<BTreeSet<&str>>> = match &was_together {
+                Some(Value::Text(was)) => Some(
+                    was.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.split('+').collect())
+                        .collect(),
+                ),
+                _ => None,
             };
-            if regrouped {
-                let (changes, more) = self.complete_sets(&mut cx, idx)?;
+            let within =
+                |set: &BTreeSet<&str>, of: &[String]| set.iter().all(|f| of.iter().any(|g| g == f));
+            let drawn: Vec<usize> = match &old {
+                Some(old) => (0..c.together.len())
+                    .filter(|&s| {
+                        !old.iter()
+                            .any(|o| c.together[s].iter().all(|f| o.contains(f.as_str())))
+                    })
+                    .collect(),
+                None => (0..c.together.len()).collect(),
+            };
+            if !drawn.is_empty() {
+                let (changes, more) = self.complete_sets(&mut cx, idx, &drawn, &added)?;
                 adopted.extend(changes);
                 set.extend(more);
+            }
+            // A field that leaves a set shows its own latest write that the merge still holds,
+            // where the wider set showed it NULL: the rows are written again from the merge.
+            let parted = old
+                .as_ref()
+                .is_some_and(|old| old.iter().any(|o| !c.together.iter().any(|s| within(o, s))));
+            if parted {
+                for r in db.query(
+                    "SELECT gid FROM fongo_ids WHERE collection = ?1",
+                    &[Value::Text(c.name.clone())],
+                )? {
+                    set.insert((c.name.clone(), as_gid(&r[0])?));
+                }
             }
         }
         set.extend(self.merge(&mut cx, &adopted, true)?);
@@ -1147,15 +1219,24 @@ impl Replica {
                 continue;
             };
             let mut found = Vec::new();
-            // A field in a set is recorded with its set, never alone.
-            for f in added.iter().filter(|f| c.together_of(f).is_none()) {
+            let mut grouped = false;
+            for f in added {
                 let value = row.get(f).cloned().unwrap_or(Value::Null);
                 m.image.insert(f.clone(), value.clone());
-                if value != Value::Null {
+                if value == Value::Null {
+                    continue;
+                }
+                // A field in a set is recorded with its set, never alone.
+                if c.together_of(f).is_some() {
+                    grouped = true;
+                } else {
                     found.push(FieldEdit::Set(f.clone(), self.shared(db, c, f, &value)?));
                 }
             }
             self.write_image(db, &c.name, &key, &m.image)?;
+            if grouped {
+                set.insert((c.name.clone(), gid));
+            }
             if found.is_empty() {
                 continue;
             }
@@ -1185,72 +1266,97 @@ impl Replica {
         Ok((changes, set))
     }
 
-    /// After the sets of fields that change together are redrawn, writes made before hold only
-    /// some fields of a set, so the set never shows whole. Each row that holds a value for such a
-    /// set records the whole set afresh, and the newest of those wins.
-    fn complete_sets(&self, cx: &mut Ctx, idx: usize) -> Result<Recorded> {
+    /// After the sets `drawn` of fields that change together are drawn anew, writes made before
+    /// hold only some fields of such a set, so it would not show whole. Each group whose set is
+    /// not whole records it again with what its registers hold, and for a field the registry has
+    /// just `added` that no register holds, what the row holds. The clock is the one just past
+    /// the set's latest write on this replica, carrying this replica's node, so an edit made
+    /// elsewhere and not yet here still wins unless it was made in that write's millisecond;
+    /// a set no register holds anything of takes the adoption clock. Values a row holds back or
+    /// an edit not yet collected are never sent: the edit is collected afterwards, as an edit.
+    fn complete_sets(
+        &self,
+        cx: &mut Ctx,
+        idx: usize,
+        drawn: &[usize],
+        added: &[String],
+    ) -> Result<Recorded> {
         let c = self.collection(idx);
         let db = cx.db;
         let ev = self.evaluator();
         let facts = Facts { db };
         let mut changes = Vec::new();
         let mut set = BTreeSet::new();
+        let mut done = BTreeSet::new();
         let mapped = db.query(
-            "SELECT key, gid FROM fongo_ids WHERE collection = ?1",
+            "SELECT key, gid FROM fongo_ids WHERE collection = ?1 ORDER BY key",
             &[Value::Text(c.name.clone())],
         )?;
         for r in mapped {
             let key = as_text(&r[0])?.to_string();
             let gid = as_gid(&r[1])?;
-            let (Some(row), Some(mut m)) = (read_row(db, c, &key)?, mapping(db, &c.name, &key)?)
-            else {
+            let Some(row) = read_row(db, c, &key)? else {
                 continue;
             };
             let Ok(target) = ev.target(&facts, &c.name, gid) else {
                 continue;
             };
+            // Two rows standing for one group would record two values at one clock.
+            if !done.insert(target.canonical) {
+                continue;
+            }
             let members = if target.live.is_empty() {
                 target.members.clone()
             } else {
                 target.live.clone()
             };
-            let mut found = Vec::new();
-            for fields in &c.together {
-                let mut clocks = Vec::new();
+            for &s in drawn {
+                let fields = &c.together[s];
+                let mut found = Vec::new();
+                let mut latest: Option<Hlc> = None;
+                let mut whole = true;
+                let mut fills = false;
                 for f in fields {
-                    clocks.push(
-                        facts
-                            .register(&self.schema, &c.name, &members, f)?
-                            .map(|(_, k)| k),
-                    );
-                }
-                let whole = clocks.iter().all(|k| *k == clocks[0]);
-                let empty = fields
-                    .iter()
-                    .all(|f| row.get(f).is_none_or(|v| *v == Value::Null));
-                if whole || empty {
-                    continue;
-                }
-                for f in fields {
-                    let value = row.get(f).cloned().unwrap_or(Value::Null);
-                    m.image.insert(f.clone(), value.clone());
+                    let held = facts.register(&self.schema, &c.name, &members, f)?;
+                    let unheld = held.is_none();
+                    let value = match held {
+                        Some((value, clock)) => {
+                            whole &= latest.is_none_or(|l| l == clock);
+                            latest = Some(latest.map_or(clock, |l| l.max(clock)));
+                            value
+                        }
+                        None if added.contains(f) => {
+                            let value = row.get(f).cloned().unwrap_or(Value::Null);
+                            self.shared(db, c, f, &value)?
+                        }
+                        None => Value::Null,
+                    };
+                    fills |= unheld && value != Value::Null;
                     found.push(FieldEdit::Set(f.clone(), value));
                 }
+                let empty = found
+                    .iter()
+                    .all(|e| matches!(e, FieldEdit::Set(_, Value::Null)));
+                if empty || (whole && !fills) {
+                    continue;
+                }
+                let clock = match latest {
+                    None => cx.adoption_clock()?,
+                    Some(latest) => match cx.successor(latest) {
+                        Some(clock) => clock,
+                        None => continue,
+                    },
+                };
+                changes.extend(plan::record(
+                    &self.schema,
+                    &c.name,
+                    &found,
+                    Some(&target),
+                    None,
+                    clock,
+                ));
+                set.insert((c.name.clone(), gid));
             }
-            if found.is_empty() {
-                continue;
-            }
-            self.write_image(db, &c.name, &key, &m.image)?;
-            let clock = cx.clock.tick(cx.wall);
-            changes.extend(plan::record(
-                &self.schema,
-                &c.name,
-                &found,
-                Some(&target),
-                None,
-                clock,
-            ));
-            set.insert((c.name.clone(), gid));
         }
         db.check()?;
         Ok((changes, set))

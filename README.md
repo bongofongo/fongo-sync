@@ -44,9 +44,43 @@ reference may own its row, which then goes with its target. A collection can als
 - fields that change together, which merge as one write.
 - fields that report conflicts, so an application can combine concurrent edits to text. Through
   `fongo-sync-client`, of two concurrent edits only the device whose envelope lands later in the
-  log is told; the other takes the winning value without a report.
+  log is told; the other takes the winning value without a report. The remote value reported is
+  the latest made elsewhere, whatever it is: a remote edit that sets the field back to the base
+  is reported with the base as its remote value, and so is a write that leaves the field as it
+  was, such as an upgrade recording a redrawn set again. A three-way merge then gives the local
+  value back, so an application must not treat a remote value equal to the base as an error.
 - columns it fills when inserting a row, and tables outside the registry whose rows follow a
   merged row.
+
+A set of fields that change together should hold only fields a person edits as one decision. A
+write to any field of a set records the whole set at one clock, so a field the application writes
+itself, such as one derived from others or rewritten after a sync, records the person's fields
+with it, and that write beats an edit to them made concurrently on another device. Keep such
+fields out of a set with fields a person edits: sync them as plain fields, or keep them out of
+the registry and derive them on each device.
+
+Adding a field to an existing set, merging two sets, or grouping fields written apart changes
+what the set means. On upgrade each device records such a set again where its writes so far hold
+only part of it, at the clock just past the set's latest write the device holds, with the values
+the merged changes hold. That record does not beat an edit made elsewhere and not yet received,
+except for an edit made in the same millisecond as that latest write, the part of that write
+still on its way, and a write older than that latest write to a field of the new set that it
+did not carry. A device with an unsent edit to a field of the set that reports conflicts is told
+of the record as a conflict whose remote value is the base. Two losses remain:
+
+- an edit of one of those three kinds is lost for good, also after the set is later narrowed
+  again;
+- a value an upgrade moves into a newly added field is lost when a device not yet upgraded
+  writes the set after the upgrade and the user of an upgraded device then edits the set before
+  that device upgrades, since the new field reads NULL after the old device's write and the edit
+  records that NULL.
+
+An upgrade that narrows a set, so that a field leaves it or the set is removed, sends nothing; a
+field that leaves a set shows its own latest write that the merge still holds. To show it, the
+install writes every row of that collection again in one transaction, holding the write lock:
+seconds for a hundred thousand rows, several times what adopting a new plain field takes. An
+install in steps does this in its first step, as it adopts any change of the registry.
+`Collection::together` sets out what an upgrade sends.
 
 When two replicas each make a row that is valid alone and together break a rule of the
 application's own, such as a partial unique index, the kernel holds one of them back and the

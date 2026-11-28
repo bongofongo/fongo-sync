@@ -110,6 +110,43 @@ impl Peer {
         self.install().await;
     }
 
+    /// [`Peer::upgrade`] with an install that takes a bounded step of `rows` rows, then steps of
+    /// collecting until none is left.
+    pub async fn upgrade_in_steps(&mut self, registry: Registry, rows: usize) {
+        self.replica = Replica::new(registry);
+        let waiting = self
+            .writes
+            .installing(&mut self.conn, &self.replica, &self.taken)
+            .await;
+        let replica = self.replica.clone();
+        let mut step = replica.install_step(&mut self.conn, rows).await.unwrap();
+        self.writes.touched(&step.touched);
+        if step.more {
+            self.writes
+                .installed_step(&mut self.conn, &self.replica, waiting)
+                .await;
+        } else {
+            self.writes
+                .installed(&mut self.conn, &self.replica, waiting)
+                .await;
+        }
+        self.midway().await;
+        while step.more {
+            let seen = super::seen(&mut self.conn, &self.replica, &self.taken).await;
+            self.writes
+                .before(&mut self.conn, &self.replica, &seen)
+                .await;
+            step = replica.collect_step(&mut self.conn, rows).await.unwrap();
+            self.writes.touched(&step.touched);
+            if step.more {
+                self.writes.after_step(&mut self.conn, &self.replica).await;
+            } else {
+                self.writes.after(&mut self.conn, &self.replica).await;
+            }
+            self.midway().await;
+        }
+    }
+
     pub async fn suspend(&mut self) {
         self.replica.suspend(&mut self.conn).await.unwrap();
         self.suspended = true;
