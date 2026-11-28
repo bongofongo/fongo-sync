@@ -845,3 +845,28 @@ async fn crossing_a_long_gap_goes_on_after_a_crash() {
         (len, chain(id.0, &server.log(id)))
     );
 }
+
+/// Inside a gap an older build left, the cursor reported is where this build has read to, so a
+/// notification of the log's head says a sync is worth running until the gap is crossed.
+#[tokio::test]
+async fn the_cursor_reported_inside_a_gap_is_where_this_build_has_read() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for key in ["b0", "b1"] {
+        sending(&mut b, &server, key).await;
+    }
+    a.sync(&server).await.unwrap();
+    for key in ["b2", "b3"] {
+        sending(&mut b, &server, key).await;
+    }
+    a.run("UPDATE fongo_client_state SET cursor = max(cursor, 4)")
+        .await;
+    let head = fongo_sync_client::protocol::api::Notification { seq: 4 };
+    assert_eq!(a.cursor().await, 2);
+    assert!(fongo_sync_client::worth_syncing(&head, a.cursor().await));
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 4);
+    assert!(!fongo_sync_client::worth_syncing(&head, a.cursor().await));
+    assert_eq!(fingerprint(&mut a.conn, id).await.unwrap().seq, 4);
+}

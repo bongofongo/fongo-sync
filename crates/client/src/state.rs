@@ -13,22 +13,21 @@
 //! the log or writes anything else. A build of layout 2 reads the layout first, so every sync of it
 //! that begins after the upgrade refuses these tables with [`Error::NewerClientTables`].
 //!
-//! A sync of a layout-2 build already running when another connection upgrades the tables goes
-//! on with its own statements, which touch none of layout 3's columns. It can move the cursor
-//! alone, where this build moves it with the position of its digest: the next syncs of this build
-//! then read on from the position it last stored, applying again what the older build applied and
+//! A sync of a layout-2 build already running when another connection upgrades the tables goes on
+//! with its own statements, which touch none of layout 3's columns. It can move the cursor alone,
+//! where this build moves it with the position of its digest: the next syncs of this build then
+//! read on from the position it last stored, applying again what the older build applied and
 //! storing their progress as that position, never moving the cursor back, until they reach where
 //! the older build got, which the log must reach. So a resolution that set the cursor to 0 is not
 //! undone, a log that went back is still found, and an append landing right after the moved cursor
 //! is read in its turn, after what lies before it. Where the older build's advance comes after a
-//! resolution and before other devices have refilled the log up to it, the log is then shorter
-//! than that cursor, and the next sync finds a second fault there, which asks for a second
-//! resolution. On tables just upgraded, where this
-//! build has stored no cursor yet, the digest kept for the old position is not taken for the new
-//! one's, and the log is hashed again up to the cursor. It can drop records of appends read past
-//! without keeping them in `fongo_client_passed`: an append later answered at such a position is
-//! then read back before it is taken for reuse. It does not see a stored fault, and goes on
-//! applying and sending until it ends.
+//! resolution, the sync of this build that next reads to the end of the log finds a second fault if
+//! the log does not reach the cursor that build moved, and that asks for a second resolution. On
+//! tables just upgraded, where this build has stored no cursor yet, the digest kept for the old
+//! position is not taken for the new one's, and the log is hashed again up to the cursor. It can
+//! drop records of appends read past without keeping them in `fongo_client_passed`: an append later
+//! answered at such a position is then read back before it is taken for reuse. It does not see a
+//! stored fault, and goes on applying and sending until it ends.
 
 use fongo_sync_protocol::LibraryId;
 use sha2::{Digest, Sha256};
@@ -898,8 +897,8 @@ pub(crate) async fn clear_sending(
 
 /// Records where the pull stopped at a later version's envelope, unless the stored position is
 /// already past it, and forgets a recorded stop the stored position has passed: the cursor, or
-/// this build's position where a build that keeps no digest moved the cursor past it. Written after the
-/// cursor, so that a stop another sync recorded further on stays.
+/// this build's position where a build that keeps no digest moved the cursor past it. Written
+/// after the cursor, so that a stop another sync recorded further on stays.
 pub(crate) async fn record_stop(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -989,9 +988,12 @@ pub async fn step_past(
 }
 
 /// The sequence number of the last envelope in `library`'s log that this database has applied or
-/// knows it wrote; 0 before the first sync, and where the kernel is not installed. Fails, as the
-/// kernel's own calls do, where its tables are of a layout other than the one this build uses, and
-/// where the client's own tables are of a later layout than this build's.
+/// knows it wrote; 0 before the first sync, and where the kernel is not installed. Where a build of
+/// the client that keeps no digest of the envelope at the cursor moved the cursor past where this
+/// build last stored it, this is where this build stored it, from which its syncs read on, so that
+/// [`crate::worth_syncing`] says a sync is worth running until they have read that far. Fails, as
+/// the kernel's own calls do, where its tables are of a layout other than the one this build uses,
+/// and where the client's own tables are of a later layout than this build's.
 pub async fn cursor(conn: &mut SqliteConnection, library: LibraryId) -> Result<u64, Error> {
     // One transaction, so the checks and the read see one state of the database.
     let mut tx = conn.begin().await?;
@@ -1100,10 +1102,16 @@ async fn read_cursor(
     if !exists(conn, "fongo_client_state").await? {
         return Ok(None);
     }
-    Ok(
-        sqlx::query_scalar("SELECT cursor FROM fongo_client_state WHERE library = ?")
-            .bind(&library.0[..])
-            .fetch_optional(&mut *conn)
-            .await?,
-    )
+    let sql = match layout(conn).await? {
+        Layout::Current => {
+            "SELECT CASE WHEN anchor_seq < cursor AND chain_seq <= anchor_seq THEN anchor_seq
+                         ELSE cursor END
+             FROM fongo_client_state WHERE library = ?"
+        }
+        _ => "SELECT cursor FROM fongo_client_state WHERE library = ?",
+    };
+    Ok(sqlx::query_scalar(sql)
+        .bind(&library.0[..])
+        .fetch_optional(&mut *conn)
+        .await?)
 }

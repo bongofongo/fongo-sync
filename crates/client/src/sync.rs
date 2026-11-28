@@ -1893,7 +1893,11 @@ async fn acknowledge<A: Apply>(
             let chain = (chain_seq == cursor).then(|| state::chain_step(chain, seq, digest));
             state::advance(&mut tx, library, seq, Some(digest), chain).await?;
         }
-        let read = if follows { seq } else { cursor };
+        // What this build has read, which is short of the cursor where an older build moved it.
+        let read = match follows {
+            true => seq,
+            false => position.map_or(cursor, |at| at.min(cursor)),
+        };
         if let Some(through) = state::read_past(&mut tx, library, read).await? {
             replica.release_bases(&mut tx, through).await?;
         }
