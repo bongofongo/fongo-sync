@@ -38,7 +38,8 @@
 //! first place in the first page, so a sync whose new envelopes fill whole pages reads one page
 //! more: with pages of `p` envelopes and `n` new ones, `n` at least 1, it reads `(n + 1) / p`
 //! pages rounded up in place of `n / p`; a pull stopped at a later version's envelope reads two
-//! envelopes where it read one. An append answered at a position the device has read costs one
+//! envelopes where it read one, which is a page more only where the server's pages hold one. An
+//! append answered at a position the device has read costs one
 //! read of that envelope.
 //!
 //! After tables of layout 2 are upgraded, the next syncs read the log from its start to the cursor,
@@ -48,13 +49,14 @@
 //! sends nothing, does not settle, and reports [`SyncReport::more`]; a log rewritten at or before
 //! the cursor in that window, not shortened, is not found.
 //!
-//! What cannot be detected this way: a rollback to a point after the last envelope this device read
-//! or appended, which leaves it nothing to miss; an envelope rewritten behind the cursor, which no
-//! sync reads again, though another device reading the log anew has another fingerprint; a server
-//! withholding the newest envelopes, which looks like nothing new; a server keeping separate logs for different devices, where no envelope
-//! crosses between them; and, on a device that never read the lost part, the loss itself, until a
-//! device that read it syncs and finds the fault. Two devices comparing their [`fingerprint`]s at
-//! one position out of band find a split.
+//! What cannot be detected this way: a rollback to a point at or after the last envelope this
+//! device read or appended, which leaves it nothing to miss; an envelope rewritten behind the
+//! cursor, which no sync reads again, though another device reading the log anew has another
+//! fingerprint; a server withholding the newest envelopes, which looks like nothing new; a server
+//! keeping separate logs for different devices, where no envelope crosses between them; and, on a
+//! device that never read the lost part, the loss itself, until a device that read it syncs and
+//! finds the fault. Two devices comparing their [`fingerprint`]s at one position out of band find
+//! a split; no call acts on that, as [`fingerprint`] says.
 //!
 //! To create or join a library so that a lost response can be retried, make the credentials
 //! first ([`Credentials::for_new_library`], [`Credentials::for_recovery_code`]), store them, then

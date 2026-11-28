@@ -447,16 +447,17 @@ pub struct SyncReport {
 ///   at a position this device has read must be read back there. A sync that finds otherwise fails
 ///   with [`Error::LogFault`] and stores the fault; see [`crate::LogFault`]. Reading the envelope
 ///   at the cursor costs its bytes in every sync, and a page read more where the new envelopes
-///   fill whole pages or the pull is stopped at a later version's envelope; a suspect answer to
-///   an append costs one read of one envelope.
+///   fill whole pages; a pull stopped at a later version's envelope reads two envelopes where it
+///   read one, a page more only where the server's pages hold one; a suspect answer to an append
+///   costs one read of one envelope.
 /// - After the client's tables are upgraded from layout 2, which kept no fingerprint, the next
-///   syncs read the log from its start to the cursor, every page one sync reads each, storing
-///   how far they got after each page, to make one: a cursor at `c` with pages of `p` envelopes
-///   takes `c / (1000 p)` syncs rounded up, as the cursor does not move meanwhile, however fast
-///   the log grows. Until that is done each sync reads the envelope at the cursor, which must be
-///   there or the sync fails with [`crate::LogFault::Behind`]; reads nothing past it, sends
-///   nothing and does not call [`Apply::caught_up`], and sets [`SyncReport::more`]. In that window a log rewritten at or
-///   before the cursor, but not shortened, is not found, now or later, as with any rewrite
+///   syncs read the log from its start to the cursor, every page one sync reads each, storing how
+///   far they got after each page, to make one: a cursor at `c` with pages of `p` envelopes takes
+///   `c / (1000 p)` syncs rounded up, as the cursor does not move meanwhile, however fast the log
+///   grows. Until that is done each sync reads the envelope at the cursor, which must be there or
+///   the sync fails with [`crate::LogFault::Behind`]; reads nothing past it, sends nothing and does
+///   not call [`Apply::caught_up`], and sets [`SyncReport::more`]. In that window a log rewritten
+///   at or before the cursor, but not shortened, is not found, now or later, as with any rewrite
 ///   behind the cursor.
 /// - Nothing else about appends: storing an identical envelope only once is welcome but not
 ///   relied on, since a copy is applied idempotently.

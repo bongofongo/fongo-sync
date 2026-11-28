@@ -1,11 +1,12 @@
-//! Two or three syncs at once on one database, interleaved at random at every request they make
-//! and every gap between their transactions, while the application writes, one or two other
-//! devices write and sync, requests fail before the server sees them or lose their answers after,
-//! and syncs crash. The server stores an identical envelope again or not, and pages hold one to
-//! five envelopes, as each seed draws. The server is honest throughout, so no sync may find a fault in its log, and
-//! every device ends with the same fingerprint of it. A run is a function of its seed: one sync runs at a time, each until it reaches a point
-//! where it waits, and the databases' clocks and random bytes come from the seed. The clock stands
-//! still for many writes and sometimes steps back.
+//! Two or three syncs at once on one database, interleaved at random at every request they make and
+//! every gap between their transactions, while the application writes, one or two other devices
+//! write and sync, requests fail before the server sees them or lose their answers after, and syncs
+//! crash. The server stores an identical envelope again or not, and pages hold one to five
+//! envelopes, as each seed draws. The server is honest throughout, so no sync may find a fault in
+//! its log, and every device ends with the same fingerprint of it. A run is a function of its seed:
+//! one sync runs at a time, each until it reaches a point where it waits, and the databases' clocks
+//! and random bytes come from the seed. The clock stands still for many writes and sometimes steps
+//! back.
 
 #[allow(dead_code)]
 mod support;

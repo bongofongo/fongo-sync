@@ -33,8 +33,8 @@ use crate::sync::check_connection;
 /// first written.
 ///
 /// What this cannot detect: a server that shows this device a log consistent with everything it
-/// read and wrote, as after a rollback to a point after the last envelope this device read or
-/// appended; an envelope rewritten behind this device's cursor, which it does not read again; a
+/// read and wrote, as after a rollback to a point at or after the last envelope this device read
+/// or appended; an envelope rewritten behind this device's cursor, which it does not read again; a
 /// server that withholds the newest envelopes, which looks like nothing new; and a split, where
 /// the server keeps separate logs for different devices and no envelope crosses between them.
 /// Devices that compare [`fingerprint`]s at one position, out of band, detect a split, and a
@@ -142,10 +142,18 @@ pub async fn log_fault(
 }
 
 /// The fingerprint of `library`'s log through the furthest position this device has hashed:
-/// usually its cursor ([`crate::cursor`]). A database whose client tables were made by a build
-/// that kept no fingerprint gives position 0 until a sync has read the log again up to its
-/// cursor, which the first sync after the upgrade does, as far as its page limit lets it. Fails
-/// where the client's tables are of a later layout than this build's.
+/// usually its cursor ([`crate::cursor`]). On a database whose client tables were made by a build
+/// that kept no fingerprint, the syncs after the upgrade hash the log again from its start and
+/// store how far they got after each page: until they reach the cursor this gives the position
+/// they reached, 0 before the first. Fails where the client's tables are of a later layout than
+/// this build's.
+///
+/// Two devices whose fingerprints at one position differ were shown different logs. Nothing in
+/// this crate acts on that: [`resend_all`] needs a fault this device found itself, and no call
+/// records one an application found by comparing fingerprints. What an application can do today
+/// is tell the user the server is not keeping one log, choose the log to keep, and rebuild each
+/// device that followed another, after an export, as [`resend_all`] describes; what only those
+/// devices held is lost unless entered again.
 pub async fn fingerprint(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -173,19 +181,26 @@ pub async fn fingerprint(
 /// still stepped past if found at the same position with the same bytes.
 ///
 /// A crash leaves the transaction whole or undone: with the fault still stored, call this again.
-/// Two devices that each resolve so both send everything, which costs room and nothing else. A
-/// sync running on another connection meanwhile writes nothing more once this commits, and fails
-/// with [`Error::ResolvedMeanwhile`]. Should the server roll back again before the outbox is
-/// sent, the next sync finds a new fault, and resolving it sends everything again, the earlier
-/// copies included.
+/// Two devices that each resolve so both send everything, which costs room on the server. Near the
+/// library's storage limit ([`fongo_sync_protocol::api::Capabilities::max_library_bytes`]) the
+/// server refuses part of it: each sync then reads the log and fails with [`Error::Server`]
+/// carrying [`fongo_sync_protocol::api::ErrorCode::LibraryFull`], the fault stays resolved, and
+/// nothing is lost on this device, as what was not sent waits in the outbox. The application can
+/// tell the user the library is full, so that room is made on the server, and sync again; or
+/// rebuild the device instead, which gives up what only it held. A sync running on another
+/// connection meanwhile writes nothing more once this commits, and fails with
+/// [`Error::ResolvedMeanwhile`]. Should the server roll back again before the outbox is sent, the
+/// next sync finds a new fault, and resolving it sends everything again, the earlier copies
+/// included.
 ///
 /// A device that then takes the log, of this version or an older one later upgraded to it, shows
 /// the rows this device shows, with what follows from the kernel's own record, as
-/// [`Replica::resend`] states: of a field's history only the change that wins is sent, which changes nothing a device shows but which collection an id with facts in
-/// more than one belongs to; values the application kept as this device's own on resuming, and
-/// rows held back for a clash, stay this device's alone. A change only another device held, and
-/// the server lost, waits for that device to resolve too. Reading the log again reports no
-/// conflict this device was told of before, nor one with an edit it has not sent.
+/// [`Replica::resend`] states: of a field's history only the change that wins is sent, which
+/// changes nothing a device shows but which collection an id with facts in more than one belongs
+/// to; values the application kept as this device's own on resuming, and rows held back for a
+/// clash, stay this device's alone. A change only another device held, and the server lost, waits
+/// for that device to resolve too. Reading the log again reports no conflict this device was told
+/// of before, nor one with an edit it has not sent.
 ///
 /// The other resolutions: leave the fault stored, and the device stays stopped while local edits
 /// gather; or rebuild the device from the server, giving up what it holds that the server lost:

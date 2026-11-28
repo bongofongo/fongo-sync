@@ -151,24 +151,27 @@ checks that the server still holds the log it read and wrote: it reads the envel
 again and compares it with a digest it kept, looks for each envelope it appended at the place the
 server named, and takes an append answered at a position it has read for reuse once the envelope
 read back there is another. Reading the envelope at the cursor costs its bytes in every sync, up to
-the server's largest envelope, and one page read more where the new envelopes fill whole pages or
-the pull is stopped at a later version's envelope; a suspect answer to an append costs one read. A
-log rolled back, restored from a backup, rewritten at the cursor or missing an acknowledged
-envelope fails one of these; the sync stores a `LogFault` naming the cause and stops, and every
-sync after it, on any connection, fails with it before reaching the server, applying, sealing and
-settling nothing, until the application resolves it. A server must never change bytes it has
-served at a position, not even to repair damaged storage, as it cannot know that no device has read
-past them: a device stopped at damaged bytes reads what is put there later as any envelope, and
-one that read past them reports other bytes at its cursor as a rewrite. `resend_all` puts everything the device holds in its outbox again, which
-entities are one included, and reads the log from its start, so that once it has synced the
-server's log again holds every change the device had, and a new device, of its version or an
-older one later upgraded to it, shows its rows, but for rows the device holds back for a clash
-and values it kept as its own on resuming; applying a change twice changes nothing. The device can instead be rebuilt from the server, or left stopped.
-The client also keeps a fingerprint of the log it has read, a hash chained over every envelope in
-order, which two devices can compare at one position to find a server showing them different
-logs; nothing in this stage compares them by itself, and a rollback to a point after everything a
-device read and wrote, a rewrite behind its cursor, or a server withholding the newest envelopes,
-is not detected. Credentials
+the server's largest envelope, and one page read more where the new envelopes fill whole pages; a
+pull stopped at a later version's envelope reads two envelopes where it read one, which is a page
+more only where the server's pages hold one; a suspect answer to an append costs one read. A log
+rolled back, restored from a backup, rewritten at the cursor or missing an acknowledged envelope
+fails one of these; the sync stores a `LogFault` naming the cause and stops, and every sync after
+it, on any connection, fails with it before reaching the server, applying, sealing and settling
+nothing, until the application resolves it. A server must never change bytes it has served at a
+position, not even to repair damaged storage, as it cannot know that no device has read past them:
+a device stopped at damaged bytes reads what is put there later as any envelope, and one that read
+past them reports other bytes at its cursor as a rewrite. `resend_all` puts everything the device
+holds in its outbox again, which entities are one included, and reads the log from its start, so
+that once it has synced the server's log again holds every change the device had, and a new
+device, of its version or an older one later upgraded to it, shows its rows, but for rows the
+device holds back for a clash and values it kept as its own on resuming; applying a change twice
+changes nothing. Near the library's storage limit the server refuses part of it, and each sync
+fails with that refusal, losing nothing, until it has room. The device can instead be rebuilt from
+the server, or left stopped. The client also keeps a fingerprint of the log it has read, a hash
+chained over every envelope in order, which two devices can compare at one position to find a
+server showing them different logs; nothing in this stage compares them by itself or acts on a
+difference, and a rollback to a point at or after everything a device read and wrote, a rewrite
+behind its cursor, or a server withholding the newest envelopes, is not detected. Credentials
 stay with the application; the client stores only its cursor, the digest of the envelope there
 and the fingerprint, the envelope it is sending, where its recent envelopes landed and where its
 pull stopped, and a fault it found, in tables of its own, which record their own layout.

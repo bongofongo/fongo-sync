@@ -625,6 +625,14 @@ impl State {
                 }
                 let log = &mut self.libraries.get_mut(&id).unwrap().log;
                 let stored = log.iter().position(|stored| *stored == request.body);
+                let held: usize = log.iter().map(Vec::len).sum();
+                let full = self
+                    .caps
+                    .max_library_bytes
+                    .is_some_and(|max| (held + request.body.len()) as u64 > max);
+                if full && (stored.is_none() || self.store_again) {
+                    return Err(ErrorCode::LibraryFull);
+                }
                 let seq = match stored.filter(|_| !self.store_again) {
                     Some(at) => at + 1,
                     None => {

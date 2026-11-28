@@ -1212,3 +1212,70 @@ async fn a_refused_envelope_is_not_cleared_once_another_connection_stores_a_faul
     assert!(matches!(held.await, Err(Error::LogFault(_))));
     assert_eq!(in_flight(&mut x).await, recorded);
 }
+
+/// Resending everything near the library's storage limit: the server refuses part of it, every
+/// sync then fails with the server's refusal after reading the log, no fault is stored again, and
+/// nothing is lost: what was not sent waits in the outbox until the server has room.
+#[tokio::test]
+async fn resending_into_a_full_library_fails_each_sync_and_loses_nothing() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for n in 0..6 {
+        a.run(&format!("INSERT INTO settings VALUES ('a{n}', 'x')"))
+            .await;
+    }
+    sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut OneEach,
+    )
+    .await
+    .unwrap();
+    b.sync(&server).await.unwrap();
+    let used: usize = server.log(id).iter().map(Vec::len).sum();
+    server.roll_back(id, 0);
+    assert!(matches!(a.sync(&server).await, Err(Error::LogFault(_))));
+    resend_all(&mut a.conn, &a.replica, id).await.unwrap();
+    // Room for about half of what is resent.
+    server.with(|s| s.caps.max_library_bytes = Some(used as u64 / 2));
+    for _ in 0..2 {
+        let full = sync_with(
+            &mut a.conn,
+            &a.replica,
+            &server,
+            &a.credentials,
+            now,
+            &mut OneEach,
+        )
+        .await;
+        assert!(
+            matches!(
+                full,
+                Err(Error::Server {
+                    code: fongo_sync_client::protocol::api::ErrorCode::LibraryFull,
+                    ..
+                })
+            ),
+            "{full:?}"
+        );
+        assert_eq!(stored(&mut a).await, None);
+        assert!(outbox_len(&mut a).await > 0);
+    }
+    assert!(!server.log(id).is_empty());
+    server.with(|s| s.caps.max_library_bytes = None);
+    a.sync(&server).await.unwrap();
+    assert_eq!(outbox_len(&mut a).await, 0);
+    assert!(matches!(b.sync(&server).await, Err(Error::LogFault(_))));
+    resend_all(&mut b.conn, &b.replica, id).await.unwrap();
+    let c = another(&server, &a).await;
+    let mut peers = [a, b, c];
+    settle(&mut peers, &server).await;
+    let rows = assert_converged(&mut peers).await;
+    for n in 0..6 {
+        assert!(rows.contains(&format!("setting a{n}=x")), "{rows:#?}");
+    }
+}
