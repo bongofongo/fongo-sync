@@ -1456,6 +1456,31 @@ async fn resent_shows_the_same(
             .entry((c.collection.clone(), c.gid, c.field.clone()))
             .or_default() += 1;
     }
+    // Each alias is resent at a clock later than the first fact of the entity it is written on.
+    let firsts: Vec<(Vec<u8>, String, String)> =
+        sqlx::query_as("SELECT gid, collection, first FROM fongo_claims")
+            .fetch_all(&mut from.conn)
+            .await
+            .unwrap();
+    let first_of: std::collections::BTreeMap<(Gid, String), fongo_sync_sqlite::core::Hlc> = firsts
+        .into_iter()
+        .map(|(gid, collection, first)| {
+            let clock = fongo_sync_sqlite::core::Hlc::decode(&first).unwrap();
+            ((Gid::from_slice(&gid).unwrap(), collection), clock)
+        })
+        .collect();
+    for c in resent
+        .iter()
+        .filter(|c| c.field == "$alias" && known.contains(&c.collection))
+    {
+        let first = first_of.get(&(c.gid, c.collection.clone()));
+        if first.is_none_or(|first| c.clock <= *first) {
+            return Err(format!(
+                "an alias is resent at {:?}, not later than its entity's first clock {first:?}",
+                c.clock
+            ));
+        }
+    }
     if kept != sent_of {
         let differ: Vec<_> = kept
             .iter()
