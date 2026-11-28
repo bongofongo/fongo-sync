@@ -25,9 +25,12 @@ use crate::sync::check_connection;
 ///
 /// The log is append-only byte for byte: once a server has served bytes at a position, it serves
 /// those bytes there for good, as the protocol's rule that every device reads the same envelope at
-/// each position requires. A server that finds an envelope damaged leaves it as it served it:
-/// bytes put in place of those served, at this device's cursor, are [`LogFault::Rewritten`], even
-/// when they are the envelope as first written.
+/// each position requires. A server that finds an envelope damaged leaves it as it served it,
+/// since it cannot know that no device has read past it. A device whose pull stopped at the
+/// damaged bytes, and so has not passed them, reads other bytes found there later as any
+/// envelope; to one that refused or stepped past them, that position is the cursor or behind it,
+/// and other bytes at the cursor are [`LogFault::Rewritten`], even when they are the envelope as
+/// first written.
 ///
 /// What this cannot detect: a server that shows this device a log consistent with everything it
 /// read and wrote, as after a rollback to a point after the last envelope this device read or

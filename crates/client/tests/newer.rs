@@ -855,8 +855,12 @@ async fn stepping_past_other_bytes_or_another_place_is_refused_and_changes_nothi
     assert_eq!(a.cursor().await, 1);
 }
 
+/// Other bytes put where a pull stopped, against the rule that bytes once served never change,
+/// reach a device that has not passed that position as any envelope: read, applied, and not
+/// stepped past, as only the bytes named are. One that has passed it finds a rewrite instead, as
+/// `rollback.rs` shows.
 #[tokio::test]
-async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
+async fn bytes_changed_where_a_pull_stopped_are_read_and_not_stepped_past() {
     let server = Server::new();
     let ([mut a, b], junk) = stopped_at_junk(&server).await;
     let id = a.credentials.library_id();
@@ -865,7 +869,7 @@ async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
         id,
         2,
         seal(
-            &setting("repaired"),
+            &setting("replaced"),
             &keys,
             0,
             b.credentials.device(),
@@ -877,7 +881,46 @@ async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
     assert_eq!((report.newer, report.refused_total), (None, 0));
     assert_eq!(
         a.settings().await,
-        ["mine=x", "repaired=repaired", "s1=x", "s3=x"]
+        ["mine=x", "replaced=replaced", "s1=x", "s3=x"]
+    );
+}
+
+/// Other bytes put where a device has stepped past, while that is its cursor: a rewrite. Behind
+/// the cursor they would go unseen, as any rewrite there.
+#[tokio::test]
+async fn bytes_changed_where_a_device_stepped_past_are_a_rewrite() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    let keys = a.credentials.library().clone();
+    b.run("INSERT INTO settings VALUES ('s1', 'x')").await;
+    b.sync(&server).await.unwrap();
+    let junk = b"\x02 damaged in storage".to_vec();
+    server.inject(id, junk.clone());
+    assert_eq!(a.sync(&server).await.unwrap().newer.map(|n| n.seq), Some(2));
+    step_past(&mut a, 2, digest(&junk)).await.unwrap();
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 2);
+    server.replace(
+        id,
+        2,
+        seal(
+            &setting("replaced"),
+            &keys,
+            0,
+            b.credentials.device(),
+            nonce(),
+        ),
+    );
+    let found = a.sync(&server).await;
+    assert!(
+        matches!(
+            found,
+            Err(Error::LogFault(fongo_sync_client::LogFault::Rewritten {
+                seq: 2
+            }))
+        ),
+        "{found:?}"
     );
 }
 

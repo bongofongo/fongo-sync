@@ -1,9 +1,10 @@
 //! What the client keeps in the database, one row per library: its position in the server's log,
 //! the digest of the envelope there with the position it is for, the log's fingerprint up to some
-//! position, the envelope it is about to append and the head it knew then, the envelope its pull last stopped at and one the
-//! application chose to step past, a fault found in the log and how many times one was resolved;
-//! where each envelope it appended landed, with a digest of it, until it reads the log past it;
-//! and where its latest appends that it has read past landed. No secret is stored here.
+//! position, the envelope it is about to append and the head it knew then, the envelope its pull
+//! last stopped at and one the application chose to step past, a fault found in the log and how
+//! many times one was resolved; where each envelope it appended landed, with a digest of it, until
+//! it reads the log past it; and where its latest appends that it has read past landed. No secret
+//! is stored here.
 //!
 //! The tables are of layout 3, recorded in `fongo_client_meta`. Layouts 1 and 2 are upgraded in
 //! place, in one transaction. Layout 1 kept no record of its layout: a sync of a layout-1 build on
@@ -912,9 +913,11 @@ pub(crate) async fn clear_passing(
 /// expected to read, such as one whose bytes were damaged.
 ///
 /// It applies to a stop of every [`crate::Unknown`] kind. The next sync still reads the envelope
-/// first: if it can now read it, because the server holds repaired bytes there or this device has
-/// since learned the key of its epoch, it applies it and steps past nothing. Bytes other than
-/// those named are never stepped past.
+/// first: if it can now read it, because this device has since learned the key of its epoch, it
+/// applies it and steps past nothing. Bytes other than those named are never stepped past: should
+/// the server hold other bytes there, against the rule that bytes once served never change, a
+/// device stopped before them reads them as any envelope, and one that stepped past the damaged
+/// bytes, whose cursor they are then, finds [`crate::LogFault::Rewritten`].
 pub async fn step_past(
     conn: &mut SqliteConnection,
     library: LibraryId,
