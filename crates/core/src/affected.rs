@@ -115,8 +115,15 @@ impl Evaluator<'_> {
                     || old.members.is_empty() != new.members.is_empty()
                     || old.row.is_some() != new.row.is_some();
                 if read_differently && expanded.insert(x) {
+                    let held = Value::Ref(x);
                     for (c, f) in &referring {
-                        queue.extend(after.holding(c, &[(f, &Value::Ref(x))]));
+                        // The source may name gids that hold the reference in a collection they
+                        // are not kept in, or as a key entry that is not their key.
+                        for y in after.holding(c, &[(f, &held)]) {
+                            if will.keeps(y, c, f, &held)? {
+                                queue.push(y);
+                            }
+                        }
                     }
                 }
             }

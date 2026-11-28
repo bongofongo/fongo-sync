@@ -608,3 +608,59 @@ fn a_key_whose_references_fall_in_large_groups_is_undetermined_before_its_lookup
         counting.work.get()
     );
 }
+
+/// The region of a natural entity takes in the gid each of its keys, read through the groups,
+/// derives only where that gid holds the key: one claimed in the key's collection without it
+/// joins nothing and leaves the region the size it had, so a question is decided at the same
+/// region limits whether or not such a gid exists.
+#[test]
+fn a_derived_gid_that_does_not_hold_its_key_takes_no_room_in_a_region() {
+    let schema = Schema::new(vec![
+        Collection::minted("r").plain("p", Merge::Lww),
+        Collection::natural("k", &["up", "p0"])
+            .reference("up", "r")
+            .plain("p0", Merge::Lww)
+            .plain("v", Merge::Lww),
+    ]);
+    let at = |c: &str, g: Gid, f: &str, v: Value, wall_ms: u64| Change {
+        collection: c.into(),
+        gid: g,
+        field: f.into(),
+        value: v,
+        clock: Hlc {
+            wall_ms,
+            counter: 0,
+            node: Gid([9; 16]),
+        },
+    };
+    let (r1, r2) = (Gid([1; 16]), Gid([2; 16]));
+    let key = [Value::Ref(r1), Value::Int(1)];
+    let e = Gid::derive("k", &key);
+    let z = Gid::derive("k", &[Value::Ref(r2), Value::Int(1)]);
+    let without = vec![
+        at("r", r1, "p", Value::Int(0), 1),
+        at("r", r2, "p", Value::Int(0), 1),
+        at("r", r2, ALIAS, Value::Ref(r1), 2),
+        at("k", e, "up", key[0].clone(), 1),
+        at("k", e, "p0", key[1].clone(), 1),
+    ];
+    let mut with = without.clone();
+    with.push(at("k", z, "v", Value::Int(7), 1));
+    let decided = |changes: &[Change]| -> Vec<bool> {
+        let store = store(&schema, changes);
+        (1..=6)
+            .map(|region| {
+                Evaluator::new(&schema)
+                    .unwrap()
+                    .with_limits(Limits {
+                        region,
+                        ..Limits::default()
+                    })
+                    .target(&store, "k", e)
+                    .is_ok()
+            })
+            .collect()
+    };
+    assert_eq!(decided(&without), [false, false, true, true, true, true]);
+    assert_eq!(decided(&with), [false, false, true, true, true, true]);
+}
