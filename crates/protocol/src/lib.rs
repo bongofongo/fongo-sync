@@ -49,10 +49,14 @@
 //! without a gap, repeat or step back. It cannot observe a log truncated or rolled back, which
 //! looks like nothing new; a fork, where devices are shown different envelopes at one number; a
 //! number in [`api::Appended`] that the envelope is not read back at; or an envelope withheld from
-//! it. This version detects none of these. It does not rely on a server storing an identical
-//! envelope only once, since a copy is applied idempotently, nor on notifications arriving, since
-//! they are hints, nor on anything a server reports about a library (`last_seen`, its status) for
-//! the library's content.
+//! it. By keeping digests of what it read and wrote, `fongo-sync-client` detects some of these
+//! anyway: a log that ends before a device's cursor or holds other bytes there, an envelope a device
+//! appended that is not where [`api::Appended`] placed it, and a number in [`api::Appended`] whose
+//! position holds another envelope; not a rollback past everything a device read, a rewrite behind
+//! its cursor, a fork no envelope crosses, or a withheld envelope. It does not rely on a server
+//! storing an identical envelope only once, since a copy is applied idempotently, nor on
+//! notifications arriving, since they are hints, nor on anything a server reports about a library
+//! (`last_seen`, its status) for the library's content.
 //!
 //! # Membership proofs
 //!

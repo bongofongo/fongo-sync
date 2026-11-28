@@ -14,7 +14,7 @@ use fongo_sync_core::eval::{Evaluator, Origin};
 use fongo_sync_core::model::{Row, Schema};
 use fongo_sync_core::plan::{self, FieldEdit};
 use fongo_sync_core::source::{admit, well_formed};
-use fongo_sync_core::{Change, Clock, Gid, Hlc, Value, wins};
+use fongo_sync_core::{ALIAS, Change, Clock, Gid, Hlc, Value, wins};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::adopt;
@@ -1721,6 +1721,86 @@ impl Replica {
         .await
     }
 
+    /// Puts in the outbox again every change this replica keeps: the winning entry of every
+    /// field, each kept entry of a natural key's field, every change to a collection its registry
+    /// lacks, each with its own clock, and every alias, that two entities are one. Returns how
+    /// many changes it put there. For a server that lost changes; `fongo-sync-client` calls it
+    /// through its `resend_all`, which also reads the log again from its start.
+    ///
+    /// The kernel keeps no clock for an alias, so each is sent at a clock of its own, made from
+    /// the earliest clock among the facts of the entity it is written on, in that collection: the
+    /// same wall time and counter, or the next counter, on a node derived from the collection and
+    /// the two entities, so that it is later than that earliest clock. Such a clock is:
+    ///
+    /// - no earlier than the entity's first fact, so a replica given only what this sends places
+    ///   the entity in the same collection, at the same first clock as this one where that first
+    ///   fact is sent too, as it is unless a later change to its field replaced it;
+    /// - one per alias, so two aliases on one entity are two changes, which a replica that lacks
+    ///   the collection keeps both of;
+    /// - on a node no replica writes as, so it never meets another change at its clock and is
+    ///   never taken for a second database writing as one node;
+    /// - the same on every replica that holds the alias and the entity's first fact, so two that
+    ///   resend one state send the same changes.
+    ///
+    /// The node is `Gid::derive("fongo-sync/v1/resent-alias", [collection, entity, other])`, the
+    /// two entities as references: an id no device owns or issues clocks as. A replica that takes
+    /// the change treats that node as any other, and its own clock reads the clock as it reads
+    /// every clock it receives. A replica that already holds the alias changes nothing for it.
+    /// Which entities are one does not depend on an alias's clock.
+    ///
+    /// What a replica that takes only what this sends can show otherwise than this one: changes
+    /// that lost to later ones are not kept, so not sent. Where such a change was the earliest of
+    /// an entity's facts in a collection, the entity's first clock there is later on the other
+    /// replica; that decides only which collection an id belongs to when it has facts in more than
+    /// one, which ids minted apart never have. Values the application kept as this replica's own
+    /// when resuming, and rows held back for a clash, are this replica's alone and were never
+    /// sent.
+    pub async fn resend(&self, conn: &mut SqliteConnection) -> Result<usize> {
+        with_db(conn, |db| {
+            db.atomically_writing(|db| {
+                self.ready(db)?.current()?;
+                let mut sent = 0;
+                for table in ["fongo_shadow", "fongo_foreign"] {
+                    let n = db.exec(
+                        &format!(
+                            "INSERT INTO fongo_outbox (collection, gid, field, value, is_ref, clock)
+                             SELECT collection, gid, field, value, is_ref, clock FROM {table}
+                             ORDER BY clock, collection, gid, field"
+                        ),
+                        &[],
+                    )?;
+                    sent += usize::try_from(n).unwrap_or(usize::MAX);
+                }
+                let aliases = db.query(
+                    "SELECT a.collection, a.a, a.b, c.first
+                       FROM fongo_alias a
+                       JOIN fongo_claims c ON c.gid = a.a AND c.collection = a.collection
+                      ORDER BY c.first, a.collection, a.a, a.b",
+                    &[],
+                )?;
+                for row in &aliases {
+                    let collection = as_text(&row[0])?;
+                    let (from, to) = (as_gid(&row[1])?, as_gid(&row[2])?);
+                    let clock = resent_alias_clock(collection, from, to, as_clock(&row[3])?);
+                    db.exec(
+                        "INSERT INTO fongo_outbox (collection, gid, field, value, is_ref, clock)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                        &[
+                            Value::Text(collection.into()),
+                            Value::Ref(from),
+                            Value::Text(ALIAS.into()),
+                            Value::Ref(to),
+                            Value::Text(clock.encode()),
+                        ],
+                    )?;
+                }
+                let aliases = aliases.len();
+                Ok(sent + aliases)
+            })
+        })
+        .await
+    }
+
     pub async fn acknowledge(&self, conn: &mut SqliteConnection, through: i64) -> Result<()> {
         with_db(conn, |db| {
             db.atomically_writing(|db| {
@@ -2456,4 +2536,31 @@ fn marked_past_start(db: &Db) -> Result<bool> {
     Ok(!db
         .query("SELECT 1 FROM fongo_dirty LIMIT 1", &[])?
         .is_empty())
+}
+
+/// The clock an alias from `from` to `to` is resent at, its entity's first clock in `collection`
+/// being `first`: the first clock with the wall time and counter of `first`, or the next counter,
+/// that is later than `first`, on a node no replica is: one derived from the alias alone.
+fn resent_alias_clock(collection: &str, from: Gid, to: Gid, first: Hlc) -> Hlc {
+    let node = Gid::derive(
+        "fongo-sync/v1/resent-alias",
+        &[
+            Value::Text(collection.into()),
+            Value::Ref(from),
+            Value::Ref(to),
+        ],
+    );
+    let at = |wall_ms, counter| Hlc {
+        wall_ms,
+        counter,
+        node,
+    };
+    let same = at(first.wall_ms, first.counter);
+    if same > first {
+        return same;
+    }
+    match first.counter.checked_add(1) {
+        Some(counter) => at(first.wall_ms, counter),
+        None => at(first.wall_ms.saturating_add(1), 0),
+    }
 }

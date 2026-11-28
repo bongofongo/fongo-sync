@@ -293,6 +293,16 @@ impl Server {
         self.with(|s| s.libraries.get_mut(&library).unwrap().log[seq as usize - 1] = envelope);
     }
 
+    /// Keeps the first `len` envelopes of a library's log and drops the rest, as a server restored
+    /// from a backup would.
+    pub fn roll_back(&self, library: LibraryId, len: usize) {
+        self.with(|s| {
+            let log = &mut s.libraries.get_mut(&library).unwrap().log;
+            assert!(len <= log.len(), "the log is shorter than {len}");
+            log.truncate(len);
+        });
+    }
+
     /// Lists a key as a device without any request.
     pub fn register(&self, library: LibraryId, key: VerifyingKey) {
         self.with(|s| {
@@ -330,6 +340,35 @@ impl Server {
             let mut changes = Vec::new();
             for bytes in &library.log {
                 let opened = open(bytes, keys, |id| {
+                    library
+                        .devices
+                        .iter()
+                        .find(|d| !d.recovery && DeviceId::of(&d.public_key) == id)
+                        .map(|d| d.public_key)
+                });
+                if let Ok(opened) = opened {
+                    changes.extend(opened.changes);
+                }
+            }
+            changes
+        })
+    }
+
+    /// Every change in the log, opened with the library's keys, taking copies of one envelope once.
+    pub fn changes_once(&self, keys: &LibraryKeys) -> Vec<Change> {
+        let log = self.log(keys.id);
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        for (i, bytes) in log.iter().enumerate() {
+            if seen.insert(bytes.clone()) {
+                kept.push(i);
+            }
+        }
+        self.with(|s| {
+            let library = &s.libraries[&keys.id];
+            let mut changes = Vec::new();
+            for i in kept {
+                let opened = open(&library.log[i], keys, |id| {
                     library
                         .devices
                         .iter()
@@ -586,6 +625,14 @@ impl State {
                 }
                 let log = &mut self.libraries.get_mut(&id).unwrap().log;
                 let stored = log.iter().position(|stored| *stored == request.body);
+                let held: usize = log.iter().map(Vec::len).sum();
+                let full = self
+                    .caps
+                    .max_library_bytes
+                    .is_some_and(|max| (held + request.body.len()) as u64 > max);
+                if full && (stored.is_none() || self.store_again) {
+                    return Err(ErrorCode::LibraryFull);
+                }
                 let seq = match stored.filter(|_| !self.store_again) {
                     Some(at) => at + 1,
                     None => {
@@ -862,9 +909,10 @@ pub async fn assert_converged(peers: &mut [Peer]) -> Vec<String> {
     first
 }
 
-/// No change sits in the log twice: nothing was sealed into two different envelopes.
+/// No change sits in the log twice but in copies of one envelope: nothing was sealed into two
+/// different envelopes.
 pub fn assert_no_change_sent_twice(server: &Server, keys: &LibraryKeys) {
-    let changes = server.changes(keys);
+    let changes = server.changes_once(keys);
     let mut seen = HashSet::new();
     for change in &changes {
         let key = (

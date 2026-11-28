@@ -202,11 +202,11 @@ async fn stops_at_and_reads_on_from(later: Later) {
         "this device's own write went up"
     );
 
-    // Each later sync of this build reads the one envelope it stopped at, stops there again,
-    // and with nothing of its own to send appends nothing.
+    // Each later sync of this build reads the envelope at its cursor and the one it stopped at,
+    // stops there again, and with nothing of its own to send appends nothing.
     let page = ReadBatches {
-        after: 5,
-        limit: Some(1),
+        after: 4,
+        limit: Some(2),
     }
     .target(id);
     let appends = server.count(Method::Post, &batches_path(id));
@@ -733,7 +733,7 @@ async fn this_devices_envelope_is_read_back_at_the_first_copy_whichever_it_recor
 }
 
 #[tokio::test]
-async fn a_stopped_sync_reads_one_envelope() {
+async fn a_stopped_sync_reads_the_envelope_at_its_cursor_and_one_more() {
     let server = Server::new();
     server.with(|s| s.caps.max_page_batches = Some(256));
     let [mut a, mut b] = pair(&server).await;
@@ -766,8 +766,8 @@ async fn a_stopped_sync_reads_one_envelope() {
         assert_eq!(report.newer.map(|n| n.seq), Some(2));
         let requests: Vec<(Method, String)> = server.with(|s| s.requests[from..].to_vec());
         let read = ReadBatches {
-            after: 1,
-            limit: Some(1),
+            after: 0,
+            limit: Some(2),
         }
         .target(id);
         let reads: Vec<&String> = requests
@@ -781,8 +781,9 @@ async fn a_stopped_sync_reads_one_envelope() {
             [&read],
             "first stopped sync: {first} bytes; {requests:?}"
         );
+        let anchor = server.log(id)[0].len();
         assert!(
-            bytes <= junk.len() + 32,
+            bytes <= anchor + junk.len() + 32,
             "first stopped sync: {first} bytes; this one: {bytes}"
         );
         assert_eq!(requests.len(), 2, "{requests:?}");
@@ -854,8 +855,12 @@ async fn stepping_past_other_bytes_or_another_place_is_refused_and_changes_nothi
     assert_eq!(a.cursor().await, 1);
 }
 
+/// Other bytes put where a pull stopped, against the rule that bytes once served never change,
+/// reach a device that has not passed that position as any envelope: read, applied, and not
+/// stepped past, as only the bytes named are. One that has passed it finds a rewrite instead, as
+/// `rollback.rs` shows.
 #[tokio::test]
-async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
+async fn bytes_changed_where_a_pull_stopped_are_read_and_not_stepped_past() {
     let server = Server::new();
     let ([mut a, b], junk) = stopped_at_junk(&server).await;
     let id = a.credentials.library_id();
@@ -864,7 +869,7 @@ async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
         id,
         2,
         seal(
-            &setting("repaired"),
+            &setting("replaced"),
             &keys,
             0,
             b.credentials.device(),
@@ -876,14 +881,53 @@ async fn an_envelope_repaired_before_the_step_is_read_and_not_stepped_past() {
     assert_eq!((report.newer, report.refused_total), (None, 0));
     assert_eq!(
         a.settings().await,
-        ["mine=x", "repaired=repaired", "s1=x", "s3=x"]
+        ["mine=x", "replaced=replaced", "s1=x", "s3=x"]
+    );
+}
+
+/// Other bytes put where a device has stepped past, while that is its cursor: a rewrite. Behind
+/// the cursor they would go unseen, as any rewrite there.
+#[tokio::test]
+async fn bytes_changed_where_a_device_stepped_past_are_a_rewrite() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    let keys = a.credentials.library().clone();
+    b.run("INSERT INTO settings VALUES ('s1', 'x')").await;
+    b.sync(&server).await.unwrap();
+    let junk = b"\x02 damaged in storage".to_vec();
+    server.inject(id, junk.clone());
+    assert_eq!(a.sync(&server).await.unwrap().newer.map(|n| n.seq), Some(2));
+    step_past(&mut a, 2, digest(&junk)).await.unwrap();
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 2);
+    server.replace(
+        id,
+        2,
+        seal(
+            &setting("replaced"),
+            &keys,
+            0,
+            b.credentials.device(),
+            nonce(),
+        ),
+    );
+    let found = a.sync(&server).await;
+    assert!(
+        matches!(
+            found,
+            Err(Error::LogFault(fongo_sync_client::LogFault::Rewritten {
+                seq: 2
+            }))
+        ),
+        "{found:?}"
     );
 }
 
 #[tokio::test]
 async fn an_envelope_stepped_past_stays_skipped_after_a_build_that_reads_it() {
     let server = Server::new();
-    let [mut a, b] = pair(&server).await;
+    let [mut a, mut b] = pair(&server).await;
     let keys = a.credentials.library().clone();
     let later = (LATER_ENVELOPE_FORMAT.write)(&setting("later"), &keys, b.credentials.device());
     server.inject(keys.id, later.clone());
@@ -891,6 +935,11 @@ async fn an_envelope_stepped_past_stays_skipped_after_a_build_that_reads_it() {
     step_past(&mut a, 1, digest(&later)).await.unwrap();
     a.sync(&server).await.unwrap();
     assert_eq!(a.cursor().await, 1);
+    // Other bytes at the cursor itself are a rewritten log, so the cursor moves on first.
+    b.run("INSERT INTO settings VALUES ('b', 'x')").await;
+    b.sync(&server).await.unwrap();
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 2);
 
     server.replace(
         keys.id,
@@ -899,7 +948,7 @@ async fn an_envelope_stepped_past_stays_skipped_after_a_build_that_reads_it() {
     );
     let report = a.sync(&server).await.unwrap();
     assert_eq!(report.received, 0);
-    assert_eq!(a.settings().await, Vec::<String>::new());
+    assert_eq!(a.settings().await, ["b=x"]);
 }
 
 #[tokio::test]

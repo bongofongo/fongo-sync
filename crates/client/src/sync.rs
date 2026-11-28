@@ -16,6 +16,7 @@ use sqlx::{Connection, Sqlite, SqliteConnection, Transaction};
 
 use crate::credentials::Credentials;
 use crate::error::Error;
+use crate::fault::LogFault;
 use crate::rpc::{Body, Rpc, json};
 use crate::state::{self, Digest32, Sending};
 use crate::transport::{Method, Transport};
@@ -291,6 +292,10 @@ pub struct SyncReport {
     pub newer: Option<Newer>,
     /// The pull stopped after the most pages one call reads, with more waiting. Everything read
     /// was applied and the outbox was sent; call again to read on.
+    ///
+    /// Also set while the syncs after the client's tables are upgraded from layout 2 hash the log
+    /// up to the cursor: such a sync reads nothing past the cursor, sends nothing and does not
+    /// call [`Apply::caught_up`] until the hash is done; call again.
     pub more: bool,
     /// Changes were left unsent because another sync on this database had an envelope recorded
     /// as being sent: this one sends nothing then, so as not to seal the same changes twice. The
@@ -436,6 +441,24 @@ pub struct SyncReport {
 ///
 /// - Numbering each library's envelopes 1, 2, 3 and so on without gaps, as the protocol states. A
 ///   page that skips, repeats or reorders a number is refused as malformed.
+/// - Keeping what it stored, byte for byte, which is checked as far as this device can: each sync
+///   reads first the envelope at the cursor again, and compares it with the digest kept of it; an
+///   envelope this device appended must be at the place the server named; and an append answered
+///   at a position this device has read must be read back there. A sync that finds otherwise fails
+///   with [`Error::LogFault`] and stores the fault; see [`crate::LogFault`]. Reading the envelope
+///   at the cursor costs its bytes in every sync, and a page read more where the new envelopes
+///   fill whole pages; a pull stopped at a later version's envelope reads two envelopes where it
+///   read one, a page more only where the server's pages hold one; a suspect answer to an append
+///   costs one read of one envelope.
+/// - After the client's tables are upgraded from layout 2, which kept no fingerprint, the next
+///   syncs read the log from its start to the cursor, every page one sync reads each, storing how
+///   far they got after each page, to make one: a cursor at `c` with pages of `p` envelopes takes
+///   `c / (1000 p)` syncs rounded up, as the cursor does not move meanwhile, however fast the log
+///   grows. Until that is done each sync reads the envelope at the cursor, which must be there or
+///   the sync fails with [`crate::LogFault::Behind`]; reads nothing past it, sends nothing and does
+///   not call [`Apply::caught_up`], and sets [`SyncReport::more`]. In that window a log rewritten
+///   at or before the cursor, but not shortened, is not found, now or later, as with any rewrite
+///   behind the cursor.
 /// - Nothing else about appends: storing an identical envelope only once is welcome but not
 ///   relied on, since a copy is applied idempotently.
 pub async fn sync<T: Transport>(
@@ -445,7 +468,19 @@ pub async fn sync<T: Transport>(
     credentials: &Credentials,
     now: impl Fn() -> u64 + Sync,
 ) -> Result<SyncReport, Error> {
-    let result = run(conn, replica, transport, credentials, now, &mut (), false).await;
+    let mut resets = 0;
+    let result = run(
+        conn,
+        replica,
+        transport,
+        credentials,
+        now,
+        &mut (),
+        false,
+        &mut resets,
+    )
+    .await;
+    let result = store_fault(conn, credentials.library_id(), resets, result).await;
     finish(conn, result).await
 }
 
@@ -627,8 +662,43 @@ pub async fn sync_with<T: Transport, A: Apply>(
     now: impl Fn() -> u64 + Sync,
     apply: &mut A,
 ) -> Result<SyncReport, Error> {
-    let result = run(conn, replica, transport, credentials, now, apply, true).await;
+    let mut resets = 0;
+    let result = run(
+        conn,
+        replica,
+        transport,
+        credentials,
+        now,
+        apply,
+        true,
+        &mut resets,
+    )
+    .await;
+    let result = store_fault(conn, credentials.library_id(), resets, result).await;
     finish(conn, result).await
+}
+
+/// Stores a fault the sync found, unless one is stored already, and returns the stored one. A
+/// connection left unsound is left for [`finish`] to report, and the fault is found again by the
+/// next sync, which reads the log from where this one began.
+async fn store_fault(
+    conn: &mut SqliteConnection,
+    library: fongo_sync_protocol::LibraryId,
+    resets: i64,
+    result: Result<SyncReport, Error>,
+) -> Result<SyncReport, Error> {
+    let Err(Error::LogFault(found)) = result else {
+        return result;
+    };
+    if check_connection(conn).await.is_err() {
+        return Err(Error::LogFault(found));
+    }
+    if let Some(stored) = state::read_fault(conn, library).await? {
+        return Err(Error::LogFault(stored));
+    }
+    Err(Error::LogFault(
+        state::record_fault(conn, library, resets, found).await?,
+    ))
 }
 
 /// Returns a sync's result, unless it is an error that left the connection unsound: a step that
@@ -652,7 +722,9 @@ async fn finish(
     }
 }
 
-/// One sync; `settles` says whether to call [`Apply::caught_up`], which `()` leaves empty.
+/// One sync; `settles` says whether to call [`Apply::caught_up`], which `()` leaves empty. Sets
+/// `resets` to the count of resolved faults it loaded.
+#[allow(clippy::too_many_arguments)]
 async fn run<T: Transport, A: Apply>(
     conn: &mut SqliteConnection,
     replica: &Replica,
@@ -661,6 +733,7 @@ async fn run<T: Transport, A: Apply>(
     now: impl Fn() -> u64 + Sync,
     apply: &mut A,
     settles: bool,
+    resets: &mut i64,
 ) -> Result<SyncReport, Error> {
     check_connection(conn).await?;
     if !fongo_sync_sqlite::installed(conn).await? {
@@ -674,7 +747,6 @@ async fn run<T: Transport, A: Apply>(
         transport,
         now: &now,
     };
-    let caps = rpc.capabilities().await?;
     let library = credentials.library_id();
     let me = credentials.device_id();
     let pace = apply.pace();
@@ -684,6 +756,11 @@ async fn run<T: Transport, A: Apply>(
         held = Duration::ZERO;
     }
     let saved = state::load(conn, library).await?;
+    *resets = saved.resets;
+    if let Some(fault) = saved.fault {
+        return Err(Error::LogFault(fault));
+    }
+    let caps = rpc.capabilities().await?;
     let cursor = saved.cursor;
     let limit = caps.max_page_batches.unwrap_or(DEFAULT_PAGE).max(1);
     let mut keys = Keys::new(credentials);
@@ -695,8 +772,13 @@ async fn run<T: Transport, A: Apply>(
             own.entry(digest).or_default().push(seq);
         }
     }
+    let (chain_seq, chain) = saved.chain;
     let mut pull = Pull {
         read: cursor,
+        anchor: saved.anchor,
+        chain: (chain_seq == cursor).then_some(chain),
+        rehash: (chain_seq < cursor).then_some(saved.chain),
+        recorded: saved.appended.iter().copied().collect(),
         held: Vec::new(),
         applied: false,
         appended: saved.appended.iter().map(|&(seq, _)| seq).collect(),
@@ -705,12 +787,14 @@ async fn run<T: Transport, A: Apply>(
         sending: saved.sending,
         landed: None,
         stopped_at: saved.stopped.map(|(seq, _)| seq),
+        reach: saved.reach,
         stopped: None,
         passing: saved.passing,
     };
     let mut steps = Steps {
         replica,
         library,
+        resets: saved.resets,
         pace,
         apply,
         committed: false,
@@ -730,13 +814,20 @@ async fn run<T: Transport, A: Apply>(
     .await;
     steps.failed |= pulled.is_err();
     let collect = !pull.applied;
-    let committed = if matches!(pulled, Err(Error::ConnectionUnsound { .. })) {
+    let committed = if matches!(
+        pulled,
+        Err(Error::ConnectionUnsound { .. } | Error::LogFault(_) | Error::ResolvedMeanwhile)
+    ) {
         Ok(())
     } else {
         pull.commit(conn, &mut steps, library, &mut report, collect)
             .await
     };
     pulled.and(committed)?;
+    // Until the log is hashed to the cursor, what the device read is not known whole, so it
+    // neither settles nor sends.
+    let hashing = pull.chain.is_none();
+    report.more |= hashing;
     report.head = pull
         .read
         .max(report.blocked.map_or(0, |b| b.seq))
@@ -763,7 +854,7 @@ async fn run<T: Transport, A: Apply>(
         }
     }
 
-    if let Some(sending) = pull.sending.take() {
+    if let Some(sending) = pull.sending.take().filter(|_| !hashing) {
         let ours = Envelope::decode(&sending.envelope)
             .is_ok_and(|envelope| envelope.library == library && envelope.device == me);
         if ours && !state::still_sending(conn, library, &sending.envelope).await? {
@@ -782,11 +873,14 @@ async fn run<T: Transport, A: Apply>(
             };
             let appended = match found {
                 Some(seq) => Ok(seq),
-                None => append(&rpc, credentials, sending.envelope.clone()).await,
+                None => {
+                    state::check_turn(conn, library, steps.resets).await?;
+                    append(&rpc, credentials, sending.envelope.clone()).await
+                }
             };
             match appended {
                 Ok(seq) => {
-                    acknowledge(conn, &mut steps, library, &sending, seq).await?;
+                    confirm(&rpc, credentials, conn, &mut steps, &sending, seq).await?;
                     report.sent += count;
                     report.head = report.head.max(seq);
                 }
@@ -810,7 +904,7 @@ async fn run<T: Transport, A: Apply>(
         seal_at_most,
     };
     loop {
-        if replica.outbox(conn, 1).await?.changes.is_empty() {
+        if hashing || replica.outbox(conn, 1).await?.changes.is_empty() {
             break;
         }
         let (mut tx, began) = steps.begin(conn).await?;
@@ -829,8 +923,9 @@ async fn run<T: Transport, A: Apply>(
                 break;
             }
         };
+        state::check_turn(conn, library, steps.resets).await?;
         let seq = append(&rpc, credentials, sending.envelope.clone()).await?;
-        acknowledge(conn, &mut steps, library, &sending, seq).await?;
+        confirm(&rpc, credentials, conn, &mut steps, &sending, seq).await?;
         report.sent += count;
         report.head = report.head.max(seq);
     }
@@ -852,16 +947,19 @@ async fn run<T: Transport, A: Apply>(
     Ok(report)
 }
 
-/// Forgets `envelope` as being sent, in a write of its own.
+/// Forgets `envelope` as being sent, in a write of its own, which like every write of a sync is
+/// made only while no fault is stored and none was resolved since the sync began.
 async fn clear_sending<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
     envelope: &[u8],
 ) -> Result<(), Error> {
-    steps.turn(conn).await?;
-    let began = Instant::now();
-    state::clear_sending(conn, library, envelope).await?;
+    let (mut tx, began) = steps.begin(conn).await?;
+    if let Err(error) = state::clear_sending(&mut tx, library, envelope).await {
+        return Err(abandon(tx, error).await);
+    }
+    tx.commit().await?;
     steps.committed(began);
     Ok(())
 }
@@ -946,6 +1044,8 @@ impl Sealing<'_> {
 struct Steps<'a, A> {
     replica: &'a Replica,
     library: fongo_sync_protocol::LibraryId,
+    /// How many faults were resolved when this sync loaded its state.
+    resets: i64,
     apply: &'a mut A,
     pace: Pace,
     /// A transaction of this sync committed since the last turn was given.
@@ -983,6 +1083,8 @@ impl<A: Apply> Steps<'_, A> {
     /// connection wrote since it first read, which SQLite answers with an error instead of a wait.
     /// sqlx's `begin_with("BEGIN IMMEDIATE")` would do the same, but a future dropped inside it
     /// can leave the transaction open with nothing to end it.
+    ///
+    /// Fails, writing nothing, once a fault is stored or one was resolved since this sync began.
     async fn begin<'c>(
         &mut self,
         conn: &'c mut SqliteConnection,
@@ -994,6 +1096,9 @@ impl<A: Apply> Steps<'_, A> {
             .bind(&self.library.0[..])
             .execute(&mut *tx)
             .await?;
+        if let Err(error) = state::check_turn(&mut tx, self.library, self.resets).await {
+            return Err(abandon(tx, error).await);
+        }
         Ok((tx, began))
     }
 
@@ -1123,6 +1228,15 @@ pub async fn check_connection(conn: &mut SqliteConnection) -> Result<(), Error> 
 /// past `read`.
 struct Pull {
     read: u64,
+    /// The digest of the envelope at `read`, when known.
+    anchor: Option<Digest32>,
+    /// The log's fingerprint through `read`, when known.
+    chain: Option<Digest32>,
+    /// A fingerprint stored short of `read`, and its position: the log is hashed on from there
+    /// before the pull reads on.
+    rehash: Option<(u64, Digest32)>,
+    /// The digest each append the sync loaded was recorded with, by position.
+    recorded: HashMap<u64, Option<Digest32>>,
     held: Vec<Change>,
     applied: bool,
     appended: BTreeSet<u64>,
@@ -1134,6 +1248,9 @@ struct Pull {
     sending: Option<Sending>,
     /// The outbox position and bytes of a recorded envelope, once found at `read`.
     landed: Option<(i64, Vec<u8>)>,
+    /// Where a build that keeps no digest moved the cursor past where the pull begins: the log
+    /// must reach it.
+    reach: Option<u64>,
     /// Where the last sync's pull stopped at a later version's envelope.
     stopped_at: Option<u64>,
     /// Where this one did, and the digest of what it stopped at.
@@ -1159,6 +1276,23 @@ impl Pull {
             steps.collect(conn, report).await?;
         }
         let (mut tx, began) = steps.begin(conn).await?;
+        // Stored with its evidence, before anything is applied, so a crash cannot lose it.
+        let diverged = state::diverges(&mut tx, library, self.read, self.anchor, self.chain).await;
+        match diverged {
+            Ok(None) => {}
+            Ok(Some(fault)) => {
+                let stored = state::record_fault_in(&mut tx, library, steps.resets, fault).await;
+                return match stored {
+                    Ok(stored) => {
+                        tx.commit().await?;
+                        steps.committed(began);
+                        Err(stored.map_or(Error::ResolvedMeanwhile, Error::LogFault))
+                    }
+                    Err(error) => Err(abandon(tx, error).await),
+                };
+            }
+            Err(error) => return Err(abandon(tx, error).await),
+        }
         let written = async {
             let applied = if collect || !self.held.is_empty() {
                 begin_watch(&mut tx).await?;
@@ -1168,7 +1302,7 @@ impl Pull {
             } else {
                 None
             };
-            state::advance(&mut tx, library, self.read).await?;
+            state::advance(&mut tx, library, self.read, self.anchor, self.chain).await?;
             if let Some((through, envelope)) = &self.landed {
                 replica.acknowledge(&mut tx, *through).await?;
                 state::clear_sending(&mut tx, library, envelope).await?;
@@ -1224,30 +1358,79 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
 ) -> Result<(), Error> {
     let library = keys.credentials.library_id();
     let me = keys.credentials.device_id();
-    for page_number in 0..MAX_PAGES {
+    let mut pages = 0;
+    // Without a digest of the envelope at the cursor, as before tables of an earlier layout are
+    // hashed that far, the read still shows whether the log reaches the cursor.
+    let mut probe = pull.read > 0;
+    // A fingerprint short of the cursor, left by tables of a layout that kept none, is hashed on
+    // first, with every page a sync reads. Until it reaches the cursor the pull reads nothing past
+    // it, so the hash ends in the syncs the log's length then takes, however fast the log grows;
+    // the envelope at the cursor is still read, to see that the log reaches it.
+    if let Some((from, chain)) = pull.rehash.take() {
+        let done = rehash(
+            rpc,
+            conn,
+            steps,
+            keys.credentials,
+            limit,
+            pull,
+            from,
+            chain,
+            &mut pages,
+        )
+        .await?;
+        if done {
+            probe = false;
+        } else {
+            let page = read_page(rpc, keys.credentials, pull.read - 1, 1).await?;
+            let Some(at_cursor) = page.batches.first() else {
+                return Err(Error::LogFault(LogFault::Behind { cursor: pull.read }));
+            };
+            if pull
+                .anchor
+                .is_some_and(|anchor| state::digest(&at_cursor.envelope) != anchor)
+            {
+                return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
+            }
+            return Ok(());
+        }
+    }
+    let mut first = true;
+    while pages < MAX_PAGES {
+        pages += 1;
         // Where the last sync stopped at a later version's envelope, one is enough to see whether
         // it still does.
-        let limit = if page_number == 0 && pull.stopped_at == Some(pull.read + 1) {
-            1
-        } else {
-            limit
+        let stopped_next = std::mem::take(&mut first) && pull.stopped_at == Some(pull.read + 1);
+        // The first page begins with the envelope at the cursor, to see that it is still there.
+        let probing = std::mem::take(&mut probe);
+        let limit = match (stopped_next, probing) {
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, _) => limit,
         };
-        let query = ReadBatches {
-            after: pull.read,
-            limit: Some(limit),
-        };
-        let body = rpc
-            .call(
-                Method::Get,
-                query.target(library),
-                Body::Empty,
-                Some(keys.credentials.device()),
-            )
-            .await?;
-        let page = BatchPage::decode(&body)
-            .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
-        check_page(&page, pull.read, limit)?;
-        for batch in &page.batches {
+        let after = if probing { pull.read - 1 } else { pull.read };
+        let page = read_page(rpc, keys.credentials, after, limit).await?;
+        let mut batches = &page.batches[..];
+        if probing {
+            let Some((at_cursor, rest)) = batches.split_first() else {
+                return Err(Error::LogFault(LogFault::Behind { cursor: pull.read }));
+            };
+            if pull
+                .anchor
+                .is_some_and(|anchor| state::digest(&at_cursor.envelope) != anchor)
+            {
+                return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
+            }
+            batches = rest;
+        }
+        for batch in batches {
+            let digest = state::digest(&batch.envelope);
+            if let Some(Some(recorded)) = pull.recorded.get(&batch.seq)
+                && *recorded != digest
+                && pull.own.contains_key(recorded)
+            {
+                return Err(Error::LogFault(LogFault::AppendReplaced { seq: batch.seq }));
+            }
             let landed = pull
                 .sending
                 .take_if(|sending| sending.envelope == batch.envelope);
@@ -1290,6 +1473,8 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
                 }
             }
             pull.read = batch.seq;
+            pull.anchor = Some(digest);
+            pull.chain = pull.chain.map(|c| state::chain_step(c, batch.seq, digest));
             // The server stored the recorded envelope although its answer was lost: it is
             // appended here, and must not be appended again.
             if let Some(sending) = landed {
@@ -1301,28 +1486,25 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             if pull.held.len() > before
                 && !pull.appended.contains(&batch.seq)
                 && Envelope::decode(&batch.envelope).is_ok_and(|e| e.device == me)
+                && !pull.own.contains_key(&digest)
             {
-                let digest = state::digest(&batch.envelope);
-                if !pull.own.contains_key(&digest) {
-                    match state::known(conn, library, digest, &batch.envelope).await? {
-                        Some(state::Known::Appended(recorded)) => {
-                            pull.appended.insert(batch.seq);
-                            if recorded != [batch.seq] {
-                                pull.moved.push((digest, batch.seq));
-                            }
+                match state::known(conn, library, digest, &batch.envelope).await? {
+                    Some(state::Known::Appended(recorded)) => {
+                        pull.appended.insert(batch.seq);
+                        if recorded != [batch.seq] {
+                            pull.moved.push((digest, batch.seq));
                         }
-                        Some(state::Known::Sending(through)) => {
-                            pull.landed = Some((through, batch.envelope.clone()));
-                            pull.appended.insert(batch.seq);
-                        }
-                        None => {}
                     }
+                    Some(state::Known::Sending(through)) => {
+                        pull.landed = Some((through, batch.envelope.clone()));
+                        pull.appended.insert(batch.seq);
+                    }
+                    None => {}
                 }
             }
             // The first copy of an envelope this device appended is where it landed, whichever
             // copy it recorded.
             if !pull.own.is_empty()
-                && let digest = state::digest(&batch.envelope)
                 && let Some(recorded) = pull.own.remove(&digest)
             {
                 for seq in &recorded {
@@ -1340,6 +1522,13 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             }
         }
         if !page.more {
+            if let Some(reach) = pull.reach.filter(|&reach| pull.read < reach) {
+                return Err(Error::LogFault(LogFault::Behind { cursor: reach }));
+            }
+            // The log ends here: an append of this device recorded further on is not in it.
+            if let Some(&seq) = pull.appended.iter().find(|&&seq| seq > pull.read) {
+                return Err(Error::LogFault(LogFault::AppendMissing { seq }));
+            }
             return Ok(());
         }
         if pull.held.is_empty() || pull.held.len() >= steps.pace.apply {
@@ -1350,16 +1539,67 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     Ok(())
 }
 
-/// Where `envelope` is among the next few envelopes in the log after `after`, comparing bytes
-/// only; `None` when it is not among them.
-async fn find<T: Transport, N: Fn() -> u64 + Sync>(
+/// Hashes the log on from `from`, through which `chain` is its fingerprint, toward the cursor
+/// `pull.read`, in at most the pages one sync reads, counted in `pages`, storing the
+/// fingerprint after each page with its position, so that a failure loses one page of the work.
+/// Returns whether it reached the cursor; then `pull` holds the fingerprint and digest there.
+/// Fails with [`LogFault::Behind`] when the log ends first, and with [`LogFault::Rewritten`] when
+/// the envelope at the cursor is not the one recorded there.
+#[allow(clippy::too_many_arguments)]
+async fn rehash<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     rpc: &Rpc<'_, T, N>,
+    conn: &mut SqliteConnection,
+    steps: &mut Steps<'_, A>,
     credentials: &Credentials,
     limit: u32,
+    pull: &mut Pull,
+    from: u64,
+    mut chain: Digest32,
+    pages: &mut usize,
+) -> Result<bool, Error> {
+    let mut at = from;
+    let mut last = None;
+    while at < pull.read && *pages < MAX_PAGES {
+        *pages += 1;
+        let page = read_page(rpc, credentials, at, limit).await?;
+        let before = at;
+        for batch in page.batches.iter().take_while(|b| b.seq <= pull.read) {
+            let digest = state::digest(&batch.envelope);
+            chain = state::chain_step(chain, batch.seq, digest);
+            at = batch.seq;
+            last = Some(digest);
+        }
+        if at < pull.read && !page.more {
+            return Err(Error::LogFault(LogFault::Behind { cursor: pull.read }));
+        }
+        let done = at == pull.read;
+        if done && pull.anchor.is_some() && last != pull.anchor {
+            return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
+        }
+        let anchor = if done { last } else { None };
+        let (mut tx, began) = steps.begin(conn).await?;
+        let stored = state::record_chain(&mut tx, steps.library, before, at, chain, anchor).await;
+        if let Err(error) = stored {
+            return Err(abandon(tx, error).await);
+        }
+        tx.commit().await?;
+        steps.committed(began);
+    }
+    let done = at == pull.read;
+    if done {
+        pull.chain = Some(chain);
+        pull.anchor = last.or(pull.anchor);
+    }
+    Ok(done)
+}
+
+/// The page of at most `limit` envelopes after `after`, checked to continue the log from there.
+async fn read_page<T: Transport, N: Fn() -> u64 + Sync>(
+    rpc: &Rpc<'_, T, N>,
+    credentials: &Credentials,
     after: u64,
-    envelope: &[u8],
-) -> Result<Option<u64>, Error> {
-    let limit = limit.min(LOOK_FOR);
+    limit: u32,
+) -> Result<BatchPage, Error> {
     let query = ReadBatches {
         after,
         limit: Some(limit),
@@ -1375,6 +1615,19 @@ async fn find<T: Transport, N: Fn() -> u64 + Sync>(
     let page = BatchPage::decode(&body)
         .map_err(|_| Error::MalformedResponse("a batch page does not decode"))?;
     check_page(&page, after, limit)?;
+    Ok(page)
+}
+
+/// Where `envelope` is among the next few envelopes in the log after `after`, comparing bytes
+/// only; `None` when it is not among them.
+async fn find<T: Transport, N: Fn() -> u64 + Sync>(
+    rpc: &Rpc<'_, T, N>,
+    credentials: &Credentials,
+    limit: u32,
+    after: u64,
+    envelope: &[u8],
+) -> Result<Option<u64>, Error> {
+    let page = read_page(rpc, credentials, after, limit.min(LOOK_FOR)).await?;
     Ok(page
         .batches
         .iter()
@@ -1609,39 +1862,87 @@ async fn append<T: Transport, N: Fn() -> u64 + Sync>(
 /// when the server answers with an earlier copy of the same envelope; otherwise by the pull that
 /// reads past it. The record of the envelope being sent is cleared only if it still holds these
 /// bytes: another sync may have found them first and recorded the next.
+///
+/// An answer at or before what this device read or appended, with no record that this envelope
+/// is there, is not acknowledged unless `verified`: it returns the fault it would be, for the
+/// caller to read the envelope back at `seq` and call again verified, or report it.
 async fn acknowledge<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
     sending: &Sending,
     seq: u64,
-) -> Result<(), Error> {
+    verified: bool,
+) -> Result<Option<LogFault>, Error> {
     let replica = steps.replica;
     let through = sending.through;
     let digest = state::digest(&sending.envelope);
     let (mut tx, began) = steps.begin(conn).await?;
     let written = async {
-        let cursor = state::stored_cursor(&mut tx, library).await?;
-        let follows = Some(seq) == cursor.checked_add(1);
+        if !verified && let Some(fault) = state::reused(&mut tx, library, seq, digest).await? {
+            return Ok(Some(fault));
+        }
+        // An append follows only this build's own position, where that is the cursor too.
+        let (position, cursor) = state::stored_position(&mut tx, library).await?;
+        let follows = Some(seq) == cursor.checked_add(1) && position.is_none_or(|at| at == cursor);
         replica.acknowledge(&mut tx, through).await?;
         state::clear_sending(&mut tx, library, &sending.envelope).await?;
         state::record_appended(&mut tx, library, seq, through, digest).await?;
         if follows {
-            state::advance(&mut tx, library, seq).await?;
+            let (chain_seq, chain) = state::stored_chain(&mut tx, library).await?;
+            let chain = (chain_seq == cursor).then(|| state::chain_step(chain, seq, digest));
+            state::advance(&mut tx, library, seq, Some(digest), chain).await?;
         }
-        let read = if follows { seq } else { cursor };
+        // What this build has read, which is short of the cursor where an older build moved it.
+        let read = match follows {
+            true => seq,
+            false => position.map_or(cursor, |at| at.min(cursor)),
+        };
         if let Some(through) = state::read_past(&mut tx, library, read).await? {
             replica.release_bases(&mut tx, through).await?;
         }
-        Ok(())
+        Ok(None)
     }
     .await;
-    if let Err(error) = written {
-        return Err(abandon(tx, error).await);
+    match written {
+        Err(error) => Err(abandon(tx, error).await),
+        Ok(Some(unproven)) => {
+            tx.rollback().await?;
+            Ok(Some(unproven))
+        }
+        Ok(None) => {
+            tx.commit().await?;
+            steps.committed(began);
+            Ok(None)
+        }
     }
-    tx.commit().await?;
-    steps.committed(began);
-    Ok(())
+}
+
+/// [`acknowledge`], reading the envelope back at `seq` first when the answer is at or before what
+/// this device read or appended: a server may hold a copy there. Fails with [`LogFault::Reused`]
+/// when it holds other bytes or none, and with the transport's error when the read fails, leaving
+/// the envelope recorded as being sent and its changes in the outbox, so the next sync appends
+/// it again.
+async fn confirm<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
+    rpc: &Rpc<'_, T, N>,
+    credentials: &Credentials,
+    conn: &mut SqliteConnection,
+    steps: &mut Steps<'_, A>,
+    sending: &Sending,
+    seq: u64,
+) -> Result<(), Error> {
+    let library = credentials.library_id();
+    let Some(suspect) = acknowledge(conn, steps, library, sending, seq, false).await? else {
+        return Ok(());
+    };
+    let page = read_page(rpc, credentials, seq - 1, 1).await?;
+    match page.batches.first() {
+        Some(there) if there.seq == seq && there.envelope == sending.envelope => {
+            acknowledge(conn, steps, library, sending, seq, true).await?;
+            Ok(())
+        }
+        _ => Err(Error::LogFault(suspect)),
+    }
 }
 
 /// How many of `changes`, from the front, seal into an envelope of at most `max` bytes.

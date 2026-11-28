@@ -160,13 +160,26 @@ impl Peer {
         seed: u64,
         step: Option<Option<usize>>,
     ) -> Peer {
+        Peer::new_on(world, n, schema, rows, seed, step, registry(false)).await
+    }
+
+    /// [`Peer::new`] on another registry.
+    async fn new_on(
+        world: &World,
+        n: u64,
+        schema: &[&str],
+        rows: &[&str],
+        seed: u64,
+        step: Option<Option<usize>>,
+        registry: Registry,
+    ) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
         let mut peer = Peer {
             conn,
-            replica: Replica::new(registry(false)),
+            replica: Replica::new(registry),
             step: step.unwrap_or(match std::env::var("PROPERTY_STEP").as_deref() {
                 Ok("whole") => None,
                 Ok(rows) => rows.parse().ok(),
@@ -1254,6 +1267,484 @@ fn run_back(
     outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
 }
 
+/// The registry of a version older than [`registry`]`(false)`: without the series and their
+/// volumes, whose changes it keeps for a later version.
+fn older_registry() -> Registry {
+    let collections = registry(false)
+        .collections()
+        .iter()
+        .filter(|c| c.name != "series" && c.name != "volumes")
+        .cloned()
+        .collect();
+    Registry::new(collections).unwrap()
+}
+
+/// A replica's rows and what it holds back, by canonical gid in its own groups.
+async fn shown(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+) -> (
+    fongo_sync_sqlite::core::model::View,
+    BTreeSet<(String, Gid)>,
+) {
+    let kernel = support::read(conn, replica).await;
+    let held = kernel
+        .pending
+        .iter()
+        .map(|(c, g)| (c.clone(), kernel.canonical(c, *g)))
+        .collect();
+    (kernel.view, held)
+}
+
+/// Rows `got` shows as `want` does, but for entities `want` holds back; `got` holds back nothing
+/// else but rows naming those, which wait on them where written afresh, and every such row it
+/// shows is compared too.
+fn same_rows(
+    want: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    got: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    who: &str,
+) -> Result<(), String> {
+    // What `want` holds back, and every entity whose row there names one of those, which waits
+    // on it where its row is written afresh.
+    let mut held = want.1.clone();
+    loop {
+        let naming: Vec<(String, Gid)> = want
+            .0
+            .collections
+            .iter()
+            .flat_map(|(collection, rows)| {
+                rows.iter().map(move |(gid, row)| (collection, gid, row))
+            })
+            .filter(|(collection, gid, row)| {
+                !held.contains(&((*collection).clone(), **gid))
+                    && row.values().any(|v| {
+                        matches!(v, fongo_sync_sqlite::core::Value::Ref(to)
+                            if held.iter().any(|(_, g)| g == to))
+                    })
+            })
+            .map(|(collection, gid, _)| (collection.clone(), *gid))
+            .collect();
+        if naming.is_empty() {
+            break;
+        }
+        held.extend(naming);
+    }
+    if !got.1.is_subset(&held) {
+        return Err(format!(
+            "{who} holds back {:?}, the sender {:?}",
+            got.1, want.1
+        ));
+    }
+    // Every row either shows is compared, but for what `want` holds back and what `got` holds
+    // back of the rows naming it.
+    let skip = |collection: &str, gid: &Gid| {
+        let at = (collection.to_string(), *gid);
+        want.1.contains(&at) || got.1.contains(&at)
+    };
+    let rows = |view: &fongo_sync_sqlite::core::model::View| {
+        view.collections
+            .iter()
+            .flat_map(|(c, rows)| {
+                rows.iter()
+                    .map(move |(g, row)| ((c.clone(), *g), row.clone()))
+            })
+            .filter(|((c, g), _)| !skip(c, g))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (want_rows, got_rows) = (rows(&want.0), rows(&got.0));
+    if want_rows != got_rows {
+        let differ: Vec<_> = want_rows
+            .keys()
+            .chain(got_rows.keys())
+            .filter(|k| want_rows.get(*k) != got_rows.get(*k))
+            .map(|k| (k, want_rows.get(k), got_rows.get(k)))
+            .collect();
+        return Err(format!("{who} shows other rows: {differ:#?}"));
+    }
+    Ok(())
+}
+
+/// A copy of `peer`'s database collects what was written and resends everything it holds. Where
+/// no database was copied, no two resent changes share a field and clock with different values,
+/// and no replica taking them reports a shared node. A new replica given only them, one of an
+/// older version given them and then upgraded, and one that held what `peer` took before taking
+/// them, each show `peer`'s rows and hold back nothing it does not, but rows that name what it holds
+/// back, which wait on them; the new one, when it holds back nothing, is settled.
+async fn resent_shows_the_same(
+    peer: &mut Peer,
+    schema: &[&str],
+    seed: u64,
+    copied: bool,
+    aliased_twice: bool,
+    databases: &mut u64,
+) -> Result<(), String> {
+    *databases += 1;
+    let mut from = peer.copy(*databases).await;
+    if from.replica.suspended(&mut from.conn).await.unwrap() {
+        return Ok(());
+    }
+    from.replica.collect(&mut from.conn).await.unwrap();
+    let before = from.replica.outbox(&mut from.conn, u32::MAX).await.unwrap();
+    let sent = from.replica.resend(&mut from.conn).await.unwrap();
+    let outbox = from.replica.outbox(&mut from.conn, u32::MAX).await.unwrap();
+    if outbox.changes.len() != before.changes.len() + sent {
+        return Err(format!(
+            "resend reported {sent} changes, the outbox grew by {}",
+            outbox.changes.len() - before.changes.len()
+        ));
+    }
+    let resent = &outbox.changes[before.changes.len()..];
+    if aliased_twice {
+        let mut aliases: std::collections::BTreeMap<(&str, Gid), usize> = Default::default();
+        for c in resent.iter().filter(|c| c.field == "$alias") {
+            *aliases.entry((&c.collection, c.gid)).or_default() += 1;
+        }
+        if !aliases.values().any(|&n| n > 1) {
+            return Err("no entity resent with two aliases".into());
+        }
+    }
+    if !copied {
+        let mut at: std::collections::BTreeMap<
+            (&str, Gid, &str, fongo_sync_sqlite::core::Hlc),
+            &fongo_sync_sqlite::core::Value,
+        > = Default::default();
+        for c in resent {
+            if let Some(other) = at.insert((&c.collection, c.gid, &c.field, c.clock), &c.value)
+                && other.total_cmp(&c.value) != std::cmp::Ordering::Equal
+            {
+                return Err(format!(
+                    "two resent changes share a clock: {c:?} and {other:?}"
+                ));
+            }
+        }
+    }
+    // What is resent is every entry the kernel keeps, as `Replica::resend` says: for each field,
+    // as many changes as it keeps entries, of collections the registry has or lacks.
+    let mut kept: std::collections::BTreeMap<(String, Gid, String), i64> = Default::default();
+    for table in ["fongo_shadow", "fongo_foreign"] {
+        let rows: Vec<(String, Vec<u8>, String, i64)> = sqlx::query_as(&format!(
+            "SELECT collection, gid, field, count(*) FROM {table} GROUP BY collection, gid, field"
+        ))
+        .fetch_all(&mut from.conn)
+        .await
+        .unwrap();
+        for (collection, gid, field, n) in rows {
+            let gid = Gid::from_slice(&gid).unwrap();
+            *kept.entry((collection, gid, field)).or_default() += n;
+        }
+    }
+    // Aliases in a collection the registry has are kept apart, without a clock.
+    let known: BTreeSet<String> = from
+        .replica
+        .registry()
+        .collections()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let mut sent_of: std::collections::BTreeMap<(String, Gid, String), i64> = Default::default();
+    for c in resent
+        .iter()
+        .filter(|c| c.field != "$alias" || !known.contains(&c.collection))
+    {
+        *sent_of
+            .entry((c.collection.clone(), c.gid, c.field.clone()))
+            .or_default() += 1;
+    }
+    // Each alias is resent at a clock later than the first fact of the entity it is written on.
+    let firsts: Vec<(Vec<u8>, String, String)> =
+        sqlx::query_as("SELECT gid, collection, first FROM fongo_claims")
+            .fetch_all(&mut from.conn)
+            .await
+            .unwrap();
+    let first_of: std::collections::BTreeMap<(Gid, String), fongo_sync_sqlite::core::Hlc> = firsts
+        .into_iter()
+        .map(|(gid, collection, first)| {
+            let clock = fongo_sync_sqlite::core::Hlc::decode(&first).unwrap();
+            ((Gid::from_slice(&gid).unwrap(), collection), clock)
+        })
+        .collect();
+    for c in resent
+        .iter()
+        .filter(|c| c.field == "$alias" && known.contains(&c.collection))
+    {
+        let first = first_of.get(&(c.gid, c.collection.clone()));
+        if first.is_none_or(|first| c.clock <= *first) {
+            return Err(format!(
+                "an alias is resent at {:?}, not later than its entity's first clock {first:?}",
+                c.clock
+            ));
+        }
+    }
+    if kept != sent_of {
+        let differ: Vec<_> = kept
+            .iter()
+            .filter(|(k, n)| sent_of.get(*k) != Some(n))
+            .chain(sent_of.iter().filter(|(k, n)| kept.get(*k) != Some(n)))
+            .collect();
+        return Err(format!("resent other entries than are kept: {differ:?}"));
+    }
+    // A sender whose registry lacks the series keeps their changes for a later version; it and
+    // every receiver are then compared on that later version.
+    let older = !from
+        .replica
+        .registry()
+        .collections()
+        .iter()
+        .any(|c| c.name == "series");
+    let target = from.upgraded || older;
+    if older {
+        from.replica = Replica::new(registry(true));
+        from.replica.install(&mut from.conn).await.unwrap();
+    }
+    let want = shown(&mut from.conn, &from.replica).await;
+    let registry_of = |upgraded| Replica::new(registry(upgraded));
+    let no_shared = |applied: &fongo_sync_sqlite::Applied, who: &str| {
+        if !copied && !applied.shared.is_empty() {
+            return Err(format!("{who} reports shared nodes {:?}", applied.shared));
+        }
+        Ok(())
+    };
+
+    *databases += 1;
+    let mut fresh = Peer::new_on(
+        &from.world,
+        *databases,
+        schema,
+        &[],
+        seed,
+        Some(None),
+        registry(target),
+    )
+    .await;
+    let applied = fresh
+        .replica
+        .apply(&mut fresh.conn, &outbox.changes)
+        .await
+        .unwrap();
+    no_shared(&applied, "a new replica")?;
+    let got = shown(&mut fresh.conn, &fresh.replica).await;
+    same_rows(&want, &got, "a new replica")?;
+    same_facts(&mut from, &mut fresh, &want, &got).await?;
+    if got.1.is_empty() {
+        support::settled(&mut fresh.conn, &fresh.replica, &outbox.changes)
+            .await
+            .map_err(|e| format!("a new replica given what was resent: {e}"))?;
+    }
+
+    *databases += 1;
+    let mut old = from.world.connect(*databases).await;
+    for sql in schema {
+        sqlx::query(sql).execute(&mut old).await.unwrap();
+    }
+    let older = Replica::new(older_registry());
+    older.install(&mut old).await.unwrap();
+    let applied = older.apply(&mut old, &outbox.changes).await.unwrap();
+    no_shared(&applied, "a replica of an older version")?;
+    let upgraded = registry_of(target);
+    upgraded.install(&mut old).await.unwrap();
+    let applied = upgraded.apply(&mut old, &[]).await.unwrap();
+    no_shared(&applied, "a replica of an older version, upgraded")?;
+    same_rows(
+        &want,
+        &shown(&mut old, &upgraded).await,
+        "a replica of an older version, upgraded",
+    )?;
+
+    *databases += 1;
+    let mut holding = Peer::new_on(
+        &from.world,
+        *databases,
+        schema,
+        &[],
+        seed,
+        Some(None),
+        registry(target),
+    )
+    .await;
+    holding
+        .replica
+        .apply(&mut holding.conn, &from.taken)
+        .await
+        .unwrap();
+    let applied = holding
+        .replica
+        .apply(&mut holding.conn, &outbox.changes)
+        .await
+        .unwrap();
+    no_shared(&applied, "a replica holding what was taken")?;
+    same_rows(
+        &want,
+        &shown(&mut holding.conn, &holding.replica).await,
+        "a replica holding what was taken",
+    )?;
+    Ok(())
+}
+
+/// `got` keeps what `want` keeps: the winning entry of every field, the groups of entities found to
+/// be one, and who made each entity it shows, but for entities either holds back.
+async fn same_facts(
+    want_peer: &mut Peer,
+    got_peer: &mut Peer,
+    want: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    got: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+) -> Result<(), String> {
+    let a = want_peer
+        .replica
+        .inspect(&mut want_peer.conn)
+        .await
+        .unwrap();
+    let b = got_peer.replica.inspect(&mut got_peer.conn).await.unwrap();
+    let registers = |i: &fongo_sync_sqlite::Inspection| {
+        i.registers
+            .iter()
+            .map(|(c, g, f, v, k)| format!("{c} {g:?} {f} {v:?} {k:?}"))
+            .collect::<BTreeSet<_>>()
+    };
+    let (ra, rb) = (registers(&a), registers(&b));
+    if ra != rb {
+        return Err(format!(
+            "a new replica keeps other entries: only the sender's {:#?}, only its own {:#?}",
+            ra.difference(&rb).collect::<Vec<_>>(),
+            rb.difference(&ra).collect::<Vec<_>>()
+        ));
+    }
+    let groups =
+        |i: &fongo_sync_sqlite::Inspection| i.aliases.iter().cloned().collect::<BTreeSet<_>>();
+    if groups(&a) != groups(&b) {
+        return Err(format!(
+            "a new replica groups other entities: {:?} against {:?}",
+            groups(&a),
+            groups(&b)
+        ));
+    }
+    for (collection, rows) in &want.0.collections {
+        for gid in rows.keys() {
+            let at = (collection.clone(), *gid);
+            if want.1.contains(&at) || got.1.contains(&at) {
+                continue;
+            }
+            // Which replica made an entity differs on purpose; whether one did, or it was adopted,
+            // does not.
+            let kind = |m: Option<fongo_sync_sqlite::Made>| match m {
+                Some(fongo_sync_sqlite::Made::Here | fongo_sync_sqlite::Made::Elsewhere) => {
+                    "made".to_string()
+                }
+                other => format!("{other:?}"),
+            };
+            let x = want_peer
+                .replica
+                .made(&mut want_peer.conn, collection, *gid)
+                .await
+                .unwrap();
+            let y = got_peer
+                .replica
+                .made(&mut got_peer.conn, collection, *gid)
+                .await
+                .unwrap();
+            if kind(x) != kind(y) {
+                return Err(format!(
+                    "made differs for {collection} {gid:?}: the sender {x:?}, a new replica {y:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Three replicas each make one shelf of one name; each pair of them is found to be one by a
+/// replica of its own, and replica 1 takes all of it and renames the shelf. The entity with the
+/// greatest id is written an alias to each of the two others, so replica 1 holds an entity with
+/// two aliases.
+fn two_aliases_first() -> Vec<(usize, Op)> {
+    use Op::*;
+    vec![
+        (0, AddShelf(0)),
+        (0, Push),
+        (1, AddShelf(0)),
+        (1, Push),
+        (2, AddShelf(0)),
+        (2, Push),
+        (3, Log(0, false)),
+        (3, Log(1, false)),
+        (3, Push),
+        (4, Log(1, false)),
+        (4, Log(2, false)),
+        (4, Push),
+        (0, Log(2, false)),
+        (0, Push),
+        // A series, unknown to replica 1 where its registry is the older one, and a setting two
+        // replicas make apart, so its key is kept with two clocks.
+        (0, AddSeries(0, 0)),
+        (0, SetSetting(0, 0)),
+        (0, Push),
+        (2, SetSetting(0, 1)),
+        (2, Push),
+        (1, Log(0, false)),
+        (1, Log(2, false)),
+        (1, Log(3, false)),
+        (1, Log(4, false)),
+        // The shelf found to be one is renamed, so its identity no longer joins its members.
+        (1, RenameShelf(0, 1)),
+    ]
+}
+
+/// Runs [`two_aliases_first`] and then `script` on five peers, and has replica 1 resend what it
+/// holds, as [`resent_shows_the_same`] checks.
+fn run_resending(seed: u64, every: u64, back: u64, script: &[(usize, Op)]) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let world = World::stepping_back(seed, every, back);
+        let mut hub = Vec::new();
+        let mut peers = Vec::new();
+        // One script in two, replica 1 is of a version without the series.
+        let older = seed.is_multiple_of(2);
+        for n in 0..5 {
+            let registry = match n == 1 && older {
+                true => older_registry(),
+                false => registry(false),
+            };
+            peers.push(Peer::new_on(&world, n, SCHEMA, &[], seed, None, registry).await);
+        }
+        let mut databases = 5;
+        let steps = two_aliases_first().into_iter().chain(script.iter().cloned());
+        for (step, (who, op)) in steps.enumerate() {
+            // A replica of the older version writes nothing its registry lacks: its upgrade would
+            // adopt such rows as its own, which no resend made before it could carry.
+            let unknown = matches!(
+                op,
+                Op::AddSeries(..)
+                    | Op::SetSeriesCode(..)
+                    | Op::AddVolume(..)
+                    | Op::SetExtra(..)
+                    | Op::Upgrade
+            );
+            if older && who == 1 && unknown {
+                continue;
+            }
+            perform(&mut peers[who], op, &mut hub)
+                .await
+                .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
+        }
+        resent_shows_the_same(&mut peers[1], SCHEMA, seed, false, true, &mut databases)
+            .await
+            .map_err(|e| format!("peer 1 resending what it holds: {e}\n\nseed {seed}, every {every}, back {back}, script {script:?}"))
+    })
+}
+
 /// Replaces peer `to`'s database with a copy of peer `from`'s; then, with the clock held, each
 /// titles its `book`th book with a title of its own and sends it.
 async fn copy(
@@ -1315,6 +1806,15 @@ fn cases() -> u32 {
         .unwrap_or(32)
 }
 
+/// Cases of the resend property: fewer than [`cases`] by default, as each resends and builds three
+/// replicas more; `PROPTEST_CASES` sets both.
+fn resend_cases() -> u32 {
+    match std::env::var("PROPTEST_CASES") {
+        Ok(_) => cases(),
+        Err(_) => 8,
+    }
+}
+
 /// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
 fn sharing_cases() -> u32 {
     match std::env::var("PROPTEST_CASES") {
@@ -1372,6 +1872,30 @@ proptest! {
     ) {
         let outcome = run_back(SCHEMA, false, seed, every, back, &script, None);
         if let Err(error) = outcome {
+            prop_assert!(false, "{}", error);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: resend_cases(),
+        rng_seed: rng_seed(),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    /// A replica that holds an entity with two aliases and whatever a script leaves it resends
+    /// everything it holds: no two resent changes share a field and clock with different values,
+    /// and replicas given them, new, of an older version, or holding what it took, report no
+    /// shared node and show its rows.
+    #[test]
+    fn what_a_replica_resends_shows_its_rows_elsewhere(
+        seed in any::<u64>(),
+        every in prop_oneof![Just(0u64), Just(1), Just(3), Just(8), Just(40)],
+        back in prop_oneof![Just(0u64), Just(1), Just(2), Just(40)],
+        script in proptest::collection::vec((0usize..5, arb_op()), 0..300)
+    ) {
+        if let Err(error) = run_resending(seed, every, back, &script) {
             prop_assert!(false, "{}", error);
         }
     }

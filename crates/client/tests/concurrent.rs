@@ -626,7 +626,8 @@ async fn a_pull_keeps_a_step_past_recorded_after_it_began() {
     step_past(&mut a.conn, library.id, first.seq, first.digest)
         .await
         .unwrap();
-    let hold = server.hold_if(|request| reads_after(request, 2), false);
+    // The pull's first read begins at the envelope at its cursor, 2.
+    let hold = server.hold_if(|request| reads_after(request, 1), false);
     let mut held = Box::pin(sync(&mut b.conn, &b.replica, &server, &b.credentials, now));
     tokio::select! {
         _ = &mut held => panic!("the read was never held"),

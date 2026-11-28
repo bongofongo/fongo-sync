@@ -1,9 +1,12 @@
-//! Two or three syncs at once on one database, interleaved at random at every request they make
-//! and every gap between their transactions, while the application writes, a second device writes
-//! and syncs, requests fail before the server sees them or lose their answers after, and syncs
-//! crash. A run is a function of its seed: one sync runs at a time, each until it reaches a point
-//! where it waits, and the databases' clocks and random bytes come from the seed. The clock stands
-//! still for many writes and sometimes steps back.
+//! Two or three syncs at once on one database, interleaved at random at every request they make and
+//! every gap between their transactions, while the application writes, one or two other devices
+//! write and sync, requests fail before the server sees them or lose their answers after, and syncs
+//! crash. The server stores an identical envelope again or not, and pages hold one to five
+//! envelopes, as each seed draws. The server is honest throughout, so no sync may find a fault in
+//! its log, and every device ends with the same fingerprint of it. A run is a function of its seed:
+//! one sync runs at a time, each until it reaches a point where it waits, and the databases' clocks
+//! and random bytes come from the seed. The clock stands still for many writes and sometimes steps
+//! back.
 
 #[allow(dead_code)]
 mod support;
@@ -17,7 +20,7 @@ use std::task::Poll;
 
 use fongo_sync_client::{
     Apply, Error, Pace, Request, Response, SyncReport, Transport, TransportError, create_library,
-    join_library, sync_with,
+    fingerprint, join_library, sync_with,
 };
 use libsqlite3_sys as ffi;
 use sqlx::SqliteConnection;
@@ -318,14 +321,25 @@ async fn run(seed: u64) {
     let dir = scratch(&format!("interleaved-{seed}"));
     let path = dir.join("x.db");
     let server = Arc::new(Server::new());
+    // A server may store an identical envelope again, and serves pages of its own size.
+    let again = rng.one_in(2);
+    let page = 1 + rng.below(5) as u32;
+    server.with(|s| {
+        s.store_again = again;
+        s.caps.max_page_batches = Some(page);
+    });
     let made = create_library(&*server, now).await.unwrap();
-    let joined = join_library(&*server, &made.recovery_code(), now)
-        .await
-        .unwrap();
+    let mut others = Vec::new();
+    for _ in 0..1 + rng.below(2) {
+        let joined = join_library(&*server, &made.recovery_code(), now)
+            .await
+            .unwrap();
+        let mut other = Peer::new(joined).await;
+        control(&mut other.conn, &wall, splitmix(&mut rng.0)).await;
+        others.push(other);
+    }
     let mut writer = Peer::new_at(&path, made).await;
     control(&mut writer.conn, &wall, splitmix(&mut rng.0)).await;
-    let mut other = Peer::new(joined).await;
-    control(&mut other.conn, &wall, splitmix(&mut rng.0)).await;
 
     let connections = 2 + rng.below(2) as usize;
     let mut idle: Vec<Peer> = Vec::new();
@@ -348,11 +362,12 @@ async fn run(seed: u64) {
                 }
             }
             1 => {
+                let at = rng.below(others.len() as u64) as usize;
                 for _ in 0..rng.below(3) {
-                    let sql = a_write(&mut rng, "there");
-                    other.run(&sql).await;
+                    let sql = a_write(&mut rng, &format!("there{at}"));
+                    others[at].run(&sql).await;
                 }
-                other.sync(&server).await.unwrap();
+                others[at].sync(&server).await.unwrap();
             }
             2 | 3 if !idle.is_empty() => {
                 let peer = idle.remove(rng.below(idle.len() as u64) as usize);
@@ -404,12 +419,17 @@ async fn run(seed: u64) {
     }
     assert_no_change_sent_twice(&server, &keys);
 
-    let mut peers = vec![idle.pop().unwrap(), other];
+    let mut peers = vec![idle.pop().unwrap()];
+    peers.extend(others);
     settle(&mut peers, &server).await;
     assert_no_change_sent_twice(&server, &keys);
     let log = server.log(keys.id).len() as u64;
+    let first = fingerprint(&mut peers[0].conn, keys.id).await.unwrap();
+    assert_eq!(first.seq, log, "seed {seed}");
     for peer in peers.iter_mut() {
         assert_eq!(peer.cursor().await, log, "seed {seed}");
+        let print = fingerprint(&mut peer.conn, keys.id).await.unwrap();
+        assert_eq!(print, first, "seed {seed}");
         assert_eq!(in_flight(peer).await, None, "seed {seed}");
         let unsent = peer.replica.outbox(&mut peer.conn, 1).await.unwrap();
         assert!(unsent.changes.is_empty(), "seed {seed}");
