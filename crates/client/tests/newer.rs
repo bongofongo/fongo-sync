@@ -684,6 +684,9 @@ impl Transport for AnswersWithALaterCopy<'_> {
     }
 }
 
+/// 2100-01-01: replicas stamp their edits with the system clock, which this is beyond.
+const LATER_THAN_ANY_EDIT_HERE: u64 = 4_102_444_800_000;
+
 #[tokio::test]
 async fn this_devices_envelope_is_read_back_at_the_first_copy_whichever_it_recorded() {
     let server = Server::new();
@@ -708,11 +711,7 @@ async fn this_devices_envelope_is_read_back_at_the_first_copy_whichever_it_recor
         field: "body".into(),
         value: Value::Text("B2".into()),
         clock: Hlc {
-            wall_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-                + 3_600_000,
+            wall_ms: LATER_THAN_ANY_EDIT_HERE,
             counter: 0,
             node: Gid([9; 16]),
         },
