@@ -14,14 +14,16 @@
 //! that begins after the upgrade refuses these tables with [`Error::NewerClientTables`].
 //!
 //! A sync of a layout-2 build already running when another connection upgrades the tables goes
-//! on with its own statements, which touch none of layout 3's columns. It can move the cursor:
-//! the digest kept for the old position is then not taken for the new one's, and the log is hashed
-//! again from where the fingerprint stands up to the cursor, as after an upgrade, so neither a
-//! fault nor a wrong fingerprint follows. It can drop records of appends read past without keeping
-//! them in `fongo_client_passed`: an append later answered at such a position is then read back
-//! before it is taken for reuse. It does not see a stored fault and goes on applying and sending;
-//! and a resolution while it runs is undone in part where it moves the cursor up again after the
-//! resolution set it to 0, so that this device does not read again what lies before that.
+//! on with its own statements, which touch none of layout 3's columns. It can move the cursor
+//! alone, where this build moves it with the position of its digest: the next sync of this build
+//! then reads on from the position it last stored, applying again what the older build applied,
+//! and requires the log to reach where the older build got, so a resolution that set the cursor to
+//! 0 is not undone and a log that went back is still found. On tables just upgraded, where this
+//! build has stored no cursor yet, the digest kept for the old position is not taken for the new
+//! one's, and the log is hashed again up to the cursor. It can drop records of appends read past
+//! without keeping them in `fongo_client_passed`: an append later answered at such a position is
+//! then read back before it is taken for reuse. It does not see a stored fault, and goes on
+//! applying and sending until it ends.
 
 use fongo_sync_protocol::LibraryId;
 use sha2::{Digest, Sha256};
@@ -126,7 +128,11 @@ pub(crate) fn chain_step(previous: Digest32, seq: u64, envelope: Digest32) -> Di
 }
 
 pub(crate) struct State {
+    /// Where the pull begins: the stored cursor, or where this build last stored it when a build
+    /// that keeps no digest has moved it since.
     pub(crate) cursor: u64,
+    /// The stored cursor such a build moved it to, which the log must reach.
+    pub(crate) reach: Option<u64>,
     /// The digest of the envelope at the cursor, when known.
     pub(crate) anchor: Option<Digest32>,
     /// The log's fingerprint through a position at or before the cursor.
@@ -374,11 +380,17 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
     };
     let stopped = mark(row.try_get(4)?, row.try_get(5)?)?;
     let passing = mark(row.try_get(6)?, row.try_get(7)?)?;
-    // A digest stored for another position than the cursor, as when a build that keeps none moved
-    // the cursor, is not known to be the cursor's.
-    let anchor_seq: Option<i64> = row.try_get(15)?;
-    let anchor = digest_of(row.try_get(8)?)?.filter(|_| anchor_seq == Some(cursor));
     let chain = chain_of(library, row.try_get(9)?, row.try_get(10)?)?;
+    // This build writes the cursor and the position its digest is for together; only a build that
+    // keeps no digest moves the cursor alone. The pull then reads on from the position this build
+    // wrote, applying again what that build applied, and requires the log to reach where it got.
+    let stored = u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))?;
+    let anchor_seq = row.try_get::<Option<i64>, _>(15)?.map(seq_of).transpose()?;
+    let (cursor, reach) = match anchor_seq {
+        Some(at) if at < stored && chain.0 <= at => (at, Some(stored)),
+        _ => (stored, None),
+    };
+    let anchor = digest_of(row.try_get(8)?)?.filter(|_| anchor_seq == Some(cursor));
     let fault = fault_of(row.try_get(11)?, row.try_get(12)?, row.try_get(13)?)?;
     let resets: i64 = row.try_get(14)?;
     let appended: Vec<(i64, Option<Vec<u8>>)> =
@@ -387,7 +399,8 @@ pub(crate) async fn load(conn: &mut SqliteConnection, library: LibraryId) -> Res
             .fetch_all(&mut *conn)
             .await?;
     Ok(State {
-        cursor: u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))?,
+        cursor,
+        reach,
         anchor,
         chain,
         fault,
@@ -453,7 +466,7 @@ pub(crate) async fn advance(
     let at = as_i64(seq)?;
     let moved = sqlx::query(
         "UPDATE fongo_client_state SET cursor = ?1, anchor = ?2,
-            anchor_seq = CASE WHEN ?2 IS NULL THEN NULL ELSE ?1 END,
+            anchor_seq = ?1,
             chain_seq = CASE WHEN ?3 IS NULL THEN chain_seq ELSE ?1 END,
             chain = CASE WHEN ?3 IS NULL THEN chain ELSE ?3 END
          WHERE library = ?4 AND cursor < ?1",
@@ -1023,7 +1036,7 @@ pub(crate) async fn resend_all(
     let mut tx = conn.begin().await?;
     let reset = sqlx::query(
         "UPDATE fongo_client_state SET
-            cursor = 0, anchor = NULL, anchor_seq = NULL, chain_seq = 0, chain = NULL,
+            cursor = 0, anchor = NULL, anchor_seq = 0, chain_seq = 0, chain = NULL,
             sending_through = NULL, sending_envelope = NULL, sending_after = NULL,
             stopped_seq = NULL, stopped_digest = NULL,
             fault_kind = NULL, fault_seq = NULL, fault_other = NULL,

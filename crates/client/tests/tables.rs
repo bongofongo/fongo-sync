@@ -565,8 +565,8 @@ async fn hashing_after_an_upgrade_ends_however_fast_the_log_grows() {
 
 /// A sync of a layout-2 build that loaded its state before another connection upgraded the
 /// tables goes on with its own statements: it moves the cursor and leaves the digest of the
-/// envelope at the old cursor. That digest belongs to another position, so this build takes it
-/// for unknown, sees that the log reaches the cursor, and hashes the log again up to it.
+/// envelope at the old cursor, with that position. This build reads on from there, checking that
+/// digest, and requires the log to reach the moved cursor.
 #[tokio::test]
 async fn an_older_build_running_through_the_upgrade_moves_the_cursor_past_the_anchor() {
     let server = Server::new();
@@ -601,4 +601,66 @@ async fn fault_of(peer: &mut Peer) -> Option<LogFault> {
     fongo_sync_client::log_fault(&mut peer.conn, peer.credentials.library_id())
         .await
         .unwrap()
+}
+
+/// A sync of a layout-2 build that read to 3 before the device resolved a fault writes its
+/// advance after the resolution set the cursor to 0. The device must still read the log from 0,
+/// where other devices have since refilled positions with envelopes it never applied.
+#[tokio::test]
+async fn an_older_build_raising_the_cursor_after_a_resolution_loses_nothing() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    let mut c = Peer::new(
+        join_library(&server, &a.credentials.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    for key in ["b1", "b2", "b3"] {
+        b.run(&format!("INSERT INTO settings VALUES ('{key}', 'x')"))
+            .await;
+        b.sync(&server).await.unwrap();
+    }
+    a.sync(&server).await.unwrap();
+    assert_eq!(a.cursor().await, 3);
+    server.roll_back(id, 1);
+    c.sync(&server).await.unwrap();
+    for key in ["c1", "c2"] {
+        c.run(&format!("INSERT INTO settings VALUES ('{key}', 'x')"))
+            .await;
+        c.sync(&server).await.unwrap();
+    }
+    assert!(matches!(a.sync(&server).await, Err(Error::LogFault(_))));
+    fongo_sync_client::resend_all(&mut a.conn, &a.replica, id)
+        .await
+        .unwrap();
+    a.run("UPDATE fongo_client_state SET cursor = max(cursor, 3)")
+        .await;
+    for _ in 0..10 {
+        for p in [&mut a, &mut b, &mut c] {
+            match p.sync(&server).await {
+                Ok(_) => {}
+                Err(Error::LogFault(_)) => {
+                    fongo_sync_client::resend_all(&mut p.conn, &p.replica, id)
+                        .await
+                        .unwrap();
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+    let mut d = Peer::new(
+        join_library(&server, &a.credentials.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    while d.sync(&server).await.unwrap().more {}
+    let want = d.settings().await;
+    assert_eq!(want.len(), 5, "{want:?}");
+    for p in [&mut a, &mut b, &mut c] {
+        assert_eq!(fault_of(p).await, None);
+        assert_eq!(p.settings().await, want);
+    }
 }

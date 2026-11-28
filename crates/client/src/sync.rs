@@ -787,6 +787,7 @@ async fn run<T: Transport, A: Apply>(
         sending: saved.sending,
         landed: None,
         stopped_at: saved.stopped.map(|(seq, _)| seq),
+        reach: saved.reach,
         stopped: None,
         passing: saved.passing,
     };
@@ -1247,6 +1248,9 @@ struct Pull {
     sending: Option<Sending>,
     /// The outbox position and bytes of a recorded envelope, once found at `read`.
     landed: Option<(i64, Vec<u8>)>,
+    /// Where a build that keeps no digest moved the cursor past where the pull begins: the log
+    /// must reach it.
+    reach: Option<u64>,
     /// Where the last sync's pull stopped at a later version's envelope.
     stopped_at: Option<u64>,
     /// Where this one did, and the digest of what it stopped at.
@@ -1518,6 +1522,9 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             }
         }
         if !page.more {
+            if let Some(reach) = pull.reach.filter(|&reach| pull.read < reach) {
+                return Err(Error::LogFault(LogFault::Behind { cursor: reach }));
+            }
             // The log ends here: an append of this device recorded further on is not in it.
             if let Some(&seq) = pull.appended.iter().find(|&&seq| seq > pull.read) {
                 return Err(Error::LogFault(LogFault::AppendMissing { seq }));
