@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use fongo_sync_client::protocol::{LibraryKeys, SigningKey};
+use fongo_sync_client::protocol::{LibraryId, LibraryKeys, SigningKey, WrapSecret};
 use fongo_sync_client::protocol::{generate_signing_key, open, random_nonce, seal};
 use fongo_sync_client::sqlite::core::Change;
 use fongo_sync_client::sqlite::{Applied, Collection, Registry, Replica};
 use fongo_sync_client::{
     Apply, Credentials, Error, Method, Pace, Request, Response, SyncReport, Transport,
-    TransportError, create_library, join_library, sync, sync_with,
+    TransportError, create_library, create_library_with, join_library, join_library_with, sync,
+    sync_with,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Connection, SqliteConnection};
@@ -3006,6 +3007,12 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
     assert_clean_on(&mut peer.conn, at).await;
 }
 
+/// 32 bytes fixed by `seed` and `n`.
+fn keyed(seed: u64, n: u64) -> [u8; 32] {
+    let mut rng = Rng::new(seed.wrapping_mul(1_000_003).wrapping_add(n));
+    std::array::from_fn(|_| rng.below(256) as u8)
+}
+
 /// Three devices write at random and sync through a server that fails, loses or hangs a random
 /// request, stores copies of envelopes already in the log, holds envelopes from signers it lists
 /// only later, sometimes holds more than one sync reads, and pages one to three envelopes at a
@@ -3019,8 +3026,9 @@ async fn assert_clean(peer: &mut Peer, at: &str) {
 /// fresh connection, at once or when its next sync refuses the old one. At the end every device agrees, and a second
 /// connection reads what each wrote.
 ///
-/// `FONGO_CLIENT_CASES` sets how many seeds run from `FONGO_CLIENT_SEED`. A seed fixes the steps;
-/// keys and ids are still drawn afresh, so a failure names its seed but may need a few runs.
+/// `FONGO_CLIENT_CASES` sets how many seeds run from `FONGO_CLIENT_SEED`. A seed fixes the steps
+/// and every key; the replicas still draw their nodes, row gids and clocks, and sealing its nonces,
+/// so a failure names its seed but may need a few runs.
 #[tokio::test]
 async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge() {
     let first = env("FONGO_CLIENT_SEED", 1);
@@ -3037,8 +3045,16 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
             pause: Duration::from_millis(rng.below(2)),
             held: Duration::ZERO,
         };
-        let [made, joined] = credentials(&server).await;
-        let third = Credentials::for_new_device(made.library().clone()).unwrap();
+        let library = LibraryKeys::new(
+            LibraryId(keyed(seed, 0)[..16].try_into().unwrap()),
+            keyed(seed, 1),
+        );
+        let [made, joined, third] = [2, 4, 6].map(|n| {
+            Credentials::new(library.clone(), SigningKey::from_bytes(&keyed(seed, n)), 0)
+                .with_wrap_secret(WrapSecret::from_bytes(&keyed(seed, n + 1)))
+        });
+        create_library_with(&server, &made, now).await.unwrap();
+        join_library_with(&server, &joined, now).await.unwrap();
         fongo_sync_client::add_device(&server, &made, &third.device_offer().unwrap(), now)
             .await
             .unwrap();
@@ -3079,7 +3095,7 @@ async fn devices_with_random_writes_failures_and_copies_keep_counts_and_converge
                     }
                 }
                 4 if rng.below(2) == 0 => {
-                    let stranger = generate_signing_key().unwrap();
+                    let stranger = SigningKey::from_bytes(&keyed(seed, 100 + strangers));
                     let name = format!("stranger{strangers}");
                     strangers += 1;
                     server.inject(id, sealed_setting(&keys, &stranger, &name).await);

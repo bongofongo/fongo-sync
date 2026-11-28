@@ -138,6 +138,7 @@ impl<'s> Evaluator<'s> {
             limits: self.limits,
             source,
             infos: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             groups: BTreeMap::new(),
             member_live: BTreeMap::new(),
             group_live: BTreeMap::new(),
@@ -182,7 +183,6 @@ struct Info {
     home: Option<usize>,
     registers: BTreeMap<String, (Value, Hlc)>,
     key: Key,
-    aliases: Vec<Alias>,
 }
 
 #[derive(Debug)]
@@ -203,6 +203,7 @@ pub struct Session<'a, S> {
     limits: Limits,
     pub(crate) source: &'a S,
     infos: BTreeMap<Gid, Answer<Rc<Info>>>,
+    aliases: BTreeMap<Gid, Rc<Vec<Alias>>>,
     groups: BTreeMap<Gid, Answer<Rc<Group>>>,
     member_live: BTreeMap<Gid, Answer<bool>>,
     group_live: BTreeMap<Gid, Answer<bool>>,
@@ -462,10 +463,10 @@ impl<'a, S: Source> Session<'a, S> {
         answer
     }
 
-    fn fetch(&self, gid: Gid) -> Answer<Info> {
+    /// The collection `gid` is kept in, from its claims alone.
+    fn kept_in(&self, gid: Gid) -> Option<usize> {
         let schema = self.schema;
-        let home = self
-            .source
+        self.source
             .claims(gid)
             .into_iter()
             .filter_map(|c| {
@@ -476,13 +477,16 @@ impl<'a, S: Source> Session<'a, S> {
                 Some((c.first, c.collection, i))
             })
             .min()
-            .map(|(_, _, i)| i);
-        let Some(home) = home else {
+            .map(|(_, _, i)| i)
+    }
+
+    fn fetch(&self, gid: Gid) -> Answer<Info> {
+        let schema = self.schema;
+        let Some(home) = self.kept_in(gid) else {
             return Ok(Info {
                 home: None,
                 registers: BTreeMap::new(),
                 key: Key::Minted,
-                aliases: Vec::new(),
             });
         };
         let coll = &schema.collections[home];
@@ -542,8 +546,38 @@ impl<'a, S: Source> Session<'a, S> {
             home: Some(home),
             registers,
             key,
-            aliases: self.source.aliases(gid),
         })
+    }
+
+    /// The aliases kept with `gid` at either end, which only a gid that can join reads: one kept
+    /// somewhere, and if natural, holding a key that derives it.
+    fn aliases(&mut self, gid: Gid, info: &Info) -> Rc<Vec<Alias>> {
+        if info.home.is_none() || matches!(info.key, Key::Unverified) {
+            return Rc::new(Vec::new());
+        }
+        self.aliases
+            .entry(gid)
+            .or_insert_with(|| Rc::new(self.source.aliases(gid)))
+            .clone()
+    }
+
+    /// Whether `gid` is kept in `collection` with `value` in `field`: in its row, or as its key.
+    pub(crate) fn keeps(
+        &mut self,
+        gid: Gid,
+        collection: &str,
+        field: &str,
+        value: &Value,
+    ) -> Answer<bool> {
+        let schema = self.schema;
+        let info = self.info(gid)?;
+        Ok(info
+            .home
+            .is_some_and(|h| schema.collections[h].name == collection)
+            && info
+                .registers
+                .get(field)
+                .is_some_and(|(v, _)| v.total_cmp(value) == std::cmp::Ordering::Equal))
     }
 
     fn group(&mut self, gid: Gid) -> Answer<Rc<Group>> {
@@ -560,9 +594,13 @@ impl<'a, S: Source> Session<'a, S> {
     }
 
     /// Gathers the least set of gids that contains `start` and is closed under: alias
-    /// neighbours, the gids a natural key names, and natural entities that may share a key with
-    /// one in the set. Alias groups computed over that set alone are the groups over every fact,
-    /// so the group of every gid in it is cached.
+    /// neighbours kept in the alias's collection, the gids a natural key names, and the natural
+    /// entities that may share a key with one in the set, each the gid one of the keys reading
+    /// as that key through the groups derives, where it is kept in the key's collection and
+    /// holds that key. An alias joins only gids both kept in
+    /// its collection, so of a neighbour kept elsewhere only its claims are read. Alias groups
+    /// computed over that set alone are the groups over every fact, so the group of every gid in
+    /// it is cached.
     ///
     /// Groups are kept as they are found: each gid is fetched once, each alias joins once, a join
     /// re-reads only the keys that name the smaller of the two groups (congruence closure), and a
@@ -575,7 +613,7 @@ impl<'a, S: Source> Session<'a, S> {
             ..Closure::default()
         };
         r.add(start);
-        let mut asked: BTreeSet<(usize, Vec<Total>)> = BTreeSet::new();
+        let mut asked: BTreeSet<Gid> = BTreeSet::new();
         let mut infos: BTreeMap<usize, Rc<Info>> = BTreeMap::new();
         let mut edges: Vec<(usize, usize, String)> = Vec::new();
         loop {
@@ -584,11 +622,20 @@ impl<'a, S: Source> Session<'a, S> {
                 let x = r.gids[i];
                 let info = self.info(x)?;
                 let home = info.home.map(|h| schema.collections[h].name.as_str());
-                for a in &info.aliases {
-                    if Some(a.collection.as_str()) == home {
-                        let j = r.add(if a.from == x { a.to } else { a.from });
-                        edges.push((i, j, a.collection.clone()));
+                for a in self.aliases(x, &info).iter() {
+                    if Some(a.collection.as_str()) != home {
+                        continue;
                     }
+                    let y = if a.from == x { a.to } else { a.from };
+                    let kept = match self.infos.get(&y) {
+                        Some(Ok(known)) => known.home,
+                        _ => self.kept_in(y),
+                    };
+                    if kept != info.home {
+                        continue;
+                    }
+                    let j = r.add(y);
+                    edges.push((i, j, a.collection.clone()));
                 }
                 if let (Key::Verified(key), Some(h)) = (&info.key, info.home) {
                     let refs: Vec<Option<usize>> = key
@@ -630,16 +677,27 @@ impl<'a, S: Source> Session<'a, S> {
                 let Identity::Natural(fields) = &schema.collections[h].identity else {
                     continue;
                 };
-                let question: Vec<Total> = key.into_iter().map(Total).collect();
-                if !asked.insert((h, question.clone())) {
+                // Only the gid a key derives can hold it as its key, so no other is asked about,
+                // and it takes room in the region only where it holds the key.
+                let name = &schema.collections[h].name;
+                let z = Gid::derive(name, &key);
+                if !asked.insert(z) {
                     continue;
                 }
-                let pairs: Vec<(&str, &Value)> = fields
-                    .iter()
-                    .zip(&question)
-                    .map(|(f, v)| (f.as_str(), &v.0))
-                    .collect();
-                for z in self.source.holding(&schema.collections[h].name, &pairs) {
+                let kept = match self.infos.get(&z) {
+                    Some(Ok(known)) => known.home,
+                    _ => self.kept_in(z),
+                };
+                if kept != Some(h) {
+                    continue;
+                }
+                let entries = self.source.entries(name, z);
+                let holds = fields.iter().zip(&key).all(|(f, v)| {
+                    entries
+                        .iter()
+                        .any(|e| &e.field == f && e.value.total_cmp(v) == std::cmp::Ordering::Equal)
+                });
+                if holds {
                     r.add(z);
                 }
             }
@@ -1020,6 +1078,66 @@ fn product(parts: &[Part], lists: &[&[usize]], gids: &[Gid], out: &mut Vec<Vec<V
                 break;
             }
             at[d] = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change::{ALIAS, Change, Strategy};
+    use crate::model::merge;
+    use crate::source::Store;
+
+    /// Where a gid is kept, read from its claims alone, is where its full fetch and the model
+    /// keep it: with no claims, deleted, claimed in three collections at once or one after
+    /// another, and claimed only by an alias it wrote.
+    #[test]
+    fn a_gid_is_kept_where_its_claims_alone_say() {
+        let schema = Schema::new(vec![
+            Collection::minted("c").plain("p", Strategy::Lww),
+            Collection::minted("a").plain("p", Strategy::Lww),
+            Collection::minted("b").plain("p", Strategy::Lww),
+        ]);
+        let gid = |n: u8| Gid([n; 16]);
+        let at = |c: &str, g: u8, field: &str, value: Value, wall_ms: u64| Change {
+            collection: c.into(),
+            gid: gid(g),
+            field: field.into(),
+            value,
+            clock: Hlc {
+                wall_ms,
+                counter: 0,
+                node: Gid([9; 16]),
+            },
+        };
+        let changes = vec![
+            at("a", 2, DELETED, Value::Int(1), 1),
+            at("c", 3, "p", Value::Int(0), 5),
+            at("b", 3, "p", Value::Int(0), 5),
+            at("a", 3, "p", Value::Int(0), 5),
+            at("c", 4, "p", Value::Int(0), 3),
+            at("a", 4, "p", Value::Int(0), 2),
+            at("b", 4, "p", Value::Int(0), 1),
+            at("b", 5, ALIAS, Value::Ref(gid(4)), 1),
+            at("c", 5, "p", Value::Int(0), 2),
+        ];
+        let mut store = Store::default();
+        for c in &changes {
+            store.merge(&schema, c);
+        }
+        let model = merge(&schema, &changes);
+        let ev = Evaluator::new(&schema).unwrap();
+        let mut session = ev.session(&store);
+        for g in 1..=5 {
+            let kept = session.kept_in(gid(g));
+            assert_eq!(kept, session.info(gid(g)).unwrap().home, "gid {g}");
+            let modelled = model.entities.get(&gid(g)).map(|e| e.collection.as_str());
+            assert_eq!(
+                kept.map(|i| schema.collections[i].name.as_str()),
+                modelled,
+                "gid {g}"
+            );
         }
     }
 }
