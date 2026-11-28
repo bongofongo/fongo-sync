@@ -342,7 +342,8 @@ async fn an_upgrade_over_a_growing_log_under_losses_ends_and_sends() {
         }
         assert!(sent, "seed {seed}: never sent");
         eprintln!(
-            "seed {seed}: page {page}, cursor at upgrade {cursor}, successful syncs before sending {ok_syncs}, bound per connection {bound}"
+            "seed {seed}: page {page}, cursor at upgrade {cursor}, successful syncs before \
+             sending {ok_syncs}, bound per connection {bound}"
         );
         assert_eq!(log_fault(&mut a1.conn, id).await.unwrap(), None::<LogFault>);
         let _ = std::fs::remove_dir_all(&dir);
@@ -355,13 +356,15 @@ async fn random_edit(peer: &mut Peer, rng: &mut Rng, tag: &str) {
     let sql = match rng.below(7) {
         0 | 1 => format!("INSERT INTO books (title, year) VALUES ('{tag}{v}', {k})"),
         2 => format!(
-            "UPDATE books SET title = '{tag}t{v}' WHERE id = (SELECT id FROM books ORDER BY id LIMIT 1 OFFSET {k})"
+            "UPDATE books SET title = '{tag}t{v}'
+             WHERE id = (SELECT id FROM books ORDER BY id LIMIT 1 OFFSET {k})"
         ),
         3 => format!(
             "DELETE FROM books WHERE id = (SELECT id FROM books ORDER BY id LIMIT 1 OFFSET {k})"
         ),
         4 => format!(
-            "INSERT INTO notes (book_id, body) SELECT id, '{tag}n{v}' FROM books ORDER BY id LIMIT 1 OFFSET {k}"
+            "INSERT INTO notes (book_id, body)
+             SELECT id, '{tag}n{v}' FROM books ORDER BY id LIMIT 1 OFFSET {k}"
         ),
         5 => format!("INSERT OR REPLACE INTO settings VALUES ('s{k}', '{tag}{v}')"),
         _ => format!("DELETE FROM settings WHERE key = 's{k}'"),

@@ -151,9 +151,10 @@ pub async fn log_fault(
 /// Two devices whose fingerprints at one position differ were shown different logs. Nothing in
 /// this crate acts on that: [`resend_all`] needs a fault this device found itself, and no call
 /// records one an application found by comparing fingerprints. What an application can do today
-/// is tell the user the server is not keeping one log, choose the log to keep, and rebuild each
-/// device that followed another, after an export, as [`resend_all`] describes; what only those
-/// devices held is lost unless entered again.
+/// is tell the user the server is not keeping one log, and stop using that server, or have it
+/// repaired, until it serves one log to every device: rebuilding a device helps only after that.
+/// Then choose the log to keep and rebuild each device that followed another, after an export, as
+/// [`resend_all`] describes; what only those devices held is lost unless entered again.
 pub async fn fingerprint(
     conn: &mut SqliteConnection,
     library: LibraryId,
