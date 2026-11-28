@@ -6,7 +6,9 @@
 mod support;
 
 use fongo_sync_client::protocol::api::CAPABILITIES_PATH;
-use fongo_sync_client::{Error, LogFault, Method, create_library, fingerprint, join_library};
+use fongo_sync_client::{
+    Apply, Error, LogFault, Method, create_library, fingerprint, join_library, sync_with,
+};
 use support::{Peer, Server, assert_converged, now};
 
 async fn pair(server: &Server) -> [Peer; 2] {
@@ -423,4 +425,106 @@ async fn hashing_the_log_after_an_upgrade_goes_on_from_where_a_failure_stopped_i
         let done = fingerprint(&mut a.conn, id).await.unwrap();
         assert_eq!((done.seq, done.digest), (LOG, whole));
     }
+}
+
+/// Counts the calls to `caught_up`.
+#[derive(Default)]
+struct Counting {
+    caught_up: usize,
+}
+
+impl Apply for Counting {
+    async fn caught_up(
+        &mut self,
+        _: &mut sqlx::SqliteConnection,
+        _: &fongo_sync_client::sqlite::Replica,
+    ) -> Result<Option<fongo_sync_client::sqlite::Applied>, Error> {
+        self.caught_up += 1;
+        Ok(None)
+    }
+}
+
+/// Tables of layout 2 over a log longer than one sync hashes. `a` has read all of it and has a
+/// write of its own to send.
+async fn upgraded_over_a_long_log(server: &Server) -> [Peer; 2] {
+    server.with(|s| s.caps.max_page_batches = Some(4));
+    let [mut a, mut b] = pair(server).await;
+    let id = a.credentials.library_id();
+    b.run("INSERT INTO settings VALUES ('b0', 'x')").await;
+    b.sync(server).await.unwrap();
+    let one = server.log(id)[0].clone();
+    for _ in 1..3000 {
+        server.inject(id, one.clone());
+    }
+    while a.sync(server).await.unwrap().more {}
+    as_layout_two(&mut a).await;
+    a.run("INSERT INTO settings VALUES ('a1', 'x')").await;
+    [a, b]
+}
+
+/// Until the log is hashed to the cursor, a sync sends nothing, does not call `caught_up`, and
+/// says more is to read; the sync that finishes the hash does both.
+#[tokio::test]
+async fn syncs_hashing_the_log_after_an_upgrade_send_and_settle_nothing() {
+    let server = Server::new();
+    let [mut a, _b] = upgraded_over_a_long_log(&server).await;
+    let id = a.credentials.library_id();
+    let mut counting = Counting::default();
+    let first = sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut counting,
+    )
+    .await
+    .unwrap();
+    assert!(first.more);
+    assert_eq!((first.sent, counting.caught_up), (0, 0));
+    assert_eq!(server.log(id).len(), 3000);
+    assert!(fingerprint(&mut a.conn, id).await.unwrap().seq < 3000);
+    let second = sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut counting,
+    )
+    .await
+    .unwrap();
+    assert!(!second.more);
+    assert!(second.sent > 0);
+    assert_eq!(counting.caught_up, 1);
+    assert_eq!(fingerprint(&mut a.conn, id).await.unwrap().seq, 3001);
+}
+
+/// Rolled back before the cursor, past what the first sync after the upgrade hashes: that sync
+/// finds it, sending nothing and settling nothing.
+#[tokio::test]
+async fn a_rollback_beyond_the_first_hash_after_an_upgrade_is_found_at_once() {
+    let server = Server::new();
+    let [mut a, _b] = upgraded_over_a_long_log(&server).await;
+    let id = a.credentials.library_id();
+    server.roll_back(id, 2500);
+    let mut counting = Counting::default();
+    let found = sync_with(
+        &mut a.conn,
+        &a.replica,
+        &server,
+        &a.credentials,
+        now,
+        &mut counting,
+    )
+    .await;
+    assert!(
+        matches!(
+            found,
+            Err(Error::LogFault(LogFault::Behind { cursor: 3000 }))
+        ),
+        "{found:?}"
+    );
+    assert_eq!(counting.caught_up, 0);
+    assert_eq!(server.log(id).len(), 2500);
 }

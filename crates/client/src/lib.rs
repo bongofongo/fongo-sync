@@ -37,8 +37,15 @@
 //! envelope the server accepts, as no route serves a digest in place of the bytes. It takes the
 //! first place in the first page, so a sync whose new envelopes fill whole pages reads one page
 //! more: with pages of `p` envelopes and `n` new ones, `n` at least 1, it reads `(n + 1) / p`
-//! pages rounded up in place of `n / p`. The first sync after tables of layout 2 are upgraded also reads the log up to the
-//! cursor once, to make a fingerprint.
+//! pages rounded up in place of `n / p`; a pull stopped at a later version's envelope reads two
+//! envelopes where it read one. An append answered at a position the device has read costs one
+//! read of that envelope.
+//!
+//! After tables of layout 2 are upgraded, the next syncs read the log from its start to the cursor,
+//! half the pages a sync reads at most each, to make a fingerprint. Until that is done each still
+//! finds a log that ends before the cursor, applies what it reads past it, but sends nothing and
+//! does not settle, and reports [`SyncReport::more`]; a log rewritten at or before the cursor in
+//! that window, not shortened, is not found.
 //!
 //! What cannot be detected this way: a rollback to a point after the last envelope this device read
 //! or appended, which leaves it nothing to miss; an envelope rewritten behind the cursor, which no

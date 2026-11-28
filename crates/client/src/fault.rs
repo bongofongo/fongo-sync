@@ -174,9 +174,9 @@ pub async fn fingerprint(
 /// sent, the next sync finds a new fault, and resolving it sends everything again, the earlier
 /// copies included.
 ///
-/// A device that then takes the log shows the rows this device shows, with what follows from the
-/// kernel's own record, as [`Replica::resend`] states: of a field's history only the change that
-/// wins is sent, which changes nothing a device shows but which collection an id with facts in
+/// A device that then takes the log, of this version or an older one later upgraded to it, shows
+/// the rows this device shows, with what follows from the kernel's own record, as
+/// [`Replica::resend`] states: of a field's history only the change that wins is sent, which changes nothing a device shows but which collection an id with facts in
 /// more than one belongs to; values the application kept as this device's own on resuming, and
 /// rows held back for a clash, stay this device's alone. A change only another device held, and
 /// the server lost, waits for that device to resolve too. Reading the log again reports no
