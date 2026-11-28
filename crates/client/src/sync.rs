@@ -294,8 +294,8 @@ pub struct SyncReport {
     /// was applied and the outbox was sent; call again to read on.
     ///
     /// Also set while the syncs after the client's tables are upgraded from layout 2 hash the log
-    /// up to the cursor: such a sync applies what it reads past the cursor, but sends nothing and
-    /// does not call [`Apply::caught_up`] until the hash is done; call again.
+    /// up to the cursor: such a sync reads nothing past the cursor, sends nothing and does not
+    /// call [`Apply::caught_up`] until the hash is done; call again.
     pub more: bool,
     /// Changes were left unsent because another sync on this database had an envelope recorded
     /// as being sent: this one sends nothing then, so as not to seal the same changes twice. The
@@ -450,12 +450,12 @@ pub struct SyncReport {
 ///   fill whole pages or the pull is stopped at a later version's envelope; a suspect answer to
 ///   an append costs one read of one envelope.
 /// - After the client's tables are upgraded from layout 2, which kept no fingerprint, the next
-///   syncs read the log from its start to the cursor, at most half the pages one sync reads
-///   each, storing how far they got after each page, to make one. Until that is done each sync
-///   reads the envelope at the cursor, which must be there or the sync fails with
-///   [`crate::LogFault::Behind`]; applies what it reads past the cursor, since a change applied
-///   is a change made, whatever is later found of the log; sends nothing and does not call
-///   [`Apply::caught_up`], and sets [`SyncReport::more`]. In that window a log rewritten at or
+///   syncs read the log from its start to the cursor, every page one sync reads each, storing
+///   how far they got after each page, to make one: a cursor at `c` with pages of `p` envelopes
+///   takes `c / (1000 p)` syncs rounded up, as the cursor does not move meanwhile, however fast
+///   the log grows. Until that is done each sync reads the envelope at the cursor, which must be
+///   there or the sync fails with [`crate::LogFault::Behind`]; reads nothing past it, sends
+///   nothing and does not call [`Apply::caught_up`], and sets [`SyncReport::more`]. In that window a log rewritten at or
 ///   before the cursor, but not shortened, is not found, now or later, as with any rewrite
 ///   behind the cursor.
 /// - Nothing else about appends: storing an identical envelope only once is welcome but not
@@ -1355,9 +1355,11 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
     // hashed that far, the read still shows whether the log reaches the cursor.
     let mut probe = pull.read > 0;
     // A fingerprint short of the cursor, left by tables of a layout that kept none, is hashed on
-    // first, in part when the log is long; the pull reads on either way.
-    if let Some((from, chain)) = pull.rehash.take()
-        && rehash(
+    // first, with every page a sync reads. Until it reaches the cursor the pull reads nothing past
+    // it, so the hash ends in the syncs the log's length then takes, however fast the log grows;
+    // the envelope at the cursor is still read, to see that the log reaches it.
+    if let Some((from, chain)) = pull.rehash.take() {
+        let done = rehash(
             rpc,
             conn,
             steps,
@@ -1368,9 +1370,22 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
             chain,
             &mut pages,
         )
-        .await?
-    {
-        probe = false;
+        .await?;
+        if done {
+            probe = false;
+        } else {
+            let page = read_page(rpc, keys.credentials, pull.read - 1, 1).await?;
+            let Some(at_cursor) = page.batches.first() else {
+                return Err(Error::LogFault(LogFault::Behind { cursor: pull.read }));
+            };
+            if pull
+                .anchor
+                .is_some_and(|anchor| state::digest(&at_cursor.envelope) != anchor)
+            {
+                return Err(Error::LogFault(LogFault::Rewritten { seq: pull.read }));
+            }
+            return Ok(());
+        }
     }
     let mut first = true;
     while pages < MAX_PAGES {
@@ -1514,7 +1529,7 @@ async fn read_pages<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
 }
 
 /// Hashes the log on from `from`, through which `chain` is its fingerprint, toward the cursor
-/// `pull.read`, in at most half the pages one sync reads, counted in `pages`, storing the
+/// `pull.read`, in at most the pages one sync reads, counted in `pages`, storing the
 /// fingerprint after each page with its position, so that a failure loses one page of the work.
 /// Returns whether it reached the cursor; then `pull` holds the fingerprint and digest there.
 /// Fails with [`LogFault::Behind`] when the log ends first, and with [`LogFault::Rewritten`] when
@@ -1533,7 +1548,7 @@ async fn rehash<T: Transport, N: Fn() -> u64 + Sync, A: Apply>(
 ) -> Result<bool, Error> {
     let mut at = from;
     let mut last = None;
-    while at < pull.read && *pages < MAX_PAGES / 2 {
+    while at < pull.read && *pages < MAX_PAGES {
         *pages += 1;
         let page = read_page(rpc, credentials, at, limit).await?;
         let before = at;

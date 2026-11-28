@@ -42,10 +42,11 @@
 //! read of that envelope.
 //!
 //! After tables of layout 2 are upgraded, the next syncs read the log from its start to the cursor,
-//! half the pages a sync reads at most each, to make a fingerprint. Until that is done each still
-//! finds a log that ends before the cursor, applies what it reads past it, but sends nothing and
-//! does not settle, and reports [`SyncReport::more`]; a log rewritten at or before the cursor in
-//! that window, not shortened, is not found.
+//! every page a sync reads, 1,000, to make a fingerprint: a cursor at `c` with pages of `p`
+//! envelopes takes `c / (1000 p)` syncs rounded up, however fast the log grows meanwhile. Until
+//! that is done each still finds a log that ends before the cursor, but reads nothing past it,
+//! sends nothing, does not settle, and reports [`SyncReport::more`]; a log rewritten at or before
+//! the cursor in that window, not shortened, is not found.
 //!
 //! What cannot be detected this way: a rollback to a point after the last envelope this device read
 //! or appended, which leaves it nothing to miss; an envelope rewritten behind the cursor, which no

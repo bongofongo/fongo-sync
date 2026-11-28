@@ -453,7 +453,7 @@ async fn upgraded_over_a_long_log(server: &Server) -> [Peer; 2] {
     b.run("INSERT INTO settings VALUES ('b0', 'x')").await;
     b.sync(server).await.unwrap();
     let one = server.log(id)[0].clone();
-    for _ in 1..3000 {
+    for _ in 1..5000 {
         server.inject(id, one.clone());
     }
     while a.sync(server).await.unwrap().more {}
@@ -482,8 +482,8 @@ async fn syncs_hashing_the_log_after_an_upgrade_send_and_settle_nothing() {
     .unwrap();
     assert!(first.more);
     assert_eq!((first.sent, counting.caught_up), (0, 0));
-    assert_eq!(server.log(id).len(), 3000);
-    assert!(fingerprint(&mut a.conn, id).await.unwrap().seq < 3000);
+    assert_eq!(server.log(id).len(), 5000);
+    assert_eq!(fingerprint(&mut a.conn, id).await.unwrap().seq, 4000);
     let second = sync_with(
         &mut a.conn,
         &a.replica,
@@ -497,7 +497,7 @@ async fn syncs_hashing_the_log_after_an_upgrade_send_and_settle_nothing() {
     assert!(!second.more);
     assert!(second.sent > 0);
     assert_eq!(counting.caught_up, 1);
-    assert_eq!(fingerprint(&mut a.conn, id).await.unwrap().seq, 3001);
+    assert_eq!(fingerprint(&mut a.conn, id).await.unwrap().seq, 5001);
 }
 
 /// Rolled back before the cursor, past what the first sync after the upgrade hashes: that sync
@@ -507,7 +507,7 @@ async fn a_rollback_beyond_the_first_hash_after_an_upgrade_is_found_at_once() {
     let server = Server::new();
     let [mut a, _b] = upgraded_over_a_long_log(&server).await;
     let id = a.credentials.library_id();
-    server.roll_back(id, 2500);
+    server.roll_back(id, 4500);
     let mut counting = Counting::default();
     let found = sync_with(
         &mut a.conn,
@@ -521,10 +521,44 @@ async fn a_rollback_beyond_the_first_hash_after_an_upgrade_is_found_at_once() {
     assert!(
         matches!(
             found,
-            Err(Error::LogFault(LogFault::Behind { cursor: 3000 }))
+            Err(Error::LogFault(LogFault::Behind { cursor: 5000 }))
         ),
         "{found:?}"
     );
     assert_eq!(counting.caught_up, 0);
-    assert_eq!(server.log(id).len(), 2500);
+    assert_eq!(server.log(id).len(), 4500);
+}
+
+/// After an upgrade from layout 2, with pages of one envelope, the log grows between syncs by
+/// as many envelopes as a sync could read and more. The hash reaches the cursor of the upgrade in
+/// the syncs its length takes, whatever the growth, and the outbox then goes out.
+#[tokio::test]
+async fn hashing_after_an_upgrade_ends_however_fast_the_log_grows() {
+    for grow in [100usize, 499, 500, 600, 1500] {
+        let server = Server::new();
+        server.with(|s| s.caps.max_page_batches = Some(1));
+        let [mut a, mut b] = pair(&server).await;
+        let id = a.credentials.library_id();
+        b.run("INSERT INTO settings VALUES ('b0', 'x')").await;
+        b.sync(&server).await.unwrap();
+        let one = server.log(id)[0].clone();
+        for _ in 1..1500 {
+            server.inject(id, one.clone());
+        }
+        while a.sync(&server).await.unwrap().more {}
+        as_layout_two(&mut a).await;
+        a.run("INSERT INTO settings VALUES ('a1', 'x')").await;
+        let mut sent_at = None;
+        for syncs in 1..=4 {
+            if a.sync(&server).await.unwrap().sent > 0 {
+                sent_at = Some(syncs);
+                break;
+            }
+            for _ in 0..grow {
+                server.inject(id, one.clone());
+            }
+        }
+        // 1,500 pages of one envelope: a whole sync's pages, then the rest.
+        assert_eq!(sent_at, Some(2), "growing by {grow} a sync");
+    }
 }
