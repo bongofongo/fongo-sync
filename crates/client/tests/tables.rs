@@ -562,3 +562,43 @@ async fn hashing_after_an_upgrade_ends_however_fast_the_log_grows() {
         assert_eq!(sent_at, Some(2), "growing by {grow} a sync");
     }
 }
+
+/// A sync of a layout-2 build that loaded its state before another connection upgraded the
+/// tables goes on with its own statements: it moves the cursor and leaves the digest of the
+/// envelope at the old cursor. That digest belongs to another position, so this build takes it
+/// for unknown, sees that the log reaches the cursor, and hashes the log again up to it.
+#[tokio::test]
+async fn an_older_build_running_through_the_upgrade_moves_the_cursor_past_the_anchor() {
+    let server = Server::new();
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    for key in ["b0", "b1", "b2"] {
+        b.run(&format!("INSERT INTO settings VALUES ('{key}', 'x')"))
+            .await;
+        b.sync(&server).await.unwrap();
+    }
+    a.sync(&server).await.unwrap();
+    b.run("INSERT INTO settings VALUES ('b3', 'x')").await;
+    b.sync(&server).await.unwrap();
+    // What a layout-2 build's advance writes, having read and applied envelope 4.
+    a.run("UPDATE fongo_client_state SET cursor = max(cursor, 4)")
+        .await;
+    a.sync(&server).await.unwrap();
+    assert_eq!(fault_of(&mut a).await, None);
+    let print = fingerprint(&mut a.conn, id).await.unwrap();
+    assert_eq!((print.seq, print.digest), (4, chain(id.0, &server.log(id))));
+    // A log that no longer reaches a cursor moved so is still found.
+    a.run("UPDATE fongo_client_state SET cursor = max(cursor, 5)")
+        .await;
+    server.roll_back(id, 4);
+    assert!(matches!(
+        a.sync(&server).await,
+        Err(Error::LogFault(LogFault::Behind { cursor: 5 }))
+    ));
+}
+
+async fn fault_of(peer: &mut Peer) -> Option<LogFault> {
+    fongo_sync_client::log_fault(&mut peer.conn, peer.credentials.library_id())
+        .await
+        .unwrap()
+}
