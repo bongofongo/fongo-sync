@@ -1733,7 +1733,8 @@ impl Replica {
     /// the two entities, so that it is later than that earliest clock. Such a clock is:
     ///
     /// - no earlier than the entity's first fact, so a replica given only what this sends places
-    ///   the entity in the same collection at the same first clock as this one;
+    ///   the entity in the same collection, at the same first clock as this one where that first
+    ///   fact is sent too, as it is unless a later change to its field replaced it;
     /// - one per alias, so two aliases on one entity are two changes, which a replica that lacks
     ///   the collection keeps both of;
     /// - on a node no replica writes as, so it never meets another change at its clock and is

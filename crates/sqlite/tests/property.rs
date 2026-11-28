@@ -160,13 +160,26 @@ impl Peer {
         seed: u64,
         step: Option<Option<usize>>,
     ) -> Peer {
+        Peer::new_on(world, n, schema, rows, seed, step, registry(false)).await
+    }
+
+    /// [`Peer::new`] on another registry.
+    async fn new_on(
+        world: &World,
+        n: u64,
+        schema: &[&str],
+        rows: &[&str],
+        seed: u64,
+        step: Option<Option<usize>>,
+        registry: Registry,
+    ) -> Peer {
         let mut conn = world.connect(n).await;
         for sql in schema.iter().chain(rows) {
             sqlx::query(sql).execute(&mut conn).await.unwrap();
         }
         let mut peer = Peer {
             conn,
-            replica: Replica::new(registry(false)),
+            replica: Replica::new(registry),
             step: step.unwrap_or(match std::env::var("PROPERTY_STEP").as_deref() {
                 Ok("whole") => None,
                 Ok(rows) => rows.parse().ok(),
@@ -1411,6 +1424,59 @@ async fn resent_shows_the_same(
             }
         }
     }
+    // What is resent is every entry the kernel keeps, as `Replica::resend` says: for each field,
+    // as many changes as it keeps entries, of collections the registry has or lacks.
+    let mut kept: std::collections::BTreeMap<(String, Gid, String), i64> = Default::default();
+    for table in ["fongo_shadow", "fongo_foreign"] {
+        let rows: Vec<(String, Vec<u8>, String, i64)> = sqlx::query_as(&format!(
+            "SELECT collection, gid, field, count(*) FROM {table} GROUP BY collection, gid, field"
+        ))
+        .fetch_all(&mut from.conn)
+        .await
+        .unwrap();
+        for (collection, gid, field, n) in rows {
+            let gid = Gid::from_slice(&gid).unwrap();
+            *kept.entry((collection, gid, field)).or_default() += n;
+        }
+    }
+    // Aliases in a collection the registry has are kept apart, without a clock.
+    let known: BTreeSet<String> = from
+        .replica
+        .registry()
+        .collections()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let mut sent_of: std::collections::BTreeMap<(String, Gid, String), i64> = Default::default();
+    for c in resent
+        .iter()
+        .filter(|c| c.field != "$alias" || !known.contains(&c.collection))
+    {
+        *sent_of
+            .entry((c.collection.clone(), c.gid, c.field.clone()))
+            .or_default() += 1;
+    }
+    if kept != sent_of {
+        let differ: Vec<_> = kept
+            .iter()
+            .filter(|(k, n)| sent_of.get(*k) != Some(n))
+            .chain(sent_of.iter().filter(|(k, n)| kept.get(*k) != Some(n)))
+            .collect();
+        return Err(format!("resent other entries than are kept: {differ:?}"));
+    }
+    // A sender whose registry lacks the series keeps their changes for a later version; it and
+    // every receiver are then compared on that later version.
+    let older = !from
+        .replica
+        .registry()
+        .collections()
+        .iter()
+        .any(|c| c.name == "series");
+    let target = from.upgraded || older;
+    if older {
+        from.replica = Replica::new(registry(true));
+        from.replica.install(&mut from.conn).await.unwrap();
+    }
     let want = shown(&mut from.conn, &from.replica).await;
     let registry_of = |upgraded| Replica::new(registry(upgraded));
     let no_shared = |applied: &fongo_sync_sqlite::Applied, who: &str| {
@@ -1421,11 +1487,16 @@ async fn resent_shows_the_same(
     };
 
     *databases += 1;
-    let mut fresh = Peer::new(&from.world, *databases, schema, &[], seed, Some(None)).await;
-    if from.upgraded {
-        fresh.replica = registry_of(true);
-        fresh.replica.install(&mut fresh.conn).await.unwrap();
-    }
+    let mut fresh = Peer::new_on(
+        &from.world,
+        *databases,
+        schema,
+        &[],
+        seed,
+        Some(None),
+        registry(target),
+    )
+    .await;
     let applied = fresh
         .replica
         .apply(&mut fresh.conn, &outbox.changes)
@@ -1434,6 +1505,7 @@ async fn resent_shows_the_same(
     no_shared(&applied, "a new replica")?;
     let got = shown(&mut fresh.conn, &fresh.replica).await;
     same_rows(&want, &got, "a new replica")?;
+    same_facts(&mut from, &mut fresh, &want, &got).await?;
     if got.1.is_empty() {
         support::settled(&mut fresh.conn, &fresh.replica, &outbox.changes)
             .await
@@ -1449,7 +1521,7 @@ async fn resent_shows_the_same(
     older.install(&mut old).await.unwrap();
     let applied = older.apply(&mut old, &outbox.changes).await.unwrap();
     no_shared(&applied, "a replica of an older version")?;
-    let upgraded = registry_of(from.upgraded);
+    let upgraded = registry_of(target);
     upgraded.install(&mut old).await.unwrap();
     let applied = upgraded.apply(&mut old, &[]).await.unwrap();
     no_shared(&applied, "a replica of an older version, upgraded")?;
@@ -1460,11 +1532,16 @@ async fn resent_shows_the_same(
     )?;
 
     *databases += 1;
-    let mut holding = Peer::new(&from.world, *databases, schema, &[], seed, Some(None)).await;
-    if from.upgraded {
-        holding.replica = registry_of(true);
-        holding.replica.install(&mut holding.conn).await.unwrap();
-    }
+    let mut holding = Peer::new_on(
+        &from.world,
+        *databases,
+        schema,
+        &[],
+        seed,
+        Some(None),
+        registry(target),
+    )
+    .await;
     holding
         .replica
         .apply(&mut holding.conn, &from.taken)
@@ -1484,9 +1561,87 @@ async fn resent_shows_the_same(
     Ok(())
 }
 
+/// `got` keeps what `want` keeps: the winning entry of every field, the groups of entities found to
+/// be one, and who made each entity it shows, but for entities either holds back.
+async fn same_facts(
+    want_peer: &mut Peer,
+    got_peer: &mut Peer,
+    want: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    got: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+) -> Result<(), String> {
+    let a = want_peer
+        .replica
+        .inspect(&mut want_peer.conn)
+        .await
+        .unwrap();
+    let b = got_peer.replica.inspect(&mut got_peer.conn).await.unwrap();
+    let registers = |i: &fongo_sync_sqlite::Inspection| {
+        i.registers
+            .iter()
+            .map(|(c, g, f, v, k)| format!("{c} {g:?} {f} {v:?} {k:?}"))
+            .collect::<BTreeSet<_>>()
+    };
+    let (ra, rb) = (registers(&a), registers(&b));
+    if ra != rb {
+        return Err(format!(
+            "a new replica keeps other entries: only the sender's {:#?}, only its own {:#?}",
+            ra.difference(&rb).collect::<Vec<_>>(),
+            rb.difference(&ra).collect::<Vec<_>>()
+        ));
+    }
+    let groups =
+        |i: &fongo_sync_sqlite::Inspection| i.aliases.iter().cloned().collect::<BTreeSet<_>>();
+    if groups(&a) != groups(&b) {
+        return Err(format!(
+            "a new replica groups other entities: {:?} against {:?}",
+            groups(&a),
+            groups(&b)
+        ));
+    }
+    for (collection, rows) in &want.0.collections {
+        for gid in rows.keys() {
+            let at = (collection.clone(), *gid);
+            if want.1.contains(&at) || got.1.contains(&at) {
+                continue;
+            }
+            // Which replica made an entity differs on purpose; whether one did, or it was adopted,
+            // does not.
+            let kind = |m: Option<fongo_sync_sqlite::Made>| match m {
+                Some(fongo_sync_sqlite::Made::Here | fongo_sync_sqlite::Made::Elsewhere) => {
+                    "made".to_string()
+                }
+                other => format!("{other:?}"),
+            };
+            let x = want_peer
+                .replica
+                .made(&mut want_peer.conn, collection, *gid)
+                .await
+                .unwrap();
+            let y = got_peer
+                .replica
+                .made(&mut got_peer.conn, collection, *gid)
+                .await
+                .unwrap();
+            if kind(x) != kind(y) {
+                return Err(format!(
+                    "made differs for {collection} {gid:?}: the sender {x:?}, a new replica {y:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Three replicas each make one shelf of one name; each pair of them is found to be one by a
-/// replica of its own, and replica 1 takes all of it. The entity with the greatest id is written
-/// an alias to each of the two others, so replica 1 holds an entity with two aliases.
+/// replica of its own, and replica 1 takes all of it and renames the shelf. The entity with the
+/// greatest id is written an alias to each of the two others, so replica 1 holds an entity with
+/// two aliases.
 fn two_aliases_first() -> Vec<(usize, Op)> {
     use Op::*;
     vec![
@@ -1504,10 +1659,19 @@ fn two_aliases_first() -> Vec<(usize, Op)> {
         (4, Push),
         (0, Log(2, false)),
         (0, Push),
+        // A series, unknown to replica 1 where its registry is the older one, and a setting two
+        // replicas make apart, so its key is kept with two clocks.
+        (0, AddSeries(0, 0)),
+        (0, SetSetting(0, 0)),
+        (0, Push),
+        (2, SetSetting(0, 1)),
+        (2, Push),
         (1, Log(0, false)),
         (1, Log(2, false)),
         (1, Log(3, false)),
         (1, Log(4, false)),
+        // The shelf found to be one is renamed, so its identity no longer joins its members.
+        (1, RenameShelf(0, 1)),
     ]
 }
 
@@ -1521,12 +1685,31 @@ fn run_resending(seed: u64, every: u64, back: u64, script: &[(usize, Op)]) -> Re
         let world = World::stepping_back(seed, every, back);
         let mut hub = Vec::new();
         let mut peers = Vec::new();
+        // One script in two, replica 1 is of a version without the series.
+        let older = seed.is_multiple_of(2);
         for n in 0..5 {
-            peers.push(Peer::new(&world, n, SCHEMA, &[], seed, None).await);
+            let registry = match n == 1 && older {
+                true => older_registry(),
+                false => registry(false),
+            };
+            peers.push(Peer::new_on(&world, n, SCHEMA, &[], seed, None, registry).await);
         }
         let mut databases = 5;
         let steps = two_aliases_first().into_iter().chain(script.iter().cloned());
         for (step, (who, op)) in steps.enumerate() {
+            // A replica of the older version writes nothing its registry lacks: its upgrade would
+            // adopt such rows as its own, which no resend made before it could carry.
+            let unknown = matches!(
+                op,
+                Op::AddSeries(..)
+                    | Op::SetSeriesCode(..)
+                    | Op::AddVolume(..)
+                    | Op::SetExtra(..)
+                    | Op::Upgrade
+            );
+            if older && who == 1 && unknown {
+                continue;
+            }
             perform(&mut peers[who], op, &mut hub)
                 .await
                 .map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
@@ -1598,7 +1781,6 @@ fn cases() -> u32 {
         .unwrap_or(32)
 }
 
-/// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
 /// Cases of the resend property: fewer than [`cases`] by default, as each resends and builds three
 /// replicas more; `PROPTEST_CASES` sets both.
 fn resend_cases() -> u32 {
@@ -1608,6 +1790,7 @@ fn resend_cases() -> u32 {
     }
 }
 
+/// Half as many cases for databases that share a node, unless `PROPTEST_CASES` asks for more.
 fn sharing_cases() -> u32 {
     match std::env::var("PROPTEST_CASES") {
         Ok(_) => cases(),
