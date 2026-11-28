@@ -1246,11 +1246,11 @@ fn run_back(
             done.map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
             agree(&peers, who).map_err(|e| format!("after step {step}, peer {who}: {e}"))?;
         }
-        for (who, peer) in peers.iter_mut().enumerate() {
-            resent_shows_the_same(peer, schema, seed, &mut databases)
-                .await
-                .map_err(|e| format!("peer {who} resending what it holds: {e}"))?;
-        }
+        // One replica a script, as the seed picks: each check makes four databases more.
+        let who = (seed % peers.len() as u64) as usize;
+        resent_shows_the_same(&mut peers[who], schema, seed, copied, &mut databases)
+            .await
+            .map_err(|e| format!("peer {who} resending what it holds: {e}"))?;
         finish(&mut peers, &mut hub)
             .await
             .map_err(|e| format!("while exchanging everything: {e}"))?;
@@ -1259,12 +1259,107 @@ fn run_back(
     outcome.map_err(|e| format!("{e}\n\n{}", reproduction(found, seed, every, back, script)))
 }
 
-/// A copy of `peer`'s database collects what was written and resends everything it holds; a new
-/// replica that takes only that must show the same rows, but for entities either holds back.
+/// The registry of a version older than [`registry`]`(false)`: without the series and their
+/// volumes, whose changes it keeps for a later version.
+fn older_registry() -> Registry {
+    let collections = registry(false)
+        .collections()
+        .iter()
+        .filter(|c| c.name != "series" && c.name != "volumes")
+        .cloned()
+        .collect();
+    Registry::new(collections).unwrap()
+}
+
+/// A replica's rows and what it holds back, by canonical gid in its own groups.
+async fn shown(
+    conn: &mut SqliteConnection,
+    replica: &Replica,
+) -> (
+    fongo_sync_sqlite::core::model::View,
+    BTreeSet<(String, Gid)>,
+) {
+    let kernel = support::read(conn, replica).await;
+    let held = kernel
+        .pending
+        .iter()
+        .map(|(c, g)| (c.clone(), kernel.canonical(c, *g)))
+        .collect();
+    (kernel.view, held)
+}
+
+/// Rows `got` shows as `want` does, but for entities `want` holds back and rows naming them, and
+/// holds back nothing else.
+fn same_rows(
+    want: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    got: &(
+        fongo_sync_sqlite::core::model::View,
+        BTreeSet<(String, Gid)>,
+    ),
+    who: &str,
+) -> Result<(), String> {
+    // What `want` holds back, and every entity whose row there names one of those, which waits
+    // on it where its row is written afresh.
+    let mut held = want.1.clone();
+    loop {
+        let naming: Vec<(String, Gid)> = want
+            .0
+            .collections
+            .iter()
+            .flat_map(|(collection, rows)| {
+                rows.iter().map(move |(gid, row)| (collection, gid, row))
+            })
+            .filter(|(collection, gid, row)| {
+                !held.contains(&((*collection).clone(), **gid))
+                    && row.values().any(|v| {
+                        matches!(v, fongo_sync_sqlite::core::Value::Ref(to)
+                            if held.iter().any(|(_, g)| g == to))
+                    })
+            })
+            .map(|(collection, gid, _)| (collection.clone(), *gid))
+            .collect();
+        if naming.is_empty() {
+            break;
+        }
+        held.extend(naming);
+    }
+    if !got.1.is_subset(&held) {
+        return Err(format!(
+            "{who} holds back {:?}, the sender {:?}",
+            got.1, want.1
+        ));
+    }
+    let strip = |view: &fongo_sync_sqlite::core::model::View| {
+        let mut view = view.clone();
+        for (collection, rows) in view.collections.iter_mut() {
+            rows.retain(|gid, _| !held.contains(&(collection.clone(), *gid)));
+        }
+        view.collections.retain(|_, rows| !rows.is_empty());
+        view
+    };
+    if strip(&want.0) != strip(&got.0) {
+        return Err(format!(
+            "{who} shows other rows:\n{:#?}\n{:#?}",
+            want.0, got.0
+        ));
+    }
+    Ok(())
+}
+
+/// A copy of `peer`'s database collects what was written and resends everything it holds. Where
+/// no database was copied, no two resent changes share a field and clock with different values,
+/// and no replica taking them reports a shared node. A new replica given only them, one of an
+/// older version given them and then upgraded, and one that held what `peer` took before taking
+/// them, each show `peer`'s rows and hold back nothing it does not, but rows that name what it holds
+/// back, which wait on them; the new one, when it holds back nothing, is settled.
 async fn resent_shows_the_same(
     peer: &mut Peer,
     schema: &[&str],
     seed: u64,
+    copied: bool,
     databases: &mut u64,
 ) -> Result<(), String> {
     *databases += 1;
@@ -1282,38 +1377,92 @@ async fn resent_shows_the_same(
             outbox.changes.len() - before.changes.len()
         ));
     }
+    let resent = &outbox.changes[before.changes.len()..];
+    if !copied {
+        let mut at: std::collections::BTreeMap<
+            (&str, Gid, &str, fongo_sync_sqlite::core::Hlc),
+            &fongo_sync_sqlite::core::Value,
+        > = Default::default();
+        for c in resent {
+            if let Some(other) = at.insert((&c.collection, c.gid, &c.field, c.clock), &c.value)
+                && other.total_cmp(&c.value) != std::cmp::Ordering::Equal
+            {
+                return Err(format!(
+                    "two resent changes share a clock: {c:?} and {other:?}"
+                ));
+            }
+        }
+    }
+    let want = shown(&mut from.conn, &from.replica).await;
+    let registry_of = |upgraded| Replica::new(registry(upgraded));
+    let no_shared = |applied: &fongo_sync_sqlite::Applied, who: &str| {
+        if !copied && !applied.shared.is_empty() {
+            return Err(format!("{who} reports shared nodes {:?}", applied.shared));
+        }
+        Ok(())
+    };
+
     *databases += 1;
     let mut fresh = Peer::new(&from.world, *databases, schema, &[], seed, Some(None)).await;
     if from.upgraded {
-        fresh.upgraded = true;
-        fresh.replica = Replica::new(registry(true));
+        fresh.replica = registry_of(true);
         fresh.replica.install(&mut fresh.conn).await.unwrap();
     }
-    fresh
+    let applied = fresh
         .replica
         .apply(&mut fresh.conn, &outbox.changes)
         .await
         .unwrap();
-    let mut shown = support::read(&mut from.conn, &from.replica).await;
-    let mut taken = support::read(&mut fresh.conn, &fresh.replica).await;
-    let held: BTreeSet<(String, Gid)> = shown
-        .pending
-        .iter()
-        .chain(&taken.pending)
-        .map(|(c, g)| (c.clone(), shown.canonical(c, *g)))
-        .collect();
-    for view in [&mut shown.view, &mut taken.view] {
-        for (collection, rows) in view.collections.iter_mut() {
-            rows.retain(|gid, _| !held.contains(&(collection.clone(), *gid)));
-        }
-        view.collections.retain(|_, rows| !rows.is_empty());
+    no_shared(&applied, "a new replica")?;
+    let got = shown(&mut fresh.conn, &fresh.replica).await;
+    same_rows(&want, &got, "a new replica")?;
+    if got.1.is_empty() {
+        support::settled(&mut fresh.conn, &fresh.replica, &outbox.changes)
+            .await
+            .map_err(|e| format!("a new replica given what was resent: {e}"))?;
     }
-    if shown.view != taken.view {
-        return Err(format!(
-            "a replica given only what was resent shows other rows:\n{:#?}\n{:#?}",
-            shown.view, taken.view
-        ));
+
+    *databases += 1;
+    let mut old = from.world.connect(*databases).await;
+    for sql in schema {
+        sqlx::query(sql).execute(&mut old).await.unwrap();
     }
+    let older = Replica::new(older_registry());
+    older.install(&mut old).await.unwrap();
+    let applied = older.apply(&mut old, &outbox.changes).await.unwrap();
+    no_shared(&applied, "a replica of an older version")?;
+    let upgraded = registry_of(from.upgraded);
+    upgraded.install(&mut old).await.unwrap();
+    let applied = upgraded.apply(&mut old, &[]).await.unwrap();
+    no_shared(&applied, "a replica of an older version, upgraded")?;
+    same_rows(
+        &want,
+        &shown(&mut old, &upgraded).await,
+        "a replica of an older version, upgraded",
+    )?;
+
+    *databases += 1;
+    let mut holding = Peer::new(&from.world, *databases, schema, &[], seed, Some(None)).await;
+    if from.upgraded {
+        holding.replica = registry_of(true);
+        holding.replica.install(&mut holding.conn).await.unwrap();
+    }
+    holding
+        .replica
+        .apply(&mut holding.conn, &from.taken)
+        .await
+        .unwrap();
+    let applied = holding
+        .replica
+        .apply(&mut holding.conn, &outbox.changes)
+        .await
+        .unwrap();
+    no_shared(&applied, "a replica holding what was taken")?;
+    same_rows(
+        &want,
+        &shown(&mut holding.conn, &holding.replica).await,
+        "a replica holding what was taken",
+    )?;
     Ok(())
 }
 
