@@ -8,13 +8,32 @@
 //! queue and member lists compared, and in `order` rows, requirements and parkings looked at.
 //!
 //! - `affected` over a batch of B changes, then `target` of every pair it reports: work is at
-//!   most 512 + 8 · E · log2(E + 2) · max(D, 1)². E is B, plus the gids the changes name, the
-//!   pairs reported and the gids referring to a moved entity, plus what deciding each distinct
-//!   group these fall in, before and after, reads by the model's groups: the gids of the group
-//!   and of every group its natural keys reach, and for each distinct key among them, read
-//!   through the groups, the product of the sizes of the groups it names. D is the most natural
-//!   collections a chain of natural keys passes through (its cost grows about as the square of
-//!   that depth).
+//!   most 512 + 8 · E · log2(E + 2) · max(D, 1)². D is the most natural collections a chain of
+//!   natural keys passes through (its cost grows about as the square of that depth). E is B,
+//!   plus the gids the changes name, the pairs reported and the gids referring to a moved
+//!   entity, plus what the source answers when asked for those referrers, plus what deciding
+//!   each distinct group these fall in, before and after, reads (`reach`).
+//!
+//!   Deciding a group reads, by the model's groups and the facts the source keeps:
+//!   - the gids of the group and of every group reached from it through natural keys (read for
+//!     congruence) and owners (read for liveness, of every member of every group reached), and
+//!     through the group's own references (read once each for its row, as a canonical gid of a
+//!     live group);
+//!   - for each of those gids, its entries where it is kept and its aliases, each alias once;
+//!   - for each alias, the entries of the gid at its other end where that gid is kept in the
+//!     alias's collection, fetched to see whether the two join;
+//!   - for each distinct natural key among those gids, read through the groups, every key that
+//!     reads so: one lookup each, and the entries of the gid that key derives where it is kept
+//!     in the key's collection, fetched to see whether it holds that key.
+//!
+//!   Each term is a fact the source hands back or a question it is asked, each of constant
+//!   size: a gid's claims are one per collection of the schema. Each is owed: a source answers
+//!   for a gid's entries and aliases whole, and for every gid holding a value however it holds
+//!   it, so a peer can make any of them as long as it likes, and the evaluator must read them to
+//!   tell which matter. What it need not read it does not: the facts of a gid that holds a key
+//!   it does not derive, the aliases of one that cannot join, the group of a gid kept elsewhere
+//!   or holding a reference it does not keep; the tests named `read_nothing`, `read_no` and
+//!   `decide_no` keep that work flat as those facts grow.
 //!
 //!   An entity is moved when its collection, its canonical gid or whether its group has a live
 //!   member differs before and after the batch, and a gid refers to it when either model shows
@@ -49,7 +68,7 @@ use common::{Counting, Rng, random_changes, random_schema};
 use fongo_sync_core::eval::Evaluator;
 use fongo_sync_core::model::{self, ALIAS, Collection, FieldKind, Identity, Row, Schema};
 use fongo_sync_core::plan::{Columns, Planned, RowAction, order};
-use fongo_sync_core::source::{Body, Store, admit};
+use fongo_sync_core::source::{Body, Source, Store, admit};
 use fongo_sync_core::{Change, DELETED, Gid, Hlc, Strategy as Merge, Value, work};
 use proptest::prelude::*;
 
@@ -89,8 +108,13 @@ fn log2(x: f64) -> f64 {
     (x + 2.0).log2()
 }
 
-/// Runs `affected` over `batch` and `target` of everything it names, and checks the work.
-fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> Result<(), String> {
+/// Runs `affected` over `batch` and `target` of everything it names, checks the work and returns
+/// it.
+fn affected_within_bound(
+    schema: &Schema,
+    base: &[Change],
+    batch: &[Change],
+) -> Result<usize, String> {
     let ev = Evaluator::new(schema).unwrap();
     let before = store(schema, base);
     let mut after = before.clone();
@@ -100,14 +124,14 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
     work::take();
     let counting = Counting::new(&before);
     let Ok(found) = ev.affected(&counting, batch) else {
-        return Ok(());
+        return Err("affected is undetermined".into());
     };
     let mut done = counting.work.get() + work::take();
     let counting = Counting::new(&after);
     let mut session = ev.session(&counting);
     for (c, g) in &found {
         if session.target(c, *g).is_err() {
-            return Ok(());
+            return Err(format!("the target of {c} {g:?} is undetermined"));
         }
     }
     done += counting.work.get() + work::take();
@@ -128,7 +152,7 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
         }
     }
     named.extend(referrers(schema, &models));
-    let mut extent = batch.len() + named.len();
+    let mut extent = batch.len() + named.len() + holders(schema, &models, &after);
     let (mut was, mut will) = (ev.session(&before), ev.session(&after));
     let mut groups = BTreeSet::new();
     for (c, g) in &named {
@@ -136,7 +160,8 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
             if let Ok(t) = s.target(c, *g)
                 && groups.insert((when, c.clone(), t.canonical))
             {
-                extent += reach(schema, &models[when], &groups_of[when], t.canonical);
+                let kept = [&before, &after][when];
+                extent += reach(schema, &models[when], &groups_of[when], kept, t.canonical);
             }
         }
     }
@@ -157,16 +182,15 @@ fn affected_within_bound(schema: &Schema, base: &[Change], batch: &[Change]) -> 
             chain(schema)
         ));
     }
-    Ok(())
+    Ok(done)
 }
 
 /// The members of each group, by canonical gid.
 type Members = BTreeMap<Gid, Vec<Gid>>;
 
-/// Every gid that either model shows holding a reference to a moved entity in a reference, owner
-/// or natural key field, with its collection. An entity is moved when its collection, its
-/// canonical gid or whether a member of its group is live differs between the models.
-fn referrers(schema: &Schema, models: &[model::Merge; 2]) -> BTreeSet<(String, Gid)> {
+/// The entities whose collection, canonical gid or whether a member of its group is live
+/// differs between the models.
+fn moved(models: &[model::Merge; 2]) -> BTreeSet<Gid> {
     let live: Vec<BTreeSet<Gid>> = models
         .iter()
         .map(|m| {
@@ -185,12 +209,53 @@ fn referrers(schema: &Schema, models: &[model::Merge; 2]) -> BTreeSet<(String, G
             live[when].contains(&e.canonical),
         ))
     };
-    let moved: BTreeSet<Gid> = models
+    models
         .iter()
         .flat_map(|m| m.entities.keys())
         .filter(|x| read(0, x) != read(1, x))
         .copied()
-        .collect();
+        .collect()
+}
+
+/// The fields that hold a reference: reference, owner and natural key fields.
+fn referring(schema: &Schema) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for c in &schema.collections {
+        let key: &[String] = match &c.identity {
+            Identity::Natural(key) => key,
+            Identity::Minted => &[],
+        };
+        for f in &c.fields {
+            if matches!(f.kind, FieldKind::Reference(_) | FieldKind::Owner(_))
+                || key.contains(&f.name)
+            {
+                out.push((c.name.clone(), f.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// What the source answers when asked for the gids holding a reference to a moved entity: each
+/// gid it names, and the entries `after` holds for it where it is kept, read to see whether it
+/// keeps the reference.
+fn holders(schema: &Schema, models: &[model::Merge; 2], after: &Store) -> usize {
+    let mut n = 0;
+    for x in moved(models) {
+        for (c, f) in referring(schema) {
+            for y in after.holding(&c, &[(&f, &Value::Ref(x))]) {
+                let home = models[1].entities.get(&y).map(|e| e.collection.as_str());
+                n += 1 + home.map_or(0, |h| after.entries(h, y).len());
+            }
+        }
+    }
+    n
+}
+
+/// Every gid that either model shows holding a reference to a moved entity in a reference, owner
+/// or natural key field, with its collection.
+fn referrers(schema: &Schema, models: &[model::Merge; 2]) -> BTreeSet<(String, Gid)> {
+    let moved = moved(models);
     let mut found = BTreeSet::new();
     for m in models {
         for (y, e) in &m.entities {
@@ -223,53 +288,115 @@ fn members(merged: &model::Merge) -> Members {
     members
 }
 
-/// What deciding the group of `g` reads at least, by the model's groups: the gids of its group
-/// and of every group a natural key reaches from it, and for each distinct natural key among
-/// them, read through the groups, the product of the sizes of the groups it names.
-fn reach(schema: &Schema, merged: &model::Merge, members: &Members, g: Gid) -> usize {
+/// A natural key read through the groups, with its collection: a canonical gid or a value at
+/// each position.
+type Sign = (String, Vec<Result<Gid, String>>);
+
+/// What deciding the group of `g` reads at least, by the model's groups and the facts `kept`
+/// holds. The groups: `g`'s, every group a natural key or an owner reaches from it, read for
+/// congruence and liveness, and the groups `g`'s own references name, read for its row. For
+/// each gid of those groups, the entries `kept` holds for it where it is kept, and the aliases
+/// with it at either end, each once; for each alias, the entries of a gid at its other end kept
+/// in its collection, which is fetched to see whether it joins. For each distinct natural key
+/// among them, read through the groups, every key reading so: one lookup each, and the entries
+/// of the gid that key derives where it is kept in the key's collection.
+fn reach(schema: &Schema, merged: &model::Merge, members: &Members, kept: &Store, g: Gid) -> usize {
     let canonical = |x: Gid| merged.entities.get(&x).map_or(x, |e| e.canonical);
-    let size = |x: Gid| members.get(&x).map_or(1, Vec::len);
-    let mut seen = BTreeSet::from([canonical(g)]);
-    let mut todo = vec![canonical(g)];
-    let mut signs: BTreeSet<(String, Vec<Result<Gid, String>>)> = BTreeSet::new();
+    let home = |x: Gid| merged.entities.get(&x).map(|e| e.collection.as_str());
+    let of = |x: Gid| members.get(&x).cloned().unwrap_or_else(|| vec![x]);
+    let facts = |x: Gid| home(x).map_or(0, |c| kept.entries(c, x).len());
+    let start = canonical(g);
+    let mut seen = BTreeSet::from([start]);
+    let mut todo = vec![start];
+    let mut signs: BTreeMap<Sign, Vec<Value>> = BTreeMap::new();
     while let Some(group) = todo.pop() {
-        for m in members.get(&group).cloned().unwrap_or_default() {
-            let e = &merged.entities[&m];
-            let Some(Identity::Natural(key)) =
-                schema.collection(&e.collection).map(|c| &c.identity)
-            else {
+        for m in of(group) {
+            let Some(e) = merged.entities.get(&m) else {
                 continue;
             };
-            if !e.keyed {
+            let Some(c) = schema.collection(&e.collection) else {
                 continue;
-            }
-            let parts: Vec<Result<Gid, String>> = key
-                .iter()
-                .map(|f| match e.registers.get(f) {
-                    Some((Value::Ref(y), _)) => Ok(canonical(*y)),
-                    Some((v, _)) => Err(format!("{v:?}")),
-                    None => Err(String::new()),
-                })
-                .collect();
-            for y in parts.iter().flatten() {
-                if seen.insert(*y) {
-                    todo.push(*y);
+            };
+            let mut next = Vec::new();
+            for f in &c.fields {
+                let follows = match f.kind {
+                    FieldKind::Owner(_) => true,
+                    FieldKind::Reference(_) => group == start,
+                    FieldKind::Plain => false,
+                };
+                if let (true, Some((Value::Ref(y), _))) = (follows, e.registers.get(&f.name)) {
+                    next.push(canonical(*y));
                 }
             }
-            signs.insert((e.collection.clone(), parts));
+            if let (Identity::Natural(key), true) = (&c.identity, e.keyed) {
+                let values: Vec<Value> = key
+                    .iter()
+                    .map(|f| e.registers.get(f).map_or(Value::Null, |(v, _)| v.clone()))
+                    .collect();
+                let parts: Vec<Result<Gid, String>> = values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Ref(y) => Ok(canonical(*y)),
+                        v => Err(format!("{v:?}")),
+                    })
+                    .collect();
+                next.extend(parts.iter().flatten());
+                signs.entry((e.collection.clone(), parts)).or_insert(values);
+            }
+            for y in next {
+                if seen.insert(y) {
+                    todo.push(y);
+                }
+            }
         }
     }
-    let gids: usize = seen.iter().map(|&x| size(x)).sum();
-    let lookups: usize = signs
+    let counted: BTreeSet<Gid> = seen.iter().flat_map(|&x| of(x)).collect();
+    let entries: usize = counted.iter().map(|&m| facts(m)).sum();
+    let aliases: BTreeSet<(String, Gid, Gid)> = counted
         .iter()
-        .map(|(_, parts)| {
-            parts
-                .iter()
-                .flatten()
-                .fold(1usize, |n, &y| n.saturating_mul(size(y)))
-        })
-        .sum();
-    gids + lookups
+        .flat_map(|&m| kept.aliases(m))
+        .map(|a| (a.collection, a.from, a.to))
+        .collect();
+    let neighbours: BTreeSet<Gid> = aliases
+        .iter()
+        .flat_map(|(c, from, to)| [(c, *from), (c, *to)])
+        .filter(|(c, x)| !counted.contains(x) && home(*x) == Some(c.as_str()))
+        .map(|(_, x)| x)
+        .collect();
+    let neighbours: usize = neighbours.iter().map(|&x| 1 + facts(x)).sum();
+    let mut lookups = 0usize;
+    for ((c, parts), values) in &signs {
+        let lists: Vec<Vec<Value>> = parts
+            .iter()
+            .zip(values)
+            .map(|(p, v)| match p {
+                Ok(y) => of(*y).into_iter().map(Value::Ref).collect(),
+                Err(_) => vec![v.clone()],
+            })
+            .collect();
+        let n = lists.iter().fold(1usize, |n, l| n.saturating_mul(l.len()));
+        lookups = lookups.saturating_add(n);
+        if n > 1 << 18 {
+            continue;
+        }
+        let mut at = vec![0; lists.len()];
+        'keys: loop {
+            let key: Vec<Value> = lists.iter().zip(&at).map(|(l, &i)| l[i].clone()).collect();
+            let z = Gid::derive(c, &key);
+            if !counted.contains(&z) && home(z) == Some(c.as_str()) {
+                lookups += 1 + facts(z);
+            }
+            for d in (0..lists.len()).rev() {
+                at[d] += 1;
+                if at[d] < lists[d].len() {
+                    continue 'keys;
+                }
+                at[d] = 0;
+            }
+            break;
+        }
+    }
+    counted.len() + entries + aliases.len() + neighbours + lookups
 }
 
 /// The most natural collections a chain of natural keys passes through, each keyed on a
@@ -1034,8 +1161,13 @@ proptest! {
         n in 1u32..600,
     ) {
         let (schema, base, batch) = shape(kind, n);
-        if let Err(e) = affected_within_bound(&schema, &base, &batch) {
-            prop_assert!(false, "shape {}: {e}", kind % SHAPES);
+        // `aliased_labels` asks n² lookups, past `Limits::lookups` beyond 512 items.
+        let gives_up = kind % SHAPES == 7 && n > 512;
+        match affected_within_bound(&schema, &base, &batch) {
+            Err(e) if gives_up => prop_assert!(e.contains("undetermined"), "shape 7: {e}"),
+            Ok(_) if gives_up => prop_assert!(false, "shape 7 at {n} items is decided"),
+            Err(e) => prop_assert!(false, "shape {}: {e}", kind % SHAPES),
+            Ok(_) => {}
         }
     }
 
@@ -1058,11 +1190,407 @@ proptest! {
 }
 
 /// The gids referring to a moved entity are decided again however little the batch changes, so
-/// the bound counts them: here a batch of one change makes `n` tags be decided again.
+/// the bound counts them: here a batch of one change makes `n` tags be decided again. At the
+/// largest `n`, work quadratic in the gids referring to the entity is several times the bound,
+/// though at 300 it is within it.
 #[test]
 fn affected_and_targets_count_the_gids_referring_to_a_moved_entity() {
-    for n in [1, 20, 300] {
+    for n in [1, 20, 300, 3_000] {
         let (schema, base, batch) = shape(13, n);
         affected_within_bound(&schema, &base, &batch).unwrap();
     }
+}
+
+/// An alias that a gid kept in one collection writes in another joins nothing, so the model's
+/// group of the gid it names holds that gid alone. Deciding it should then read nothing of the
+/// group the aliasing gid has in its own collection, however large: here one field of the named
+/// gid is edited, and the aliasing gid is merged with `n` others in its own collection.
+#[test]
+fn affected_and_targets_read_no_group_through_an_alias_its_writer_is_not_kept_in() {
+    flat(|n| {
+        let (x, y) = (wide(1), wide(2));
+        let mut base = vec![
+            change("a", x, "p", Value::Int(0), 1, 0),
+            change("d", y, "p", Value::Int(0), 1, 0),
+            change("a", y, ALIAS, Value::Ref(x), 2, 0),
+        ];
+        for i in 0..n {
+            let z = wide(100 + i);
+            let prev = if i == 0 { y } else { wide(99 + i) };
+            base.push(change("d", z, "p", Value::Int(0), 1, i));
+            base.push(change("d", z, ALIAS, Value::Ref(prev), 1, i));
+        }
+        (
+            two_collections(),
+            base,
+            vec![change("a", x, "p", Value::Int(1), 3, 0)],
+        )
+    });
+}
+
+fn two_collections() -> Schema {
+    Schema::new(vec![
+        Collection::minted("a").plain("p", Merge::Lww),
+        Collection::minted("d").plain("p", Merge::Lww),
+    ])
+}
+
+/// Checks the work of `shape(n)` against the bound for every `n`, and that it does not grow.
+fn flat(shape: impl Fn(u32) -> (Schema, Vec<Change>, Vec<Change>)) {
+    let works: Vec<usize> = [1, 100, 1_000, 5_000]
+        .into_iter()
+        .map(|n| {
+            let (schema, base, batch) = shape(n);
+            affected_within_bound(&schema, &base, &batch).unwrap()
+        })
+        .collect();
+    assert!(works.iter().all(|&w| w > 0 && w == works[0]), "{works:?}");
+}
+
+/// A gid kept in `d`, aliased there by `n` others or aliasing `n` others itself, writes an alias
+/// to `x` in `a`, or `n` gids of `a` write aliases to it; then one field of `x` is edited. None
+/// of these aliases joins `x` with anything, and deciding `x` reads none of them.
+#[test]
+fn affected_and_targets_read_nothing_of_a_hub_kept_elsewhere() {
+    let (x, y) = (wide(1), wide(2));
+    let edit = || vec![change("a", x, "p", Value::Int(1), 3, 0)];
+    let hub = |n: u32, written_by_hub: bool| {
+        let mut base = vec![
+            change("a", x, "p", Value::Int(0), 1, 0),
+            change("d", y, "p", Value::Int(0), 1, 0),
+            change("a", y, ALIAS, Value::Ref(x), 2, 0),
+        ];
+        for i in 0..n {
+            let z = wide(100 + i);
+            base.push(change("d", z, "p", Value::Int(0), 1, i));
+            base.push(if written_by_hub {
+                change("d", y, ALIAS, Value::Ref(z), 1, i)
+            } else {
+                change("d", z, ALIAS, Value::Ref(y), 1, i)
+            });
+        }
+        (two_collections(), base, edit())
+    };
+    flat(|n| hub(n, false));
+    flat(|n| hub(n, true));
+    flat(|n| {
+        let mut base = vec![
+            change("a", x, "p", Value::Int(0), 1, 0),
+            change("d", y, "p", Value::Int(0), 0, 0),
+            change("a", x, ALIAS, Value::Ref(y), 2, 0),
+        ];
+        for i in 0..n {
+            let z = wide(100 + i);
+            base.push(change("a", z, "p", Value::Int(0), 1, i));
+            base.push(change("a", z, ALIAS, Value::Ref(y), 1, i));
+        }
+        (two_collections(), base, edit())
+    });
+}
+
+/// A source answers for a gid's aliases in every collection, though only those of the collection
+/// it is kept in can join it, so the bound counts them: here `n` gids kept in `d` write aliases to
+/// `x` in `a`, or `x` writes `n` aliases in `d`, and one field of `x` is edited.
+#[test]
+fn affected_and_targets_count_the_aliases_a_decided_gid_holds() {
+    let x = wide(1);
+    for n in [1, 100, 1_000, 5_000] {
+        for written_by_x in [false, true] {
+            let mut base = vec![change("a", x, "p", Value::Int(0), 1, 0)];
+            for i in 0..n {
+                let y = wide(100 + i);
+                base.push(change("d", y, "p", Value::Int(0), 1, i));
+                base.push(if written_by_x {
+                    change("d", x, ALIAS, Value::Ref(y), 2, i)
+                } else {
+                    change("a", y, ALIAS, Value::Ref(x), 2, i)
+                });
+            }
+            let batch = vec![change("a", x, "p", Value::Int(1), 3, 0)];
+            affected_within_bound(&two_collections(), &base, &batch).unwrap();
+        }
+    }
+}
+
+/// One field edited of one item of a merged group. At the largest `n`, work quadratic in the
+/// group's size is several times the bound; at the expensive shapes' sizes it is near it.
+#[test]
+fn affected_and_targets_decide_a_large_merged_group_in_work_linear_in_it() {
+    for n in [3_000, 300, 1] {
+        let (schema, base, batch) = shape(9, n);
+        affected_within_bound(&schema, &base, &batch).unwrap();
+    }
+}
+
+/// `a`, `d`, and `t` keyed by a reference to `a` and a number, with a plain field `v`; and the
+/// gid of the `t` keyed by `x` and 0 with the changes that make it.
+fn keyed_on_a() -> (Schema, Gid, Vec<Change>) {
+    let schema = Schema::new(vec![
+        Collection::minted("a").plain("p", Merge::Lww),
+        Collection::minted("d").plain("p", Merge::Lww),
+        Collection::natural("t", &["up", "k"])
+            .reference("up", "a")
+            .plain("k", Merge::Lww)
+            .plain("v", Merge::Lww),
+    ]);
+    let x = wide(1);
+    let key = [Value::Ref(x), Value::Int(0)];
+    let t1 = Gid::derive("t", &key);
+    let base = vec![
+        change("a", x, "p", Value::Int(0), 1, 0),
+        change("t", t1, "up", key[0].clone(), 1, 0),
+        change("t", t1, "k", key[1].clone(), 1, 1),
+    ];
+    (schema, t1, base)
+}
+
+/// Writes `up` = `x` and `k` = 0 to `z` in `t`, the key `t1` holds, at a clock after `t1`'s.
+fn same_key(z: Gid, i: u32) -> [Change; 2] {
+    [
+        change("t", z, "up", Value::Ref(wide(1)), 2, i),
+        change("t", z, "k", Value::Int(0), 2, i),
+    ]
+}
+
+/// Gids that hold the values of a natural key without being the gid that key derives join
+/// nothing, whether they are kept in the key's collection or elsewhere and however many aliases
+/// they hold, so deciding the entity that key derives reads none of them: one gid holding the
+/// key with `n` aliases in `d` or in `t`, `n` gids kept in `t` holding it, or `n` gids kept in
+/// `d` holding it, and one field of the entity edited.
+#[test]
+fn affected_and_targets_read_nothing_of_gids_holding_a_key_they_do_not_derive() {
+    let edit = |t1: Gid| vec![change("t", t1, "v", Value::Int(1), 3, 0)];
+    for aliased_in in ["d", "t"] {
+        flat(|n| {
+            let (schema, t1, mut base) = keyed_on_a();
+            let z = wide(3);
+            base.extend(same_key(z, 0));
+            for i in 0..n {
+                let y = wide(100 + i);
+                base.push(change(aliased_in, y, "p", Value::Int(0), 1, i));
+                base.push(change(aliased_in, y, ALIAS, Value::Ref(z), 2, i));
+            }
+            (schema, base, edit(t1))
+        });
+    }
+    for kept_in in ["t", "d"] {
+        flat(|n| {
+            let (schema, t1, mut base) = keyed_on_a();
+            for i in 0..n {
+                let y = wide(100 + i);
+                base.push(change(kept_in, y, "p", Value::Int(0), 1, i));
+                base.extend(same_key(y, i));
+            }
+            (schema, base, edit(t1))
+        });
+    }
+}
+
+/// Gids that hold a reference to an entity in a field of a collection they are not kept in,
+/// or in a key field whose key is not theirs, read nothing of it, so when the entity is deleted
+/// none of them is decided again: one such gid merged with `n` others where it is kept.
+#[test]
+fn affected_and_targets_decide_no_gid_holding_a_reference_it_does_not_keep() {
+    let keyed = |up: Gid, i: u32| {
+        let key = [Value::Ref(up), Value::Int(0)];
+        let g = Gid::derive("t", &key);
+        (
+            g,
+            [
+                change("t", g, "up", key[0].clone(), 1, i),
+                change("t", g, "k", key[1].clone(), 1, i),
+            ],
+        )
+    };
+    for kept_in_d in [true, false] {
+        flat(|n| {
+            let (schema, _, mut base) = keyed_on_a();
+            let y = if kept_in_d {
+                let y = wide(3);
+                base.push(change("d", y, "p", Value::Int(0), 1, 0));
+                y
+            } else {
+                let (y, made) = keyed(wide(2), 0);
+                base.extend(made);
+                y
+            };
+            base.push(change("t", y, "up", Value::Ref(wide(1)), 2, 0));
+            let home = if kept_in_d { "d" } else { "t" };
+            for i in 0..n {
+                let z = if kept_in_d {
+                    let z = wide(100 + i);
+                    base.push(change("d", z, "p", Value::Int(0), 1, i));
+                    z
+                } else {
+                    let (z, made) = keyed(wide(100_000 + i), i);
+                    base.extend(made);
+                    z
+                };
+                base.push(change(home, z, ALIAS, Value::Ref(y), 1, i));
+            }
+            (
+                schema,
+                base,
+                vec![change("a", wide(1), DELETED, Value::Int(1), 3, 0)],
+            )
+        });
+    }
+}
+
+/// Facts the source answers for though the model shows nothing of them, each read once:
+/// `n` gids kept in `d` holding a reference in `t` to an entity that is deleted, and `n`
+/// undeclared fields of an entity one of whose fields is edited.
+#[test]
+fn affected_and_targets_count_the_facts_the_source_answers_with() {
+    for n in [1, 100, 1_000, 5_000] {
+        let (schema, _, mut base) = keyed_on_a();
+        for i in 0..n {
+            let y = wide(100 + i);
+            base.push(change("d", y, "p", Value::Int(0), 1, i));
+            base.push(change("t", y, "up", Value::Ref(wide(1)), 2, i));
+        }
+        let batch = vec![change("a", wide(1), DELETED, Value::Int(1), 3, 0)];
+        affected_within_bound(&schema, &base, &batch).unwrap();
+
+        let (schema, t1, mut base) = keyed_on_a();
+        for i in 0..n {
+            base.push(change("t", t1, &format!("u{i}"), Value::Int(0), 2, i));
+        }
+        let batch = vec![change("t", t1, "v", Value::Int(1), 3, 0)];
+        affected_within_bound(&schema, &base, &batch).unwrap();
+    }
+}
+
+/// A row reads each reference and owner it holds as the canonical gid of the group it names,
+/// and whether that group is live, so the bound counts the group: an item referring to, or
+/// owned by, a site merged with `n` others, and one field of the item edited.
+#[test]
+fn affected_and_targets_count_the_groups_a_row_refers_to() {
+    for owner in [false, true] {
+        for n in [1, 100, 1_000, 5_000] {
+            let items = Collection::minted("items").plain("text", Merge::Lww);
+            let items = if owner {
+                items.owner("r", "sites")
+            } else {
+                items.reference("r", "sites")
+            };
+            let schema = Schema::new(vec![
+                Collection::minted("sites").plain("name", Merge::Lww),
+                items,
+            ]);
+            let mut base = vec![change("sites", wide(1), "name", Value::Int(0), 1, 0)];
+            for i in 0..n {
+                let prev = if i == 0 { wide(1) } else { wide(99 + i) };
+                base.push(change("sites", wide(100 + i), "name", Value::Int(0), 1, i));
+                base.push(change(
+                    "sites",
+                    wide(100 + i),
+                    ALIAS,
+                    Value::Ref(prev),
+                    1,
+                    i,
+                ));
+            }
+            base.push(change("items", wide(9), "r", Value::Ref(wide(1)), 1, 0));
+            let batch = vec![change("items", wide(9), "text", Value::Int(1), 2, 0)];
+            affected_within_bound(&schema, &base, &batch).unwrap();
+        }
+    }
+}
+
+/// A gid written many times in every collection holds one claim in each, so where it is kept is
+/// one question of constant size: `n` writes to `x` in each of `a`, `d` and `t`, and one field
+/// of the `t` keyed by `x` edited.
+#[test]
+fn affected_and_targets_ask_where_a_gid_is_kept_in_one_small_question() {
+    flat(|n| {
+        let (schema, t1, mut base) = keyed_on_a();
+        for i in 0..n {
+            for c in ["a", "d", "t"] {
+                base.push(change(c, wide(1), "p", Value::Int(i.into()), 2, i));
+            }
+        }
+        (
+            schema,
+            base,
+            vec![change("t", t1, "v", Value::Int(1), 3, 0)],
+        )
+    });
+}
+
+/// A gid that cannot join is not asked for its aliases, however many it holds: a gid kept in
+/// `t` that does not hold a key deriving it, aliasing the entity edited, or the gid a key of the
+/// entity derives through a merged group, claimed in `t` without that key; `n` aliases in `d`
+/// name it.
+#[test]
+fn affected_and_targets_read_no_aliases_of_a_gid_that_cannot_join() {
+    for derived in [false, true] {
+        flat(|n| {
+            let (schema, t1, mut base) = keyed_on_a();
+            let y = if derived {
+                base.push(change("a", wide(2), "p", Value::Int(0), 1, 1));
+                base.push(change("a", wide(2), ALIAS, Value::Ref(wide(1)), 2, 0));
+                Gid::derive("t", &[Value::Ref(wide(2)), Value::Int(0)])
+            } else {
+                wide(3)
+            };
+            base.push(change("t", y, "v", Value::Int(7), 1, 2));
+            if !derived {
+                base.push(change("t", y, ALIAS, Value::Ref(t1), 2, 0));
+            }
+            for i in 0..n {
+                let z = wide(100 + i);
+                base.push(change("d", z, "p", Value::Int(0), 1, i));
+                base.push(change("d", z, ALIAS, Value::Ref(y), 2, i));
+            }
+            (
+                schema,
+                base,
+                vec![change("t", t1, "v", Value::Int(1), 3, 0)],
+            )
+        });
+    }
+}
+
+/// A chain of aliases arriving in one batch moves every gid of the chain, whose referrers are
+/// each asked about once. At the largest `n`, asking about the referrers of every member of a
+/// moved group for each of them is several times the bound.
+#[test]
+fn affected_and_targets_ask_for_the_referrers_of_each_moved_gid_once() {
+    for n in [2_000, 300, 1] {
+        let (schema, base, batch) = shape(1, n);
+        affected_within_bound(&schema, &base, &batch).unwrap();
+    }
+}
+
+/// The gid a key of the edited entity derives through a merged group is kept in `d`, and holds
+/// `n` entries in the key's collection. It cannot hold the key there, so none of them is read.
+#[test]
+fn affected_and_targets_read_no_entries_of_a_derived_gid_kept_elsewhere() {
+    flat(|n| {
+        let schema = Schema::new(vec![
+            Collection::minted("r").plain("p", Merge::Lww),
+            Collection::minted("d").plain("p", Merge::Lww),
+            Collection::natural("k", &["up", "p0"])
+                .reference("up", "r")
+                .plain("p0", Merge::Lww)
+                .plain("v", Merge::Lww),
+        ]);
+        let (r1, r2) = (wide(1), wide(2));
+        let key = [Value::Ref(r1), Value::Int(1)];
+        let e = Gid::derive("k", &key);
+        let z = Gid::derive("k", &[Value::Ref(r2), Value::Int(1)]);
+        let mut base = vec![
+            change("r", r1, "p", Value::Int(0), 1, 0),
+            change("r", r2, "p", Value::Int(0), 1, 1),
+            change("r", r2, ALIAS, Value::Ref(r1), 2, 0),
+            change("k", e, "up", key[0].clone(), 1, 0),
+            change("k", e, "p0", key[1].clone(), 1, 1),
+            change("d", z, "p", Value::Int(0), 0, 0),
+        ];
+        for i in 0..n {
+            base.push(change("k", z, &format!("f{i}"), Value::Int(1), 1, i));
+        }
+        (schema, base, vec![change("k", e, "v", Value::Int(1), 3, 0)])
+    });
 }
