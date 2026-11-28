@@ -1882,8 +1882,9 @@ async fn acknowledge<A: Apply>(
         if !verified && let Some(fault) = state::reused(&mut tx, library, seq, digest).await? {
             return Ok(Some(fault));
         }
-        let cursor = state::stored_cursor(&mut tx, library).await?;
-        let follows = Some(seq) == cursor.checked_add(1);
+        // An append follows only this build's own position, where that is the cursor too.
+        let (position, cursor) = state::stored_position(&mut tx, library).await?;
+        let follows = Some(seq) == cursor.checked_add(1) && position.is_none_or(|at| at == cursor);
         replica.acknowledge(&mut tx, through).await?;
         state::clear_sending(&mut tx, library, &sending.envelope).await?;
         state::record_appended(&mut tx, library, seq, through, digest).await?;

@@ -15,10 +15,15 @@
 //!
 //! A sync of a layout-2 build already running when another connection upgrades the tables goes
 //! on with its own statements, which touch none of layout 3's columns. It can move the cursor
-//! alone, where this build moves it with the position of its digest: the next sync of this build
-//! then reads on from the position it last stored, applying again what the older build applied,
-//! and requires the log to reach where the older build got, so a resolution that set the cursor to
-//! 0 is not undone and a log that went back is still found. On tables just upgraded, where this
+//! alone, where this build moves it with the position of its digest: the next syncs of this build
+//! then read on from the position it last stored, applying again what the older build applied and
+//! storing their progress as that position, never moving the cursor back, until they reach where
+//! the older build got, which the log must reach. So a resolution that set the cursor to 0 is not
+//! undone, a log that went back is still found, and an append landing right after the moved cursor
+//! is read in its turn, after what lies before it. Where the older build's advance comes after a
+//! resolution and before other devices have refilled the log up to it, the log is then shorter
+//! than that cursor, and the next sync finds a second fault there, which asks for a second
+//! resolution. On tables just upgraded, where this
 //! build has stored no cursor yet, the digest kept for the old position is not taken for the new
 //! one's, and the log is hashed again up to the cursor. It can drop records of appends read past
 //! without keeping them in `fongo_client_passed`: an append later answered at such a position is
@@ -439,10 +444,10 @@ pub(crate) async fn diverges(
     .fetch_one(&mut *conn)
     .await?;
     let at = as_i64(seq)?;
-    if row.try_get::<i64, _>(0)? != at {
+    let anchor_seq: Option<i64> = row.try_get(4)?;
+    if row.try_get::<i64, _>(0)? != at && anchor_seq != Some(at) {
         return Ok(None);
     }
-    let anchor_seq: Option<i64> = row.try_get(4)?;
     let stored_anchor = digest_of(row.try_get(1)?)?.filter(|_| anchor_seq == Some(at));
     let (chain_seq, stored_chain) = chain_of(library, row.try_get(2)?, row.try_get(3)?)?;
     let differs = |stored: Option<Digest32>, mine: Option<Digest32>| {
@@ -455,7 +460,9 @@ pub(crate) async fn diverges(
 
 /// Moves the cursor forward to `seq`, with the digest of the envelope there and, when known, the
 /// fingerprint through it, all in one statement; never back. Where another sync already stored
-/// `seq`, fills in what it lacks; [`diverges`] says first whether the two disagree.
+/// `seq`, fills in what it lacks; [`diverges`] says first whether the two disagree. Where the
+/// stored cursor is past `seq` and this build's position short of it, stores `seq` as that
+/// position.
 pub(crate) async fn advance(
     conn: &mut SqliteConnection,
     library: LibraryId,
@@ -497,7 +504,35 @@ pub(crate) async fn advance(
     .bind(&library.0[..])
     .execute(&mut *conn)
     .await?;
+    // Short of a cursor a build that keeps no digest moved on, the pull's progress is this
+    // build's position, kept apart from the cursor, which only ever moves forward.
+    sqlx::query(
+        "UPDATE fongo_client_state SET anchor = ?1, anchor_seq = ?3,
+            chain = CASE WHEN ?2 IS NOT NULL AND chain_seq < ?3 THEN ?2 ELSE chain END,
+            chain_seq = CASE WHEN ?2 IS NOT NULL AND chain_seq < ?3 THEN ?3 ELSE chain_seq END
+         WHERE library = ?4 AND cursor > ?3 AND anchor_seq < ?3 AND ?1 IS NOT NULL",
+    )
+    .bind(anchor.map(|a| a.to_vec()))
+    .bind(chain.map(|c| c.to_vec()))
+    .bind(at)
+    .bind(&library.0[..])
+    .execute(&mut *conn)
+    .await?;
     Ok(())
+}
+
+/// Where this build last stored its position in the log, and the stored cursor, which a build
+/// that keeps no digest may have moved past it; `None` for the first on tables just upgraded.
+pub(crate) async fn stored_position(
+    conn: &mut SqliteConnection,
+    library: LibraryId,
+) -> Result<(Option<u64>, u64), Error> {
+    let row = sqlx::query("SELECT anchor_seq, cursor FROM fongo_client_state WHERE library = ?")
+        .bind(&library.0[..])
+        .fetch_one(&mut *conn)
+        .await?;
+    let anchor_seq = row.try_get::<Option<i64>, _>(0)?.map(seq_of).transpose()?;
+    Ok((anchor_seq, seq_of(row.try_get(1)?)?))
 }
 
 /// Stores the fingerprint through `at`, hashed on from the one stored through `from`, unless
@@ -807,18 +842,6 @@ pub(crate) async fn known(
     Ok(through.map(Known::Sending))
 }
 
-/// The stored cursor.
-pub(crate) async fn stored_cursor(
-    conn: &mut SqliteConnection,
-    library: LibraryId,
-) -> Result<u64, Error> {
-    let cursor: i64 = sqlx::query_scalar("SELECT cursor FROM fongo_client_state WHERE library = ?")
-        .bind(&library.0[..])
-        .fetch_one(&mut *conn)
-        .await?;
-    u64::try_from(cursor).map_err(|_| corrupt("the cursor is negative"))
-}
-
 /// The stored fingerprint and its position.
 pub(crate) async fn stored_chain(
     conn: &mut SqliteConnection,
@@ -873,8 +896,9 @@ pub(crate) async fn clear_sending(
     Ok(())
 }
 
-/// Records where the pull stopped at a later version's envelope, unless the stored cursor is
-/// already past it, and forgets a recorded stop the stored cursor has passed. Written after the
+/// Records where the pull stopped at a later version's envelope, unless the stored position is
+/// already past it, and forgets a recorded stop the stored position has passed: the cursor, or
+/// this build's position where a build that keeps no digest moved the cursor past it. Written after the
 /// cursor, so that a stop another sync recorded further on stays.
 pub(crate) async fn record_stop(
     conn: &mut SqliteConnection,
@@ -884,10 +908,12 @@ pub(crate) async fn record_stop(
     let seq = stopped.map(|(seq, _)| as_i64(seq)).transpose()?;
     sqlx::query(
         "UPDATE fongo_client_state SET
-            stopped_seq = CASE WHEN ?1 > cursor THEN ?1
-                               WHEN stopped_seq <= cursor THEN NULL ELSE stopped_seq END,
-            stopped_digest = CASE WHEN ?1 > cursor THEN ?2
-                                  WHEN stopped_seq <= cursor THEN NULL ELSE stopped_digest END
+            stopped_seq = CASE WHEN ?1 > min(cursor, coalesce(anchor_seq, cursor)) THEN ?1
+                               WHEN stopped_seq <= min(cursor, coalesce(anchor_seq, cursor))
+                               THEN NULL ELSE stopped_seq END,
+            stopped_digest = CASE WHEN ?1 > min(cursor, coalesce(anchor_seq, cursor)) THEN ?2
+                                  WHEN stopped_seq <= min(cursor, coalesce(anchor_seq, cursor))
+                                  THEN NULL ELSE stopped_digest END
          WHERE library = ?3",
     )
     .bind(seq)
@@ -944,7 +970,8 @@ pub async fn step_past(
     let mut tx = conn.begin().await?;
     let found = sqlx::query(
         "UPDATE fongo_client_state SET passing_seq = stopped_seq, passing_digest = stopped_digest
-         WHERE library = ? AND stopped_seq = ? AND stopped_digest = ? AND cursor = ? - 1",
+         WHERE library = ? AND stopped_seq = ? AND stopped_digest = ?
+           AND min(cursor, coalesce(anchor_seq, cursor)) = ? - 1",
     )
     .bind(&library.0[..])
     .bind(as_i64(seq)?)

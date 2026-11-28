@@ -664,3 +664,184 @@ async fn an_older_build_raising_the_cursor_after_a_resolution_loses_nothing() {
         assert_eq!(p.settings().await, want);
     }
 }
+
+async fn sending(peer: &mut Peer, server: &Server, key: &str) {
+    peer.run(&format!(
+        "INSERT OR REPLACE INTO settings VALUES ('{key}', 'x')"
+    ))
+    .await;
+    peer.sync(server).await.unwrap();
+}
+
+/// Syncs until a sync reads the whole log, at most `n` times; whether one did.
+async fn caught_up(peer: &mut Peer, server: &Server, n: usize) -> bool {
+    for _ in 0..n {
+        if !peer.sync(server).await.unwrap().more {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pages of one envelope, and an older build moves the cursor across more of the log than one
+/// sync reads: the syncs after it read on from where the last one got, and cross it.
+#[tokio::test]
+async fn a_gap_an_older_build_left_longer_than_one_sync_reads_is_crossed() {
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    let [mut a, mut b] = pair(&server).await;
+    let id = a.credentials.library_id();
+    sending(&mut b, &server, "b0").await;
+    a.sync(&server).await.unwrap();
+    let one = server.log(id)[0].clone();
+    for _ in 0..1500 {
+        server.inject(id, one.clone());
+    }
+    sending(&mut b, &server, "b9").await;
+    let len = server.log(id).len();
+    a.run(&format!(
+        "UPDATE fongo_client_state SET cursor = max(cursor, {len})"
+    ))
+    .await;
+    assert!(caught_up(&mut a, &server, 4).await);
+    assert_eq!(fault_of(&mut a).await, None);
+    let print = fingerprint(&mut a.conn, id).await.unwrap();
+    assert_eq!(
+        (print.seq, print.digest),
+        (len as u64, chain(id.0, &server.log(id)))
+    );
+}
+
+/// After a resolution, the log refilled by another device ends exactly where an older build had
+/// read, more than one sync reads past where the resolution put the cursor; the device's first
+/// append lands right after that. The device must still read and apply all of the refill.
+async fn append_right_after_a_raised_cursor(connections: usize) {
+    let dir = support::scratch(&format!("append-after-raised-{connections}"));
+    let path = dir.join("x.db");
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    let made = create_library(&server, now).await.unwrap();
+    let code = made.recovery_code();
+    let join = || join_library(&server, &code, now);
+    let mut b = Peer::new(join().await.unwrap()).await;
+    let mut c = Peer::new(join().await.unwrap()).await;
+    let mut a = Peer::new_at(&path, made.clone()).await;
+    a.run("PRAGMA journal_mode = WAL").await;
+    a.run("PRAGMA busy_timeout = 10000").await;
+    let id = made.library_id();
+    sending(&mut b, &server, "b1").await;
+    let one = server.log(id)[0].clone();
+    for _ in 0..1200 {
+        server.inject(id, one.clone());
+    }
+    assert!(caught_up(&mut a, &server, 4).await);
+    let stored = a.cursor().await;
+    server.roll_back(id, 1);
+    c.sync(&server).await.unwrap();
+    sending(&mut c, &server, "c1").await;
+    let theirs = server.log(id)[1].clone();
+    while (server.log(id).len() as u64) < stored - 1 {
+        server.inject(id, theirs.clone());
+    }
+    sending(&mut c, &server, "c-last").await;
+    assert_eq!(server.log(id).len() as u64, stored);
+    assert!(matches!(a.sync(&server).await, Err(Error::LogFault(_))));
+    fongo_sync_client::resend_all(&mut a.conn, &a.replica, id)
+        .await
+        .unwrap();
+    a.run(&format!(
+        "UPDATE fongo_client_state SET cursor = max(cursor, {stored})"
+    ))
+    .await;
+    if connections == 1 {
+        for _ in 0..6 {
+            a.sync(&server).await.unwrap();
+        }
+    } else {
+        let mut other = Peer::open(&path, made.clone()).await;
+        other.run("PRAGMA busy_timeout = 10000").await;
+        for _ in 0..4 {
+            let (x, y) = tokio::join!(a.sync(&server), other.sync(&server));
+            x.unwrap();
+            y.unwrap();
+        }
+        for _ in 0..2 {
+            a.sync(&server).await.unwrap();
+        }
+    }
+    assert_eq!(fault_of(&mut a).await, None);
+    let mut d = Peer::new(join().await.unwrap()).await;
+    assert!(caught_up(&mut d, &server, 4).await);
+    assert_eq!(a.settings().await, d.settings().await);
+    assert!(a.settings().await.contains(&"c-last=x".to_string()));
+}
+
+#[tokio::test]
+async fn an_append_right_after_a_raised_cursor_does_not_skip_what_lies_before() {
+    append_right_after_a_raised_cursor(1).await;
+}
+
+#[tokio::test]
+async fn two_connections_appending_right_after_a_raised_cursor_skip_nothing() {
+    append_right_after_a_raised_cursor(2).await;
+}
+
+/// Crossing a gap longer than one sync reads, the second sync is dropped part-way and the third
+/// fails part-way: what the first read is kept, nothing goes back, and the syncs after them go on
+/// from there.
+#[tokio::test]
+async fn crossing_a_long_gap_goes_on_after_a_crash() {
+    let dir = support::scratch("long-gap-crash");
+    let path = dir.join("x.db");
+    let server = Server::new();
+    server.with(|s| s.caps.max_page_batches = Some(1));
+    let made = create_library(&server, now).await.unwrap();
+    let mut b = Peer::new(
+        join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut a = Peer::new_at(&path, made.clone()).await;
+    let id = made.library_id();
+    sending(&mut b, &server, "b0").await;
+    a.sync(&server).await.unwrap();
+    let one = server.log(id)[0].clone();
+    for _ in 0..1500 {
+        server.inject(id, one.clone());
+    }
+    sending(&mut b, &server, "b9").await;
+    let len = server.log(id).len() as u64;
+    a.run(&format!(
+        "UPDATE fongo_client_state SET cursor = max(cursor, {len})"
+    ))
+    .await;
+    let position = async |a: &mut Peer| fingerprint(&mut a.conn, id).await.unwrap().seq;
+    assert!(a.sync(&server).await.unwrap().more);
+    let first = position(&mut a).await;
+    assert!(first > 900 && first < len, "the first sync kept {first}");
+    // Dropped while its 300th request hangs.
+    server.hang_at(300, false);
+    {
+        let syncing = a.sync(&server);
+        tokio::select! {
+            _ = syncing => panic!("the sync did not hang"),
+            () = server.hung() => {}
+        }
+    }
+    server.behave();
+    sqlx::Connection::close(a.conn).await.unwrap();
+    let mut a = Peer::open(&path, made.clone()).await;
+    assert_eq!(position(&mut a).await, first);
+    server.fail_at(200);
+    assert!(matches!(a.sync(&server).await, Err(Error::Transport(_))));
+    server.behave();
+    assert!(position(&mut a).await >= first);
+    assert!(caught_up(&mut a, &server, 3).await);
+    assert_eq!(fault_of(&mut a).await, None);
+    let print = fingerprint(&mut a.conn, id).await.unwrap();
+    assert_eq!(
+        (print.seq, print.digest),
+        (len, chain(id.0, &server.log(id)))
+    );
+}
