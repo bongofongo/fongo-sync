@@ -1163,3 +1163,52 @@ async fn reuse_and_divergence_not_stored_are_not_found_again() {
     x.sync(&server).await.unwrap();
     assert_eq!(stored(&mut x).await, None);
 }
+
+async fn in_flight(peer: &mut Peer) -> Option<Vec<u8>> {
+    sqlx::query_scalar("SELECT sending_envelope FROM fongo_client_state")
+        .fetch_one(&mut peer.conn)
+        .await
+        .unwrap()
+}
+
+/// The server refuses a recorded envelope while another connection stores a fault: the sync
+/// that hears the refusal writes nothing more, and the record stays for the resolution.
+#[tokio::test]
+async fn a_refused_envelope_is_not_cleared_once_another_connection_stores_a_fault() {
+    let dir = scratch("refused-after-fault");
+    let path = dir.join("x.db");
+    let server = Server::new();
+    let made = create_library(&server, now).await.unwrap();
+    let mut b = Peer::new(
+        join_library(&server, &made.recovery_code(), now)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut x = Peer::new_at(&path, made.clone()).await;
+    let mut y = Peer::open(&path, made).await;
+    let id = x.credentials.library_id();
+    for key in ["b1", "b2"] {
+        send(&mut b, &server, key).await;
+    }
+    x.sync(&server).await.unwrap();
+    x.run("INSERT INTO settings VALUES ('x', 'x')").await;
+    server.fail_if(is_append);
+    assert!(matches!(x.sync(&server).await, Err(Error::Transport(_))));
+    server.behave();
+    let recorded = in_flight(&mut x).await;
+    assert!(recorded.is_some());
+    // The server now refuses it as too large, and its answer waits.
+    server.with(|s| s.caps.max_batch_bytes = Some(64));
+    let hold = server.hold_if(is_append, true);
+    let mut held = Box::pin(sync(&mut x.conn, &x.replica, &server, &x.credentials, now));
+    tokio::select! {
+        _ = &mut held => panic!("the append was not held"),
+        () = hold.reached() => {}
+    }
+    server.roll_back(id, 1);
+    assert!(matches!(y.sync(&server).await, Err(Error::LogFault(_))));
+    hold.release();
+    assert!(matches!(held.await, Err(Error::LogFault(_))));
+    assert_eq!(in_flight(&mut x).await, recorded);
+}

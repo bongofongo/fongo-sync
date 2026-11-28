@@ -945,16 +945,19 @@ async fn run<T: Transport, A: Apply>(
     Ok(report)
 }
 
-/// Forgets `envelope` as being sent, in a write of its own.
+/// Forgets `envelope` as being sent, in a write of its own, which like every write of a sync is
+/// made only while no fault is stored and none was resolved since the sync began.
 async fn clear_sending<A: Apply>(
     conn: &mut SqliteConnection,
     steps: &mut Steps<'_, A>,
     library: fongo_sync_protocol::LibraryId,
     envelope: &[u8],
 ) -> Result<(), Error> {
-    steps.turn(conn).await?;
-    let began = Instant::now();
-    state::clear_sending(conn, library, envelope).await?;
+    let (mut tx, began) = steps.begin(conn).await?;
+    if let Err(error) = state::clear_sending(&mut tx, library, envelope).await {
+        return Err(abandon(tx, error).await);
+    }
+    tx.commit().await?;
     steps.committed(began);
     Ok(())
 }
